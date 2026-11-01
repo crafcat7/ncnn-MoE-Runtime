@@ -3,6 +3,7 @@
 
 #if NCNN_MOE_WITH_VULKAN
 #include "kernels/vulkan/router_select.comp.hex.h"
+#include "kernels/vulkan/router_select_raw.comp.hex.h"
 #endif
 
 #include <algorithm>
@@ -42,8 +43,61 @@ public:
     ncnn::VkMat selection_bias;
     ncnn::VkMat dummy;
     std::shared_ptr<ncnn::Pipeline> pipeline;
+    std::shared_ptr<ncnn::Pipeline> raw_pipeline;
+    uint32_t raw_subgroup_size = 0;
 #endif
 };
+
+#if NCNN_MOE_WITH_VULKAN
+static uint32_t router_raw_subgroup_size(const ncnn::GpuInfo& info, const ncnn::Option& option)
+{
+    const uint32_t subgroup = info.subgroup_size();
+    const uint32_t required_ops = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT;
+    if (!option.use_subgroup_ops || (info.support_subgroup_ops() & required_ops) != required_ops
+        || !info.queryMaintenance4Features().maintenance4
+        || !info.support_subgroup_size_control() || !info.support_compute_full_subgroups()
+        || (info.querySubgroupSizeControlProperties().requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) == 0
+        || subgroup < 32 || subgroup > 128 || (subgroup & (subgroup - 1)) != 0
+        || subgroup < info.min_subgroup_size() || subgroup > info.max_subgroup_size()
+        || subgroup > info.max_workgroup_invocations() || subgroup > info.max_workgroup_size_x())
+        return 0;
+    return subgroup;
+}
+
+static bool create_router_pipeline(const std::shared_ptr<VulkanContext>& context,
+                                   const ncnn::Option& option, const char* shader, size_t size,
+                                   uint64_t variant, uint32_t group_size, uint32_t subgroup_size,
+                                   const std::vector<ncnn::vk_specialization_type>& specializations,
+                                   std::shared_ptr<ncnn::Pipeline>& output)
+{
+    const auto binary = context->shader_binary(shader, static_cast<int>(size), option, 0);
+    if (!binary || binary->empty())
+        return false;
+    // The deleter also locks for unprepared pipelines, so allocation of its
+    // shared ownership control block must precede the command lock.
+    auto pipeline = std::shared_ptr<ncnn::Pipeline>(new ncnn::Pipeline(context->device()),
+                                                    [context = context](ncnn::Pipeline* value) mutable {
+                                                        {
+                                                            const std::lock_guard<std::mutex> lock(context->command_mutex());
+                                                            delete value;
+                                                        }
+                                                        // Weak cache entries retain the deleter after disposal.
+                                                        context.reset();
+                                                    });
+    const std::lock_guard<std::mutex> lock(context->command_mutex());
+    output = context->find_pipeline(shader, variant);
+    if (output)
+        return true;
+    if (subgroup_size != 0)
+        pipeline->set_subgroup_size(subgroup_size);
+    pipeline->set_local_size_xyz(group_size, 1, 1);
+    if (pipeline->create(binary->data(), binary->size() * sizeof(uint32_t), specializations) != 0)
+        return false;
+    output = pipeline;
+    context->cache_pipeline(shader, variant, output);
+    return true;
+}
+#endif
 
 Router_vulkan::Router_vulkan() : d(new Implementation)
 {
@@ -81,33 +135,31 @@ Router_vulkan::create(const TensorData& weight, const TensorData* bias,
     implementation.opt = projection->option();
     implementation.expert_count = weight.shape[0];
     implementation.input_columns = weight.shape[1];
-    const std::lock_guard<std::mutex> lock(implementation.context->command_mutex());
-    const auto spirv = implementation.context->shader_binary(router_select_shader, static_cast<int>(sizeof(router_select_shader) - 1),
-                                                             implementation.opt, 0);
-    if (!spirv || spirv->empty())
+    if (!create_router_pipeline(implementation.context, implementation.opt,
+                                router_select_shader, sizeof(router_select_shader) - 1,
+                                0, 128, 0, {}, implementation.pipeline))
         return {};
-    implementation.pipeline = implementation.context->find_pipeline(router_select_shader, 0);
-    if (!implementation.pipeline)
+    implementation.raw_subgroup_size = router_raw_subgroup_size(implementation.context->device()->info,
+                                                                implementation.opt);
+    if (implementation.raw_subgroup_size != 0)
     {
-        std::unique_ptr<ncnn::Pipeline> pipeline(new ncnn::Pipeline(implementation.context->device()));
-        pipeline->set_local_size_xyz(128, 1, 1);
-        const std::vector<ncnn::vk_specialization_type> specializations;
-        if (pipeline->create(spirv->data(), spirv->size() * sizeof(uint32_t),
-                             specializations)
-            != 0)
+        const uint32_t subgroup = implementation.raw_subgroup_size;
+        const uint32_t experts_per_lane = (implementation.expert_count + subgroup - 1) / subgroup;
+        const uint64_t variant = static_cast<uint64_t>(experts_per_lane) << 32 | subgroup;
+        ncnn::Option compile_option = implementation.opt;
+        compile_option.use_subgroup_ops = true;
+        // Enabled maintenance4 makes ncnn emit SPIR-V 1.6. Together with a
+        // required subgroup size equal to local_size_x, this guarantees every
+        // shuffle source is active without a REQUIRE_FULL_SUBGROUPS stage flag.
+        std::vector<ncnn::vk_specialization_type> specializations(1);
+        specializations[0].u32 = experts_per_lane;
+        if (!create_router_pipeline(implementation.context, compile_option,
+                                    router_select_raw_shader, sizeof(router_select_raw_shader) - 1,
+                                    variant, subgroup, subgroup, specializations,
+                                    implementation.raw_pipeline))
             return {};
-        implementation.pipeline = std::shared_ptr<ncnn::Pipeline>(pipeline.release(),
-                                                                  [context = implementation.context](ncnn::Pipeline* value) mutable {
-                                                                      {
-                                                                          const std::lock_guard<std::mutex> lock(context->command_mutex());
-                                                                          delete value;
-                                                                      }
-                                                                      // Weak cache entries retain the deleter control block after disposal.
-                                                                      context.reset();
-                                                                  });
-        implementation.context->cache_pipeline(router_select_shader, 0,
-                                               implementation.pipeline);
     }
+    const std::lock_guard<std::mutex> lock(implementation.context->command_mutex());
     ncnn::VkTransfer transfer(implementation.context->device());
     ncnn::Mat dummy(1, sizeof(float));
     dummy[0] = 0.0f;
@@ -267,6 +319,23 @@ bool Router_vulkan::record(const ncnn::VkMat& input,
                               implementation.opt.blob_vkallocator);
     if (workspace.selected.empty())
         return false;
+    const bool raw_topk = options.score_function == RouterScoreFunction::Softmax
+                          && options.normalization == RouterNormalization::SelectedExperts
+                          && options.selection_bias.empty() && options.explicit_expert_ids.empty();
+    if (raw_topk && implementation.raw_pipeline)
+    {
+        std::vector<ncnn::vk_constant_type> constants(3);
+        constants[0].u32 = options.expert_count;
+        constants[1].u32 = options.top_k;
+        constants[2].f = options.routed_scaling_factor;
+        ncnn::VkMat dispatcher;
+        dispatcher.w = implementation.raw_subgroup_size;
+        dispatcher.h = input.h;
+        dispatcher.c = 1;
+        cmd.record_pipeline_readonly(implementation.raw_pipeline.get(),
+                                     {workspace.logits, workspace.selected}, {1, 0}, constants, dispatcher);
+        return true;
+    }
     std::vector<ncnn::vk_constant_type> constants(7);
     constants[0].u32 = options.expert_count;
     constants[1].u32 = options.top_k;

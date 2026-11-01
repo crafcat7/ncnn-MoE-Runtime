@@ -9,6 +9,13 @@ namespace ncnn {
 namespace moe {
 
 #if NCNN_MOE_WITH_VULKAN
+enum class BankCodeBasis
+{
+    None,
+    GateUp,
+    Down
+};
+
 struct BankNumericCase
 {
     uint32_t intermediate;
@@ -20,6 +27,7 @@ struct BankNumericCase
     uint32_t input_columns = 128;
     bool projected_input = false;
     bool subnormal_gate_scale = false;
+    BankCodeBasis code_basis = BankCodeBasis::None;
 };
 
 struct BankNumericExpert
@@ -54,6 +62,39 @@ static std::array<BankNumericExpert, 4> numeric_experts(const BankNumericCase& t
         item.gate_bias.shape = {test.intermediate * 2};
         item.down_bias.shape = {test.output};
         item.gate_bias.float32_data.resize(test.intermediate * 2);
+        if (test.code_basis != BankCodeBasis::None)
+        {
+            // SiLU(128) rounds to exactly 128. One coefficient per output
+            // exposes each FP4 code at different packed-word positions as
+            // a dyadic result without cancellation.
+            std::fill_n(item.gate_bias.float32_data.data(), test.intermediate, 128.0f);
+            item.down_bias.float32_data.resize(test.output, 0.0f);
+            if (test.code_basis == BankCodeBasis::GateUp)
+            {
+                for (uint32_t middle = 0; middle < test.intermediate; ++middle)
+                {
+                    const size_t index = static_cast<size_t>(test.intermediate + middle) * test.input_columns + middle % 8;
+                    item.gate.mxfp4_blocks[index / 2] = static_cast<uint8_t>((middle % 16) << ((index % 2) * 4));
+                }
+                std::fill_n(item.gate.mxfp4_scales.data(), item.gate.mxfp4_scales.size(), test.scale);
+                for (uint32_t column = 0; column < test.output; ++column)
+                {
+                    const size_t index = static_cast<size_t>(column) * test.intermediate + column;
+                    item.down.mxfp4_blocks[index / 2] = static_cast<uint8_t>(2u << ((index % 2) * 4));
+                }
+            }
+            else
+            {
+                std::fill_n(item.gate_bias.float32_data.data() + test.intermediate, 8, std::ldexp(1.0f, test.input_exponent - 7));
+                for (uint32_t column = 0; column < test.output; ++column)
+                {
+                    const size_t index = static_cast<size_t>(column) * test.intermediate + column % 8;
+                    item.down.mxfp4_blocks[index / 2] = static_cast<uint8_t>((column % 16) << ((index % 2) * 4));
+                }
+                std::fill_n(item.down.mxfp4_scales.data(), item.down.mxfp4_scales.size(), test.scale);
+            }
+            continue;
+        }
         for (uint32_t middle = 0; middle < test.intermediate; ++middle)
         {
             item.gate_bias.float32_data[middle] = 1.0f;
@@ -112,28 +153,31 @@ static ActivationBuffer numeric_reference(const std::array<BankNumericExpert, 4>
     for (size_t expert = 0; expert < experts.size(); ++expert)
     {
         const auto& item = experts[expert];
-        std::vector<double> activated(test.intermediate);
-        for (uint32_t middle = 0; middle < test.intermediate; ++middle)
+        for (size_t row = 0; row < input.rows(); ++row)
         {
-            double gate = item.gate_bias.float32_data[middle];
-            double up = item.gate_bias.float32_data[test.intermediate + middle];
-            if (test.projected_input)
-                for (uint32_t k = 0; k < test.input_columns; ++k)
-                {
-                    gate += numeric_value(item.gate, static_cast<size_t>(middle) * test.input_columns + k) * input.row(0)[k];
-                    up += numeric_value(item.gate, static_cast<size_t>(test.intermediate + middle) * test.input_columns + k) * input.row(0)[k];
-                }
-            activated[middle] = gate / (1.0 + std::exp(-gate)) * up;
-        }
-        for (uint32_t column = 0; column < test.output; ++column)
-        {
-            double value = item.down_bias.float32_data[column];
+            std::vector<double> activated(test.intermediate);
             for (uint32_t middle = 0; middle < test.intermediate; ++middle)
             {
-                const size_t index = static_cast<size_t>(column) * test.intermediate + middle;
-                value += numeric_value(item.down, index) * activated[middle];
+                double gate = item.gate_bias.float32_data[middle];
+                double up = item.gate_bias.float32_data[test.intermediate + middle];
+                if (test.projected_input)
+                    for (uint32_t k = 0; k < test.input_columns; ++k)
+                    {
+                        gate += numeric_value(item.gate, static_cast<size_t>(middle) * test.input_columns + k) * input.row(row)[k];
+                        up += numeric_value(item.gate, static_cast<size_t>(test.intermediate + middle) * test.input_columns + k) * input.row(row)[k];
+                    }
+                activated[middle] = gate / (1.0 + std::exp(-gate)) * up;
             }
-            projected[expert].push_back(static_cast<float>(value));
+            for (uint32_t column = 0; column < test.output; ++column)
+            {
+                double value = item.down_bias.float32_data[column];
+                for (uint32_t middle = 0; middle < test.intermediate; ++middle)
+                {
+                    const size_t index = static_cast<size_t>(column) * test.intermediate + middle;
+                    value += numeric_value(item.down, index) * activated[middle];
+                }
+                projected[expert].push_back(static_cast<float>(value));
+            }
         }
     }
     ActivationBuffer output(selected.rows(), test.output);
@@ -145,7 +189,7 @@ static ActivationBuffer numeric_reference(const std::array<BankNumericExpert, 4>
                 for (uint32_t rank = 0; rank < top_k; ++rank)
                     if (selected.row(row)[rank] == static_cast<float>(expert))
                     {
-                        volatile float term = projected[expert][column] * selected.row(row)[top_k + rank];
+                        volatile float term = projected[expert][row * test.output + column] * selected.row(row)[top_k + rank];
                         value += term;
                     }
             output.row(row)[column] = value;
@@ -167,11 +211,13 @@ static void numeric_case(const std::shared_ptr<VulkanContext>& context, const Ba
     for (const auto& [top_k, rows] : selections)
     {
         ActivationBuffer input(rows, test.input_columns), selected(rows, top_k * 2 + 1);
-        // Projection inputs repeat; each row below selects different experts.
+        // Distinct rows catch accidental reuse of the first row's projection.
         for (size_t row = 0; row < rows; ++row)
             for (uint32_t k = 0; k < test.input_columns; ++k)
-                input.row(row)[k] = test.projected_input
-                                        ? std::ldexp(static_cast<float>(static_cast<int>((k * 7 + k / 13) % 19) - 9), test.subnormal_gate_scale ? 120 : -6)
+                input.row(row)[k] = test.code_basis == BankCodeBasis::GateUp
+                                        ? (k < 8 ? std::ldexp(1.0f, test.input_exponent - 7) : 0.0f)
+                                    : test.projected_input
+                                        ? std::ldexp(static_cast<float>(static_cast<int>((k * 7 + k / 13 + row * 5) % 19) - 9), test.subnormal_gate_scale ? 120 : -6)
                                         : 0.0f;
         for (size_t row = 0; row < rows; ++row)
         {
@@ -212,15 +258,28 @@ static void numeric_case(const std::shared_ptr<VulkanContext>& context, const Ba
                                   + " scale=" + std::to_string(test.scale) + " exponent=" + std::to_string(test.input_exponent)
                                   + " random=" + std::to_string(test.random_scales) + " cancellation=" + std::to_string(test.cancellation)
                                   + " subnormal_gate_scale=" + std::to_string(test.subnormal_gate_scale)
+                                  + " code_basis=" + std::to_string(static_cast<int>(test.code_basis))
                                   + " K=" + std::to_string(top_k) + " rows=" + std::to_string(rows);
         segment_compare(actual.values(), expected.values(), label);
+        if (test.code_basis != BankCodeBasis::None)
+        {
+            static constexpr float fp4[] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6, 0, -0.5f, -1, -1.5f, -2, -3, -4, -6};
+            for (size_t row = 0; row < rows; ++row)
+                for (uint32_t column = 0; column < test.output; ++column)
+                {
+                    const float exact = std::ldexp(fp4[column % 16], static_cast<int>(test.scale) - 127 + test.input_exponent);
+                    // +0 accumulation normalizes either zero code's sign.
+                    segment_check(actual.row(row)[column] == exact && expected.row(row)[column] == exact,
+                                  label + " exact FP4 code mismatch at " + std::to_string(column));
+                }
+        }
     }
 }
 
 static int numeric_run()
 {
     if (get_gpu_count() == 0) return 77;
-    const std::array<BankNumericCase, 11> cases = {{{32, 5, 7, 123, false, false, 32},
+    const std::array<BankNumericCase, 17> cases = {{{32, 5, 7, 123, false, false, 32},
                                                     {32, 1, 1, 120, false, true},
                                                     {128, 3, 0, 120, false, false},
                                                     {128, 129, 254, -120, false, false},
@@ -230,7 +289,13 @@ static int numeric_run()
                                                     {4096, 4, 127, 0, true, false},
                                                     {128, 5, 127, 0, true, false, 2880, true},
                                                     {128, 5, 127, 0, true, false, 4096, true},
-                                                    {128, 5, 127, 0, false, false, 128, true, true}}};
+                                                    {128, 5, 127, 0, false, false, 128, true, true},
+                                                    {32, 16, 127, 0, false, false, 32, true, false, BankCodeBasis::GateUp},
+                                                    {32, 16, 0, 123, false, false, 32, true, false, BankCodeBasis::GateUp},
+                                                    {32, 16, 254, -118, false, false, 32, true, false, BankCodeBasis::GateUp},
+                                                    {32, 16, 127, 0, false, false, 32, false, false, BankCodeBasis::Down},
+                                                    {32, 16, 0, 123, false, false, 32, false, false, BankCodeBasis::Down},
+                                                    {32, 16, 254, -118, false, false, 32, false, false, BankCodeBasis::Down}}};
     for (uint32_t device = 0; device < get_gpu_count(); ++device)
     {
         const auto context = VulkanContext::acquire(device, create_vulkan_runtime(), segment_flags);

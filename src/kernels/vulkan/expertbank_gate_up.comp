@@ -9,6 +9,10 @@ layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 layout(constant_id = 0) const uint weight_format = 2;
 layout(binding = 0) readonly buffer input_blob
 { float input_data[]; };
+// MXFP4 rows and eight-value chunks are aligned to this view. Native formats
+// retain the scalar view so their input widths need no additional padding.
+layout(binding = 0) readonly buffer input_blob_v4
+{ vec4 input_data_v4[]; };
 layout(binding = 1) readonly buffer weight_blob
 { uint weights[]; };
 layout(binding = 2) readonly buffer selected_blob
@@ -135,10 +139,8 @@ void mxfp4_gate_up()
         const uint blocks = p.input_columns / 32u;
         for (uint k = tid * 8u; k < p.input_columns; k += 1024u)
         {
-            const vec4 x0 = vec4(input_data[input_base + k], input_data[input_base + k + 1u],
-                                 input_data[input_base + k + 2u], input_data[input_base + k + 3u]);
-            const vec4 x1 = vec4(input_data[input_base + k + 4u], input_data[input_base + k + 5u],
-                                 input_data[input_base + k + 6u], input_data[input_base + k + 7u]);
+            const vec4 x0 = input_data_v4[(input_base + k) / 4u];
+            const vec4 x1 = input_data_v4[(input_base + k) / 4u + 1u];
             const bool safe_input = dot8_input_range(x0) && dot8_input_range(x1);
             gate_sum.x += mxfp4_dot8(base, column * 2u, blocks, k, x0, x1, safe_input);
             up_sum.x += mxfp4_dot8(base, column * 2u + 1u, blocks, k, x0, x1, safe_input);

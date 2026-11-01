@@ -6,6 +6,7 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <utility>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -89,6 +90,11 @@ static ActivationBuffer router_run(const Router_vulkan& router,
     router_check(recorded == expect_record, "router record validity");
     if (!recorded)
         return {};
+    const auto recorded_statistics = get_vulkan_statistics(context->runtime());
+    router_check(recorded_statistics.compute_submissions == before.compute_submissions
+                     && recorded_statistics.batch_uploads == before.batch_uploads
+                     && recorded_statistics.batch_downloads == before.batch_downloads,
+                 "router recording must not submit or copy results to the CPU");
     router_check(prepare_staging_batch(download, input.rows(), selected.columns(),
                                        context->staging_allocator()),
                  "router selected staging");
@@ -109,6 +115,40 @@ static ActivationBuffer router_run(const Router_vulkan& router,
     router_check(selected.bytes().size() == input.rows() * (options.top_k * 2 + 1) * sizeof(float),
                  "router compact download size");
     return selected;
+}
+
+static void router_test_raw_tail_cases()
+{
+    // Exercise selector tails and small/large K through the production Router
+    // interface. The existing cases cover ties, nonfinite rows and publication.
+    for (const auto [count, top_k] : {std::pair{33u, 4u}, std::pair{65u, 33u},
+                                      std::pair{128u, 4u}, std::pair{2048u, 64u}})
+    {
+        ActivationBuffer input(2, count);
+        for (uint32_t expert = 0; expert < count; ++expert)
+        {
+            input.row(0)[expert] = static_cast<float>(static_cast<int>((expert * 37) % 257) - 128) * 0.125f;
+            input.row(1)[expert] = 0.0f;
+        }
+        ExpertDispatchOptions options;
+        options.expert_count = count;
+        options.top_k = top_k;
+        options.score_function = RouterScoreFunction::Softmax;
+        options.normalization = RouterNormalization::SelectedExperts;
+        options.routed_scaling_factor = 2.5f;
+        ExpertDispatchPlan expected;
+        router_check(static_cast<bool>(forward_router(input.values(), 2, options, expected)), "tail CPU oracle");
+        for (uint32_t device = 0; device < get_gpu_count(); ++device)
+        {
+            auto router = Router_vulkan::create(router_identity(count), nullptr, nullptr, device,
+                                                create_vulkan_runtime(), OptimizationDefaultFlags);
+            router_check(static_cast<bool>(router), "tail Router create");
+            ExpertDispatchPlan actual;
+            router_check(static_cast<bool>(Router_vulkan::decode_selected(router_run(*router, input, options), options, actual)),
+                         "tail selected decode");
+            router_check_plan(actual, expected, "E=" + std::to_string(count) + " K=" + std::to_string(top_k));
+        }
+    }
 }
 
 static void router_test_scores()
@@ -312,6 +352,7 @@ int main()
         ncnn::moe::router_test_scores();
         ncnn::moe::router_test_ties_and_extremes();
         ncnn::moe::router_test_invalid();
+        ncnn::moe::router_test_raw_tail_cases();
         std::cout << "Vulkan router tests passed\n";
         return 0;
     }

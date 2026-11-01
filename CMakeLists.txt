@@ -415,6 +415,7 @@ if(NCNN_MOE_WITH_VULKAN)
         src/kernels/vulkan/hyper_connection_reduce.comp
         src/kernels/vulkan/hyper_connection_post.comp
         src/kernels/vulkan/router_select.comp
+        src/kernels/vulkan/router_select_raw.comp
         src/kernels/vulkan/expertbank_gate_up.comp
         src/kernels/vulkan/expertbank_down.comp
         src/kernels/vulkan/expertbank_combine.comp
