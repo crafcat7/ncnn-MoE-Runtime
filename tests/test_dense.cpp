@@ -274,7 +274,7 @@ static void test_native_expert_layouts()
     }
 }
 
-static void test_gated_activation_projection_fallbacks()
+static void test_gated_activation_projection_contract()
 {
     for (ExpertActivation activation : {ExpertActivation::GptOssSwiGlu, ExpertActivation::DeepSeekSwiGlu})
     {
@@ -313,23 +313,32 @@ static void test_gated_activation_projection_fallbacks()
                                           * std::clamp(up_value, -limit, limit);
 
         ActivationBuffer cpu_output;
-        ActivationBuffer vulkan_fallback_output;
+        ActivationBuffer unavailable_vulkan_output;
         ExpertWorkspace cpu_workspace;
-        ExpertWorkspace fallback_workspace;
+        ExpertWorkspace unavailable_workspace;
         forward_dense_ffn(model, expert, input, cpu_output, cpu_workspace, ExecutionBackend::Cpu);
-        forward_dense_ffn(model, expert, input, vulkan_fallback_output, fallback_workspace, ExecutionBackend::Vulkan);
+        bool rejected = false;
+        try
+        {
+            forward_dense_ffn(model, expert, input, unavailable_vulkan_output, unavailable_workspace, ExecutionBackend::Vulkan);
+        }
+        catch (const std::runtime_error&)
+        {
+            rejected = true;
+        }
+        dense_check(rejected, "selected Vulkan projection without a GPU operator must report an execution error");
+        dense_check(unavailable_vulkan_output.rows() == 0, "unavailable Vulkan projection must not publish CPU output");
         for (uint32_t column = 0; column < 2; ++column)
         {
             const float expected = model.weights.at(expert.down_weight).float32_values()[column] * activated;
             dense_near(cpu_output.row(0)[column], expected);
-            dense_near(vulkan_fallback_output.row(0)[column], expected);
         }
     }
 }
 
 void test_dense_ffn()
 {
-    test_gated_activation_projection_fallbacks();
+    test_gated_activation_projection_contract();
     test_native_expert_layouts();
     for (DType dtype : {DType::Float32, DType::BFloat16})
     {

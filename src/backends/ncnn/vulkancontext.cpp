@@ -1,6 +1,7 @@
 #include "vulkancontext.h"
 #include "vulkanwaitpolicy.h"
 #include "experttransfer_vulkan.h"
+#include "graphallocator_vulkan.h"
 #include "kernels/activationbuffer.h"
 
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <new>
 #include <span>
 #include <thread>
+#include <string>
 #include <utility>
 
 namespace ncnn {
@@ -473,6 +475,85 @@ VulkanRuntimePtr create_vulkan_runtime()
     return std::make_shared<VulkanRuntime>();
 }
 
+std::shared_ptr<void> retain_vulkan_graph_context(const VulkanRuntimePtr& vulkan_runtime,
+                                                  uint32_t device_index,
+                                                  uint64_t optimization_flags) noexcept
+{
+#if NCNN_MOE_WITH_VULKAN
+    try
+    {
+        return VulkanContext::acquire(device_index, vulkan_runtime, optimization_flags);
+    }
+    catch (...)
+    {
+        return {};
+    }
+#else
+    (void)vulkan_runtime;
+    (void)device_index;
+    (void)optimization_flags;
+    return {};
+#endif
+}
+
+Result<VulkanGraphArenaSize> reserve_vulkan_graph_compute(const VulkanRuntimePtr& vulkan_runtime,
+                                                          uint32_t device_index,
+                                                          uint64_t optimization_flags,
+                                                          uint64_t compute_bytes)
+{
+#if NCNN_MOE_WITH_VULKAN
+    try
+    {
+        const auto context = VulkanContext::find(device_index, vulkan_runtime, optimization_flags);
+        if (!context)
+            return Error{ErrorCode::InternalError,
+                         "Vulkan graph compute reservation has no prepared Context for device "
+                             + std::to_string(device_index)};
+        if (!context->reserve_graph_compute(compute_bytes))
+            return Error{ErrorCode::InternalError,
+                         "Vulkan graph compute reservation failed for device "
+                             + std::to_string(device_index) + ": "
+                             + std::to_string(compute_bytes) + " bytes"};
+        return context->graph_compute_physical_size();
+    }
+    catch (const std::exception& error)
+    {
+        return Error{ErrorCode::InternalError,
+                     "Vulkan graph compute reservation failed for device "
+                         + std::to_string(device_index) + ": " + error.what()};
+    }
+#else
+    (void)vulkan_runtime;
+    (void)device_index;
+    (void)optimization_flags;
+    (void)compute_bytes;
+    return Error{ErrorCode::UnsupportedModel,
+                 "Vulkan graph compute arena is unavailable in this build"};
+#endif
+}
+
+VulkanGraphArenaSize query_vulkan_graph_compute(const VulkanRuntimePtr& vulkan_runtime,
+                                                uint32_t device_index,
+                                                uint64_t optimization_flags) noexcept
+{
+#if NCNN_MOE_WITH_VULKAN
+    try
+    {
+        const auto context = VulkanContext::find(device_index, vulkan_runtime, optimization_flags);
+        return context ? context->graph_compute_physical_size() : VulkanGraphArenaSize{};
+    }
+    catch (...)
+    {
+        return {};
+    }
+#else
+    (void)vulkan_runtime;
+    (void)device_index;
+    (void)optimization_flags;
+    return {};
+#endif
+}
+
 uint32_t get_gpu_count() noexcept
 {
 #if NCNN_MOE_WITH_VULKAN
@@ -573,6 +654,15 @@ VulkanStatistics get_vulkan_statistics(const VulkanRuntimePtr& vulkan_runtime) n
     result.compute_submissions = state.compute_submissions.load();
     result.batch_uploads = state.batch_uploads.load();
     result.batch_downloads = state.batch_downloads.load();
+    result.weight_upload_bytes = state.weight_upload_bytes.load();
+    result.weight_transfer_submissions = state.weight_transfer_submissions.load();
+    result.weight_visibility_submissions = state.weight_visibility_submissions.load();
+    result.weight_transfer_fence_waits = state.weight_transfer_fence_waits.load();
+    result.weight_transfer_wait_microseconds = state.weight_transfer_wait_microseconds.load();
+    result.resident_graph_submissions = state.resident_graph_submissions.load();
+    result.resident_graph_activation_upload_bytes = state.resident_graph_activation_upload_bytes.load();
+    result.resident_graph_activation_download_bytes = state.resident_graph_activation_download_bytes.load();
+    result.resident_graph_route_download_bytes = state.resident_graph_route_download_bytes.load();
     result.attention_qkv_rope_fusions = state.attention_qkv_rope_fusions.load();
     result.attention_device_rope_fusions = state.attention_device_rope_fusions.load();
     result.attention_qkv_ring_fusions = state.attention_qkv_ring_fusions.load();
@@ -597,18 +687,23 @@ VulkanStatistics get_vulkan_statistics(const VulkanRuntimePtr& vulkan_runtime) n
 }
 
 #if NCNN_MOE_WITH_VULKAN
-int wait_submitted_compute(ncnn::VkCompute& command, const ncnn::VulkanDevice* probe_device)
+int wait_submitted_compute(ncnn::VkCompute& command, const ncnn::VulkanDevice* probe_device,
+                           VkQueue borrowed_queue)
 {
     struct WaitContext
     {
         ncnn::VkCompute& command;
         const ncnn::VulkanDevice* device;
-    } wait_context{command, probe_device};
+        VkQueue queue;
+    } wait_context{command, probe_device, borrowed_queue};
     // Concrete callbacks keep the common CPU-testable policy allocation-free.
     const VulkanCompletionCallbacks callbacks{
         &wait_context,
         [](void* context) { return static_cast<WaitContext*>(context)->command.wait(); },
         [](void* context) noexcept {
+            const VkQueue borrowed = static_cast<WaitContext*>(context)->queue;
+            if (borrowed)
+                return classify_vulkan_completion_probe(vkQueueWaitIdle(borrowed), VK_ERROR_DEVICE_LOST);
             const ncnn::VulkanDevice* device = static_cast<WaitContext*>(context)->device;
             if (!device)
                 return VulkanCompletionProbeResult::Retry;
@@ -625,6 +720,57 @@ int wait_submitted_compute(ncnn::VkCompute& command, const ncnn::VulkanDevice* p
         },
         [](void*) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }};
     return wait_for_vulkan_submission_completion(callbacks);
+}
+
+VulkanComputeBatch::VulkanComputeBatch(VulkanContext& owner) : context(owner)
+{
+    queue = context.device()->acquire_queue(context.device()->info.compute_queue_family_index());
+}
+
+VulkanComputeBatch::~VulkanComputeBatch()
+{
+    (void)reset();
+    if (queue) context.device()->reclaim_queue(context.device()->info.compute_queue_family_index(), queue);
+}
+
+ncnn::VkCompute* VulkanComputeBatch::next()
+{
+    if (!queue || completion_error || recorded != submitted) return nullptr;
+    if (recorded == context.ordered_commands.size())
+        context.ordered_commands.push_back(std::make_unique<ncnn::VkCompute>(context.device()));
+    return context.ordered_commands[recorded++].get();
+}
+
+int VulkanComputeBatch::submit()
+{
+    if (!queue || completion_error || recorded != submitted + 1) return -1;
+    const int result = context.ordered_commands[submitted]->submit(queue);
+    if (result == 0)
+        ++submitted;
+    else
+        completion_error = result; // Submission failures are never retried.
+    return result;
+}
+
+int VulkanComputeBatch::wait() noexcept
+{
+    while (completed < submitted)
+    {
+        const int result = wait_submitted_compute(*context.ordered_commands[completed], context.device(), queue);
+        if (result != 0) completion_error = result;
+        ++completed;
+    }
+    return completion_error;
+}
+
+int VulkanComputeBatch::reset() noexcept
+{
+    int result = wait();
+    for (size_t i = 0; i < recorded; ++i)
+        if (context.ordered_commands[i]->reset() != 0) result = -1;
+    recorded = submitted = completed = 0;
+    completion_error = result;
+    return result;
 }
 
 int submit_compute_and_wait(ncnn::VkCompute& command,
@@ -647,6 +793,7 @@ VulkanContext::~VulkanContext()
 
 void VulkanContext::release_resources() noexcept
 {
+    ordered_commands.clear();
     // Active weight-transfer leases retain this Context, so all pooled lanes
     // are idle before destruction or constructor-failure cleanup.
     weight_transfer_pool.reset();
@@ -685,11 +832,33 @@ void VulkanContext::release_resources() noexcept
         vkdev->reclaim_staging_allocator(staging_alloc);
         staging_alloc = nullptr;
     }
-    if (blob_alloc)
-    {
-        vkdev->reclaim_blob_allocator(blob_alloc);
-        blob_alloc = nullptr;
-    }
+    blob_alloc = nullptr;
+    graph_allocator.reset();
+}
+
+bool VulkanContext::reserve_graph_compute(uint64_t bytes)
+{
+    return graph_allocator && graph_allocator->reserve_graph_compute(bytes);
+}
+
+VulkanGraphArenaSize VulkanContext::graph_compute_physical_size() const
+{
+    return graph_allocator ? graph_allocator->physical_size() : VulkanGraphArenaSize{};
+}
+
+std::shared_ptr<VulkanContext> VulkanContext::find(uint32_t requested_device_index,
+                                                   const VulkanRuntimePtr& vulkan_runtime,
+                                                   uint64_t optimization_flags)
+{
+    if (!vulkan_runtime)
+        return {};
+    const uint32_t device_index = requested_device_index == automatic_vulkan_device_index
+                                      ? static_cast<uint32_t>(ncnn::get_default_gpu_index())
+                                      : requested_device_index;
+    const std::lock_guard<std::mutex> lock(vulkan_runtime->context_mutex);
+    const auto existing = vulkan_runtime->contexts.find({device_index, optimization_flags});
+    return existing == vulkan_runtime->contexts.end() ? std::shared_ptr<VulkanContext>{}
+                                                      : existing->second.lock();
 }
 
 std::shared_ptr<VulkanContext> VulkanContext::acquire(uint32_t requested_device_index,
@@ -810,7 +979,8 @@ VulkanContext::VulkanContext(ncnn::VulkanDevice* device,
     try
     {
         weight_transfer_pool = std::make_unique<VulkanExpertTransferPool>(device);
-        blob_alloc = device->acquire_blob_allocator();
+        graph_allocator = std::make_unique<VulkanGraphAllocator>(device);
+        blob_alloc = graph_allocator.get();
         staging_alloc = device->acquire_staging_allocator();
         for (VulkanTransferSlot& slot : transfer_slots)
             slot.staging_allocator = device->acquire_staging_allocator();

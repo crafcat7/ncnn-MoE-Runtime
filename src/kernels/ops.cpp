@@ -1077,8 +1077,10 @@ static bool forward_linear_vulkan(const CompiledOperator* op,
                                   ActivationBuffer& output,
                                   ExecutionBackend backend)
 {
-    if (backend != ExecutionBackend::Vulkan || !op)
+    if (backend != ExecutionBackend::Vulkan)
         return false;
+    if (!op)
+        throw std::runtime_error("Vulkan linear was selected without a compiled operator");
     bool executed = false;
     if (op->bfloat16)
         executed = op->bfloat16->forward(input, output);
@@ -1089,7 +1091,7 @@ static bool forward_linear_vulkan(const CompiledOperator* op,
     else if (op->linear)
         executed = op->linear->forward(input, output);
     else
-        return false;
+        throw std::runtime_error("Vulkan linear was selected without a device operator");
 
     if (!executed)
         throw std::runtime_error("Vulkan linear execution failed");

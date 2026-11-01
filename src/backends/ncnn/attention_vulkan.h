@@ -19,6 +19,7 @@
 namespace ncnn {
 #if NCNN_MOE_WITH_VULKAN
 class VkCompute;
+class Option;
 #endif
 namespace moe {
 
@@ -27,6 +28,23 @@ class Linear;
 class Bfloat16Linear_vulkan;
 class QnkLinear_vulkan;
 class Float8Linear_vulkan;
+class VulkanContext;
+
+class AttentionWork_vulkan
+{
+public:
+    AttentionWork_vulkan();
+    ~AttentionWork_vulkan();
+    AttentionWork_vulkan(const AttentionWork_vulkan&) = delete;
+    AttentionWork_vulkan& operator=(const AttentionWork_vulkan&) = delete;
+    [[nodiscard]] bool commit() noexcept;
+    void mark_submit_failed() noexcept;
+
+private:
+    friend class Attention_vulkan;
+    class Implementation;
+    std::unique_ptr<Implementation> d;
+};
 
 #if NCNN_MOE_WITH_VULKAN
 class AttentionCache_vulkan
@@ -96,6 +114,10 @@ public:
                                                                   std::shared_ptr<Linear> fused_qkv,
                                                                   std::shared_ptr<Linear> output_projection,
                                                                   const AttentionConfig_vulkan& config);
+    [[nodiscard]] static std::shared_ptr<Attention_vulkan> create(const TensorData& norm_weight, const TensorData* sinks,
+                                                                  std::shared_ptr<Bfloat16Linear_vulkan> fused_qkv,
+                                                                  std::shared_ptr<Bfloat16Linear_vulkan> output_projection,
+                                                                  const AttentionConfig_vulkan& config);
     [[nodiscard]] static std::shared_ptr<Attention_vulkan> create(const TensorData& norm_weight,
                                                                   const TensorData& query_norm_weight,
                                                                   const TensorData& key_norm_weight,
@@ -118,6 +140,16 @@ public:
     [[nodiscard]] bool materialize_device_cache(LayerCache& cache) const;
     // Independent one-row Session caches recorded into one queue submission.
     [[nodiscard]] AttentionBatchResult_vulkan forward_batch(std::span<const AttentionBatchEntry_vulkan> entries) const;
+#if NCNN_MOE_WITH_VULKAN
+    [[nodiscard]] const std::shared_ptr<VulkanContext>& vulkan_context() const noexcept;
+    [[nodiscard]] const ncnn::Option& option() const noexcept;
+    // Caller owns the command lock and retains work through its fence. The
+    // branch-only form lets a generic residual operator compose the block.
+    [[nodiscard]] bool record_forward(uint64_t position_offset, LayerCache& cache,
+                                      const ncnn::VkMat& input, ncnn::VkMat& output,
+                                      ncnn::VkCompute& command, AttentionWork_vulkan& work,
+                                      bool add_residual = true) const;
+#endif
 
 private:
     class Implementation;

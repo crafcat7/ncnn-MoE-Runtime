@@ -9,6 +9,7 @@
 #include <vector>
 #if NCNN_MOE_WITH_VULKAN
 #include "kernels/vulkan/moe_combine.comp.hex.h"
+#include "kernels/vulkan/moe_combine_single_row.comp.hex.h"
 #endif
 
 namespace ncnn {
@@ -82,6 +83,7 @@ public:
     std::shared_ptr<VulkanContext> context;
     ncnn::Option opt;
     std::shared_ptr<ncnn::Pipeline> pipeline;
+    std::shared_ptr<ncnn::Pipeline> single_row_pipeline;
 #endif
 };
 
@@ -122,10 +124,43 @@ std::shared_ptr<MoeCombine_vulkan> MoeCombine_vulkan::create(std::shared_ptr<Vul
         });
         context->cache_pipeline(moe_combine_shader, 0, impl.pipeline);
     }
+    // The compact shader binds four sources and one output. Limits are cached
+    // device properties; unsupported devices retain the existing GPU CSR plan.
+    const auto& limits = context->device()->info.physicalDeviceProperties().limits;
+    if (limits.maxPerStageDescriptorStorageBuffers >= 5 && limits.maxDescriptorSetStorageBuffers >= 5)
+    {
+        impl.single_row_pipeline = context->find_pipeline(moe_combine_single_row_shader, 0);
+        if (!impl.single_row_pipeline)
+        {
+            const auto binary = context->shader_binary(moe_combine_single_row_shader,
+                                                       sizeof(moe_combine_single_row_shader) - 1, opt, 0);
+            if (!binary || binary->empty()) return {};
+            auto prepared = std::make_unique<ncnn::Pipeline>(context->device());
+            prepared->set_optimal_local_size_xyz(128, 1, 1);
+            if (prepared->create(binary->data(), binary->size() * sizeof(uint32_t), {}) != 0) return {};
+            impl.single_row_pipeline = std::shared_ptr<ncnn::Pipeline>(prepared.release(), [context](ncnn::Pipeline* value) mutable {
+                {
+                    const std::lock_guard<std::mutex> lock(context->command_mutex());
+                    delete value;
+                }
+                context.reset();
+            });
+            context->cache_pipeline(moe_combine_single_row_shader, 0, impl.single_row_pipeline);
+        }
+    }
     return result;
 #else
     (void)context;
     return {};
+#endif
+}
+
+bool MoeCombine_vulkan::supports_grouped_single_row() const noexcept
+{
+#if NCNN_MOE_WITH_VULKAN
+    return static_cast<bool>(d->single_row_pipeline);
+#else
+    return false;
 #endif
 }
 
@@ -310,6 +345,119 @@ bool MoeCombine_vulkan::record(const MoeCombinePending_vulkan& pending, ncnn::Vk
     }
     return record_inputs(views, pending.rows(), pending.columns(), &pending.d->shared_host,
                          pending.d->shared_device, output, command, storage, uploads);
+}
+
+bool MoeCombine_vulkan::record_device_inputs(std::span<const MoeCombineDeviceInput_vulkan> inputs,
+                                             size_t rows, uint32_t columns, ncnn::VkMat& output,
+                                             ncnn::VkCompute& command, std::vector<ncnn::VkMat>& storage,
+                                             const ncnn::VkMat* shared, uint64_t* recorded_dispatches) const
+{
+    if (!d->context || !d->pipeline || (inputs.empty() && !shared) || rows == 0
+        || rows >= static_cast<size_t>(std::numeric_limits<int>::max()) || columns == 0
+        || columns > static_cast<uint32_t>(std::numeric_limits<int>::max())
+        || rows > std::numeric_limits<uint32_t>::max() / columns)
+        return false;
+    if (shared && (shared == &output || shared->empty() || shared->dims != 2 || shared->elempack != 1 || shared->elemsize != sizeof(float) || shared->w != static_cast<int>(columns) || shared->h != static_cast<int>(rows) || !shared->allocator || shared->allocator->vkdev != d->context->device()))
+        return false;
+    for (const auto& input : inputs)
+    {
+        const auto* value = input.value;
+        if (!value || value == &output || value->empty() || value->dims != 2 || value->elempack != 1
+            || value->elemsize != sizeof(float) || value->w != static_cast<int>(columns)
+            || value->h <= 0 || static_cast<size_t>(value->h) != input.routes.size()
+            || !value->allocator || value->allocator->vkdev != d->context->device()
+            || input.routes.size() > (static_cast<size_t>(std::numeric_limits<int>::max()) - rows - 1) / 2
+            || input.routes.size() > std::numeric_limits<uint32_t>::max() / columns)
+            return false;
+        for (const auto& route : input.routes)
+            if (route.token_index >= rows) return false;
+    }
+    output.create(static_cast<int>(columns), static_cast<int>(rows), sizeof(float), d->context->blob_allocator());
+    if (output.empty()) return false;
+    const bool single_row = rows == 1 && !shared && d->single_row_pipeline
+                            && std::all_of(inputs.begin(), inputs.end(), [](const auto& input) {
+                                   return input.routes.size() == 1 && input.routes.front().token_index == 0;
+                               });
+    if (single_row)
+    {
+        std::vector<ncnn::vk_constant_type> constants(7);
+        constants[0].u32 = columns;
+        ncnn::VkMat dispatcher;
+        dispatcher.w = static_cast<int>(columns);
+        dispatcher.h = 1;
+        dispatcher.c = 1;
+        uint64_t dispatches = 0;
+        for (size_t first = 0; first < inputs.size(); first += 4)
+        {
+            const size_t count = std::min(size_t(4), inputs.size() - first);
+            std::vector<ncnn::VkMat> bindings(5);
+            for (size_t slot = 0; slot < 4; ++slot)
+            {
+                // Unused descriptors still bind a valid read-only source.
+                bindings[slot] = *inputs[first + std::min(slot, count - 1)].value;
+                constants[3 + slot].f = slot < count ? inputs[first + slot].routes.front().weight : 0.0f;
+            }
+            bindings[4] = output;
+            constants[1].u32 = static_cast<uint32_t>(count);
+            constants[2].u32 = static_cast<uint32_t>(first == 0);
+            command.record_pipeline_readonly(d->single_row_pipeline.get(), bindings, {1, 1, 1, 1, 0}, constants, dispatcher);
+            ++dispatches;
+        }
+        if (recorded_dispatches) *recorded_dispatches = dispatches;
+        return true;
+    }
+    storage.reserve(storage.size() + inputs.size() * 2);
+    std::vector<ncnn::vk_constant_type> constants(5);
+    constants[0].u32 = columns;
+    constants[1].u32 = static_cast<uint32_t>(rows);
+    // Mode 2 routes are stable per-token CSR: offsets[rows + 1], followed
+    // by (source row, weight) pairs. Each output visits only its own routes.
+    constants[3].u32 = 2;
+    ncnn::VkMat dispatcher;
+    dispatcher.w = static_cast<int>(columns);
+    dispatcher.h = static_cast<int>(std::min(rows, size_t(65535)));
+    dispatcher.c = static_cast<int>((rows + 65534) / 65535);
+    bool initialize = true;
+    std::vector<uint32_t> next(rows);
+    for (const auto& input : inputs)
+    {
+        auto& staging = storage.emplace_back();
+        const size_t offset_words = rows + 1;
+        staging.create(static_cast<int>(offset_words + input.routes.size() * 2), sizeof(uint32_t), d->context->staging_allocator());
+        if (staging.empty() || !staging.mapped_ptr()) return false;
+        auto* values = static_cast<uint32_t*>(staging.mapped_ptr());
+        std::fill_n(values, offset_words, uint32_t(0));
+        for (const auto& route : input.routes)
+            ++values[route.token_index + 1];
+        for (size_t row = 1; row <= rows; ++row)
+            values[row] += values[row - 1];
+        std::copy_n(values, rows, next.begin());
+        for (size_t index = 0; index < input.routes.size(); ++index)
+        {
+            // Stable insertion preserves repeated routes' original summation
+            // order within this Expert, even when token ids are unsorted.
+            const size_t destination = offset_words + next[input.routes[index].token_index]++ * size_t(2);
+            values[destination] = static_cast<uint32_t>(index);
+            values[destination + 1] = std::bit_cast<uint32_t>(input.routes[index].weight);
+        }
+        ncnn::VkMat routes;
+        if (!record_mapped_upload(staging, routes, command, d->opt)) return false;
+        storage.push_back(routes);
+        constants[2].u32 = static_cast<uint32_t>(input.routes.size());
+        constants[4].u32 = static_cast<uint32_t>(initialize);
+        command.record_pipeline_readonly(d->pipeline.get(), {*input.value, routes, output}, {1, 1, 0}, constants, dispatcher);
+        initialize = false;
+    }
+    if (shared)
+    {
+        // Match the CPU order: all routed Experts, then the Shared Expert.
+        constants[2].u32 = 0;
+        constants[3].u32 = 1;
+        constants[4].u32 = static_cast<uint32_t>(initialize);
+        command.record_pipeline_readonly(d->pipeline.get(), {*shared, *shared, output}, {1, 1, 0}, constants, dispatcher);
+    }
+    if (recorded_dispatches) *recorded_dispatches = inputs.size() + static_cast<uint64_t>(shared != nullptr);
+    return true;
 }
 #endif
 

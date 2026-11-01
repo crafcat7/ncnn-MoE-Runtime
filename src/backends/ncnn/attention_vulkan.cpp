@@ -1,5 +1,6 @@
 #include "attention_vulkan.h"
 #include "linear.h"
+#include "rmsnorm_vulkan.h"
 #include "vulkancontext.h"
 
 #include "kernels/ops.h"
@@ -16,6 +17,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <mutex>
 #include <utility>
@@ -62,6 +64,7 @@ public:
     {
         if (vulkan_context)
         {
+            norm.reset();
             qkv_rope_pipeline.reset();
             qkv_norm_rope_pipeline.reset();
             output_gate_pipeline.reset();
@@ -84,7 +87,7 @@ public:
         weight_allocator.reset();
     }
 
-    ncnn::Layer* norm = nullptr;
+    std::shared_ptr<RmsNorm_vulkan> norm;
     ncnn::Layer* slice_qkv = nullptr;
     ncnn::Layer* reshape_query = nullptr;
     ncnn::Layer* reshape_key_value = nullptr;
@@ -393,11 +396,12 @@ static bool create_attention_pipeline(const std::shared_ptr<VulkanContext>& cont
                                       std::shared_ptr<ncnn::Pipeline>& destination)
 {
     const size_t storage_variant = vulkan_activation_storage_variant(option);
-    const std::shared_ptr<const std::vector<uint32_t>> spirv = context->shader_binary(shader, shader_size, option, storage_variant);
+    const size_t pipeline_variant = storage_variant + (option.use_subgroup_ops ? 3u : 0u);
+    const std::shared_ptr<const std::vector<uint32_t>> spirv = context->shader_binary(shader, shader_size, option, pipeline_variant);
     if (!spirv || spirv->empty())
         return false;
 
-    destination = context->find_pipeline(shader, storage_variant);
+    destination = context->find_pipeline(shader, pipeline_variant);
     if (destination)
         return true;
 
@@ -413,7 +417,17 @@ static bool create_attention_pipeline(const std::shared_ptr<VulkanContext>& cont
         pipeline->set_local_size_xyz(128, 1, 1);
     else
         pipeline->set_optimal_local_size_xyz(8, 8, 1);
-    const std::vector<ncnn::vk_specialization_type> specializations;
+    std::vector<ncnn::vk_specialization_type> specializations;
+    if (shader == attention_decode_sdpa_shader)
+    {
+        const uint32_t subgroup = vkdev->info.subgroup_size();
+        const uint32_t required_ops = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT;
+        const bool subgroup_reductions = option.use_subgroup_ops
+                                         && (vkdev->info.support_subgroup_ops() & required_ops) == required_ops
+                                         && subgroup >= 16 && subgroup <= 128 && 128 % subgroup == 0;
+        specializations.resize(1);
+        specializations[0].u32 = subgroup_reductions ? 1 : 0;
+    }
     if (pipeline->create(spirv->data(),
                          spirv->size() * sizeof(uint32_t),
                          specializations)
@@ -428,7 +442,7 @@ static bool create_attention_pipeline(const std::shared_ptr<VulkanContext>& cont
                                                       // Weak cache entries retain the deleter control block after disposal.
                                                       context.reset();
                                                   });
-    context->cache_pipeline(shader, storage_variant, destination);
+    context->cache_pipeline(shader, pipeline_variant, destination);
     return true;
 }
 
@@ -1135,6 +1149,25 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create(const TensorData& nor
 
 std::shared_ptr<Attention_vulkan>
 Attention_vulkan::create(const TensorData& norm_weight,
+                         const TensorData* sinks,
+                         std::shared_ptr<Bfloat16Linear_vulkan> fused_qkv,
+                         std::shared_ptr<Bfloat16Linear_vulkan> output_projection,
+                         const AttentionConfig_vulkan& config)
+{
+    return create_impl(norm_weight,
+                       nullptr,
+                       nullptr,
+                       sinks,
+                       {},
+                       {},
+                       std::move(fused_qkv),
+                       std::move(output_projection),
+                       {},
+                       config);
+}
+
+std::shared_ptr<Attention_vulkan>
+Attention_vulkan::create(const TensorData& norm_weight,
                          const TensorData& query_norm_weight,
                          const TensorData& key_norm_weight,
                          const TensorData* sinks,
@@ -1206,9 +1239,8 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
             && (!sinks || sinks->shape != std::vector<uint32_t>{config.head_count}))
         || (query_norm_weight == nullptr) != (key_norm_weight == nullptr)
         || has_flag(config.flags, AttentionQueryKeyNorm) != (query_norm_weight != nullptr)
-        || has_flag(config.flags, AttentionOutputGate)
-               != (use_native ? static_cast<bool>(native_projections[4].qnk || native_projections[4].float8)
-                              : static_cast<bool>(fused_qkv_gate))
+        || (use_native && has_flag(config.flags, AttentionOutputGate) != static_cast<bool>(native_projections[4].qnk || native_projections[4].float8))
+        || (!use_native && has_flag(config.flags, AttentionOutputGate) && !fused_qkv_gate)
         || (!use_native && !has_flag(config.flags, AttentionSink) && config.sliding_window > 0)
         || (use_native && (use_bfloat16 || use_linear))
         || (!use_native && use_bfloat16 && use_linear)
@@ -1218,8 +1250,7 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
     }
 
     const bool query_key_norm = query_norm_weight != nullptr;
-    const bool output_gate = use_native ? static_cast<bool>(native_projections[4].qnk || native_projections[4].float8)
-                                        : static_cast<bool>(fused_qkv_gate);
+    const bool output_gate = has_flag(config.flags, AttentionOutputGate);
     if (!use_native && !query_key_norm && !output_gate
         && config.rope_head_dimension != 0
         && config.rope_head_dimension != config.head_dimension)
@@ -1307,9 +1338,7 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
     }
     else if (use_bfloat16)
     {
-        if (!fused_qkv_gate || !output_projection_bfloat16
-            || !query_key_norm
-            || !output_gate)
+        if (!fused_qkv_gate || !output_projection_bfloat16)
         {
             return {};
         }
@@ -1399,31 +1428,6 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
         }
         implementation.rope_inverse_frequencies[index] = inverse_frequency;
     }
-
-    std::vector<float> norm_values;
-    if (!tensor_to_float_vector(norm_weight, norm_values))
-        return {};
-    for (float& value : norm_values)
-        value += config.norm_weight_offset;
-    ncnn::Layer* norm = ncnn::create_layer_vulkan(ncnn::LayerType::RMSNorm);
-    if (!norm)
-        return {};
-    norm->vkdev = vkdev;
-    ncnn::ParamDict norm_parameters;
-    norm_parameters.set(0, static_cast<int>(config.hidden_size));
-    norm_parameters.set(1, config.norm_epsilon);
-    norm_parameters.set(2, 1);
-    ncnn::Mat norm_model[1] = {
-        ncnn::Mat(static_cast<int>(norm_values.size()), norm_values.data(), sizeof(float))};
-    if (norm->load_param(norm_parameters) != 0
-        || norm->load_model(ncnn::ModelBinFromMatArray(norm_model)) != 0
-        || norm->create_pipeline(implementation.option) != 0)
-    {
-        delete norm;
-        return {};
-    }
-    implementation.layers.push_back(norm);
-    implementation.norm = norm;
 
     ncnn::ParamDict permute_parameters;
     permute_parameters.set(0, 2);
@@ -1542,6 +1546,13 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
     implementation.weight_allocator.reset(new ncnn::VkWeightAllocator(vkdev,
                                                                       static_cast<size_t>(vulkan_weight_block_size)));
     implementation.weight_staging_allocator.reset(new ncnn::VkWeightStagingAllocator(vkdev));
+    // Keep normalization weights in the same persistent constant arena as
+    // RoPE/sinks, so the graph's storage estimate and allocator lifetime agree.
+    implementation.norm = RmsNorm_vulkan::create(norm_weight, config.norm_epsilon,
+                                                 config.norm_weight_offset, implementation.vulkan_context,
+                                                 implementation.option, implementation.weight_allocator.get());
+    if (!implementation.norm)
+        return {};
     {
         const std::lock_guard<std::mutex> lock(implementation.vulkan_context->command_mutex());
         const bool needs_norm_rope = query_key_norm || output_gate
@@ -1638,10 +1649,9 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
         command.record_upload(sink_model,
                               implementation.attention_sinks,
                               upload_option);
-        if (implementation.norm->upload_model(command, upload_option) != 0
-            || (query_key_norm
-                && (implementation.query_norm_weight.empty()
-                    || implementation.key_norm_weight.empty()))
+        if ((query_key_norm
+             && (implementation.query_norm_weight.empty()
+                 || implementation.key_norm_weight.empty()))
             || implementation.rope_inverse_frequencies_gpu.empty()
             || implementation.attention_sinks.empty()
             || command.submit_and_wait() != 0)
@@ -1665,19 +1675,113 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
     return {};
 #endif
 }
-bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, const ActivationBuffer& input, ActivationBuffer& output) const
+class AttentionWork_vulkan::Implementation
+{
+public:
+#if NCNN_MOE_WITH_VULKAN
+    LayerCache* cache = nullptr;
+    std::shared_ptr<VulkanContext> context;
+    std::shared_ptr<AttentionCache_vulkan> original;
+    std::shared_ptr<AttentionCache_vulkan> next_cache;
+    std::deque<ncnn::VkMat> buffers;
+    std::deque<std::vector<ncnn::VkMat>> lists;
+    ncnn::VkMat rope_cosine, rope_sine, attention_mask, attention_cache_key, attention_cache_value;
+    AttentionConfig_vulkan config;
+    uint64_t previous_tokens = 0, previous_start = 0;
+    uint64_t retained_tokens = 0, dropped_tokens = 0, next_first_slot = 0, ring_capacity = 0;
+    uint64_t allocated_cache_size = 0;
+    size_t rows = 0;
+    bool allocate_ring = false, ring_resized = false, mutated_original = false;
+    bool qkv_rope = false, device_rope = false, qkv_ring = false, decode_sdpa = false;
+    bool wrapped = false, promoted = false;
+    bool recorded = false, failed = false, committed = false;
+#endif
+};
+
+AttentionWork_vulkan::AttentionWork_vulkan() : d(new Implementation)
+{
+}
+AttentionWork_vulkan::~AttentionWork_vulkan() = default;
+
+void AttentionWork_vulkan::mark_submit_failed() noexcept
 {
 #if NCNN_MOE_WITH_VULKAN
+    d->failed = true;
+    if (d->cache && d->mutated_original) d->cache->vulkan_attention_state_unknown = true;
+#endif
+}
+
+bool AttentionWork_vulkan::commit() noexcept
+{
+#if NCNN_MOE_WITH_VULKAN
+    if (!d->recorded || d->failed || d->committed || !d->cache
+        || d->cache->token_count != d->previous_tokens || d->cache->vulkan_attention_cache != d->original)
+        return false;
+    auto& cache = *d->cache;
+    std::vector<float>{}.swap(cache.keys);
+    std::vector<float>{}.swap(cache.values);
+    std::vector<uint16_t>{}.swap(cache.bfloat16_keys);
+    std::vector<uint16_t>{}.swap(cache.bfloat16_values);
+    cache.start_position = d->previous_start + d->dropped_tokens;
+    cache.token_count = d->retained_tokens;
+    cache.first_slot = d->next_first_slot;
+    cache.capacity_tokens = d->retained_tokens == 0 ? 0 : d->ring_capacity;
+    cache.columns = d->config.kv_head_count * d->config.head_dimension;
+    cache.dtype = d->config.kv_cache_dtype;
+    if (d->retained_tokens == 0)
+        cache.vulkan_attention_cache.reset();
+    else if (d->allocate_ring)
+        cache.vulkan_attention_cache = d->next_cache;
+    cache.device_allocated_size = d->allocated_cache_size;
+    cache.vulkan_attention_state_unknown = false;
+    record_standard_cache_transaction_rows(cache, d->rows);
+    auto& state = d->context->runtime_state();
+    state.dispatches += 2;
+    ++state.attention_blocks;
+    state.attention_qkv_rope_fusions += d->qkv_rope;
+    state.attention_device_rope_fusions += d->device_rope;
+    state.attention_qkv_ring_fusions += d->qkv_ring;
+    state.attention_decode_sdpa_fusions += d->decode_sdpa;
+    ++state.kv_ring_appends;
+    state.kv_ring_resizes += d->ring_resized;
+    state.kv_ring_wrapped_views += d->wrapped;
+    if (d->promoted) cache.vulkan_attention_promotion_disabled = false;
+    d->committed = true;
+    return true;
+#else
+    return false;
+#endif
+}
+
+#if NCNN_MOE_WITH_VULKAN
+const std::shared_ptr<VulkanContext>& Attention_vulkan::vulkan_context() const noexcept
+{ return d->vulkan_context; }
+const ncnn::Option& Attention_vulkan::option() const noexcept
+{ return d->option; }
+
+bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cache,
+                                      const ncnn::VkMat& input, ncnn::VkMat& output,
+                                      ncnn::VkCompute& command, AttentionWork_vulkan& work,
+                                      bool add_residual) const
+{
+    if (work.d->cache || input.empty() || input.dims != 2 || input.h <= 0
+        || input.elempack != 1 || input.elemsize != sizeof(float)) return false;
+    auto& ticket = *work.d;
+    ticket.cache = &cache;
+    ticket.original = cache.vulkan_attention_cache;
+    ticket.previous_tokens = cache.token_count;
+    ticket.previous_start = cache.token_count == 0 ? position_offset : cache.start_position;
+    ticket.rows = static_cast<size_t>(input.h);
+    const size_t token_count = ticket.rows;
     const Implementation& implementation = *d;
     const AttentionConfig_vulkan& config = implementation.config;
-    VulkanRuntimeState& runtime_state = implementation.vulkan_context->runtime_state();
     const size_t activation_element_size = vulkan_activation_element_size(implementation.kv_option);
     const bool low_precision_kv = vulkan_activation_storage_variant(implementation.kv_option) != 0;
     const bool has_device_cache = cache.vulkan_attention_cache != nullptr;
     const bool promote_host_cache = cache.token_count != 0 && !has_device_cache;
     if (!has_flag(config.optimization_flags, OptimizationVulkanAttention)
         || cache.vulkan_attention_state_unknown
-        || input.rows() == 0 || input.columns() != config.hidden_size || input.rows() > static_cast<size_t>(std::numeric_limits<int>::max())
+        || token_count == 0 || static_cast<uint32_t>(input.w) != config.hidden_size || token_count > static_cast<size_t>(std::numeric_limits<int>::max())
         || (cache.dtype != config.kv_cache_dtype && cache.token_count != 0)
         || (cache.token_count != 0
             && (cache.capacity_tokens == 0
@@ -1718,15 +1822,15 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
     const bool device_rope = has_flag(config.optimization_flags, OptimizationVulkanDeviceRope)
                              && !implementation.rope_inverse_frequencies_gpu.empty()
                              && position_offset <= std::numeric_limits<uint32_t>::max()
-                             && input.rows() - 1 <= std::numeric_limits<uint32_t>::max() - position_offset;
+                             && token_count - 1 <= std::numeric_limits<uint32_t>::max() - position_offset;
     const bool use_norm_rope = implementation.query_key_norm || implementation.output_gate
                                || (config.rope_head_dimension != 0
                                    && config.rope_head_dimension < config.head_dimension);
     const bool use_native = static_cast<bool>(implementation.native_projections[0].qnk
                                               || implementation.native_projections[0].float8);
-    const bool use_qkv_rope = support_qkv_rope(input.rows());
+    const bool use_qkv_rope = support_qkv_rope(token_count);
     const bool use_qkv_ring = use_qkv_rope
-                              && input.rows() == 1
+                              && token_count == 1
                               && has_flag(config.optimization_flags, OptimizationVulkanQkvRing);
     if (!use_qkv_rope && (device_rope || use_norm_rope))
         return false;
@@ -1751,7 +1855,7 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
         cache.vulkan_attention_promotion_disabled = true;
         return false;
     }
-    const uint64_t actual_token_count = cache.token_count + input.rows();
+    const uint64_t actual_token_count = cache.token_count + token_count;
     const uint64_t sink_token_count = has_flag(config.flags, AttentionSink) ? 1 : 0;
     const uint64_t destination_count = actual_token_count + sink_token_count;
     if (actual_token_count < cache.token_count || destination_count < actual_token_count
@@ -1774,7 +1878,7 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
         cache.vulkan_attention_promotion_disabled = true;
 
     const bool use_decode_sdpa = has_flag(config.optimization_flags, OptimizationVulkanDecodeSdpa)
-                                 && input.rows() == 1
+                                 && token_count == 1
                                  && attention_decode_window_is_visible(cache,
                                                                        position_offset,
                                                                        actual_token_count,
@@ -1786,72 +1890,48 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
     const Bfloat16Linear_vulkan* fused_gate = implementation.fused_qkv_gate.get();
     const Linear* projection = implementation.output_projection.get();
     const Bfloat16Linear_vulkan* projection_bfloat16 = implementation.output_projection_bfloat16.get();
-    VulkanTransferLease transfer_lease = implementation.vulkan_context->acquire_transfer_slot();
-    VulkanTransferSlot& transfer_slot = transfer_lease.slot();
-    const bool direct_host_input = input.rows() == 1
-                                   && vulkan_activation_storage_variant(implementation.option) == 0
-                                   && implementation.vulkan_context->support_direct_host_buffer(static_cast<size_t>(config.hidden_size)
-                                                                                                    * sizeof(float),
-                                                                                                input.dtype());
-    if (!fill_staging_upload(input, transfer_slot.upload, transfer_slot.staging_allocator)
-        || (!device_rope
-            && !fill_rope_staging_pair(transfer_slot.rope_cosine, transfer_slot.rope_sine, input.rows(), position_offset,
-                                       implementation.rope_inverse_frequencies, implementation.rope_concentration, bfloat16_storage,
-                                       transfer_slot.staging_allocator))
+    if ((!device_rope
+         && !fill_rope_staging_pair(ticket.rope_cosine, ticket.rope_sine, token_count, position_offset,
+                                    implementation.rope_inverse_frequencies, implementation.rope_concentration, bfloat16_storage,
+                                    implementation.vulkan_context->staging_allocator()))
         || (!use_decode_sdpa
-            && !fill_attention_mask_staging(transfer_slot.attention_mask, input.rows(), destination_count, position_offset, cache, config, implementation.sinks,
-                                            bfloat16_storage, transfer_slot.staging_allocator))
+            && !fill_attention_mask_staging(ticket.attention_mask, token_count, destination_count, position_offset, cache, config, implementation.sinks,
+                                            bfloat16_storage, implementation.vulkan_context->staging_allocator()))
         || (promote_host_cache
-            && !fill_attention_cache_promotion_staging(transfer_slot.attention_cache_key,
-                                                       transfer_slot.attention_cache_value,
+            && !fill_attention_cache_promotion_staging(ticket.attention_cache_key,
+                                                       ticket.attention_cache_value,
                                                        cache,
                                                        config,
-                                                       transfer_slot.staging_allocator))
-        || !prepare_staging_batch(transfer_slot.download, input.rows(), config.hidden_size, transfer_slot.staging_allocator))
+                                                       implementation.vulkan_context->staging_allocator())))
     {
         return false;
     }
 
-    std::unique_lock<std::mutex> lock(implementation.vulkan_context->command_mutex());
     ncnn::VulkanDevice* vkdev = implementation.vulkan_context->device();
-    ncnn::VkCompute& command = *transfer_slot.command;
-    if (transfer_slot.command_used)
-    {
-        if (command.reset() != 0)
-        {
-            return false;
-        }
-    }
-    transfer_slot.command_used = true;
-    ncnn::VkMat input_gpu;
-    ncnn::VkMat cosine_gpu = device_rope
-                                 ? implementation.rope_inverse_frequencies_gpu
-                                 : ncnn::VkMat();
-    ncnn::VkMat sine_gpu = device_rope
-                               ? implementation.rope_inverse_frequencies_gpu
-                               : ncnn::VkMat();
-    ncnn::VkMat mask_gpu;
-    ncnn::VkMat promoted_key_gpu;
-    ncnn::VkMat promoted_value_gpu;
-    if (direct_host_input)
-        input_gpu = bind_direct_host_input(transfer_slot.upload);
-    else if (!record_prepared_staging_upload(transfer_slot.upload, input.rows(), input_gpu, command, vkdev, implementation.option, input.dtype()))
-    {
-        return false;
-    }
+    auto& input_gpu = ticket.buffers.emplace_back();
+    auto& cosine_gpu = ticket.buffers.emplace_back(device_rope
+                                                       ? implementation.rope_inverse_frequencies_gpu
+                                                       : ncnn::VkMat());
+    auto& sine_gpu = ticket.buffers.emplace_back(device_rope
+                                                     ? implementation.rope_inverse_frequencies_gpu
+                                                     : ncnn::VkMat());
+    auto& mask_gpu = ticket.buffers.emplace_back();
+    auto& promoted_key_gpu = ticket.buffers.emplace_back();
+    auto& promoted_value_gpu = ticket.buffers.emplace_back();
+    input_gpu = input;
     if (!device_rope
-        && (!record_mapped_upload(transfer_slot.rope_cosine, cosine_gpu, command, implementation.option)
-            || !record_mapped_upload(transfer_slot.rope_sine, sine_gpu, command, implementation.option)))
+        && (!record_mapped_upload(ticket.rope_cosine, cosine_gpu, command, implementation.option)
+            || !record_mapped_upload(ticket.rope_sine, sine_gpu, command, implementation.option)))
     {
         return false;
     }
     if (promote_host_cache
-        && (!record_mapped_activation_upload(transfer_slot.attention_cache_key,
+        && (!record_mapped_activation_upload(ticket.attention_cache_key,
                                              promoted_key_gpu,
                                              command,
                                              vkdev,
                                              implementation.kv_option)
-            || !record_mapped_activation_upload(transfer_slot.attention_cache_value,
+            || !record_mapped_activation_upload(ticket.attention_cache_value,
                                                 promoted_value_gpu,
                                                 command,
                                                 vkdev,
@@ -1861,22 +1941,22 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
     }
     if (!use_decode_sdpa)
     {
-        if (!record_mapped_upload(transfer_slot.attention_mask, mask_gpu, command, implementation.option))
+        if (!record_mapped_upload(ticket.attention_mask, mask_gpu, command, implementation.option))
         {
             return false;
         }
     }
-    ncnn::VkMat normalized_gpu;
-    if (implementation.norm->forward(input_gpu, normalized_gpu, command, implementation.option) != 0)
+    auto& normalized_gpu = ticket.buffers.emplace_back();
+    if (!implementation.norm->record(input_gpu, normalized_gpu, command))
     {
         return false;
     }
-    ncnn::VkMat fused_gpu;
-    ncnn::VkMat normalized_unpacked_gpu = normalized_gpu;
-    std::vector<ncnn::VkMat> projection_workspace;
-    if ((use_native || use_norm_rope) && normalized_unpacked_gpu.elempack != 1)
+    auto& fused_gpu = ticket.buffers.emplace_back();
+    auto& normalized_unpacked_gpu = ticket.buffers.emplace_back(normalized_gpu);
+    auto& projection_workspace = ticket.lists.emplace_back();
+    if ((use_native || use_norm_rope || fused_gate) && normalized_unpacked_gpu.elempack != 1)
     {
-        ncnn::VkMat unpacked;
+        auto& unpacked = ticket.buffers.emplace_back();
         vkdev->convert_packing(normalized_unpacked_gpu,
                                unpacked,
                                1,
@@ -1896,7 +1976,7 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
     {
         if (normalized_unpacked_gpu.empty()
             || normalized_unpacked_gpu.dims != 2
-            || normalized_unpacked_gpu.h != static_cast<int>(input.rows())
+            || normalized_unpacked_gpu.h != static_cast<int>(token_count)
             || fused_gate->forward(normalized_unpacked_gpu,
                                    fused_gpu,
                                    command,
@@ -1923,9 +2003,10 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
     uint64_t ring_first_slot = cache.first_slot;
     const bool ring_resized = !promote_host_cache && actual_token_count > ring_capacity;
     const bool allocate_ring = !has_device_cache || ring_resized;
-    std::shared_ptr<AttentionCache_vulkan> next_cache = allocate_ring
-                                                            ? std::make_shared<AttentionCache_vulkan>()
-                                                            : cache.vulkan_attention_cache;
+    auto& next_cache = ticket.next_cache;
+    next_cache = allocate_ring
+                     ? std::make_shared<AttentionCache_vulkan>()
+                     : cache.vulkan_attention_cache;
     if (allocate_ring)
     {
         ring_capacity = next_attention_ring_capacity(has_device_cache ? ring_capacity : 0,
@@ -1961,16 +2042,17 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
         }
         ring_first_slot = 0;
     }
+    ticket.mutated_original = has_device_cache && !ring_resized;
     const uint64_t append_slot = (ring_first_slot + cache.token_count) % ring_capacity;
 
-    ncnn::VkMat query_rope;
-    ncnn::VkMat key_rope;
-    ncnn::VkMat value_heads;
-    ncnn::VkMat output_gate;
-    ncnn::VkMat fused_qkv_unpacked = fused_gpu;
+    auto& query_rope = ticket.buffers.emplace_back();
+    auto& key_rope = ticket.buffers.emplace_back();
+    auto& value_heads = ticket.buffers.emplace_back();
+    auto& output_gate = ticket.buffers.emplace_back();
+    auto& fused_qkv_unpacked = ticket.buffers.emplace_back(fused_gpu);
     if (fused_qkv_unpacked.elempack != 1)
     {
-        ncnn::VkMat unpacked;
+        auto& unpacked = ticket.buffers.emplace_back();
         vkdev->convert_packing(fused_qkv_unpacked, unpacked, 1, command, implementation.option);
         fused_qkv_unpacked = unpacked;
     }
@@ -1979,13 +2061,13 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
         const AttentionCache_vulkan* ring = use_qkv_ring ? next_cache.get() : nullptr;
         if (use_norm_rope)
         {
-            if (!record_qkv_norm_rope(fused_qkv_unpacked, cosine_gpu, sine_gpu, input.rows(),
+            if (!record_qkv_norm_rope(fused_qkv_unpacked, cosine_gpu, sine_gpu, token_count,
                                       position_offset, device_rope, ring, ring_capacity,
                                       append_slot, query_rope, key_rope, value_heads,
                                       output_gate, command))
                 return false;
         }
-        else if (!record_qkv_rope(fused_qkv_unpacked, cosine_gpu, sine_gpu, input.rows(),
+        else if (!record_qkv_rope(fused_qkv_unpacked, cosine_gpu, sine_gpu, token_count,
                                   position_offset, device_rope, ring, ring_capacity,
                                   append_slot, query_rope, key_rope, value_heads, command))
         {
@@ -1994,16 +2076,16 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
     }
     else
     {
-        std::vector<ncnn::VkMat> qkv_input(1, fused_gpu);
-        std::vector<ncnn::VkMat> qkv(3);
+        auto& qkv_input = ticket.lists.emplace_back(1, fused_gpu);
+        auto& qkv = ticket.lists.emplace_back(3);
         if (implementation.slice_qkv->forward(qkv_input, qkv, command, implementation.option) != 0)
         {
             return false;
         }
 
-        ncnn::VkMat query_shaped;
-        ncnn::VkMat key_shaped;
-        ncnn::VkMat value_shaped;
+        auto& query_shaped = ticket.buffers.emplace_back();
+        auto& key_shaped = ticket.buffers.emplace_back();
+        auto& value_shaped = ticket.buffers.emplace_back();
         if (implementation.reshape_query->forward(qkv[0], query_shaped, command, implementation.option) != 0
             || implementation.reshape_key_value->forward(qkv[1], key_shaped, command, implementation.option) != 0
             || implementation.reshape_key_value->forward(qkv[2], value_shaped, command, implementation.option) != 0)
@@ -2011,8 +2093,8 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
             return false;
         }
 
-        ncnn::VkMat query_heads;
-        ncnn::VkMat key_heads;
+        auto& query_heads = ticket.buffers.emplace_back();
+        auto& key_heads = ticket.buffers.emplace_back();
         if (implementation.permute_heads_tokens->forward(query_shaped, query_heads, command, implementation.option) != 0
             || implementation.permute_heads_tokens->forward(key_shaped, key_heads, command, implementation.option) != 0
             || implementation.permute_heads_tokens->forward(value_shaped, value_heads, command, implementation.option) != 0)
@@ -2021,35 +2103,35 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
         }
         if (query_heads.elempack != 1)
         {
-            ncnn::VkMat unpacked;
+            auto& unpacked = ticket.buffers.emplace_back();
             vkdev->convert_packing(query_heads, unpacked, 1, command, implementation.option);
             query_heads = unpacked;
         }
         if (key_heads.elempack != 1)
         {
-            ncnn::VkMat unpacked;
+            auto& unpacked = ticket.buffers.emplace_back();
             vkdev->convert_packing(key_heads, unpacked, 1, command, implementation.option);
             key_heads = unpacked;
         }
         if (value_heads.elempack != 1)
         {
-            ncnn::VkMat unpacked;
+            auto& unpacked = ticket.buffers.emplace_back();
             vkdev->convert_packing(value_heads, unpacked, 1, command, implementation.option);
             value_heads = unpacked;
         }
 
-        std::vector<ncnn::VkMat> query_rope_input = {
+        auto& query_rope_input = ticket.lists.emplace_back(std::initializer_list<ncnn::VkMat>{
             query_heads,
             cosine_gpu,
             sine_gpu,
-        };
-        std::vector<ncnn::VkMat> key_rope_input = {
+        });
+        auto& key_rope_input = ticket.lists.emplace_back(std::initializer_list<ncnn::VkMat>{
             key_heads,
             cosine_gpu,
             sine_gpu,
-        };
-        std::vector<ncnn::VkMat> query_rope_output(1);
-        std::vector<ncnn::VkMat> key_rope_output(1);
+        });
+        auto& query_rope_output = ticket.lists.emplace_back(1);
+        auto& key_rope_output = ticket.lists.emplace_back(1);
         if (implementation.rotary->forward(query_rope_input, query_rope_output, command, implementation.option) != 0
             || implementation.rotary->forward(key_rope_input, key_rope_output, command, implementation.option) != 0)
         {
@@ -2060,11 +2142,11 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
     }
 
     if (query_rope.elempack != 1 || query_rope.dims != 3 || query_rope.w != static_cast<int>(config.head_dimension)
-        || query_rope.h != static_cast<int>(input.rows()) || query_rope.c != static_cast<int>(config.head_count)
+        || query_rope.h != static_cast<int>(token_count) || query_rope.c != static_cast<int>(config.head_count)
         || (!use_qkv_ring
             && (key_rope.elempack != 1 || value_heads.elempack != 1 || key_rope.dims != 3 || key_rope.w != static_cast<int>(config.head_dimension)
-                || key_rope.h != static_cast<int>(input.rows()) || key_rope.c != static_cast<int>(config.kv_head_count) || value_heads.dims != 3
-                || value_heads.w != static_cast<int>(config.head_dimension) || value_heads.h != static_cast<int>(input.rows())
+                || key_rope.h != static_cast<int>(token_count) || key_rope.c != static_cast<int>(config.kv_head_count) || value_heads.dims != 3
+                || value_heads.w != static_cast<int>(config.head_dimension) || value_heads.h != static_cast<int>(token_count)
                 || value_heads.c != static_cast<int>(config.kv_head_count) || key_rope.elemsize != activation_element_size
                 || value_heads.elemsize != activation_element_size)))
     {
@@ -2089,13 +2171,13 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
         }
     }
 
-    ncnn::VkMat combined_key = attention_ring_view(next_cache->key, ring_first_slot, destination_count);
-    ncnn::VkMat combined_value = attention_ring_view(next_cache->value, ring_first_slot, destination_count);
+    auto& combined_key = ticket.buffers.emplace_back(attention_ring_view(next_cache->key, ring_first_slot, destination_count));
+    auto& combined_value = ticket.buffers.emplace_back(attention_ring_view(next_cache->value, ring_first_slot, destination_count));
     if (combined_key.empty() || combined_value.empty())
     {
         return false;
     }
-    ncnn::VkMat attention_matrix;
+    auto& attention_matrix = ticket.buffers.emplace_back();
     if (use_decode_sdpa)
     {
         if (!record_attention_decode_sdpa(implementation.decode_sdpa_pipeline.get(), query_rope, combined_key, combined_value, implementation.attention_sinks, config,
@@ -2114,8 +2196,8 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
                 return false;
             }
         }
-        ncnn::VkMat sdpa_key = combined_key;
-        ncnn::VkMat sdpa_value = combined_value;
+        auto& sdpa_key = ticket.buffers.emplace_back(combined_key);
+        auto& sdpa_value = ticket.buffers.emplace_back(combined_value);
         if (low_precision_kv)
         {
             vkdev->convert_packing(combined_key,
@@ -2137,19 +2219,19 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
                 return false;
             }
         }
-        std::vector<ncnn::VkMat> sdpa_input = {
+        auto& sdpa_input = ticket.lists.emplace_back(std::initializer_list<ncnn::VkMat>{
             query_rope,
             sdpa_key,
             sdpa_value,
             mask_gpu,
-        };
-        std::vector<ncnn::VkMat> sdpa_output(1);
+        });
+        auto& sdpa_output = ticket.lists.emplace_back(1);
         if (implementation.sdpa->forward(sdpa_input, sdpa_output, command, implementation.option) != 0)
         {
             return false;
         }
 
-        ncnn::VkMat attention_token_major;
+        auto& attention_token_major = ticket.buffers.emplace_back();
         if (implementation.permute_heads_tokens->forward(sdpa_output[0], attention_token_major, command, implementation.option) != 0
             || implementation.reshape_attention->forward(attention_token_major, attention_matrix, command, implementation.option) != 0)
         {
@@ -2157,9 +2239,9 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
         }
     }
 
-    if (use_native && attention_matrix.elempack != 1)
+    if ((use_native || projection_bfloat16) && attention_matrix.elempack != 1)
     {
-        ncnn::VkMat unpacked;
+        auto& unpacked = ticket.buffers.emplace_back();
         vkdev->convert_packing(attention_matrix,
                                unpacked,
                                1,
@@ -2172,7 +2254,7 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
     {
         if (attention_matrix.elempack != 1)
         {
-            ncnn::VkMat unpacked;
+            auto& unpacked = ticket.buffers.emplace_back();
             vkdev->convert_packing(attention_matrix,
                                    unpacked,
                                    1,
@@ -2183,19 +2265,19 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
         if (!record_attention_output_gate(implementation.output_gate_pipeline.get(),
                                           attention_matrix,
                                           output_gate,
-                                          input.rows(),
+                                          token_count,
                                           query_columns,
                                           command))
         {
             return false;
         }
     }
-    ncnn::VkMat projected_gpu;
+    auto& projected_gpu = ticket.buffers.emplace_back();
     if (projection_bfloat16)
     {
         if (attention_matrix.empty()
             || attention_matrix.dims != 2
-            || attention_matrix.h != static_cast<int>(input.rows()))
+            || attention_matrix.h != static_cast<int>(token_count))
         {
             return false;
         }
@@ -2236,69 +2318,66 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
             return false;
         }
     }
-    ncnn::VkMat residual_input_gpu = input_gpu;
-    if (use_native
-        && (residual_input_gpu.elempack != 1
-            || residual_input_gpu.elemsize != sizeof(float)))
+    if (add_residual)
     {
-        ncnn::VkMat unpacked;
-        vkdev->convert_packing(residual_input_gpu,
-                               unpacked,
-                               1,
-                               0,
-                               command,
-                               implementation.option);
-        residual_input_gpu = unpacked;
-    }
-    if (use_native
-        && (residual_input_gpu.empty()
-            || residual_input_gpu.dims != 2
-            || residual_input_gpu.w != static_cast<int>(config.hidden_size)
-            || residual_input_gpu.h != static_cast<int>(input.rows())
-            || residual_input_gpu.elempack != 1
-            || residual_input_gpu.elemsize != sizeof(float)))
-    {
-        return false;
-    }
-    if (projected_gpu.elempack != residual_input_gpu.elempack)
-    {
-        ncnn::VkMat packed;
-        vkdev->convert_packing(projected_gpu,
-                               packed,
-                               residual_input_gpu.elempack,
-                               command,
-                               implementation.option);
-        if (packed.empty())
+        auto& residual_input_gpu = ticket.buffers.emplace_back(input_gpu);
+        if (use_native
+            && (residual_input_gpu.elempack != 1
+                || residual_input_gpu.elemsize != sizeof(float)))
+        {
+            auto& unpacked = ticket.buffers.emplace_back();
+            vkdev->convert_packing(residual_input_gpu,
+                                   unpacked,
+                                   1,
+                                   0,
+                                   command,
+                                   implementation.option);
+            residual_input_gpu = unpacked;
+        }
+        if (use_native
+            && (residual_input_gpu.empty()
+                || residual_input_gpu.dims != 2
+                || residual_input_gpu.w != static_cast<int>(config.hidden_size)
+                || residual_input_gpu.h != static_cast<int>(token_count)
+                || residual_input_gpu.elempack != 1
+                || residual_input_gpu.elemsize != sizeof(float)))
+        {
             return false;
-        projected_gpu = packed;
-    }
-    std::vector<ncnn::VkMat> add_input = {residual_input_gpu, projected_gpu};
-    std::vector<ncnn::VkMat> add_output(1);
-    if (implementation.add->forward(add_input, add_output, command, implementation.option) != 0)
-    {
-        return false;
-    }
+        }
+        if (projected_gpu.elempack != residual_input_gpu.elempack)
+        {
+            auto& packed = ticket.buffers.emplace_back();
+            vkdev->convert_packing(projected_gpu,
+                                   packed,
+                                   residual_input_gpu.elempack,
+                                   command,
+                                   implementation.option);
+            if (packed.empty())
+                return false;
+            projected_gpu = packed;
+        }
+        auto& add_input = ticket.lists.emplace_back(std::initializer_list<ncnn::VkMat>{residual_input_gpu, projected_gpu});
+        auto& add_output = ticket.lists.emplace_back(1);
+        if (implementation.add->forward(add_input, add_output, command, implementation.option) != 0)
+        {
+            return false;
+        }
 
-    ncnn::VkMat download_gpu = add_output[0];
+        output = add_output[0];
+    }
+    else
+        output = projected_gpu;
+    auto& download_gpu = ticket.buffers.emplace_back(output);
     if (download_gpu.elempack != 1)
     {
-        ncnn::VkMat unpacked;
+        auto& unpacked = ticket.buffers.emplace_back();
         vkdev->convert_packing(download_gpu, unpacked, 1, command, implementation.option);
         download_gpu = unpacked;
     }
-    if (!record_prepared_activation_staging_download(download_gpu,
-                                                     input.rows(),
-                                                     config.hidden_size,
-                                                     transfer_slot.download,
-                                                     command,
-                                                     vkdev,
-                                                     implementation.option,
-                                                     output.dtype()))
-    {
-        return false;
-    }
-
-    const uint64_t total_actual_tokens = cache.token_count + input.rows();
+    if (download_gpu.empty() || download_gpu.dims != 2 || download_gpu.elempack != 1 || download_gpu.elemsize != sizeof(float)
+        || download_gpu.w != static_cast<int>(config.hidden_size) || download_gpu.h != static_cast<int>(token_count)) return false;
+    output = download_gpu;
+    const uint64_t total_actual_tokens = cache.token_count + token_count;
     const uint64_t retained_tokens = config.sliding_window == 0 ? total_actual_tokens
                                                                 : std::min<uint64_t>(total_actual_tokens, config.sliding_window > 1 ? config.sliding_window - 1 : 0);
     const uint64_t dropped_tokens = total_actual_tokens - retained_tokens;
@@ -2308,71 +2387,83 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
                                               : static_cast<uint64_t>(next_cache->key.cstep) * next_cache->key.c * next_cache->key.elemsize
                                                     + static_cast<uint64_t>(next_cache->value.cstep) * next_cache->value.c * next_cache->value.elemsize;
 
-    output = ActivationBuffer(input.rows(), config.hidden_size);
-    const int submit_result = submit_compute_and_wait(command, implementation.vulkan_context->device());
-    if (submit_result != 0)
-    {
-        if (has_device_cache && !ring_resized)
-            cache.vulkan_attention_state_unknown = true;
-        return false;
-    }
-    if (!copy_staging_to_cpu_batch(transfer_slot.download, output))
-    {
-        if (has_device_cache && !ring_resized)
-            cache.vulkan_attention_state_unknown = true;
-        return false;
-    }
-    for (size_t row_index = 0; row_index < output.rows(); ++row_index)
-    {
-        for (uint32_t column = 0; column < output.columns(); ++column)
-        {
-            if (!std::isfinite(output.row(row_index)[column]))
-            {
-                if (has_device_cache && !ring_resized)
-                    cache.vulkan_attention_state_unknown = true;
-                return false;
-            }
-        }
-    }
+    ticket.context = implementation.vulkan_context;
+    ticket.config = config;
+    ticket.next_cache = next_cache;
+    ticket.retained_tokens = retained_tokens;
+    ticket.dropped_tokens = dropped_tokens;
+    ticket.next_first_slot = next_first_slot;
+    ticket.ring_capacity = ring_capacity;
+    ticket.allocated_cache_size = allocated_cache_size;
+    ticket.allocate_ring = allocate_ring;
+    ticket.ring_resized = ring_resized;
+    ticket.qkv_rope = use_qkv_rope;
+    ticket.device_rope = device_rope;
+    ticket.qkv_ring = use_qkv_ring;
+    ticket.decode_sdpa = use_decode_sdpa;
+    ticket.wrapped = ring_first_slot + destination_count > ring_capacity;
+    ticket.promoted = promote_host_cache;
+    ticket.recorded = true;
+    return true;
+}
+#endif
 
-    const uint64_t previous_start = cache.token_count == 0 ? position_offset : cache.start_position;
-    std::vector<float>{}.swap(cache.keys);
-    std::vector<float>{}.swap(cache.values);
-    std::vector<uint16_t>{}.swap(cache.bfloat16_keys);
-    std::vector<uint16_t>{}.swap(cache.bfloat16_values);
-    cache.start_position = previous_start + dropped_tokens;
-    cache.token_count = retained_tokens;
-    cache.first_slot = next_first_slot;
-    cache.capacity_tokens = retained_tokens == 0 ? 0 : ring_capacity;
-    cache.columns = config.kv_head_count * config.head_dimension;
-    cache.dtype = config.kv_cache_dtype;
-    if (retained_tokens == 0)
-        cache.vulkan_attention_cache.reset();
-    else if (allocate_ring)
-        cache.vulkan_attention_cache = std::move(next_cache);
-    cache.device_allocated_size = allocated_cache_size;
-    cache.vulkan_attention_state_unknown = false;
-    record_standard_cache_transaction_rows(cache, input.rows());
-    runtime_state.dispatches += 2;
-    ++runtime_state.attention_blocks;
-    ++runtime_state.compute_submissions;
-    ++runtime_state.batch_uploads;
-    ++runtime_state.batch_downloads;
-    if (use_qkv_rope)
-        ++runtime_state.attention_qkv_rope_fusions;
-    if (device_rope)
-        ++runtime_state.attention_device_rope_fusions;
-    if (use_qkv_ring)
-        ++runtime_state.attention_qkv_ring_fusions;
-    if (use_decode_sdpa)
-        ++runtime_state.attention_decode_sdpa_fusions;
-    ++runtime_state.kv_ring_appends;
-    if (ring_resized)
-        ++runtime_state.kv_ring_resizes;
-    if (ring_first_slot + destination_count > ring_capacity)
-        ++runtime_state.kv_ring_wrapped_views;
-    if (promote_host_cache)
-        cache.vulkan_attention_promotion_disabled = false;
+bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, const ActivationBuffer& input, ActivationBuffer& output) const
+{
+#if NCNN_MOE_WITH_VULKAN
+    const auto& implementation = *d;
+    const auto& context = implementation.vulkan_context;
+    if (!context || input.rows() == 0 || input.columns() != implementation.config.hidden_size)
+        return false;
+    auto lease = context->acquire_transfer_slot();
+    auto& slot = lease.slot();
+    if (!fill_staging_upload(input, slot.upload, slot.staging_allocator)
+        || !prepare_staging_batch(slot.download, input.rows(), input.columns(), slot.staging_allocator))
+        return false;
+    const std::lock_guard<std::mutex> lock(context->command_mutex());
+    auto& command = *slot.command;
+    if (slot.command_used && command.reset() != 0) return false;
+    slot.command_used = true;
+    AttentionWork_vulkan work;
+    ncnn::VkMat input_gpu, packed_input, output_gpu;
+    bool attempted = false, successful = false;
+    const auto cleanup = [&](void*) {
+        if (!successful)
+        {
+            if (attempted) work.mark_submit_failed();
+            (void)command.reset();
+        }
+    };
+    std::unique_ptr<void, decltype(cleanup)> guard(reinterpret_cast<void*>(1), cleanup);
+    const bool direct_host_input = input.rows() == 1 && vulkan_activation_storage_variant(implementation.option) == 0
+                                   && context->support_direct_host_buffer(static_cast<size_t>(input.columns()) * sizeof(float), input.dtype());
+    if (direct_host_input)
+        input_gpu = bind_direct_host_input(slot.upload);
+    else if (!record_mapped_activation_upload(slot.upload, input_gpu, command, context->device(), implementation.option, input.dtype()))
+        return false;
+    // The recorder's public operand contract is unpacked FP32. Legacy host
+    // upload helpers may choose pack4 for four rows even with packing disabled.
+    if (input_gpu.elempack != 1)
+    {
+        packed_input = input_gpu;
+        context->device()->convert_packing(packed_input, input_gpu, 1, command, implementation.option);
+        if (input_gpu.empty()) return false;
+    }
+    if (!record_forward(position_offset, cache, input_gpu, output_gpu, command, work)
+        || !record_prepared_activation_staging_download(output_gpu, input.rows(), input.columns(), slot.download,
+                                                        command, context->device(), implementation.option)) return false;
+    attempted = true;
+    if (submit_compute_and_wait(command, context->device()) != 0) return false;
+    ActivationBuffer completed(input.rows(), input.columns());
+    if (!copy_staging_to_cpu_batch(slot.download, completed)
+        || std::any_of(completed.values().begin(), completed.values().end(), [](float value) { return !std::isfinite(value); })
+        || !work.commit()) return false;
+    output.swap(completed);
+    auto& counters = context->runtime_state();
+    ++counters.compute_submissions;
+    ++counters.batch_uploads;
+    ++counters.batch_downloads;
+    successful = true;
     return true;
 #else
     (void)position_offset;
@@ -2920,16 +3011,12 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
                 return AttentionBatchResult_vulkan::NotExecuted;
             }
         }
-        if (implementation.norm->forward(work.input_gpu,
-                                         work.normalized_gpu,
-                                         command,
-                                         implementation.option)
-            != 0)
+        if (!implementation.norm->record(work.input_gpu, work.normalized_gpu, command))
         {
             return AttentionBatchResult_vulkan::NotExecuted;
         }
 
-        if (use_native || use_norm_rope)
+        if (use_native || use_norm_rope || fused_gate)
         {
             work.normalized_unpacked_gpu = work.normalized_gpu;
             if (work.normalized_unpacked_gpu.elempack != 1)
@@ -3264,7 +3351,7 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
             }
         }
 
-        if (implementation.output_gate || use_native)
+        if (implementation.output_gate || use_native || projection_bfloat16)
         {
             if (work.attention_matrix.elempack != 1)
             {

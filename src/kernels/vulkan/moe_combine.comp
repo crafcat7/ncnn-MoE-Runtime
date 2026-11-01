@@ -22,8 +22,19 @@ void main()
     if (column >= p.columns || row >= p.rows) return;
     const uint index = row * p.columns + column;
     precise float sum = p.initialize != 0 ? 0.0 : output_data[index];
-    if (p.shared_source != 0)
+    if (p.shared_source == 1)
         sum += source_data[index];
+    else if (p.shared_source == 2)
+    {
+        const uint pair_offset = p.rows + 1;
+        for (uint route = route_data[row]; route < route_data[row + 1]; ++route)
+        {
+            const uint pair = pair_offset + route * 2;
+            const uint source_row = route_data[pair];
+            precise float product = uintBitsToFloat(route_data[pair + 1]) * source_data[source_row * p.columns + column];
+            sum += product;
+        }
+    }
     else
     {
         for (uint route = 0; route < p.route_count; ++route)

@@ -15,14 +15,17 @@
 #include "metrics.h"
 #include "expertbackend.h"
 #include "expert.h"
+#include "graphresources.h"
 #include "storage/expertcache.h"
 #include "backends/ncnn/attention_vulkan.h"
 #include "backends/ncnn/modelpipeline.h"
 #include "backends/ncnn/linear.h"
 #include "backends/ncnn/latentlayer_vulkan.h"
 #include "backends/ncnn/moecombine_vulkan.h"
+#include "backends/ncnn/residentffn_vulkan.h"
 #include "backends/ncnn/layerhead_vulkan.h"
 #include "backends/ncnn/qwenlayer_vulkan.h"
+#include "backends/ncnn/gpusegment_vulkan.h"
 
 #include "graph/router.h"
 #include "graph/compiledmodel.h"
@@ -46,6 +49,36 @@
 
 namespace ncnn {
 namespace moe {
+
+struct ScopedResidentContinuation
+{
+    std::shared_ptr<GpuSegmentContinuation_vulkan>& pending;
+    std::shared_ptr<ResidentFfnRegion_vulkan>& region;
+
+    ~ScopedResidentContinuation()
+    {
+        // Region/worker owners may outlive this local reference. Invalidate
+        // submitted, unpublished state now, before another Session operation.
+        if (pending) pending->abort();
+        region.reset();
+    }
+};
+
+static Result<void> prepare_resident_ffn_region(const CompiledModel& model, LayerState& state,
+                                                ExecutionBackend backend)
+{
+    if (backend != ExecutionBackend::Vulkan || model.opt.hybrid_mode != HybridMode::HybridExperts
+        || (state.normalized_device && !state.gpu_segment) || state.region
+        || !model.expert_backend || !model.expert_backend->supports_resident_region()
+        || state.active_experts().empty())
+        return {};
+    state.region = state.gpu_segment
+                       ? ResidentFfnRegion_vulkan::create(state.normalized_device, state.active_experts().size(), model.descriptor.hidden_size)
+                       : ResidentFfnRegion_vulkan::create(state.normalized, state.active_experts().size(), model.descriptor.hidden_size);
+    if (!state.region)
+        return Error{ErrorCode::InternalError, "cannot create resident Vulkan FFN region"};
+    return {};
+}
 
 struct RouterPredictionOutcome
 {
@@ -103,6 +136,15 @@ struct ScopedQwenLayerWorkspace
     explicit ScopedQwenLayerWorkspace(QwenLayerWorkspace_vulkan& value) : workspace(value)
     { workspace.reset(); }
     ~ScopedQwenLayerWorkspace()
+    { workspace.reset(); }
+};
+
+struct ScopedGpuSegmentWorkspace
+{
+    GpuSegmentWorkspace_vulkan& workspace;
+    explicit ScopedGpuSegmentWorkspace(GpuSegmentWorkspace_vulkan& value) : workspace(value)
+    { workspace.reset(); }
+    ~ScopedGpuSegmentWorkspace()
     { workspace.reset(); }
 };
 
@@ -171,30 +213,48 @@ static bool shared_expert_completed(const LayerState& state) noexcept
     return state.shared_expert_output.rows() != 0 || static_cast<bool>(state.shared_expert_device_output);
 }
 
-static void forward_layer_shared_expert(const CompiledModel& model,
-                                        const MoeBlockPlan& moe,
-                                        LayerState& state,
-                                        bool retain_device_output)
+static Result<void> forward_layer_shared_expert(const CompiledModel& model,
+                                                const MoeBlockPlan& moe,
+                                                LayerState& state,
+                                                bool retain_device_output,
+                                                ExecutionBackend backend)
 {
-    if (shared_expert_completed(state)) return;
-    forward_shared_expert(model, moe, state.normalized, state.shared_expert_output,
-                          state.shared_expert_workspace, state.normalized_device,
-                          retain_device_output ? &state.shared_expert_device_output : nullptr,
-                          state.require_device_execution);
+    if (shared_expert_completed(state)) return {};
+    try
+    {
+        forward_shared_expert(model, moe, state.normalized, state.shared_expert_output,
+                              state.shared_expert_workspace, state.normalized_device,
+                              retain_device_output ? &state.shared_expert_device_output : nullptr,
+                              state.require_device_execution,
+                              backend == ExecutionBackend::Vulkan && model.opt.hybrid_mode == HybridMode::HybridExperts);
+    }
+    catch (const std::exception& error)
+    {
+        return Error{ErrorCode::InternalError, error.what()};
+    }
+    return {};
 }
 
-static void forward_dense_layer(const CompiledModel& model,
-                                const CompiledLayerPlan& layer,
-                                ActivationBuffer& hidden,
-                                LayerState& scratch,
-                                ExecutionBackend backend)
+static Result<void> forward_dense_layer(const CompiledModel& model,
+                                        const CompiledLayerPlan& layer,
+                                        ActivationBuffer& hidden,
+                                        LayerState& scratch,
+                                        ExecutionBackend backend)
 {
     forward_rms_norm(hidden, model.weights.at(layer.dense_pre_ffn_norm_weight),
                      model.descriptor.norm_epsilon, scratch.normalized, model.descriptor.norm_weight_offset);
-    forward_dense_ffn(model, layer.dense_ffn, scratch.normalized, scratch.shared_expert_output,
-                      scratch.shared_expert_workspace, backend);
+    try
+    {
+        forward_dense_ffn(model, layer.dense_ffn, scratch.normalized, scratch.shared_expert_output,
+                          scratch.shared_expert_workspace, backend);
+    }
+    catch (const std::exception& error)
+    {
+        return Error{ErrorCode::InternalError, error.what()};
+    }
     add_batch_inplace(hidden, scratch.shared_expert_output);
     scratch.reset();
+    return {};
 }
 
 static ExpertDispatchOptions latent_router_options(const CompiledModel& model,
@@ -276,6 +336,11 @@ Result<void> forward_model(const CompiledModel& model,
             return Error{ErrorCode::InvalidArgument, "token id is outside the model vocabulary"};
     }
 
+    if (input_ids.size() > std::numeric_limits<uint64_t>::max() - position_offset)
+        return Error{ErrorCode::InvalidArgument, "execution position overflows"};
+    auto graph_resources = ensure_model_graph_resources(model, input_ids.size(), position_offset + input_ids.size());
+    if (!graph_resources)
+        return graph_resources.error();
     prepare_execution_state(model, state);
 
     ExpertCacheStatistics execution_cache_before;
@@ -324,6 +389,8 @@ Result<void> forward_model(const CompiledModel& model,
     const ScopedLatentLayerWorkspace latent_workspace_scope(layer_workspace,
                                                             state.expert_scratch.combine_inputs);
     const ScopedQwenLayerWorkspace qwen_workspace_scope(state.qwen_layer);
+    const ScopedGpuSegmentWorkspace gpu_workspace_scope(state.gpu_segment);
+    bool resident_head_finished = false;
     if (model.qwen_device_chain && (use_speculative_context || has_flag(model.opt.flags, OptionRouterPrediction)))
         return Error{ErrorCode::InvalidArgument, "continuous Qwen Vulkan execution does not support speculative cache transactions or router prediction"};
     bool fused_router_ready = false;
@@ -331,11 +398,17 @@ Result<void> forward_model(const CompiledModel& model,
     const bool use_layer_fusion = !use_speculative_context
                                   && !has_flag(model.opt.flags, OptionRouterPrediction);
     const auto& gpu_head = model.operators.at_weight(model.hyper_head_function).layer_head;
+    std::shared_ptr<GpuSegmentContinuation_vulkan> pending_continuation;
+    std::shared_ptr<ResidentFfnRegion_vulkan> continuation_region;
+    const ScopedResidentContinuation continuation_scope{pending_continuation, continuation_region};
+    ExecutionNodeId continuation_target = invalid_execution_node_id;
+    bool bank_chain_finished = false;
     for (const ExecutionNodeId node_id : model.schedule.node_order)
     {
         if (node_id >= model.graph.nodes.size())
             return Error{ErrorCode::InternalError, "execution schedule references an invalid node"};
         const ExecutionNode* node = &model.graph.nodes[node_id];
+        if (bank_chain_finished) continue;
         if (node->type == ExecutionNodeType::TokenEmbedding)
         {
             if (node->weight_inputs.size() != 1)
@@ -344,10 +417,67 @@ Result<void> forward_model(const CompiledModel& model,
                               input_ids,
                               hidden);
             hyper_connection_expand(hidden, model.descriptor.hyper_connection_multiplier, state.expert_scratch.staged_output);
+            if (!model.gpu_expert_banks.empty())
+            {
+                if (use_speculative_context)
+                    return Error{ErrorCode::InternalError, "resident Expert bank plan cannot consume speculative hidden captures"};
+                std::vector<uint64_t> positions(input_ids.size());
+                for (size_t row = 0; row < positions.size(); ++row) positions[row] = position_offset + row;
+                std::vector<LayerCache*> caches;
+                std::vector<ExpertDispatchOptions> options;
+                std::vector<std::vector<uint32_t>> explicit_ids(model.graph.layer_plans.size());
+                uint64_t assignments = 0;
+                for (size_t index = 0; index < model.graph.layer_plans.size(); ++index)
+                {
+                    const auto& layer = model.graph.layer_plans[index];
+                    if (layer.layer_id >= state.layers.size())
+                        return Error{ErrorCode::InternalError, "resident Expert bank layer cache is out of range"};
+                    caches.insert(caches.end(), input_ids.size(), &state.layers[layer.layer_id]);
+                    options.push_back(latent_router_options(model, layer.moe, input_ids, explicit_ids[index]));
+                    assignments += input_ids.size() * layer.moe.top_k;
+                }
+                std::string error;
+                if (!GpuSegment_vulkan::forward_banks(model, hidden, positions, caches, options,
+                                                      logits_output != LogitsOutput::None, logits_output == LogitsOutput::Last,
+                                                      state.logits, error))
+                    return Error{ErrorCode::InternalError, "resident Expert bank chain failed: " + error};
+                statistics.expert_assignments += assignments;
+                statistics.expert_gpu_routes += assignments;
+                produced_logits = logits_output != LogitsOutput::None;
+                bank_chain_finished = true;
+            }
             continue;
         }
         if (node->type == ExecutionNodeType::FinalNorm)
         {
+            if (pending_continuation)
+            {
+                std::string error;
+                if (continuation_target != node_id
+                    || !pending_continuation->publish_head(state.logits, state.gpu_segment, error))
+                    return Error{ErrorCode::InternalError, "resident Vulkan head continuation failed: " + error};
+                pending_continuation.reset();
+                continuation_region.reset();
+                continuation_target = invalid_execution_node_id;
+                resident_head_finished = true;
+                produced_logits = logits_output != LogitsOutput::None;
+                continue;
+            }
+            if (state.gpu_segment.active())
+            {
+                std::string error;
+                if (model.gpu_head && !needs_mtp_final_hidden)
+                {
+                    if (!model.gpu_head->finish(logits_output != LogitsOutput::None, logits_output == LogitsOutput::Last,
+                                                hidden, state.logits, state.gpu_segment, error))
+                        return Error{ErrorCode::InternalError, "resident Vulkan head failed: " + error};
+                    resident_head_finished = true;
+                    produced_logits = logits_output != LogitsOutput::None;
+                    continue;
+                }
+                if (!GpuSegment_vulkan::materialize_hidden(state.gpu_segment, hidden, error))
+                    return Error{ErrorCode::InternalError, "resident Vulkan head boundary failed: " + error};
+            }
             if (model.qwen_device_chain)
             {
                 if (!QwenLayer_vulkan::finish(model, logits_output != LogitsOutput::None,
@@ -441,6 +571,7 @@ Result<void> forward_model(const CompiledModel& model,
         }
         if (node->type == ExecutionNodeType::LmHead)
         {
+            if (resident_head_finished) continue;
             if (model.qwen_device_chain) continue;
             const size_t expected_weights = model.descriptor.final_norm == NormType::None ? 1 : 2;
             if (node->weight_inputs.size() != expected_weights)
@@ -522,13 +653,56 @@ Result<void> forward_model(const CompiledModel& model,
         const MoeBlockPlan& moe = layer.moe;
         if (node->type == ExecutionNodeType::DenseFfn)
         {
+            if (state.gpu_segment.active())
+            {
+                std::string error;
+                if (!GpuSegment_vulkan::materialize_hidden(state.gpu_segment, hidden, error))
+                    return Error{ErrorCode::InternalError, "resident Vulkan dense FFN boundary failed: " + error};
+            }
             if (layer_workspace.active() && !LatentLayer_vulkan::materialize_hidden(layer_workspace, hidden))
                 return Error{ErrorCode::InternalError, "cannot materialize dense FFN input"};
-            forward_dense_layer(model, layer, hidden, layer_state, node->backend);
+            auto executed = forward_dense_layer(model, layer, hidden, layer_state, node->backend);
+            if (!executed) return executed.error();
             continue;
         }
         if (node->type == ExecutionNodeType::Attention)
         {
+            const auto segment = node->layer_plan_index < model.gpu_segments.size() ? model.gpu_segments[node->layer_plan_index] : nullptr;
+            if (segment)
+            {
+                if (node->backend != ExecutionBackend::Vulkan)
+                    return Error{ErrorCode::InternalError, "resident graph segment has a non-Vulkan Attention node"};
+                auto& positions = state.attention_positions;
+                auto& caches = state.attention_caches;
+                positions.resize(input_ids.size());
+                caches.assign(input_ids.size(), &state.layers[layer.layer_id]);
+                for (size_t row = 0; row < positions.size(); ++row) positions[row] = position_offset + row;
+                auto options = latent_router_options(model, moe, input_ids, state.expert_scratch.explicit_expert_ids);
+                std::string error;
+                if (pending_continuation)
+                {
+                    if (continuation_target != node_id
+                        || !pending_continuation->publish(layer_state.dispatch_plan, state.gpu_segment, error))
+                        return Error{ErrorCode::InternalError, "resident Vulkan continuation at layer " + std::to_string(layer.layer_id) + " failed: " + error};
+                    pending_continuation.reset();
+                    continuation_region.reset();
+                    continuation_target = invalid_execution_node_id;
+                }
+                else if (!segment->forward(hidden, positions, caches, options, layer_state.dispatch_plan, state.gpu_segment, error))
+                    return Error{ErrorCode::InternalError, "resident Vulkan segment at layer " + std::to_string(layer.layer_id) + " failed: " + error};
+                layer_state.normalized.reset(input_ids.size(), model.descriptor.hidden_size, false);
+                layer_state.normalized_device = state.gpu_segment.device_input();
+                layer_state.gpu_segment = true;
+                layer_state.require_device_execution = true;
+                fused_router_ready = true;
+                continue;
+            }
+            if (state.gpu_segment.active())
+            {
+                std::string error;
+                if (!GpuSegment_vulkan::materialize_hidden(state.gpu_segment, hidden, error))
+                    return Error{ErrorCode::InternalError, "resident Vulkan graph boundary failed: " + error};
+            }
             if (model.qwen_device_chain)
             {
                 const auto& fused = model.operators.at_weight(layer.attention.output_weight).qwen_layer;
@@ -622,6 +796,9 @@ Result<void> forward_model(const CompiledModel& model,
                         fused_router_ready = true;
                         continue;
                     }
+                    return Error{ErrorCode::InternalError, "Vulkan latent layer execution failed (layer "
+                                                               + std::to_string(layer.layer_id) + ", device "
+                                                               + std::to_string(layer.vulkan_device_index) + ")"};
                 }
                 if (layer_workspace.active() && !LatentLayer_vulkan::materialize_hidden(layer_workspace, hidden))
                     return Error{ErrorCode::InternalError, "cannot materialize latent fallback state"};
@@ -819,15 +996,57 @@ Result<void> forward_model(const CompiledModel& model,
         {
             if (layer_state.experts_executed)
                 continue;
+            auto resident = prepare_resident_ffn_region(model, layer_state, node->backend);
+            if (!resident) return resident.error();
+            if (layer_state.gpu_segment && layer_state.region)
+            {
+                if (pending_continuation)
+                    return Error{ErrorCode::InternalError, "resident Vulkan continuation reached another Expert group before its target"};
+                const bool capture_boundary = use_speculative_context
+                                              && std::find(model.speculative.target_layer_ids.begin(), model.speculative.target_layer_ids.end(), layer.layer_id)
+                                                     != model.speculative.target_layer_ids.end();
+                ExecutionNodeId target_id = capture_boundary ? invalid_execution_node_id
+                                                             : GpuSegment_vulkan::continuation_target(model, node_id);
+                if (target_id != invalid_execution_node_id && needs_mtp_final_hidden
+                    && model.graph.nodes[target_id].type == ExecutionNodeType::FinalNorm)
+                    target_id = invalid_execution_node_id;
+                if (target_id != invalid_execution_node_id)
+                {
+                    const auto& target = model.graph.nodes[target_id];
+                    std::string error;
+                    if (target.type == ExecutionNodeType::FinalNorm)
+                        pending_continuation = model.gpu_head->prepare_head_continuation(logits_output != LogitsOutput::None,
+                                                                                         logits_output == LogitsOutput::Last, state.gpu_segment, error);
+                    else
+                    {
+                        const auto& next_layer = model.graph.layer_plans[target.layer_plan_index];
+                        if (next_layer.layer_id >= state.layers.size())
+                            return Error{ErrorCode::InternalError, "resident Vulkan continuation layer cache is out of range"};
+                        auto& positions = state.attention_positions;
+                        auto& caches = state.attention_caches;
+                        positions.resize(input_ids.size());
+                        caches.assign(input_ids.size(), &state.layers[next_layer.layer_id]);
+                        for (size_t row = 0; row < positions.size(); ++row) positions[row] = position_offset + row;
+                        auto options = latent_router_options(model, next_layer.moe, input_ids, state.expert_scratch.explicit_expert_ids);
+                        pending_continuation = model.gpu_segments[target.layer_plan_index]->prepare_continuation(positions, caches, options,
+                                                                                                                 state.gpu_segment, error);
+                    }
+                    if (!pending_continuation || !layer_state.region->set_continuation(pending_continuation))
+                        return Error{ErrorCode::InternalError, "cannot prepare resident Vulkan continuation from layer " + std::to_string(layer.layer_id) + ": " + error};
+                    continuation_region = layer_state.region;
+                    continuation_target = target_id;
+                }
+            }
+            Result<void> shared_result;
             std::function<void()> shared_work;
             // Both host-normalized and resident inputs are independent of
             // routed weight supply; capability, rather than MLA, selects GPU work.
-            if (moe.has_shared_expert && node->backend == ExecutionBackend::Vulkan
+            if (!layer_state.gpu_segment && moe.has_shared_expert && node->backend == ExecutionBackend::Vulkan
                 && has_flag(model.opt.optimization_flags, OptimizationVulkanSharedExpertOverlap)
                 && support_vulkan_shared_experts(model.operators, moe))
             {
                 shared_work = [&] {
-                    forward_layer_shared_expert(model, moe, layer_state, fused_router_ready);
+                    shared_result = forward_layer_shared_expert(model, moe, layer_state, fused_router_ready, ExecutionBackend::Vulkan);
                 };
             }
             auto executed = forward_moe(model,
@@ -838,15 +1057,18 @@ Result<void> forward_model(const CompiledModel& model,
                                         layer.layer_id,
                                         node->backend,
                                         has_flag(node->flags, ExecutionNodeCpuPrefetch), shared_work);
+            if (!shared_result) return shared_result.error();
             if (!executed)
                 return executed.error();
             continue;
         }
         if (node->type == ExecutionNodeType::SharedExpertGroup)
         {
+            if (layer_state.gpu_segment) continue;
             if (!moe.has_shared_expert)
                 return Error{ErrorCode::InternalError, "Shared Expert graph node has no shared Expert plan"};
-            forward_layer_shared_expert(model, moe, layer_state, fused_router_ready);
+            auto executed = forward_layer_shared_expert(model, moe, layer_state, fused_router_ready, node->backend);
+            if (!executed) return executed.error();
             continue;
         }
         if (node->type == ExecutionNodeType::Combine)
@@ -854,6 +1076,26 @@ Result<void> forward_model(const CompiledModel& model,
             if (!layer_state.experts_executed)
             {
                 return Error{ErrorCode::InternalError, "Combine executed before its Expert wave"};
+            }
+            if (layer_state.gpu_segment)
+            {
+                if (!pending_continuation && !GpuSegment_vulkan::defer_combine(layer_state.combined_device, state.gpu_segment))
+                    return Error{ErrorCode::InternalError, "resident Vulkan segment did not receive a complete Expert aggregate"};
+                if (use_speculative_context)
+                {
+                    const auto target = std::find(model.speculative.target_layer_ids.begin(), model.speculative.target_layer_ids.end(), layer.layer_id);
+                    if (target != model.speculative.target_layer_ids.end())
+                    {
+                        std::string error;
+                        if (!GpuSegment_vulkan::materialize_hidden(state.gpu_segment, hidden, error))
+                            return Error{ErrorCode::InternalError, "resident speculative hidden capture failed: " + error};
+                        capture_speculative_hidden(hidden, model.descriptor.hidden_size, model.descriptor.hyper_connection_multiplier,
+                                                   static_cast<size_t>(std::distance(model.speculative.target_layer_ids.begin(), target)), state.speculative_main_hidden);
+                    }
+                }
+                fused_router_ready = false;
+                layer_state.reset();
+                continue;
             }
             if (moe.has_shared_expert && layer_state.shared_expert_output.rows() == 0
                 && !layer_state.shared_expert_device_output)
@@ -896,6 +1138,10 @@ Result<void> forward_model(const CompiledModel& model,
                                                                     moe.has_shared_expert ? &layer_state.shared_expert_output : nullptr,
                                                                     layer_state.shared_expert_device_output, layer_workspace);
                 inputs.clear();
+                if (!device_combined)
+                    return Error{ErrorCode::InternalError, "Vulkan latent Expert combine failed (layer "
+                                                               + std::to_string(layer.layer_id) + ", device "
+                                                               + std::to_string(layer.vulkan_device_index) + ")"};
             }
             if (!device_combined)
             {
@@ -990,6 +1236,8 @@ Result<void> forward_model(const CompiledModel& model,
         return Error{ErrorCode::InternalError, "unsupported execution graph node"};
     }
 
+    if (pending_continuation)
+        return Error{ErrorCode::InternalError, "execution graph ended before its resident Vulkan continuation target"};
     if (pending_router_prediction.result.valid())
     {
         return Error{
@@ -1047,7 +1295,8 @@ static Result<void> forward_staged_shared_expert(const CompiledModel& model,
                                                  const MoeBlockPlan& moe,
                                                  std::span<const DecodeBatchEntry> entries,
                                                  BatchWorkspace& workspace,
-                                                 bool retain_device_output)
+                                                 bool retain_device_output,
+                                                 ExecutionBackend backend)
 {
     LayerState& combined = workspace.staged_state;
     if (shared_expert_completed(combined)) return {};
@@ -1061,9 +1310,18 @@ static Result<void> forward_staged_shared_expert(const CompiledModel& model,
     }
     if (shared_input.rows() != session_count || shared_input.columns() != model.descriptor.hidden_size)
         return Error{ErrorCode::InternalError, "Shared Expert input has an invalid shape"};
-    forward_shared_expert(model, moe, shared_input, combined.shared_expert_output,
-                          combined.shared_expert_workspace, combined.normalized_device,
-                          retain_device_output ? &combined.shared_expert_device_output : nullptr);
+    try
+    {
+        forward_shared_expert(model, moe, shared_input, combined.shared_expert_output,
+                              combined.shared_expert_workspace, combined.normalized_device,
+                              retain_device_output ? &combined.shared_expert_device_output : nullptr,
+                              combined.require_device_execution,
+                              backend == ExecutionBackend::Vulkan && model.opt.hybrid_mode == HybridMode::HybridExperts);
+    }
+    catch (const std::exception& error)
+    {
+        return Error{ErrorCode::InternalError, error.what()};
+    }
     for (size_t session_index = 0; session_index < session_count; ++session_index)
     {
         const DecodeBatchEntry& entry = entries[session_index];
@@ -1085,6 +1343,18 @@ Result<void> forward_decode_batch(const CompiledModel& model,
     ScopedBatchWorkspace workspace_scope{workspace};
     if (entries.empty())
         return Error{ErrorCode::InvalidArgument, "decode batch cannot be empty"};
+    uint64_t context_tokens = 0;
+    for (const DecodeBatchEntry& entry : entries)
+    {
+        if (entry.position_offset == std::numeric_limits<uint64_t>::max())
+            return Error{ErrorCode::InvalidArgument, "decode position overflows"};
+        context_tokens = std::max(context_tokens, entry.position_offset + 1);
+    }
+    if (entries.size() > std::numeric_limits<uint32_t>::max())
+        return Error{ErrorCode::InvalidArgument, "decode batch exceeds uint32 range"};
+    auto graph_resources = ensure_model_graph_resources(model, 1, context_tokens, static_cast<uint32_t>(entries.size()));
+    if (!graph_resources)
+        return graph_resources.error();
     const CpuOpenMpThreadLimitScope openmp_scope;
 
     if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
@@ -1230,10 +1500,18 @@ Result<void> forward_decode_batch(const CompiledModel& model,
     LatentLayerWorkspace_vulkan& layer_workspace = workspace.latent_layer;
     const ScopedLatentLayerWorkspace latent_workspace_scope(layer_workspace,
                                                             workspace.expert.combine_inputs);
+    const ScopedGpuSegmentWorkspace gpu_workspace_scope(workspace.gpu_segment);
+    bool resident_router_ready = false;
+    bool resident_head_finished = false;
     ExpertDispatchPlan& fused_routes = workspace.latent_routes;
     const auto& gpu_head = model.operators.at_weight(model.hyper_head_function).layer_head;
     const bool use_layer_fusion = (!model.speculative.enabled() || !use_speculative_context)
                                   && !has_flag(model.opt.flags, OptionRouterPrediction);
+    std::shared_ptr<GpuSegmentContinuation_vulkan> pending_continuation;
+    std::shared_ptr<ResidentFfnRegion_vulkan> continuation_region;
+    const ScopedResidentContinuation continuation_scope{pending_continuation, continuation_region};
+    ExecutionNodeId continuation_target = invalid_execution_node_id;
+    bool bank_chain_finished = false;
     for (const ExecutionNodeId node_id : model.schedule.node_order)
     {
         if (node_id >= model.graph.nodes.size())
@@ -1241,6 +1519,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             return Error{ErrorCode::InternalError, "execution schedule references an invalid node"};
         }
         const ExecutionNode* node = &model.graph.nodes[node_id];
+        if (bank_chain_finished) continue;
         if (node->type == ExecutionNodeType::TokenEmbedding)
         {
             if (node->weight_inputs.size() != 1)
@@ -1261,10 +1540,79 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             }
             if (!split_hidden_rows(scratch.staged_output))
                 return Error{ErrorCode::InternalError, "cannot split staged embedding rows"};
+            if (!model.gpu_expert_banks.empty())
+            {
+                if (model.speculative.enabled() && use_speculative_context)
+                    return Error{ErrorCode::InternalError, "resident staged Expert bank plan cannot consume speculative hidden captures"};
+                std::vector<uint64_t> positions(session_count);
+                for (size_t row = 0; row < session_count; ++row) positions[row] = entries[row].position_offset;
+                std::vector<LayerCache*> caches;
+                std::vector<ExpertDispatchOptions> options;
+                std::vector<std::vector<uint32_t>> explicit_ids(model.graph.layer_plans.size());
+                uint64_t assignments = 0;
+                for (size_t index = 0; index < model.graph.layer_plans.size(); ++index)
+                {
+                    const auto& layer = model.graph.layer_plans[index];
+                    for (const auto& entry : entries)
+                    {
+                        if (layer.layer_id >= entry.state->layers.size())
+                            return Error{ErrorCode::InternalError, "resident staged Expert bank cache is out of range"};
+                        caches.push_back(&entry.state->layers[layer.layer_id]);
+                    }
+                    options.push_back(latent_router_options(model, layer.moe, input_ids, explicit_ids[index]));
+                    assignments += layer.moe.top_k;
+                }
+                ActivationBuffer completed;
+                std::string error;
+                if (!GpuSegment_vulkan::forward_banks(model, scratch.staged_output, positions, caches, options,
+                                                      requested_count != 0, false, completed, error))
+                    return Error{ErrorCode::InternalError, "resident staged Expert bank chain failed: " + error};
+                for (size_t row = 0; row < session_count; ++row)
+                {
+                    if (entries[row].logits)
+                        entries[row].logits->assign(completed.row(row), completed.row(row) + completed.columns());
+                    entries[row].statistics->expert_assignments += assignments;
+                    entries[row].statistics->expert_gpu_routes += assignments;
+                }
+                bank_chain_finished = true;
+            }
             continue;
         }
         if (node->type == ExecutionNodeType::FinalNorm)
         {
+            if (pending_continuation)
+            {
+                ActivationBuffer& gpu_logits = workspace.expert.staged_output;
+                std::string error;
+                if (continuation_target != node_id
+                    || !pending_continuation->publish_head(gpu_logits, workspace.gpu_segment, error))
+                    return Error{ErrorCode::InternalError, "resident staged Vulkan head continuation failed: " + error};
+                pending_continuation.reset();
+                continuation_region.reset();
+                continuation_target = invalid_execution_node_id;
+                for (size_t row = 0; row < session_count; ++row)
+                    if (entries[row].logits) entries[row].logits->assign(gpu_logits.row(row), gpu_logits.row(row) + gpu_logits.columns());
+                resident_head_finished = true;
+                continue;
+            }
+            if (workspace.gpu_segment.active())
+            {
+                std::string error;
+                if (model.gpu_head && !(model.speculative.kind == SpeculativeModelKind::Mtp && use_speculative_context))
+                {
+                    ActivationBuffer& gpu_logits = workspace.expert.staged_output;
+                    if (!model.gpu_head->finish(requested_count != 0, false, workspace.expert.staged_merged,
+                                                gpu_logits, workspace.gpu_segment, error))
+                        return Error{ErrorCode::InternalError, "resident staged Vulkan head failed: " + error};
+                    for (size_t row = 0; row < session_count; ++row)
+                        if (entries[row].logits) entries[row].logits->assign(gpu_logits.row(row), gpu_logits.row(row) + gpu_logits.columns());
+                    resident_head_finished = true;
+                    continue;
+                }
+                if (!GpuSegment_vulkan::materialize_hidden(workspace.gpu_segment, workspace.expert.staged_merged, error)
+                    || !split_hidden_rows(workspace.expert.staged_merged))
+                    return Error{ErrorCode::InternalError, "resident staged Vulkan head boundary failed: " + error};
+            }
             if (node->weight_inputs.size() != 2)
                 return Error{ErrorCode::InternalError, "final norm node has an invalid weight binding"};
             const CompiledOperator& lm_head_operator = model.operators.at_weight(node->weight_inputs[1]);
@@ -1349,6 +1697,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         }
         if (node->type == ExecutionNodeType::LmHead)
         {
+            if (resident_head_finished) continue;
             if (node->weight_inputs.size() != 2)
                 return Error{ErrorCode::InternalError, "LM head node has an invalid weight binding"};
             if (deferred_gpu_head)
@@ -1459,7 +1808,13 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         if (node->type == ExecutionNodeType::DenseFfn)
         {
             ActivationBuffer& merged = batch_scratch.staged_merged;
-            if (layer_workspace.active())
+            if (workspace.gpu_segment.active())
+            {
+                std::string error;
+                if (!GpuSegment_vulkan::materialize_hidden(workspace.gpu_segment, merged, error))
+                    return Error{ErrorCode::InternalError, "resident staged Vulkan dense boundary failed: " + error};
+            }
+            else if (layer_workspace.active())
             {
                 if (!LatentLayer_vulkan::materialize_hidden(layer_workspace, merged))
                     return Error{ErrorCode::InternalError, "cannot materialize staged dense FFN input"};
@@ -1468,13 +1823,62 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             {
                 return Error{ErrorCode::InternalError, "cannot merge staged dense FFN rows"};
             }
-            forward_dense_layer(model, layer, merged, workspace.staged_state, node->backend);
+            auto executed = forward_dense_layer(model, layer, merged, workspace.staged_state, node->backend);
+            if (!executed) return executed.error();
             if (!split_hidden_rows(merged))
                 return Error{ErrorCode::InternalError, "cannot split staged dense FFN rows"};
             continue;
         }
         if (node->type == ExecutionNodeType::Attention)
         {
+            const auto segment = node->layer_plan_index < model.gpu_segments.size() ? model.gpu_segments[node->layer_plan_index] : nullptr;
+            if (segment)
+            {
+                if (node->backend != ExecutionBackend::Vulkan)
+                    return Error{ErrorCode::InternalError, "resident staged segment has a non-Vulkan Attention node"};
+                auto& positions = workspace.staged_attention_positions;
+                auto& caches = workspace.staged_attention_caches;
+                positions.resize(session_count);
+                caches.resize(session_count);
+                for (size_t row = 0; row < session_count; ++row)
+                {
+                    positions[row] = entries[row].position_offset;
+                    caches[row] = &entries[row].state->layers[layer.layer_id];
+                }
+                auto& initial_hidden = batch_scratch.staged_merged;
+                if (!workspace.gpu_segment.active() && !merge_hidden_rows(initial_hidden))
+                    return Error{ErrorCode::InternalError, "cannot merge resident staged segment input"};
+                auto options = latent_router_options(model, moe, workspace.staged_input_ids, batch_scratch.explicit_expert_ids);
+                std::string error;
+                if (pending_continuation)
+                {
+                    if (continuation_target != node_id
+                        || !pending_continuation->publish(fused_routes, workspace.gpu_segment, error))
+                        return Error{ErrorCode::InternalError, "resident staged Vulkan continuation at layer " + std::to_string(layer.layer_id) + " failed: " + error};
+                    pending_continuation.reset();
+                    continuation_region.reset();
+                    continuation_target = invalid_execution_node_id;
+                }
+                else if (!segment->forward(initial_hidden, positions, caches, options, fused_routes, workspace.gpu_segment, error))
+                    return Error{ErrorCode::InternalError, "resident staged Vulkan segment at layer " + std::to_string(layer.layer_id) + " failed: " + error};
+                workspace.staged_state.normalized.reset(session_count, model.descriptor.hidden_size, false);
+                for (size_t row = 0; row < session_count; ++row)
+                {
+                    auto& layer_state = entries[row].state->execution_state;
+                    layer_state.normalized.reset(1, model.descriptor.hidden_size, false);
+                    split_latent_routes(fused_routes, static_cast<uint32_t>(row), layer_state.dispatch_plan);
+                }
+                fused_router_ready = true;
+                resident_router_ready = true;
+                continue;
+            }
+            if (workspace.gpu_segment.active())
+            {
+                std::string error;
+                if (!GpuSegment_vulkan::materialize_hidden(workspace.gpu_segment, batch_scratch.staged_merged, error)
+                    || !split_hidden_rows(batch_scratch.staged_merged))
+                    return Error{ErrorCode::InternalError, "resident staged Vulkan graph boundary failed: " + error};
+            }
             if (layer_workspace.active() && layer.attention.kind != AttentionKind::MultiHeadLatent)
             {
                 ActivationBuffer& materialized = workspace.expert.staged_merged;
@@ -1548,6 +1952,9 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                         fused_router_ready = true;
                         continue;
                     }
+                    return Error{ErrorCode::InternalError, "Vulkan latent batch execution failed (layer "
+                                                               + std::to_string(layer.layer_id) + ", device "
+                                                               + std::to_string(layer.vulkan_device_index) + ")"};
                 }
                 if (layer_workspace.active())
                 {
@@ -1816,7 +2223,13 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             }
             LayerState& combined = workspace.staged_state;
             combined.reset();
-            if (fused_router_ready)
+            if (resident_router_ready)
+            {
+                combined.normalized_device = workspace.gpu_segment.device_input();
+                combined.gpu_segment = true;
+                combined.require_device_execution = true;
+            }
+            else if (fused_router_ready)
                 combined.normalized_device = layer_workspace.device_input();
             // Router already produced the complete normalized batch here.
             if (combined.normalized.rows() != session_count || combined.normalized.columns() != model.descriptor.hidden_size)
@@ -1854,6 +2267,15 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             }
 
             combined.resize_experts(combined_count);
+            // Staged CPU Combine accumulates in expert-id order. Use that
+            // same canonical order for retained device outputs, independently
+            // of which session first introduced each Expert into this batch.
+            const auto active = combined.active_experts();
+            std::sort(active.begin(), active.end(), [](const ExpertState& left, const ExpertState& right) {
+                return left.batch.expert_id < right.batch.expert_id;
+            });
+            for (size_t index = 0; index < active.size(); ++index)
+                combined_by_expert[active[index].batch.expert_id] = index;
             if (has_flag(node->flags, ExecutionNodeRequestExperts))
             {
                 auto requested = request_experts(model, moe, combined, batch_scratch,
@@ -1866,14 +2288,60 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         if (node->type == ExecutionNodeType::ExpertGroup)
         {
             LayerState& combined = workspace.staged_state;
+            auto resident = prepare_resident_ffn_region(model, combined, node->backend);
+            if (!resident) return resident.error();
+            if (combined.gpu_segment && combined.region)
+            {
+                if (pending_continuation)
+                    return Error{ErrorCode::InternalError, "resident staged Vulkan continuation reached another Expert group before its target"};
+                const bool capture_boundary = use_speculative_context
+                                              && std::find(model.speculative.target_layer_ids.begin(), model.speculative.target_layer_ids.end(), layer.layer_id)
+                                                     != model.speculative.target_layer_ids.end();
+                ExecutionNodeId target_id = capture_boundary ? invalid_execution_node_id
+                                                             : GpuSegment_vulkan::continuation_target(model, node_id);
+                if (target_id != invalid_execution_node_id && use_speculative_context
+                    && model.speculative.kind == SpeculativeModelKind::Mtp
+                    && model.graph.nodes[target_id].type == ExecutionNodeType::FinalNorm)
+                    target_id = invalid_execution_node_id;
+                if (target_id != invalid_execution_node_id)
+                {
+                    const auto& target = model.graph.nodes[target_id];
+                    std::string error;
+                    if (target.type == ExecutionNodeType::FinalNorm)
+                        pending_continuation = model.gpu_head->prepare_head_continuation(requested_count != 0, false,
+                                                                                         workspace.gpu_segment, error);
+                    else
+                    {
+                        const auto& next_layer = model.graph.layer_plans[target.layer_plan_index];
+                        auto& positions = workspace.staged_attention_positions;
+                        auto& caches = workspace.staged_attention_caches;
+                        positions.resize(session_count);
+                        caches.resize(session_count);
+                        for (size_t row = 0; row < session_count; ++row)
+                        {
+                            if (next_layer.layer_id >= entries[row].state->layers.size())
+                                return Error{ErrorCode::InternalError, "resident staged Vulkan continuation layer cache is out of range"};
+                            positions[row] = entries[row].position_offset;
+                            caches[row] = &entries[row].state->layers[next_layer.layer_id];
+                        }
+                        auto options = latent_router_options(model, next_layer.moe, workspace.staged_input_ids, batch_scratch.explicit_expert_ids);
+                        pending_continuation = model.gpu_segments[target.layer_plan_index]->prepare_continuation(positions, caches, options,
+                                                                                                                 workspace.gpu_segment, error);
+                    }
+                    if (!pending_continuation || !combined.region->set_continuation(pending_continuation))
+                        return Error{ErrorCode::InternalError, "cannot prepare resident staged Vulkan continuation from layer " + std::to_string(layer.layer_id) + ": " + error};
+                    continuation_region = combined.region;
+                    continuation_target = target_id;
+                }
+            }
             Result<void> shared_result;
             std::function<void()> shared_work;
-            if (moe.has_shared_expert && node->backend == ExecutionBackend::Vulkan
+            if (!combined.gpu_segment && moe.has_shared_expert && node->backend == ExecutionBackend::Vulkan
                 && has_flag(model.opt.optimization_flags, OptimizationVulkanSharedExpertOverlap)
                 && support_vulkan_shared_experts(model.operators, moe))
             {
                 shared_work = [&] {
-                    shared_result = forward_staged_shared_expert(model, moe, entries, workspace, fused_router_ready);
+                    shared_result = forward_staged_shared_expert(model, moe, entries, workspace, fused_router_ready, ExecutionBackend::Vulkan);
                 };
             }
             auto executed = forward_moe(model,
@@ -1923,6 +2391,10 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                         statistics.expert_gpu_routes += active.batch.routes.size();
                     else
                     {
+                        if (node->backend == ExecutionBackend::Vulkan && model.opt.hybrid_mode == HybridMode::HybridExperts)
+                            return Error{ErrorCode::InternalError, "Vulkan Expert route was not published (layer "
+                                                                       + std::to_string(layer.layer_id) + ", op ExpertGroup, Vulkan device "
+                                                                       + std::to_string(layer.vulkan_device_index) + ")"};
                         statistics.expert_cpu_routes += active.batch.routes.size();
                         ++statistics.expert_cpu_batches;
                         statistics.expert_cpu_fallbacks += node->backend == ExecutionBackend::Vulkan ? 1 : 0;
@@ -1934,15 +2406,39 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         }
         if (node->type == ExecutionNodeType::SharedExpertGroup)
         {
+            if (workspace.staged_state.gpu_segment) continue;
             if (!moe.has_shared_expert)
                 return Error{ErrorCode::InternalError, "Shared Expert graph node has no shared Expert plan"};
-            auto executed = forward_staged_shared_expert(model, moe, entries, workspace, fused_router_ready);
+            auto executed = forward_staged_shared_expert(model, moe, entries, workspace, fused_router_ready, node->backend);
             if (!executed) return executed.error();
             continue;
         }
         if (node->type == ExecutionNodeType::Combine)
         {
             LayerState& combined = workspace.staged_state;
+            if (combined.gpu_segment)
+            {
+                if (!combined.experts_executed
+                    || (!pending_continuation && !GpuSegment_vulkan::defer_combine(combined.combined_device, workspace.gpu_segment)))
+                    return Error{ErrorCode::InternalError, "resident staged segment did not receive a complete Expert aggregate"};
+                const auto target = std::find(model.speculative.target_layer_ids.begin(), model.speculative.target_layer_ids.end(), layer.layer_id);
+                if (use_speculative_context && target != model.speculative.target_layer_ids.end())
+                {
+                    std::string error;
+                    if (!GpuSegment_vulkan::materialize_hidden(workspace.gpu_segment, batch_scratch.staged_merged, error)
+                        || !split_hidden_rows(batch_scratch.staged_merged))
+                        return Error{ErrorCode::InternalError, "resident staged speculative hidden capture failed: " + error};
+                    for (const auto& entry : entries)
+                        if (entry.state->use_speculative_context)
+                            capture_speculative_hidden(entry.state->hidden, model.descriptor.hidden_size, model.descriptor.hyper_connection_multiplier,
+                                                       static_cast<size_t>(std::distance(model.speculative.target_layer_ids.begin(), target)), entry.state->speculative_main_hidden);
+                }
+                for (const auto& entry : entries) entry.state->execution_state.reset();
+                combined.reset();
+                resident_router_ready = false;
+                fused_router_ready = false;
+                continue;
+            }
             const std::vector<uint8_t>& combined_backend_aggregated = batch_scratch.backend_aggregated;
             const bool has_aggregate = batch_scratch.backend_aggregated_output_valid
                                        && batch_scratch.backend_aggregated_output.rows()
@@ -1995,6 +2491,10 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                                                                     shared_host,
                                                                     combined.shared_expert_device_output, layer_workspace);
                 inputs.clear();
+                if (!device_combined)
+                    return Error{ErrorCode::InternalError, "Vulkan latent batch Expert combine failed (layer "
+                                                               + std::to_string(layer.layer_id) + ", device "
+                                                               + std::to_string(layer.vulkan_device_index) + ")"};
             }
             if (!device_combined)
             {
@@ -2130,6 +2630,8 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         return Error{ErrorCode::InternalError, "unsupported execution graph node"};
     }
 
+    if (pending_continuation)
+        return Error{ErrorCode::InternalError, "staged execution graph ended before its resident Vulkan continuation target"};
     record_resource_delta(model, entries, cache_before, backend_before);
     for (size_t session_index = 0; session_index < session_count; ++session_index)
     {

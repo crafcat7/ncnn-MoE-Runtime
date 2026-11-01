@@ -216,6 +216,8 @@ static void norm_case(const std::shared_ptr<VulkanContext>& context, const Vulka
     }
     const auto after = get_vulkan_statistics(runtime);
     norm_check(after.compute_submissions == before.compute_submissions && after.dispatches == before.dispatches
+                   && after.weight_upload_bytes == before.weight_upload_bytes
+                   && after.weight_transfer_submissions == before.weight_transfer_submissions
                    && after.batch_uploads == before.batch_uploads && after.batch_downloads == before.batch_downloads,
                "RMSNorm recorder published counters or performed its own submission");
     norm_check(std::equal(input.values().begin(), input.values().end(), preserved.values().begin()),

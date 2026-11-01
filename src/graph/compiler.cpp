@@ -1042,9 +1042,7 @@ static Result<void> finalize_expert(WeightStore& weights,
                                     const MoeDescriptor& moe,
                                     bool use_file_backed_experts)
 {
-    const DType declared_dtype = moe.expert_weight_dtype;
-    const bool allow_file_backed_bfloat16 = declared_dtype == DType::BFloat16
-                                            && has_flag(moe.flags, MoeDescriptorFileBackedExperts);
+    const bool allow_file_backed_bfloat16 = has_flag(moe.flags, MoeDescriptorFileBackedExperts);
     const bool separate_gate_up = expert.gate_up_weight == invalid_tensor_handle
                                   && expert.gate_weight != invalid_tensor_handle
                                   && expert.up_weight != invalid_tensor_handle;
@@ -1206,12 +1204,9 @@ static Result<void> finalize_expert(WeightStore& weights,
                          "on-demand Qn_K Experts require file-backed Qn_K gate/up and down matrices"};
         }
     }
-    if (use_file_backed_experts && is_qnk_dtype(declared_dtype) && !has_qnk_weight)
-    {
-        return Error{ErrorCode::UnsupportedModel,
-                     "on-demand Qn_K Experts require file-backed Qn_K gate/up and down matrices"};
-    }
-    if (use_file_backed_experts && declared_dtype == DType::MxFp4
+    const bool has_mxfp4_weight = (gate_up_weight && gate_up_weight->dtype == DType::MxFp4)
+                                  || (down_weight && down_weight->dtype == DType::MxFp4);
+    if (use_file_backed_experts && has_mxfp4_weight
         && (!gate_up_weight || !down_weight
             || gate_up_weight->dtype != DType::MxFp4 || down_weight->dtype != DType::MxFp4
             || !is_cache_file_backed_expert_pair(*gate_up_weight, *down_weight, false)))
@@ -1219,7 +1214,7 @@ static Result<void> finalize_expert(WeightStore& weights,
         return Error{ErrorCode::InvalidModel,
                      "on-demand MXFP4 Expert weights must remain file-backed"};
     }
-    if (use_file_backed_experts && allow_file_backed_bfloat16 && !has_qnk_weight
+    if (use_file_backed_experts && allow_file_backed_bfloat16 && !has_qnk_weight && !has_mxfp4_weight
         && (!gate_up_weight || !down_weight
             || gate_up_weight->dtype != DType::BFloat16 || down_weight->dtype != DType::BFloat16
             || !is_cache_file_backed_expert_pair(*gate_up_weight, *down_weight, true)))
@@ -1436,6 +1431,7 @@ static Result<void> compile_mtp_speculative_model(CompiledModel& compiled,
                                    compiled_moe.shared_expert);
     if (!status)
         return status.error();
+    compiled_moe.shared_expert.residency_group = layer_plan.layer_id;
     if (has_flag(moe.flags, MoeDescriptorSharedExpertGate))
     {
         status = assign_required_linear_tensor(compiled.weights,
@@ -1664,6 +1660,7 @@ static Result<void> compile_speculative_model(CompiledModel& compiled,
                                        layer_plan.moe.shared_expert);
         if (!status)
             return status.error();
+        layer_plan.moe.shared_expert.residency_group = layer_plan.layer_id;
         layer_plan.moe.experts.reserve(moe.expert_count);
         for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
         {
@@ -1751,6 +1748,7 @@ static Result<void> compile_moe_layer(CompiledModel& compiled, const std::string
                                     layer_plan.moe.shared_expert);
         if (!ret)
             return ret.error();
+        layer_plan.moe.shared_expert.residency_group = layer_plan.layer_id;
         if (has_flag(moe.flags, MoeDescriptorSharedExpertGate))
         {
             ret = assign_required_linear_tensor(compiled.weights, layer_name + "shared_expert.router_gate.weight", {1, compiled.descriptor.hidden_size}, compiled.descriptor.activation_dtype, layer_plan.moe.shared_expert_gate_weight);

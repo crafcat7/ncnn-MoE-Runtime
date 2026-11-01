@@ -474,8 +474,7 @@ Result<MoeModelDescriptor> Qwen4ExpModelAdapter::parse_model(const ModelPackage&
         }
     }
     moe.shared_expert_weight_dtype = DType::BFloat16;
-    moe.flags = MoeDescriptorSharedExpertGate
-                | MoeDescriptorFileBackedExperts;
+    moe.flags = MoeDescriptorSharedExpertGate;
 
     MoeModelDescriptor descriptor;
     descriptor.model_type = "qwen4_exp";
@@ -509,8 +508,6 @@ Result<MoeModelDescriptor> Qwen4ExpModelAdapter::parse_model(const ModelPackage&
         layer.moe.shared_expert_weight_dtype = shared_expert_weight_dtypes[layer_id];
         layer.moe.expert_weight_dtype = expert_weight_dtypes[layer_id];
         layer.moe.layout = expert_layouts[layer_id];
-        if (layer.moe.layout == ExpertLayout::GateUpDown)
-            layer.moe.flags &= ~MoeDescriptorFileBackedExperts;
         if (layer_id + 1 == ple_layer_ids.value()[0])
         {
             layer.ple.embedding_dimension = ple_embedding_dimension.value();

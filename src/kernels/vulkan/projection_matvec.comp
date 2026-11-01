@@ -1,0 +1,130 @@
+#version 450
+
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint weight_format = 0;
+layout(constant_id = 1) const uint input_pack = 4;
+layout(constant_id = 2) const uint output_pack = 4;
+
+layout(binding = 0) readonly buffer input_blob
+{ float input_data[]; };
+layout(binding = 1) readonly buffer weight_blob
+{ uint weights[]; };
+layout(binding = 2) readonly buffer bias_blob
+{ float bias_data[]; };
+layout(binding = 3) writeonly buffer output_blob
+{ float output_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    uint input_columns;
+    uint output_columns;
+    uint bias_term;
+}
+p;
+
+float matrix_weight(uint output_column, uint input_column)
+{
+    if (weight_format == 1u)
+    {
+        const uint index = output_column * p.input_columns + input_column;
+        return uintBitsToFloat(((weights[index >> 1u] >> ((index & 1u) * 16u)) & 65535u) << 16u);
+    }
+    const uint tile = (output_column / output_pack) * (p.input_columns / input_pack)
+                      + input_column / input_pack;
+    const uint index = tile * input_pack * output_pack
+                       + (output_column % output_pack) * input_pack
+                       + input_column % input_pack;
+    return uintBitsToFloat(weights[index]);
+}
+
+vec4 matrix_values(uint output_column, uint input_column)
+{
+    if (weight_format == 1u && input_column + 3u < p.input_columns)
+    {
+        const uint index = output_column * p.input_columns + input_column;
+        const uint first = weights[index >> 1u];
+        const uint second = weights[(index + 2u) >> 1u];
+        return vec4(uintBitsToFloat((first & 65535u) << 16u), uintBitsToFloat(first & 0xffff0000u),
+                    uintBitsToFloat((second & 65535u) << 16u), uintBitsToFloat(second & 0xffff0000u));
+    }
+    if (weight_format == 0u && input_pack == 4u)
+    {
+        const uint tile = (output_column / output_pack) * (p.input_columns / 4u) + input_column / 4u;
+        const uint index = tile * 4u * output_pack + (output_column % output_pack) * 4u;
+        return uintBitsToFloat(uvec4(weights[index], weights[index + 1u], weights[index + 2u], weights[index + 3u]));
+    }
+    vec4 result = vec4(0.0);
+    for (uint index = 0u; index < 4u; ++index)
+        if (input_column + index < p.input_columns)
+            result[index] = matrix_weight(output_column, input_column + index);
+    return result;
+}
+
+shared float partial0[128];
+shared float partial1[128];
+
+void main()
+{
+    const uint outputs_per_group = weight_format == 1u ? 2u : 1u;
+    const uint output_column = gl_WorkGroupID.x * outputs_per_group;
+    const bool second_output = outputs_per_group == 2u && output_column + 1u < p.output_columns;
+    const uint lane = gl_LocalInvocationIndex;
+    float sum0 = 0.0;
+    float sum1 = 0.0;
+    for (uint column = lane * 4u; column < p.input_columns; column += 512u)
+    {
+        vec4 input_values = vec4(0.0);
+        input_values.x = input_data[column];
+        if (column + 1u < p.input_columns) input_values.y = input_data[column + 1u];
+        if (column + 2u < p.input_columns) input_values.z = input_data[column + 2u];
+        if (column + 3u < p.input_columns) input_values.w = input_data[column + 3u];
+        if (output_column < p.output_columns)
+            sum0 += dot(matrix_values(output_column, column), input_values);
+        if (second_output)
+            sum1 += dot(matrix_values(output_column + 1u, column), input_values);
+    }
+    float result0 = 0.0;
+    float result1 = 0.0;
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    const float reduced0 = subgroupAdd(sum0);
+    const float reduced1 = subgroupAdd(sum1);
+    if (gl_SubgroupInvocationID == 0u)
+    {
+        partial0[gl_SubgroupID] = reduced0;
+        partial1[gl_SubgroupID] = reduced1;
+    }
+    barrier();
+    if (lane == 0u)
+        for (uint subgroup = 0u; subgroup < gl_NumSubgroups; ++subgroup)
+        {
+            result0 += partial0[subgroup];
+            result1 += partial1[subgroup];
+        }
+#else
+    partial0[lane] = sum0;
+    partial1[lane] = sum1;
+    barrier();
+    for (uint stride = 64u; stride > 0u; stride >>= 1u)
+    {
+        if (lane < stride)
+        {
+            partial0[lane] += partial0[lane + stride];
+            partial1[lane] += partial1[lane + stride];
+        }
+        barrier();
+    }
+    result0 = partial0[0];
+    result1 = partial1[0];
+#endif
+    if (lane == 0u && output_column < p.output_columns)
+    {
+        output_data[output_column] = result0 + (p.bias_term != 0u ? bias_data[output_column] : 0.0);
+        if (second_output)
+            output_data[output_column + 1u] = result1 + (p.bias_term != 0u ? bias_data[output_column + 1u] : 0.0);
+    }
+}

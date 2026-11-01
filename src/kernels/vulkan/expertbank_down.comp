@@ -1,0 +1,233 @@
+#version 450
+
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint weight_format = 2;
+layout(binding = 0) readonly buffer input_blob
+{ float input_data[]; };
+layout(binding = 1) readonly buffer weight_blob
+{ uint weights[]; };
+layout(binding = 2) readonly buffer selected_blob
+{ float selected[]; };
+layout(binding = 3) writeonly buffer output_blob
+{ float output_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    uint input_columns;
+    uint intermediate_columns;
+    uint output_columns;
+    uint expert_count;
+    uint top_k;
+    uint rows;
+    uint format;
+    uint gate_stride;
+    uint gate_scales;
+    uint gate_bias;
+    uint down_weights;
+    uint down_stride;
+    uint down_scales;
+    uint down_bias;
+    uint activation;
+    float activation_limit;
+}
+p;
+
+uint weight_byte(uint base, uint index)
+{
+    return (weights[base + (index >> 2)] >> ((index & 3u) * 8u)) & 255u;
+}
+
+float native_weight(uint base, uint index)
+{
+    if (weight_format == 0u) return uintBitsToFloat(weights[base + index]);
+    return uintBitsToFloat(((weights[base + (index >> 1)] >> ((index & 1u) * 16u)) & 65535u) << 16);
+}
+
+shared float fp4_lut[16];
+
+void init_mxfp4_lut()
+{
+    const uint code = gl_LocalInvocationIndex;
+    if (code < 16u)
+    {
+        const uint magnitude = code & 7u;
+        uint bits = (((magnitude >> 1u) + 126u) << 23u) | ((magnitude & 1u) << 22u);
+        if (magnitude == 1u) bits = 0x3f000000u;
+        if (magnitude == 0u) bits = 0u;
+        fp4_lut[code] = uintBitsToFloat(bits | ((code & 8u) << 28u));
+    }
+    barrier();
+}
+
+vec4 fp4_word(uint packed)
+{
+    return vec4(fp4_lut[packed & 15u], fp4_lut[(packed >> 4u) & 15u],
+                fp4_lut[(packed >> 8u) & 15u], fp4_lut[(packed >> 12u) & 15u]);
+}
+
+shared float partial[128];
+shared vec4 mxfp4_partial[128];
+
+bool dot8_input_range(vec4 value)
+{
+    const vec4 magnitude = abs(value);
+    const vec4 nonzero = mix(magnitude, vec4(1.0), equal(magnitude, vec4(0.0)));
+    return all(lessThanEqual(magnitude, vec4(4294967296.0)))
+           && all(greaterThanEqual(nonzero, vec4(2.3283064365386962890625e-10)));
+}
+
+float mxfp4_dot8(uint base, uint column, uint blocks, uint k, vec4 x0, vec4 x1, bool safe_input)
+{
+    const uint packed = weights[base + column * blocks * 4u + k / 8u];
+    const vec4 w0 = fp4_word(packed);
+    const vec4 w1 = fp4_word(packed >> 16u);
+    const uint scale_byte = weight_byte(base + p.down_scales, column * blocks + k / 32u);
+    const float scale = uintBitsToFloat(max(scale_byte, 1u) << 23u);
+    // Power-of-two scaling commutes with the dot only while both domains
+    // retain normal range. Keep exceptional scales/inputs individually scaled.
+    if (safe_input && scale_byte >= 64u && scale_byte <= 190u)
+        return (dot(w0, x0) + dot(w1, x1)) * scale;
+    precise vec4 product0 = (w0 * x0) * scale;
+    precise vec4 product1 = (w1 * x1) * scale;
+    // E8M0 zero means 2^-127. Materializing that subnormal multiplier
+    // loses otherwise normal results on devices that flush denormal inputs.
+    if (scale_byte == 0u)
+    {
+        product0 *= 0.5;
+        product1 *= 0.5;
+    }
+    precise float sum = product0.x;
+    sum += product0.y;
+    sum += product0.z;
+    sum += product0.w;
+    sum += product1.x;
+    sum += product1.y;
+    sum += product1.z;
+    sum += product1.w;
+    return sum;
+}
+
+void mxfp4_down()
+{
+    const uint tid = gl_LocalInvocationIndex;
+    const uint column = gl_WorkGroupID.x * 4u;
+    const uint route = gl_WorkGroupID.y;
+    const uint row = gl_WorkGroupID.z;
+    const uint selected_base = row * (2u * p.top_k + 1u);
+    const float id_value = selected[selected_base + route];
+    const float weight = selected[selected_base + p.top_k + route];
+    const bool valid = route < p.top_k && row < p.rows && column < p.output_columns
+                       && selected[selected_base + 2u * p.top_k] == 0.0
+                       && !isnan(id_value) && !isinf(id_value) && id_value >= 0.0
+                       && id_value < float(p.expert_count) && floor(id_value) == id_value
+                       && !isnan(weight) && !isinf(weight) && weight >= 0.0;
+    vec4 sum = vec4(0.0);
+    if (valid)
+    {
+        const uint base = p.down_weights + uint(id_value) * p.down_stride;
+        const uint input_base = (row * p.top_k + route) * p.intermediate_columns;
+        const uint blocks = p.intermediate_columns / 32u;
+        for (uint k = tid * 8u; k < p.intermediate_columns; k += 1024u)
+        {
+            const vec4 x0 = vec4(input_data[input_base + k], input_data[input_base + k + 1u],
+                                 input_data[input_base + k + 2u], input_data[input_base + k + 3u]);
+            const vec4 x1 = vec4(input_data[input_base + k + 4u], input_data[input_base + k + 5u],
+                                 input_data[input_base + k + 6u], input_data[input_base + k + 7u]);
+            const bool safe_input = dot8_input_range(x0) && dot8_input_range(x1);
+            sum.x += mxfp4_dot8(base, column, blocks, k, x0, x1, safe_input);
+            if (column + 1u < p.output_columns) sum.y += mxfp4_dot8(base, column + 1u, blocks, k, x0, x1, safe_input);
+            if (column + 2u < p.output_columns) sum.z += mxfp4_dot8(base, column + 2u, blocks, k, x0, x1, safe_input);
+            if (column + 3u < p.output_columns) sum.w += mxfp4_dot8(base, column + 3u, blocks, k, x0, x1, safe_input);
+        }
+    }
+    vec4 reduced = vec4(0.0);
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    const vec4 subgroup_sum = subgroupAdd(sum);
+    if (gl_SubgroupInvocationID == 0u) mxfp4_partial[gl_SubgroupID] = subgroup_sum;
+    barrier();
+    if (tid == 0u)
+        for (uint group = 0u; group < gl_NumSubgroups; ++group) reduced += mxfp4_partial[group];
+#else
+    mxfp4_partial[tid] = sum;
+    barrier();
+    for (uint stride = 64u; stride > 0u; stride >>= 1u)
+    {
+        if (tid < stride) mxfp4_partial[tid] += mxfp4_partial[tid + stride];
+        barrier();
+    }
+    reduced = mxfp4_partial[0];
+#endif
+    if (tid == 0u)
+        for (uint offset = 0u; offset < 4u && column + offset < p.output_columns; ++offset)
+        {
+            if (valid)
+                reduced[offset] += uintBitsToFloat(weights[p.down_weights + uint(id_value) * p.down_stride + p.down_bias + column + offset]);
+            output_data[(row * p.top_k + route) * p.output_columns + column + offset] = valid ? reduced[offset] : 0.0;
+        }
+}
+
+void main()
+{
+    if (weight_format == 2u)
+    {
+        init_mxfp4_lut();
+        mxfp4_down();
+        return;
+    }
+    const uint local_index = gl_LocalInvocationIndex;
+    uint column_group = local_index >> 5u;
+    uint lane = local_index & 31u;
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    if (gl_SubgroupSize == 32u)
+    {
+        column_group = gl_SubgroupID;
+        lane = gl_SubgroupInvocationID;
+    }
+#endif
+    const uint column = gl_WorkGroupID.x * 4u + column_group;
+    const uint route = gl_WorkGroupID.y;
+    const uint row = gl_WorkGroupID.z;
+    const uint selected_base = row * (2u * p.top_k + 1u);
+    const float id_value = selected[selected_base + route];
+    const float weight = selected[selected_base + p.top_k + route];
+    const bool valid = column < p.output_columns && route < p.top_k && row < p.rows
+                       && selected[selected_base + 2u * p.top_k] == 0.0
+                       && !isnan(id_value) && !isinf(id_value) && id_value >= 0.0
+                       && id_value < float(p.expert_count) && floor(id_value) == id_value
+                       && !isnan(weight) && !isinf(weight) && weight >= 0.0;
+    float sum = 0.0;
+    if (valid)
+    {
+        const uint base = p.down_weights + uint(id_value) * p.down_stride;
+        const uint input_base = (row * p.top_k + route) * p.intermediate_columns;
+        for (uint k = lane; k < p.intermediate_columns; k += 32u)
+            sum += native_weight(base, column * p.intermediate_columns + k) * input_data[input_base + k];
+    }
+    float reduced = 0.0;
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    if (gl_SubgroupSize == 32u)
+        reduced = subgroupAdd(sum);
+    else
+#endif
+    {
+        partial[local_index] = sum;
+        barrier();
+        for (uint stride = 16u; stride > 0u; stride >>= 1u)
+        {
+            if (lane < stride) partial[local_index] += partial[local_index + stride];
+            barrier();
+        }
+        reduced = partial[local_index - lane];
+    }
+    if (lane == 0u && column < p.output_columns)
+    {
+        if (valid)
+            reduced += uintBitsToFloat(weights[p.down_weights + uint(id_value) * p.down_stride + p.down_bias + column]);
+        output_data[(row * p.top_k + route) * p.output_columns + column] = valid ? reduced : 0.0;
+    }
+}

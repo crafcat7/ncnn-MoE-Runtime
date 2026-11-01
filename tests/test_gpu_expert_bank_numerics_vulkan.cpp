@@ -1,0 +1,264 @@
+#include "gpu_segment_fixture.h"
+#include "backends/ncnn/expertbank_vulkan.h"
+
+#include <bit>
+#include <limits>
+#include <utility>
+
+namespace ncnn {
+namespace moe {
+
+#if NCNN_MOE_WITH_VULKAN
+struct BankNumericCase
+{
+    uint32_t intermediate;
+    uint32_t output;
+    uint8_t scale;
+    int input_exponent;
+    bool random_scales;
+    bool cancellation;
+    uint32_t input_columns = 128;
+    bool projected_input = false;
+    bool subnormal_gate_scale = false;
+};
+
+struct BankNumericExpert
+{
+    TensorData gate;
+    TensorData down;
+    TensorData gate_bias;
+    TensorData down_bias;
+};
+
+static TensorData numeric_mxfp4(uint32_t rows, uint32_t columns)
+{
+    TensorData tensor;
+    tensor.dtype = DType::MxFp4;
+    tensor.shape = {rows, columns};
+    tensor.mxfp4_blocks.resize(static_cast<size_t>(rows) * columns / 2);
+    tensor.mxfp4_scales.resize(static_cast<size_t>(rows) * columns / 32);
+    std::fill_n(tensor.mxfp4_blocks.data(), tensor.mxfp4_blocks.size(), uint8_t{0});
+    std::fill_n(tensor.mxfp4_scales.data(), tensor.mxfp4_scales.size(), uint8_t{127});
+    return tensor;
+}
+
+static std::array<BankNumericExpert, 4> numeric_experts(const BankNumericCase& test)
+{
+    std::array<BankNumericExpert, 4> experts;
+    for (uint32_t expert = 0; expert < experts.size(); ++expert)
+    {
+        auto& item = experts[expert];
+        item.gate = numeric_mxfp4(test.intermediate * 2, test.input_columns);
+        item.down = numeric_mxfp4(test.output, test.intermediate);
+        item.gate_bias.dtype = item.down_bias.dtype = DType::Float32;
+        item.gate_bias.shape = {test.intermediate * 2};
+        item.down_bias.shape = {test.output};
+        item.gate_bias.float32_data.resize(test.intermediate * 2);
+        for (uint32_t middle = 0; middle < test.intermediate; ++middle)
+        {
+            item.gate_bias.float32_data[middle] = 1.0f;
+            const float magnitude = std::ldexp(1.0f + expert * 0.125f, test.input_exponent);
+            item.gate_bias.float32_data[test.intermediate + middle] = test.random_scales
+                                                                          ? magnitude * (static_cast<int>(middle % 13) - 6) * 0.125f
+                                                                          : magnitude;
+        }
+        for (uint32_t column = 0; column < test.output; ++column)
+            item.down_bias.float32_data.push_back((static_cast<int>((column + expert) % 7) - 3) * 0.125f);
+        for (size_t index = 0; index < static_cast<size_t>(test.output) * test.intermediate; ++index)
+        {
+            const uint8_t code = test.random_scales  ? static_cast<uint8_t>((index * 13 + expert * 3) % 16)
+                                 : test.cancellation ? static_cast<uint8_t>((index % 8 < 4) ? 7 : 15)
+                                                     : uint8_t{7};
+            item.down.mxfp4_blocks[index / 2] |= static_cast<uint8_t>(code << ((index % 2) * 4));
+        }
+        for (size_t block = 0; block < item.down.mxfp4_scales.size(); ++block)
+            item.down.mxfp4_scales[block] = test.random_scales ? static_cast<uint8_t>(72 + (block * 31 + expert * 7) % 111) : test.scale;
+        if (test.projected_input)
+        {
+            for (size_t index = 0; index < item.gate.mxfp4_blocks.size(); ++index)
+                item.gate.mxfp4_blocks[index] = static_cast<uint8_t>(((index * 7 + expert * 3) % 16) | (((index * 11 + index / 7 + expert * 5) % 16) << 4));
+            for (size_t block = 0; block < item.gate.mxfp4_scales.size(); ++block)
+                item.gate.mxfp4_scales[block] = test.subnormal_gate_scale ? uint8_t{0}
+                                                                          : static_cast<uint8_t>(120 + (block * 7 + expert) % 5);
+        }
+    }
+    return experts;
+}
+
+static ExpertBankWeights_vulkan numeric_view(const BankNumericExpert& expert)
+{
+    ExpertBankWeights_vulkan weights;
+    weights.gate_up = &expert.gate;
+    weights.down = &expert.down;
+    weights.gate_up_bias = &expert.gate_bias;
+    weights.down_bias = &expert.down_bias;
+    weights.layout = ExpertLayout::PackedGateUpDown;
+    weights.activation = ExpertActivation::Silu;
+    return weights;
+}
+
+static double numeric_value(const TensorData& tensor, size_t index)
+{
+    static constexpr double fp4[] = {0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6};
+    const uint8_t code = static_cast<uint8_t>((tensor.mxfp4_blocks[index / 2] >> ((index % 2) * 4)) & 15);
+    return std::ldexp(fp4[code], static_cast<int>(tensor.mxfp4_scales[index / 32]) - 127);
+}
+
+static ActivationBuffer numeric_reference(const std::array<BankNumericExpert, 4>& experts,
+                                          const BankNumericCase& test, const ActivationBuffer& input,
+                                          const ActivationBuffer& selected, uint32_t top_k)
+{
+    std::array<std::vector<float>, 4> projected;
+    for (size_t expert = 0; expert < experts.size(); ++expert)
+    {
+        const auto& item = experts[expert];
+        std::vector<double> activated(test.intermediate);
+        for (uint32_t middle = 0; middle < test.intermediate; ++middle)
+        {
+            double gate = item.gate_bias.float32_data[middle];
+            double up = item.gate_bias.float32_data[test.intermediate + middle];
+            if (test.projected_input)
+                for (uint32_t k = 0; k < test.input_columns; ++k)
+                {
+                    gate += numeric_value(item.gate, static_cast<size_t>(middle) * test.input_columns + k) * input.row(0)[k];
+                    up += numeric_value(item.gate, static_cast<size_t>(test.intermediate + middle) * test.input_columns + k) * input.row(0)[k];
+                }
+            activated[middle] = gate / (1.0 + std::exp(-gate)) * up;
+        }
+        for (uint32_t column = 0; column < test.output; ++column)
+        {
+            double value = item.down_bias.float32_data[column];
+            for (uint32_t middle = 0; middle < test.intermediate; ++middle)
+            {
+                const size_t index = static_cast<size_t>(column) * test.intermediate + middle;
+                value += numeric_value(item.down, index) * activated[middle];
+            }
+            projected[expert].push_back(static_cast<float>(value));
+        }
+    }
+    ActivationBuffer output(selected.rows(), test.output);
+    for (size_t row = 0; row < selected.rows(); ++row)
+        for (uint32_t column = 0; column < test.output; ++column)
+        {
+            float value = 0.0f;
+            for (uint32_t expert = 0; expert < experts.size(); ++expert)
+                for (uint32_t rank = 0; rank < top_k; ++rank)
+                    if (selected.row(row)[rank] == static_cast<float>(expert))
+                    {
+                        volatile float term = projected[expert][column] * selected.row(row)[top_k + rank];
+                        value += term;
+                    }
+            output.row(row)[column] = value;
+        }
+    return output;
+}
+
+static void numeric_case(const std::shared_ptr<VulkanContext>& context, const BankNumericCase& test)
+{
+    const auto experts = numeric_experts(test);
+    std::array<ExpertBankWeights_vulkan, 4> weights;
+    for (size_t expert = 0; expert < experts.size(); ++expert) weights[expert] = numeric_view(experts[expert]);
+    const auto planned = ExpertBank_vulkan::plan(weights, context);
+    segment_check(static_cast<bool>(planned), planned ? "" : planned.error().message);
+    const auto created = ExpertBank_vulkan::create(planned.value(), context, [&](uint32_t expert) -> Result<ExpertBankWeights_vulkan> { return weights[expert]; });
+    segment_check(static_cast<bool>(created), created ? "" : created.error().message);
+    // Keep every numerical stress case; pair decode with small K and prefill with K=1.
+    const std::array<std::pair<uint32_t, size_t>, 2> selections = {{{4, 1}, {1, 3}}};
+    for (const auto& [top_k, rows] : selections)
+    {
+        ActivationBuffer input(rows, test.input_columns), selected(rows, top_k * 2 + 1);
+        // Projection inputs repeat; each row below selects different experts.
+        for (size_t row = 0; row < rows; ++row)
+            for (uint32_t k = 0; k < test.input_columns; ++k)
+                input.row(row)[k] = test.projected_input
+                                        ? std::ldexp(static_cast<float>(static_cast<int>((k * 7 + k / 13) % 19) - 9), test.subnormal_gate_scale ? 120 : -6)
+                                        : 0.0f;
+        for (size_t row = 0; row < rows; ++row)
+        {
+            for (uint32_t rank = 0; rank < top_k; ++rank)
+            {
+                selected.row(row)[rank] = static_cast<float>((3 + row - rank) % 4);
+                selected.row(row)[top_k + rank] = 1.0f / top_k;
+            }
+            selected.row(row)[top_k * 2] = 0.0f;
+        }
+        const auto expected = numeric_reference(experts, test, input, selected, top_k);
+        ActivationBuffer actual(rows, test.output), flag(1, 1);
+        {
+            const std::lock_guard<std::mutex> lock(context->command_mutex());
+            const auto& option = created.value()->option();
+            ncnn::VkCompute command(context->device());
+            ncnn::VkMat input_staging, selected_staging, zero_staging, device_input, device_selected, validation, output, output_staging, flag_staging;
+            std::vector<ncnn::VkMat> workspace;
+            const uint32_t zero = 0;
+            segment_check(fill_staging_upload(input, input_staging, option.staging_vkallocator)
+                              && record_mapped_upload(input_staging, device_input, command, option)
+                              && fill_staging_upload(selected, selected_staging, option.staging_vkallocator)
+                              && record_mapped_upload(selected_staging, device_selected, command, option)
+                              && fill_staging_values(&zero, 1, sizeof(zero), zero_staging, option.staging_vkallocator)
+                              && record_mapped_upload(zero_staging, validation, command, option)
+                              && created.value()->record(device_input, device_selected, top_k, output, validation, command, workspace)
+                              && prepare_staging_batch(output_staging, rows, test.output, option.staging_vkallocator)
+                              && record_prepared_activation_staging_download(output, rows, test.output, output_staging, command, context->device(), option)
+                              && prepare_staging_batch(flag_staging, 1, 1, option.staging_vkallocator)
+                              && record_prepared_activation_staging_download(validation, 1, 1, flag_staging, command, context->device(), option)
+                              && submit_compute_and_wait(command, context->device()) == 0
+                              && copy_staging_to_cpu_batch(output_staging, actual) && copy_staging_to_cpu_batch(flag_staging, flag),
+                          "cannot execute the indexed MXFP4 numerical fixture");
+        }
+        segment_check(std::bit_cast<uint32_t>(flag.row(0)[0]) == 0, "valid MXFP4 numeric routes set validation failure");
+        const std::string label = "MXFP4 FP64 oracle H=" + std::to_string(test.input_columns)
+                                  + " I=" + std::to_string(test.intermediate) + " O=" + std::to_string(test.output)
+                                  + " scale=" + std::to_string(test.scale) + " exponent=" + std::to_string(test.input_exponent)
+                                  + " random=" + std::to_string(test.random_scales) + " cancellation=" + std::to_string(test.cancellation)
+                                  + " subnormal_gate_scale=" + std::to_string(test.subnormal_gate_scale)
+                                  + " K=" + std::to_string(top_k) + " rows=" + std::to_string(rows);
+        segment_compare(actual.values(), expected.values(), label);
+    }
+}
+
+static int numeric_run()
+{
+    if (get_gpu_count() == 0) return 77;
+    const std::array<BankNumericCase, 11> cases = {{{32, 5, 7, 123, false, false, 32},
+                                                    {32, 1, 1, 120, false, true},
+                                                    {128, 3, 0, 120, false, false},
+                                                    {128, 129, 254, -120, false, false},
+                                                    {128, 4, 64, -31, false, false},
+                                                    {128, 5, 190, 32, false, false},
+                                                    {2880, 5, 127, 0, true, false},
+                                                    {4096, 4, 127, 0, true, false},
+                                                    {128, 5, 127, 0, true, false, 2880, true},
+                                                    {128, 5, 127, 0, true, false, 4096, true},
+                                                    {128, 5, 127, 0, false, false, 128, true, true}}};
+    for (uint32_t device = 0; device < get_gpu_count(); ++device)
+    {
+        const auto context = VulkanContext::acquire(device, create_vulkan_runtime(), segment_flags);
+        segment_check(static_cast<bool>(context), "cannot acquire numerical test Vulkan context");
+        std::cout << "MXFP4 numerical fixtures device " << device << " " << context->device()->info.device_name()
+                  << " subgroup " << context->device()->info.subgroup_size() << '\n';
+        for (const auto& test : cases) numeric_case(context, test);
+    }
+    return 0;
+}
+#endif
+
+} // namespace moe
+} // namespace ncnn
+
+int main()
+{
+#if NCNN_MOE_WITH_VULKAN
+    try
+    {
+        return ncnn::moe::numeric_run();
+    }
+    catch (const std::exception& error)
+    {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+#else
+    return 77;
+#endif
+}

@@ -1282,13 +1282,11 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
             return GatedDeltaBatchResult_vulkan::NotExecuted;
         if (forward(*entry.normalized, *entry.cache, *entry.projected))
             return GatedDeltaBatchResult_vulkan::Executed;
-        return entry.cache->gated_delta_device_state
-                   ? GatedDeltaBatchResult_vulkan::Failed
-                   : GatedDeltaBatchResult_vulkan::NotExecuted;
+        return GatedDeltaBatchResult_vulkan::Failed;
     }
-    if (!implementation.vulkan_context
-        || !implementation.pipeline
-        || entries.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
+    if (!implementation.vulkan_context || !implementation.pipeline)
+        return GatedDeltaBatchResult_vulkan::Failed;
+    if (entries.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
     {
         return GatedDeltaBatchResult_vulkan::NotExecuted;
     }
@@ -1366,14 +1364,14 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
                                                                             implementation.value_head_dimension,
                                                                             implementation.opt);
             if (!cache.gated_delta_device_state)
-                return GatedDeltaBatchResult_vulkan::NotExecuted;
+                return GatedDeltaBatchResult_vulkan::Failed;
             created_device_state = true;
             if (has_cpu_state
                 && !cache.gated_delta_device_state->prepare_cpu_state(cache.gated_delta_convolution,
                                                                       cache.gated_delta_recurrent))
             {
                 cache.gated_delta_device_state.reset();
-                return GatedDeltaBatchResult_vulkan::NotExecuted;
+                return GatedDeltaBatchResult_vulkan::Failed;
             }
             created_state_caches.push_back(&cache);
         }
@@ -1387,7 +1385,7 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
             && !state_implementation.transaction_active)
         {
             if (!state->begin_transaction(cache.transaction.expected_rows))
-                return GatedDeltaBatchResult_vulkan::NotExecuted;
+                return GatedDeltaBatchResult_vulkan::Failed;
         }
         cache.device_allocated_size = state->allocated_bytes();
         states.push_back(std::move(state));
@@ -1420,7 +1418,7 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
                                   output_columns,
                                   transfer_slot.staging_allocator))
     {
-        return GatedDeltaBatchResult_vulkan::NotExecuted;
+        return GatedDeltaBatchResult_vulkan::Failed;
     }
     ActivationBuffer combined_projected;
     combined_projected.reset(total_rows,
@@ -1438,7 +1436,7 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
     if (transfer_slot.command_used)
     {
         if (cmd.reset() != 0)
-            return GatedDeltaBatchResult_vulkan::NotExecuted;
+            return GatedDeltaBatchResult_vulkan::Failed;
     }
     transfer_slot.command_used = true;
     ncnn::VkMat input_gpu;
@@ -1449,7 +1447,7 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
                                    cmd,
                                    implementation.opt))
     {
-        return GatedDeltaBatchResult_vulkan::NotExecuted;
+        return GatedDeltaBatchResult_vulkan::Failed;
     }
     ncnn::VkMat fused_gpu;
     fused_gpu.create(static_cast<int>(implementation.fused_columns),
@@ -1467,7 +1465,7 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
                       sizeof(float),
                       implementation.vulkan_context->blob_allocator());
     if (fused_gpu.empty() || recurrent_output_gpu.empty() || output_gpu.empty())
-        return GatedDeltaBatchResult_vulkan::NotExecuted;
+        return GatedDeltaBatchResult_vulkan::Failed;
 
     std::vector<GatedDeltaState_vulkan::Implementation*>
         transaction_states;
@@ -1482,7 +1480,7 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
         GatedDeltaState_vulkan::Implementation& state_implementation = *state->d;
         if (!state_implementation.record_initial_state(cmd))
         {
-            return GatedDeltaBatchResult_vulkan::NotExecuted;
+            return GatedDeltaBatchResult_vulkan::Failed;
         }
     }
 
@@ -1494,7 +1492,7 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
         ncnn::VkMat fused_view = row_view(fused_gpu, entry_index, 1);
         ncnn::VkMat recurrent_view = row_view(recurrent_output_gpu, entry_index, 1);
         if (fused_view.empty() || recurrent_view.empty())
-            return GatedDeltaBatchResult_vulkan::NotExecuted;
+            return GatedDeltaBatchResult_vulkan::Failed;
         std::vector<ncnn::VkMat> delta_bindings = {
             fused_view,
             state_implementation.convolution,
@@ -1526,7 +1524,7 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
                                      delta_constants,
                                      delta_dispatcher);
         if (!state_implementation.record_transaction_row(cmd))
-            return GatedDeltaBatchResult_vulkan::NotExecuted;
+            return GatedDeltaBatchResult_vulkan::Failed;
     }
 
     record_output_projection(recurrent_output_gpu, output_gpu, cmd);
@@ -1540,7 +1538,7 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
                                                      implementation.opt,
                                                      combined_projected.dtype()))
     {
-        return GatedDeltaBatchResult_vulkan::NotExecuted;
+        return GatedDeltaBatchResult_vulkan::Failed;
     }
     if (submit_compute_and_wait(cmd, implementation.vulkan_context->device()) != 0)
     {

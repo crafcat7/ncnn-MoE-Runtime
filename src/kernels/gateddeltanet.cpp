@@ -339,6 +339,8 @@ Result<void> forward_gated_delta(const WeightStore& weights,
                                  uint64_t optimization_flags)
 {
     const CompiledOperator& gated_delta_operator = operators.at(plan.gated_delta_vulkan_operator);
+    if (backend == ExecutionBackend::Vulkan && !gated_delta_operator.gated_delta)
+        return Error{ErrorCode::InternalError, "Vulkan Gated DeltaNet was selected without a complete device operator"};
     const bool device_state_available = backend == ExecutionBackend::Vulkan
                                         && gated_delta_operator.gated_delta;
     const ActivationBuffer* normalized = &hidden;
@@ -597,9 +599,8 @@ bool forward_gated_delta_batch(const WeightStore& weights,
     if (batch_result == GatedDeltaBatchResult_vulkan::Failed)
         return false;
 
-    // The batch path is an optimization for independent decode rows.  If a
-    // device allocation or dispatch is unavailable, preserve the established
-    // per-Session implementation and its failure-path state handoff.
+    // An unsupported batch shape can use each Session's selected backend.
+    // A device allocation or execution failure returned above is terminal.
     return forward_each();
 }
 

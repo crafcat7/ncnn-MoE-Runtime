@@ -43,12 +43,14 @@ class Mxfp4Expert_vulkan;
 class QnkExpert_vulkan;
 class Bfloat16Expert_vulkan;
 class VulkanWeightUploadBatch;
+class MoeCombine_vulkan;
 class VulkanUploadStagingAllocator;
 
 class VulkanExpertVictimCache final : public ExpertVictimCache
 {
 public:
-    VulkanExpertVictimCache(std::shared_ptr<VulkanContext> _context, uint64_t _cache_size);
+    VulkanExpertVictimCache(std::shared_ptr<VulkanContext> _context, uint64_t _cache_size,
+                            uint64_t physical_limit_bytes = 0);
 
     ~VulkanExpertVictimCache() override;
 
@@ -198,6 +200,11 @@ public:
     std::unique_ptr<ExpertSubmission> submit_batch(std::span<const ExpertRequest> requests) override;
 
     void wait_for_background_work() override;
+
+    bool supports_resident_region() const noexcept override
+    {
+        return true;
+    }
 
     ExpertBackendStatistics statistics() const override;
     [[nodiscard]] uint64_t physical_bytes() const;
@@ -404,6 +411,7 @@ private:
     std::shared_ptr<ncnn::Pipeline> indexed_pipeline;
     std::shared_ptr<ncnn::Pipeline> input_gather_pipeline;
     std::shared_ptr<ncnn::Pipeline> route_aggregation_pipeline;
+    std::shared_ptr<MoeCombine_vulkan> resident_combiner;
     std::shared_ptr<VulkanExpertVictimCache> device_weight_source;
     // Always acquired before mutex and never held by command execution.
     std::mutex admission_mutex;
@@ -482,10 +490,12 @@ private:
 
 [[nodiscard]] std::shared_ptr<ExpertBackend> create_vulkan_expert_backend(uint64_t cache_size, uint32_t device_index,
                                                                           std::shared_ptr<ExpertVictimCache> device_weight_source,
-                                                                          const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags);
+                                                                          const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags,
+                                                                          uint64_t physical_limit_bytes = 0);
 
 [[nodiscard]] std::shared_ptr<ExpertVictimCache> create_vulkan_victim_cache(uint64_t cache_size, uint32_t device_index,
-                                                                            const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags);
+                                                                            const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags,
+                                                                            uint64_t physical_limit_bytes = 0);
 
 } // namespace moe
 } // namespace ncnn

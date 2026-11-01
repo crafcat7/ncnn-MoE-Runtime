@@ -33,6 +33,7 @@ struct TensorData;
 class VulkanContext;
 class VulkanIndependentWeightTransfer;
 class VulkanExpertTransferPool;
+class VulkanGraphAllocator;
 
 struct VulkanContextCacheKey
 {
@@ -92,6 +93,15 @@ struct VulkanRuntimeState
     AtomicCounter compute_submissions;
     AtomicCounter batch_uploads;
     AtomicCounter batch_downloads;
+    AtomicCounter weight_upload_bytes;
+    AtomicCounter weight_transfer_submissions;
+    AtomicCounter weight_visibility_submissions;
+    AtomicCounter weight_transfer_fence_waits;
+    AtomicCounter weight_transfer_wait_microseconds;
+    AtomicCounter resident_graph_submissions;
+    AtomicCounter resident_graph_activation_upload_bytes;
+    AtomicCounter resident_graph_activation_download_bytes;
+    AtomicCounter resident_graph_route_download_bytes;
     AtomicCounter command_graph_submissions;
     AtomicCounter command_graph_operations;
     AtomicCounter attention_qkv_rope_fusions;
@@ -116,7 +126,8 @@ struct VulkanRuntimeState
 // Wait an already submitted command without submitting it again. Return only
 // after its fence completes or the owning device is confirmed lost; callers
 // keep every command resource/owner alive through this call.
-int wait_submitted_compute(ncnn::VkCompute& command, const ncnn::VulkanDevice* probe_device);
+int wait_submitted_compute(ncnn::VkCompute& command, const ncnn::VulkanDevice* probe_device,
+                           VkQueue borrowed_queue = VK_NULL_HANDLE);
 
 // The device must belong to this command and stay alive through the call. It
 // is used only to detect device loss after a failed fence wait. Without one,
@@ -325,6 +336,9 @@ public:
     [[nodiscard]] static std::shared_ptr<VulkanContext> acquire(uint32_t requested_device_index,
                                                                 const VulkanRuntimePtr& vulkan_runtime,
                                                                 uint64_t optimization_flags);
+    [[nodiscard]] static std::shared_ptr<VulkanContext> find(uint32_t requested_device_index,
+                                                             const VulkanRuntimePtr& vulkan_runtime,
+                                                             uint64_t optimization_flags);
 
     [[nodiscard]] ncnn::VulkanDevice* device() const noexcept
     {
@@ -346,6 +360,9 @@ public:
     {
         return blob_alloc;
     }
+
+    [[nodiscard]] bool reserve_graph_compute(uint64_t bytes);
+    [[nodiscard]] VulkanGraphArenaSize graph_compute_physical_size() const;
 
     [[nodiscard]] ncnn::VkAllocator* staging_allocator() const noexcept
     {
@@ -389,17 +406,21 @@ public:
     { return *weight_transfer_pool; }
 
 private:
+    friend class VulkanComputeBatch;
+    // Reused under command_mutex; each batch drains before releasing the lock.
+    std::vector<std::unique_ptr<ncnn::VkCompute>> ordered_commands;
     explicit VulkanContext(ncnn::VulkanDevice* device,
                            VulkanRuntimePtr _vulkan_runtime,
                            uint64_t optimization_flags);
 
-    // Release dependent commands and tensors before returning borrowed allocators.
+    // Release dependent commands and tensors before freeing their allocator.
     void release_resources() noexcept;
 
     ncnn::VulkanDevice* vkdev = nullptr;
     VulkanRuntimePtr vulkan_runtime;
     uint64_t flags = OptimizationDefaultFlags;
     ncnn::VkAllocator* blob_alloc = nullptr;
+    std::unique_ptr<VulkanGraphAllocator> graph_allocator;
     ncnn::VkAllocator* staging_alloc = nullptr;
     std::mutex command_lock;
     // Staging slots require independent allocators while commands are in flight.
@@ -417,6 +438,32 @@ private:
         std::weak_ptr<ncnn::Pipeline>,
         ShaderCacheKeyHash>
         pipelines;
+};
+
+// Ordered asynchronous submissions within one planned resource lifetime.
+// Caller holds context.command_mutex() and all operand/pipeline owners until
+// wait/reset completes. Each boundary preserves the VkMat producer access state.
+class VulkanComputeBatch
+{
+public:
+    explicit VulkanComputeBatch(VulkanContext& context);
+    ~VulkanComputeBatch();
+    VulkanComputeBatch(const VulkanComputeBatch&) = delete;
+    VulkanComputeBatch& operator=(const VulkanComputeBatch&) = delete;
+    [[nodiscard]] ncnn::VkCompute* next();
+    [[nodiscard]] int submit();
+    [[nodiscard]] int wait() noexcept;
+    [[nodiscard]] int reset() noexcept;
+    [[nodiscard]] size_t submission_count() const noexcept
+    { return submitted; }
+    [[nodiscard]] size_t pending_count() const noexcept
+    { return submitted - completed; }
+
+private:
+    VulkanContext& context;
+    VkQueue queue = VK_NULL_HANDLE;
+    size_t recorded = 0, submitted = 0, completed = 0;
+    int completion_error = 0;
 };
 
 // Caller serializes allocations and frees in the command domain. Only free

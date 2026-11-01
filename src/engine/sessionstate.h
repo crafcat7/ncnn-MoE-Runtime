@@ -4,6 +4,7 @@
 #include "backends/ncnn/latentlayer_vulkan.h"
 #include "backends/ncnn/moecombine_vulkan.h"
 #include "backends/ncnn/qwenlayer_vulkan.h"
+#include "backends/ncnn/gpusegment_vulkan.h"
 #include "kernels/attention.h"
 #include "kernels/gateddeltanet.h"
 #include "kernels/hyperconnection.h"
@@ -60,7 +61,10 @@ struct ExpertState
 struct LayerState
 {
     ActivationBuffer normalized;
+    std::shared_ptr<ResidentFfnRegion_vulkan> region;
     std::shared_ptr<const DeviceTensor_vulkan> normalized_device;
+    std::shared_ptr<const DeviceTensor_vulkan> combined_device;
+    bool gpu_segment = false;
     ActivationBuffer router_logits;
     HyperConnectionMix ffn_hyper_mix;
     ActivationBuffer shared_expert_output;
@@ -97,6 +101,9 @@ struct LayerState
         shared_expert_output.clear();
         shared_expert_device_output.reset();
         normalized_device.reset();
+        combined_device.reset();
+        gpu_segment = false;
+        region.reset();
         for (ExpertState& active : expert_slots)
         {
             active.lease = {};
@@ -154,6 +161,7 @@ struct ExpertScratch
 struct BatchWorkspace
 {
     ExpertScratch expert;
+    GpuSegmentWorkspace_vulkan gpu_segment;
     LatentLayerWorkspace_vulkan latent_layer;
     ExpertDispatchPlan latent_routes;
     // Scratch that belongs to the in-flight staged batch rather than a
@@ -183,6 +191,7 @@ public:
     AttentionScratch attention_scratch;
     LatentLayerWorkspace_vulkan latent_layer;
     QwenLayerWorkspace_vulkan qwen_layer;
+    GpuSegmentWorkspace_vulkan gpu_segment;
     std::vector<uint64_t> attention_positions;
     std::vector<LayerCache*> attention_caches;
     GatedDeltaScratch gated_delta_scratch;

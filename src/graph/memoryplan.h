@@ -4,11 +4,24 @@
 #include "ncnn/moe/option.h"
 #include "ncnn/moe/modeldescriptor.h"
 #include "ncnn/moe/result.h"
+#include "resourceplan.h"
+#include "graphmemory.h"
 
 #include <cstdint>
+#include <vector>
 
 namespace ncnn {
 namespace moe {
+
+struct ModelGraphMemoryPlan
+{
+    uint32_t prefill_rows = 0;
+    uint32_t sequence_count = 1;
+    uint32_t context_tokens = 0;
+    GraphMemoryPlan prefill;
+    GraphMemoryPlan decode;
+    std::vector<GraphMemoryDevice> session_state;
+};
 
 struct ModelMemoryPlan
 {
@@ -26,6 +39,8 @@ struct ModelMemoryPlan
     uint64_t minimum_active_expert_size = 0;
     uint64_t expert_cache_size = 0;
     uint64_t available_memory_size = 0;
+    std::vector<GpuResourcePlan> gpu_devices;
+    ModelGraphMemoryPlan graph;
 };
 
 struct Option;

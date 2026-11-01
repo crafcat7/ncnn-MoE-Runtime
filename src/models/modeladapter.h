@@ -14,6 +14,11 @@ namespace moe {
 
 class SafetensorsArchive;
 struct ModelPackage;
+struct MoeModelDescriptor;
+
+// Recompute managed Expert storage capability from canonical tensors. Model
+// adapters describe layout and math; resource policy uses the mapped storage.
+void normalize_expert_storage(MoeModelDescriptor& descriptor, const WeightMapping& weights);
 
 // Manifest readers inspect only direct members of the supplied JSON object.
 [[nodiscard]] Result<std::string> read_manifest_object(const std::string& json, const std::string& key, const char* prefix = "");

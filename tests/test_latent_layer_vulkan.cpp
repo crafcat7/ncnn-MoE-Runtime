@@ -252,6 +252,13 @@ struct LatentLayerFixture
         }
         auto attention = LatentAttention_vulkan::create(plan, weights.at(plan.sinks), operators.at_weight(plan.output_a_weight), operators.at_weight(plan.output_b_weight));
         layer_check(attention && attention->prepare(weights, operators, layer_flags) && attention->can_record(), "prepare layer MLA recorder");
+        // The staged reference keeps CPU HC/norm/router operations, with an
+        // independent segmented GPU Attention core. Removing the core would
+        // ask a selected Vulkan Attention to execute CPU head math.
+        auto segmented_attention = LatentAttention_vulkan::create(plan, weights.at(plan.sinks),
+                                                                  operators.at_weight(plan.output_a_weight), operators.at_weight(plan.output_b_weight));
+        layer_check(segmented_attention && !segmented_attention->can_record(), "create independent segmented GPU MLA reference");
+        operators.at_weight_mutable(plan.query_a_weight).latent_attention = std::move(segmented_attention);
         auto attention_hyper = HyperConnection_vulkan::create(attention_function, scale, attention_base, layer_copies, 20, layer_norm_epsilon, layer_hyper_epsilon, get_default_gpu_index(), runtime, layer_flags);
         auto ffn_hyper = HyperConnection_vulkan::create(ffn_function, scale, ffn_base, layer_copies, 20, layer_norm_epsilon, layer_hyper_epsilon, get_default_gpu_index(), runtime, layer_flags);
         auto norm = RmsNorm_vulkan::create(ffn_norm, layer_norm_epsilon, 0.0f, attention->vulkan_context(), attention->option());
@@ -331,7 +338,8 @@ static ActivationBuffer layer_cpu(LatentLayerFixture& fixture, const ActivationB
     AttentionScratch attention_scratch;
     layer_check(static_cast<bool>(forward_hyper_connection_pre(input, fixture.attention_function, fixture.scale, fixture.attention_base, layer_copies, 20, layer_norm_epsilon, layer_hyper_epsilon, attention_mix, hc_scratch, 0)), "CPU attention HC pre");
     std::vector<LayerCache*> caches(positions.size(), backend == ExecutionBackend::Cpu ? &fixture.cpu_cache : &fixture.staged_cache);
-    layer_check(static_cast<bool>(forward_latent_attention_batch(fixture.oracle_weights, fixture.operators, fixture.plan, backend, positions, caches, attention_scratch, attention_mix.reduced, attention_output, layer_flags)), "CPU MLA reference");
+    layer_check(static_cast<bool>(forward_latent_attention_batch(fixture.oracle_weights, fixture.operators, fixture.plan, backend, positions, caches, attention_scratch, attention_mix.reduced, attention_output, layer_flags)),
+                backend == ExecutionBackend::Cpu ? "independent CPU MLA reference" : "segmented GPU MLA reference");
     if (attention_result)
         *attention_result = attention_output;
     layer_check(static_cast<bool>(forward_hyper_connection_post(attention_output, input, attention_mix, layer_copies, residual)), "CPU attention HC post");

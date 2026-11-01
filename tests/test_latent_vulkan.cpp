@@ -1,5 +1,6 @@
 #include "backends/ncnn/latentattention_vulkan.h"
 #include "backends/ncnn/linear.h"
+#include "backends/ncnn/modelpipeline.h"
 #include "backends/ncnn/vulkan.h"
 #include "backends/ncnn/vulkancontext.h"
 #include "graph/compiledoperator.h"
@@ -592,21 +593,25 @@ static bool latent_forward_record(const std::shared_ptr<LatentAttention_vulkan>&
     ++context->runtime_state().batch_downloads;
     return true;
 }
+#endif
 
 static void latent_check_cache_values(const std::vector<float>& actual,
                                       const std::vector<float>& expected,
-                                      const std::string& label)
+                                      const std::string& label,
+                                      float* maximum_absolute_error = nullptr)
 {
     latent_check(actual.size() == expected.size(), label + ": canonical shape");
     for (size_t index = 0; index < actual.size(); ++index)
     {
+        const float error = std::abs(actual[index] - expected[index]);
+        if (maximum_absolute_error)
+            *maximum_absolute_error = std::max(*maximum_absolute_error, error);
         const float tolerance = 0.015f + 0.015f * std::abs(expected[index]);
-        latent_check(std::isfinite(actual[index]) && std::abs(actual[index] - expected[index]) <= tolerance,
+        latent_check(std::isfinite(actual[index]) && error <= tolerance,
                      label + ": canonical element " + std::to_string(index) + " actual=" + std::to_string(actual[index])
                          + " expected=" + std::to_string(expected[index]));
     }
 }
-#endif
 
 static void latent_test_end_to_end(uint32_t ratio, bool record_path = false, bool bfloat16 = false, bool q8_0 = false)
 {
@@ -673,22 +678,28 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false, boo
     operators.at_weight_mutable(plan.query_a_weight).latent_attention = LatentAttention_vulkan::create(plan, weights.at(plan.sinks), operators.at_weight(plan.output_a_weight), operators.at_weight(plan.output_b_weight));
     latent_check(static_cast<bool>(operators.at_weight(plan.query_a_weight).latent_attention), "compile end-to-end GPU MLA core");
 #if NCNN_MOE_WITH_VULKAN
+    // Every selected Vulkan path needs complete device projections. The
+    // recorder option only decides whether those operators share a segment.
+    const TensorHandle compressor_handles[] = {plan.compressor_key_value_weight, plan.compressor_gate_weight,
+                                               plan.indexer_compressor_key_value_weight, plan.indexer_compressor_gate_weight,
+                                               plan.indexer_query_weight, plan.indexer_weights_weight};
+    for (TensorHandle handle : compressor_handles)
+    {
+        if (handle == invalid_tensor_handle)
+            continue;
+        CompiledOperator& op = operators.at_weight_mutable(handle);
+        if (q8_0)
+            op.qnk = QnkLinear_vulkan::create(weights.at(handle), nullptr, get_default_gpu_index(), runtime, flags);
+        else
+        {
+            op.bfloat16 = Bfloat16Linear_vulkan::create(weights.at(handle), nullptr, get_default_gpu_index(), runtime, flags);
+            if (!op.bfloat16 && !record_path)
+                op.linear = Linear::create(weights.at(handle), nullptr, get_default_gpu_index(), runtime, flags);
+        }
+        latent_check(op.bfloat16 || op.qnk || op.linear, "compile compressor/index projection");
+    }
     if (record_path)
     {
-        const TensorHandle bf16_handles[] = {plan.compressor_key_value_weight, plan.compressor_gate_weight,
-                                             plan.indexer_compressor_key_value_weight, plan.indexer_compressor_gate_weight,
-                                             plan.indexer_query_weight, plan.indexer_weights_weight};
-        for (TensorHandle handle : bf16_handles)
-        {
-            if (handle == invalid_tensor_handle)
-                continue;
-            CompiledOperator& op = operators.at_weight_mutable(handle);
-            if (q8_0)
-                op.qnk = QnkLinear_vulkan::create(weights.at(handle), nullptr, get_default_gpu_index(), runtime, flags);
-            else
-                op.bfloat16 = Bfloat16Linear_vulkan::create(weights.at(handle), nullptr, get_default_gpu_index(), runtime, flags);
-            latent_check(op.bfloat16 || op.qnk, "compile compressor/index projection");
-        }
         latent_check(operators.at_weight(plan.query_a_weight).latent_attention->prepare(weights, operators, flags), "prepare continuous GPU MLA segment");
         latent_check(operators.at_weight(plan.query_a_weight).latent_attention->can_record(), "continuous GPU MLA capability");
     }
@@ -704,7 +715,27 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false, boo
                 latent_check(weights.at(handle).qnk_values().empty(), "Q8_0 MLA runs after native host storage release");
             }
     CompiledOperatorTable prior_operators = operators;
-    prior_operators.at_weight_mutable(plan.query_a_weight).latent_attention.reset();
+    prior_operators.at_weight_mutable(plan.query_a_weight).latent_attention = LatentAttention_vulkan::create(plan, weights.at(plan.sinks),
+                                                                                                             operators.at_weight(plan.output_a_weight), operators.at_weight(plan.output_b_weight));
+    latent_check(support_vulkan_attention(operators, plan) && support_vulkan_attention(prior_operators, plan),
+                 "complete and segmented MLA device capabilities");
+    if (!record_path)
+    {
+        CompiledOperatorTable incomplete = operators;
+        incomplete.at_weight_mutable(plan.query_a_weight).latent_attention.reset();
+        latent_check(!support_vulkan_attention(incomplete, plan), "GPU projections alone cannot place MLA Attention on Vulkan");
+        LayerCache rejected_cache;
+        AttentionScratch rejected_scratch;
+        ActivationBuffer rejected_input(1, 128);
+        ActivationBuffer rejected_output;
+        const auto before_rejection = get_vulkan_statistics(runtime);
+        const auto rejected = forward_latent_attention(oracle_weights, incomplete, plan, ExecutionBackend::Vulkan,
+                                                       0, rejected_cache, rejected_scratch, rejected_input, rejected_output, flags);
+        latent_check(!rejected && rejected_cache.latent_token_count == 0,
+                     "missing selected GPU core fails without updating the canonical cache");
+        latent_check(get_vulkan_statistics(runtime).dispatches == before_rejection.dispatches,
+                     "missing selected GPU core fails before device work or CPU Attention recovery");
+    }
 
     LayerCache cpu_cache;
     LayerCache gpu_cache;
@@ -723,6 +754,7 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false, boo
 #endif
         return static_cast<bool>(forward_latent_attention(oracle_weights, operators, plan, ExecutionBackend::Vulkan, position, cache, gpu_scratch, input, output, flags));
     };
+    float maximum_compressor_error = 0.0f;
     const uint64_t count = ratio == 128 ? 129 : 9;
     for (uint64_t position = 0; position < count; ++position)
     {
@@ -733,7 +765,7 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false, boo
         ActivationBuffer actual;
         ActivationBuffer prior_output;
         latent_check(static_cast<bool>(forward_latent_attention(oracle_weights, operators, plan, ExecutionBackend::Cpu, position, cpu_cache, cpu_scratch, input, expected, flags)), "end-to-end CPU MLA forward");
-        latent_check(static_cast<bool>(forward_latent_attention(oracle_weights, prior_operators, plan, ExecutionBackend::Vulkan, position, prior_cache, prior_scratch, input, prior_output, flags)), "prior Hybrid MLA CPU-attention path");
+        latent_check(static_cast<bool>(forward_latent_attention(oracle_weights, prior_operators, plan, ExecutionBackend::Vulkan, position, prior_cache, prior_scratch, input, prior_output, flags)), "segmented GPU MLA reference path");
         const VulkanStatistics before = get_vulkan_statistics(runtime);
         latent_check(forward_gpu(position, gpu_cache, input, actual), "end-to-end GPU MLA forward ratio=" + std::to_string(ratio) + " position=" + std::to_string(position));
         const VulkanStatistics after = get_vulkan_statistics(runtime);
@@ -746,8 +778,14 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false, boo
         }
         else if (query_stays_on_device)
         {
-            latent_check(after.compute_submissions == before.compute_submissions + 2, "end-to-end projection and MLA core share two submissions");
-            latent_check(after.batch_downloads == before.batch_downloads + 2, "end-to-end downloads only CPU KV projection and final output");
+            // The unfused compressor explicitly runs each value/gate device
+            // projection. Their host results feed the canonical cache update.
+            const uint64_t compressor_projections = ratio == 4 ? 4 : ratio == 128 ? 2
+                                                                                  : 0;
+            latent_check(after.compute_submissions == before.compute_submissions + 2 + compressor_projections,
+                         "end-to-end query/core and all unfused compressor projections execute on GPU");
+            latent_check(after.batch_downloads == before.batch_downloads + 2 + compressor_projections,
+                         "end-to-end downloads canonical KV/compressor projections and final output");
             latent_check(gpu_scratch.query.rows() == 0, "raw query projection stays on GPU");
         }
         const std::string label = std::string(q8_0 ? "Q8_0" : (bfloat16 ? "BF16" : "FP8")) + " end-to-end ratio " + std::to_string(ratio) + " position " + std::to_string(position);
@@ -764,13 +802,43 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false, boo
         else
 #endif
         {
-            latent_check(cpu_cache.latent_compressed == gpu_cache.latent_compressed, "CPU compressor canonical state parity");
+            latent_check_cache_values(gpu_cache.latent_compressed, cpu_cache.latent_compressed,
+                                      label + " independent CPU compressor", &maximum_compressor_error);
+            latent_check_cache_values(gpu_cache.latent_index_compressed, cpu_cache.latent_index_compressed,
+                                      label + " independent CPU index compressor", &maximum_compressor_error);
             latent_check(cpu_cache.latent_selected_indices == gpu_cache.latent_selected_indices, "CPU compressed index selection parity");
         }
-        latent_check_output(actual, prior_output, label + " existing Hybrid parity", (bfloat16 || q8_0) ? 0.003f : (record_path ? 0.015f : 0.005f), (bfloat16 || q8_0) ? 0.003f : (record_path ? 0.015f : 0.005f));
+        latent_check_output(actual, prior_output, label + " segmented GPU reference parity", (bfloat16 || q8_0) ? 0.003f : (record_path ? 0.015f : 0.005f), (bfloat16 || q8_0) ? 0.003f : (record_path ? 0.015f : 0.005f));
         // BF16 has no FP8 activation quantization and must agree with the
         // independent CPU attention and grouped projection oracle tightly.
         latent_check_output(actual, expected, label + " CPU parity including existing output quantization", (bfloat16 || q8_0) ? 0.003f : 0.05f, (bfloat16 || q8_0) ? 0.003f : 0.08f);
+    }
+
+    if (!record_path)
+    {
+        LayerCache batch_cache;
+        LayerCache row_cache;
+        ActivationBuffer batch_input(3, 128);
+        for (size_t row = 0; row < batch_input.rows(); ++row)
+            for (uint32_t column = 0; column < batch_input.columns(); ++column)
+                batch_input.row(row)[column] = std::sin(static_cast<float>(column * 7 + row * 11) * 0.037f);
+        ActivationBuffer batch_output;
+        const auto before_batch = get_vulkan_statistics(runtime);
+        latent_check(forward_gpu(0, batch_cache, batch_input, batch_output), "segmented same-cache GPU MLA prefill");
+        latent_check(get_vulkan_statistics(runtime).attention_blocks == before_batch.attention_blocks + batch_input.rows(),
+                     "every segmented prefill row executes the GPU Attention core");
+        ActivationBuffer row_expected(batch_input.rows(), 128);
+        for (size_t row = 0; row < batch_input.rows(); ++row)
+        {
+            ActivationBuffer row_input(1, 128);
+            std::copy_n(batch_input.row(row), 128, row_input.row(0));
+            ActivationBuffer row_output;
+            latent_check(static_cast<bool>(forward_latent_attention(oracle_weights, prior_operators, plan, ExecutionBackend::Vulkan,
+                                                                    row, row_cache, prior_scratch, row_input, row_output, flags)),
+                         "ordered segmented GPU prefill reference");
+            std::copy_n(row_output.row(0), 128, row_expected.row(row));
+        }
+        latent_check_output(batch_output, row_expected, "segmented prefill ordering and GPU-only core");
     }
 
     const std::vector<float> initial_window = gpu_cache.latent_window;
@@ -796,9 +864,9 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false, boo
     ActivationBuffer actual;
     ActivationBuffer prior_output;
     latent_check(static_cast<bool>(forward_latent_attention(oracle_weights, operators, plan, ExecutionBackend::Cpu, count, cpu_cache, cpu_scratch, branch_input, expected, flags)), "CPU replacement branch after rollback");
-    latent_check(static_cast<bool>(forward_latent_attention(oracle_weights, prior_operators, plan, ExecutionBackend::Vulkan, count, prior_cache, prior_scratch, branch_input, prior_output, flags)), "prior Hybrid replacement branch after rollback");
+    latent_check(static_cast<bool>(forward_latent_attention(oracle_weights, prior_operators, plan, ExecutionBackend::Vulkan, count, prior_cache, prior_scratch, branch_input, prior_output, flags)), "segmented GPU replacement branch after rollback");
     latent_check(forward_gpu(count, gpu_cache, branch_input, actual), "GPU replacement branch after rollback");
-    latent_check_output(actual, prior_output, "GPU MLA replacement branch existing Hybrid parity", (bfloat16 || q8_0) ? 0.003f : (record_path ? 0.015f : 0.005f), (bfloat16 || q8_0) ? 0.003f : (record_path ? 0.015f : 0.005f));
+    latent_check_output(actual, prior_output, "GPU MLA replacement branch segmented GPU reference parity", (bfloat16 || q8_0) ? 0.003f : (record_path ? 0.015f : 0.005f), (bfloat16 || q8_0) ? 0.003f : (record_path ? 0.015f : 0.005f));
     latent_check_output(actual, expected, "GPU MLA replacement branch CPU parity including existing output quantization", (bfloat16 || q8_0) ? 0.003f : 0.05f, (bfloat16 || q8_0) ? 0.003f : 0.08f);
 #if NCNN_MOE_WITH_VULKAN
     if (record_path)
@@ -813,7 +881,7 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false, boo
                      "abandoned GPU MLA recorder preserves canonical state");
         latent_check(!gpu_cache.latent_device_state, "abandoned GPU MLA recorder invalidates device state");
         LayerCache reference_branch = prior_cache;
-        latent_check(static_cast<bool>(forward_latent_attention(oracle_weights, prior_operators, plan, ExecutionBackend::Vulkan, count + 1, reference_branch, prior_scratch, branch_input, prior_output, flags)), "prior Hybrid after abandoned recorder");
+        latent_check(static_cast<bool>(forward_latent_attention(oracle_weights, prior_operators, plan, ExecutionBackend::Vulkan, count + 1, reference_branch, prior_scratch, branch_input, prior_output, flags)), "segmented GPU reference after abandoned recorder");
         latent_check(forward_gpu(count + 1, gpu_cache, branch_input, actual), "GPU MLA reconstructs cache after abandoned recorder");
         latent_check_output(actual, prior_output, "GPU MLA after canceled recorder", 0.015f, 0.015f);
 
@@ -837,7 +905,7 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false, boo
             ActivationBuffer row_input(1, 128);
             std::copy_n(prefill_input.row(row), 128, row_input.row(0));
             ActivationBuffer row_output;
-            latent_check(static_cast<bool>(forward_latent_attention(oracle_weights, prior_operators, plan, ExecutionBackend::Vulkan, row, prefill_reference, prior_scratch, row_input, row_output, flags)), "prefill CPU canonical oracle");
+            latent_check(static_cast<bool>(forward_latent_attention(oracle_weights, prior_operators, plan, ExecutionBackend::Vulkan, row, prefill_reference, prior_scratch, row_input, row_output, flags)), "prefill segmented GPU canonical reference");
             std::copy_n(row_output.row(0), 128, prefill_expected.row(row));
         }
         latent_check_output(actual, prefill_expected, "GPU MLA prefill row ordering", 0.02f, 0.02f);
@@ -888,7 +956,7 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false, boo
                 AttentionScratch alias_scratch;
                 latent_check(static_cast<bool>(forward_latent_attention(oracle_weights, prior_operators, alias_plan, ExecutionBackend::Vulkan,
                                                                         alias_position, alias_reference, alias_scratch, branch_input, alias_expected, flags)),
-                             "selected-index allocation CPU canonical oracle");
+                             "selected-index allocation segmented GPU reference");
                 const std::array<uint64_t, 1> alias_positions = {alias_position};
                 const std::array<LayerCache*, 1> alias_caches = {&alias_cache};
                 const auto alias_before = get_vulkan_statistics(runtime);
@@ -909,6 +977,9 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false, boo
     const std::weak_ptr<LatentAttention_vulkan> lifetime = operators.at_weight(plan.query_a_weight).latent_attention;
     operators.at_weight_mutable(plan.query_a_weight).latent_attention.reset();
     latent_check(lifetime.expired(), "prepared MLA projections must not retain their owning operator");
+    if (!record_path && ratio != 0)
+        std::cout << "MLA independent CPU/GPU compressor ratio=" << ratio
+                  << " max_abs_error=" << maximum_compressor_error << '\n';
 }
 
 } // namespace moe

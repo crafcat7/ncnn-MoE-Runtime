@@ -53,9 +53,13 @@ set(NCNN_MOE_SOURCES
     src/backends/ncnn/attention_vulkan.cpp
     src/backends/ncnn/expertbackend_vulkan.cpp
     src/backends/ncnn/experttransfer_vulkan.cpp
+    src/backends/ncnn/graphallocator_vulkan.cpp
     src/backends/ncnn/gateddeltanet_vulkan.cpp
     src/backends/ncnn/gatedresidual_vulkan.cpp
     src/backends/ncnn/qwenlayer_vulkan.cpp
+    src/backends/ncnn/gpusegment_vulkan.cpp
+    src/backends/ncnn/expertbank_vulkan.cpp
+    src/backends/ncnn/sharedffn_vulkan.cpp
     src/backends/ncnn/qsaattention_vulkan.cpp
     src/backends/ncnn/hyperconnection_vulkan.cpp
     src/backends/ncnn/rmsnorm_vulkan.cpp
@@ -63,6 +67,7 @@ set(NCNN_MOE_SOURCES
     src/backends/ncnn/layerhead_vulkan.cpp
     src/backends/ncnn/latentlayer_vulkan.cpp
     src/backends/ncnn/moecombine_vulkan.cpp
+    src/backends/ncnn/residentffn_vulkan.cpp
     src/backends/ncnn/latentattention_vulkan.cpp
     src/backends/ncnn/linear.cpp
     src/backends/ncnn/modelpipeline.cpp
@@ -81,8 +86,10 @@ set(NCNN_MOE_SOURCES
     # Graph
     src/graph/compiler.cpp
     src/graph/graph.cpp
+    src/graph/graphmemory.cpp
     src/graph/memoryplan.cpp
     src/graph/resourceplan.cpp
+    src/engine/graphresources.cpp
     src/graph/router.cpp
     # Kernels
     src/kernels/attention.cpp
@@ -389,6 +396,7 @@ if(NCNN_MOE_WITH_VULKAN)
         src/kernels/vulkan/float8_quantize.comp
         src/kernels/vulkan/float8_rms_norm_quantize.comp
         src/kernels/vulkan/float8_swiglu_quantize.comp
+        src/kernels/vulkan/projection_matvec.comp
         src/kernels/vulkan/gated_delta_net.comp
         src/kernels/vulkan/qwen_elementwise.comp
         src/kernels/vulkan/qsa_norm_rope.comp
@@ -404,6 +412,9 @@ if(NCNN_MOE_WITH_VULKAN)
         src/kernels/vulkan/hyper_connection_reduce.comp
         src/kernels/vulkan/hyper_connection_post.comp
         src/kernels/vulkan/router_select.comp
+        src/kernels/vulkan/expertbank_gate_up.comp
+        src/kernels/vulkan/expertbank_down.comp
+        src/kernels/vulkan/expertbank_combine.comp
         src/kernels/vulkan/latent_attention_transform.comp
         src/kernels/vulkan/latent_attention_compress.comp
         src/kernels/vulkan/latent_attention_index_score.comp
@@ -417,6 +428,7 @@ if(NCNN_MOE_WITH_VULKAN)
         src/kernels/vulkan/latent_attention_query.comp
         src/kernels/vulkan/expert_gather.comp
         src/kernels/vulkan/moe_combine.comp
+        src/kernels/vulkan/moe_combine_single_row.comp
         src/kernels/vulkan/mxfp4_gate_up.comp
         src/kernels/vulkan/mxfp4_row_tile.comp
         src/kernels/vulkan/mxfp4_indexed.comp
@@ -487,7 +499,61 @@ if(NCNN_MOE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
     add_test(NAME ncnn_moe_vulkan_wait_policy COMMAND ncnn_moe_vulkan_wait_policy_test)
 
+    add_executable(ncnn_moe_graph_memory_test tests/test_graph_memory.cpp)
+    target_link_libraries(ncnn_moe_graph_memory_test PRIVATE ncnn::moe)
+    target_compile_features(ncnn_moe_graph_memory_test PRIVATE cxx_std_20)
+    target_include_directories(ncnn_moe_graph_memory_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME ncnn_moe_graph_memory COMMAND ncnn_moe_graph_memory_test)
+
     if(NCNN_MOE_WITH_VULKAN)
+        add_executable(ncnn_moe_graph_allocator_vulkan_test tests/test_graph_allocator_vulkan.cpp)
+        target_link_libraries(ncnn_moe_graph_allocator_vulkan_test PRIVATE ncnn::moe)
+        target_compile_features(ncnn_moe_graph_allocator_vulkan_test PRIVATE cxx_std_20)
+        target_compile_definitions(ncnn_moe_graph_allocator_vulkan_test PRIVATE NCNN_MOE_WITH_VULKAN=1)
+        target_include_directories(ncnn_moe_graph_allocator_vulkan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME ncnn_moe_graph_allocator_vulkan COMMAND ncnn_moe_graph_allocator_vulkan_test)
+        set_tests_properties(ncnn_moe_graph_allocator_vulkan PROPERTIES SKIP_RETURN_CODE 77)
+
+        add_executable(ncnn_moe_resident_ffn_vulkan_test tests/test_resident_ffn_vulkan.cpp)
+        target_link_libraries(ncnn_moe_resident_ffn_vulkan_test PRIVATE ncnn::moe)
+        target_compile_features(ncnn_moe_resident_ffn_vulkan_test PRIVATE cxx_std_20)
+        target_compile_definitions(ncnn_moe_resident_ffn_vulkan_test PRIVATE NCNN_MOE_WITH_VULKAN=1)
+        target_include_directories(ncnn_moe_resident_ffn_vulkan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME ncnn_moe_resident_ffn_vulkan COMMAND ncnn_moe_resident_ffn_vulkan_test)
+        set_tests_properties(ncnn_moe_resident_ffn_vulkan PROPERTIES SKIP_RETURN_CODE 77)
+
+        add_executable(ncnn_moe_grouped_moe_combine_vulkan_test tests/test_grouped_moe_combine_vulkan.cpp)
+        target_link_libraries(ncnn_moe_grouped_moe_combine_vulkan_test PRIVATE ncnn::moe)
+        target_compile_features(ncnn_moe_grouped_moe_combine_vulkan_test PRIVATE cxx_std_20)
+        target_compile_definitions(ncnn_moe_grouped_moe_combine_vulkan_test PRIVATE NCNN_MOE_WITH_VULKAN=1)
+        target_include_directories(ncnn_moe_grouped_moe_combine_vulkan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME ncnn_moe_grouped_moe_combine_vulkan COMMAND ncnn_moe_grouped_moe_combine_vulkan_test)
+        set_tests_properties(ncnn_moe_grouped_moe_combine_vulkan PROPERTIES SKIP_RETURN_CODE 77)
+
+        add_executable(ncnn_moe_gpu_segment_vulkan_test tests/test_gpu_segment_vulkan.cpp)
+        target_link_libraries(ncnn_moe_gpu_segment_vulkan_test PRIVATE ncnn::moe)
+        target_compile_features(ncnn_moe_gpu_segment_vulkan_test PRIVATE cxx_std_20)
+        target_compile_definitions(ncnn_moe_gpu_segment_vulkan_test PRIVATE NCNN_MOE_WITH_VULKAN=1)
+        target_include_directories(ncnn_moe_gpu_segment_vulkan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME ncnn_moe_gpu_segment_vulkan COMMAND ncnn_moe_gpu_segment_vulkan_test)
+        set_tests_properties(ncnn_moe_gpu_segment_vulkan PROPERTIES SKIP_RETURN_CODE 77)
+
+        add_executable(ncnn_moe_gpu_continuation_vulkan_test tests/test_gpu_continuation_vulkan.cpp)
+        target_link_libraries(ncnn_moe_gpu_continuation_vulkan_test PRIVATE ncnn::moe)
+        target_compile_features(ncnn_moe_gpu_continuation_vulkan_test PRIVATE cxx_std_20)
+        target_compile_definitions(ncnn_moe_gpu_continuation_vulkan_test PRIVATE NCNN_MOE_WITH_VULKAN=1)
+        target_include_directories(ncnn_moe_gpu_continuation_vulkan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME ncnn_moe_gpu_continuation_vulkan COMMAND ncnn_moe_gpu_continuation_vulkan_test)
+        set_tests_properties(ncnn_moe_gpu_continuation_vulkan PROPERTIES SKIP_RETURN_CODE 77)
+
+        add_executable(ncnn_moe_gpu_expert_bank_vulkan_test tests/test_gpu_expert_bank_vulkan.cpp)
+        target_link_libraries(ncnn_moe_gpu_expert_bank_vulkan_test PRIVATE ncnn::moe)
+        target_compile_features(ncnn_moe_gpu_expert_bank_vulkan_test PRIVATE cxx_std_20)
+        target_compile_definitions(ncnn_moe_gpu_expert_bank_vulkan_test PRIVATE NCNN_MOE_WITH_VULKAN=1)
+        target_include_directories(ncnn_moe_gpu_expert_bank_vulkan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME ncnn_moe_gpu_expert_bank_vulkan COMMAND ncnn_moe_gpu_expert_bank_vulkan_test)
+        set_tests_properties(ncnn_moe_gpu_expert_bank_vulkan PROPERTIES SKIP_RETURN_CODE 77)
+
         add_executable(ncnn_moe_linear_allocation_vulkan_test tests/test_linear_allocation_vulkan.cpp)
         target_link_libraries(ncnn_moe_linear_allocation_vulkan_test PRIVATE ncnn::moe)
         target_compile_features(ncnn_moe_linear_allocation_vulkan_test PRIVATE cxx_std_20)
@@ -503,6 +569,30 @@ if(NCNN_MOE_BUILD_TESTS)
         target_include_directories(ncnn_moe_rmsnorm_vulkan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR})
         add_test(NAME ncnn_moe_rmsnorm_vulkan COMMAND ncnn_moe_rmsnorm_vulkan_test)
         set_tests_properties(ncnn_moe_rmsnorm_vulkan PROPERTIES SKIP_RETURN_CODE 77)
+
+        add_executable(ncnn_moe_projection_matvec_vulkan_test tests/test_projection_matvec_vulkan.cpp)
+        target_link_libraries(ncnn_moe_projection_matvec_vulkan_test PRIVATE ncnn::moe)
+        target_compile_features(ncnn_moe_projection_matvec_vulkan_test PRIVATE cxx_std_20)
+        target_compile_definitions(ncnn_moe_projection_matvec_vulkan_test PRIVATE NCNN_MOE_WITH_VULKAN=1)
+        target_include_directories(ncnn_moe_projection_matvec_vulkan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME ncnn_moe_projection_matvec_vulkan COMMAND ncnn_moe_projection_matvec_vulkan_test)
+        set_tests_properties(ncnn_moe_projection_matvec_vulkan PROPERTIES SKIP_RETURN_CODE 77)
+
+        add_executable(ncnn_moe_gpu_expert_bank_numerics_vulkan_test tests/test_gpu_expert_bank_numerics_vulkan.cpp)
+        target_link_libraries(ncnn_moe_gpu_expert_bank_numerics_vulkan_test PRIVATE ncnn::moe)
+        target_compile_features(ncnn_moe_gpu_expert_bank_numerics_vulkan_test PRIVATE cxx_std_20)
+        target_compile_definitions(ncnn_moe_gpu_expert_bank_numerics_vulkan_test PRIVATE NCNN_MOE_WITH_VULKAN=1)
+        target_include_directories(ncnn_moe_gpu_expert_bank_numerics_vulkan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME ncnn_moe_gpu_expert_bank_numerics_vulkan COMMAND ncnn_moe_gpu_expert_bank_numerics_vulkan_test)
+        set_tests_properties(ncnn_moe_gpu_expert_bank_numerics_vulkan PROPERTIES SKIP_RETURN_CODE 77)
+
+        add_executable(ncnn_moe_attention_bf16_decode_vulkan_test tests/test_attention_bf16_decode_vulkan.cpp)
+        target_link_libraries(ncnn_moe_attention_bf16_decode_vulkan_test PRIVATE ncnn::moe)
+        target_compile_features(ncnn_moe_attention_bf16_decode_vulkan_test PRIVATE cxx_std_20)
+        target_compile_definitions(ncnn_moe_attention_bf16_decode_vulkan_test PRIVATE NCNN_MOE_WITH_VULKAN=1)
+        target_include_directories(ncnn_moe_attention_bf16_decode_vulkan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR})
+        add_test(NAME ncnn_moe_attention_bf16_decode_vulkan COMMAND ncnn_moe_attention_bf16_decode_vulkan_test)
+        set_tests_properties(ncnn_moe_attention_bf16_decode_vulkan PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
     # --- Core regression suite ------------------------------------------------

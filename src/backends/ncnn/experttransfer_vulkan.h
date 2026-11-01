@@ -37,6 +37,9 @@ public:
     void clear() override;
     [[nodiscard]] uint64_t physical_bytes() const;
     [[nodiscard]] uint64_t physical_limit_rejections() const;
+    // The graph arena retains reusable blocks and permits physical growth only
+    // during explicit preparation/reservation. Expert-cache pools never call it.
+    void configure_graph_pool(bool allow_growth);
 
 private:
     struct Range
@@ -58,6 +61,8 @@ private:
     const uint64_t physical_limit;
     uint64_t allocated_bytes = 0;
     uint64_t limit_rejections = 0;
+    bool retain_free_blocks = false;
+    bool allow_physical_growth = true;
     mutable std::mutex mutex;
     std::vector<std::unique_ptr<Block>> blocks;
 };
@@ -84,7 +89,9 @@ private:
 
 // Each in-flight batch exclusively leases a transfer lane. A completed copy
 // semaphore is consumed by a short compute visibility command before weights
-// are published. Success and unsubmitted cancellation permit pool reuse.
+// are published. Multiple compute queues permit waiting only for the final
+// visibility fence; one compute queue remains available during copying.
+// Success and unsubmitted cancellation permit pool reuse.
 class VulkanIndependentWeightTransfer
 {
 public:
