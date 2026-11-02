@@ -68,6 +68,10 @@ private:
 class LatentAttention_vulkan
 {
 public:
+    // Private FP32 buffers retained through the fence, one element count per
+    // allocation. Cache/state and the logical output are planned separately.
+    [[nodiscard]] static std::vector<uint64_t> scratch_elements(const AttentionBlockPlan& plan, uint32_t hidden,
+                                                               uint32_t rows, uint32_t context_tokens);
     ~LatentAttention_vulkan();
 
     [[nodiscard]] static std::shared_ptr<LatentAttention_vulkan> create(const AttentionBlockPlan& plan,

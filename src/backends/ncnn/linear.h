@@ -162,6 +162,8 @@ public:
                                                                              uint32_t vulkan_device_index,
                                                                              const VulkanRuntimePtr& vulkan_runtime,
                                                                              uint64_t optimization_flags);
+    [[nodiscard]] static std::vector<uint64_t> swiglu_scratch_elements(uint32_t intermediate_columns,
+                                                                       bool router_gate, uint64_t rows);
     [[nodiscard]] bool prepare_rms_norm(const TensorData& weight,
                                         float epsilon,
                                         float weight_offset = 0.0f);
@@ -286,6 +288,8 @@ public:
                                                                        ExpertActivation activation,
                                                                        const VulkanRuntimePtr& vulkan_runtime,
                                                                        uint64_t optimization_flags);
+    [[nodiscard]] static std::vector<uint64_t> scratch_elements(uint32_t gate_output_columns,
+                                                                 uint64_t rows);
     [[nodiscard]] bool forward(const ActivationBuffer& input,
                                ActivationBuffer& output) const;
 
@@ -329,6 +333,13 @@ public:
                                                                      uint32_t vulkan_device_index,
                                                                      const VulkanRuntimePtr& vulkan_runtime,
                                                                      uint64_t optimization_flags);
+    [[nodiscard]] static std::vector<uint64_t> scratch_elements(uint32_t input_columns,
+                                                                 uint64_t rows);
+    // Device input includes its FP32 clone; host input quantizes and uploads before recording.
+    [[nodiscard]] static std::vector<uint64_t> swiglu_scratch_elements(uint32_t input_columns,
+                                                                       uint32_t intermediate_columns,
+                                                                       uint64_t rows,
+                                                                       bool device_input = true);
     [[nodiscard]] bool prepare_rms_norm(const TensorData& weight, float epsilon);
     [[nodiscard]] bool prepare_input_rms_norm(const TensorData& weight, float epsilon);
     [[nodiscard]] bool forward(const ActivationBuffer& input, ActivationBuffer& output) const;
@@ -552,6 +563,11 @@ public:
                                                                            ExpertActivation activation,
                                                                            const VulkanRuntimePtr& vulkan_runtime,
                                                                            uint64_t optimization_flags);
+    [[nodiscard]] static std::vector<uint64_t> scratch_elements(uint32_t intermediate_columns,
+                                                                 uint32_t output_columns,
+                                                                 bool separate_up,
+                                                                 bool router_gate,
+                                                                 uint64_t rows);
     [[nodiscard]] bool forward(const ActivationBuffer& input, ActivationBuffer& output) const;
     [[nodiscard]] bool forward_device(const DeviceTensor_vulkan& input, DeviceTensor_vulkan& output) const;
     [[nodiscard]] bool prepare_router_gate(const TensorData& weight);

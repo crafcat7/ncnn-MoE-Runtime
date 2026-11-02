@@ -38,6 +38,49 @@
 namespace ncnn {
 namespace moe {
 
+std::vector<uint64_t> LatentAttention_vulkan::scratch_elements(const AttentionBlockPlan& plan, uint32_t hidden,
+                                                               uint32_t rows, uint32_t context_tokens)
+{
+    const uint64_t query = saturating_multiply_u64(plan.head_count, plan.head_dimension);
+    const uint64_t rank = plan.query_lora_rank;
+    std::vector<uint64_t> columns = {hidden, rank, rank, query, plan.head_dimension, query, query,
+               saturating_multiply_u64(plan.output_lora_rank, std::max(1u, plan.output_group_count))};
+    if (plan.compression_ratio != 0)
+    {
+        columns.insert(columns.end(), {plan.head_dimension, plan.head_dimension});
+        if (plan.compression_ratio == 4)
+            columns.insert(columns.end(), {plan.index_head_dimension, plan.index_head_dimension});
+    }
+    const uint64_t compressed = context_tokens / std::max(1u, plan.compression_ratio);
+    // Per-row rope, window update and compressed publication operands
+    // are retained by LatentAttentionRecording until the single wait.
+    columns.insert(columns.end(), {plan.rope_head_dimension, plan.head_dimension});
+    if (plan.compression_ratio != 0)
+    {
+        const uint64_t banks = plan.compression_ratio == 4 ? 4 : 2;
+        columns.insert(columns.end(), {plan.rope_head_dimension, plan.head_dimension,
+                       saturating_multiply_u64(plan.head_dimension, banks), plan.head_dimension});
+        if (plan.compression_ratio == 4)
+            columns.insert(columns.end(), {plan.index_head_dimension,
+                   saturating_multiply_u64(plan.index_head_dimension, banks), plan.index_head_dimension});
+    }
+    const uint64_t candidates = std::min<uint64_t>(context_tokens, plan.sliding_window)
+                + (plan.compression_ratio == 0 ? 0 : std::min<uint64_t>(compressed, plan.index_top_k == 0 ? compressed : plan.index_top_k));
+    if (candidates >= 8) columns.push_back(saturating_multiply_u64(plan.head_count, candidates));
+    if (plan.compression_ratio == 4 && compressed > plan.index_top_k)
+    {
+        const uint64_t index = saturating_multiply_u64(plan.index_head_count, plan.index_head_dimension);
+        columns.insert(columns.end(), {index, plan.index_head_count, index, compressed, plan.index_top_k});
+        const uint64_t runs = (compressed + 1023) / 1024;
+        if (runs > 1)
+            columns.insert(columns.end(), {saturating_multiply_u64(runs, plan.index_top_k),
+                   saturating_multiply_u64((runs + 1) / 2, plan.index_top_k)});
+    }
+    for (uint64_t& columns_per_row : columns)
+        columns_per_row = saturating_multiply_u64(columns_per_row, rows);
+    return columns;
+}
+
 #if NCNN_MOE_WITH_VULKAN
 static bool create_latent_pipeline(const std::shared_ptr<VulkanContext>& context,
                                    const ncnn::Option& opt,

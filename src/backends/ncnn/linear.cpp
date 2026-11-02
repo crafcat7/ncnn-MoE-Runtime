@@ -2656,6 +2656,26 @@ bool Bfloat16Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
 #endif
 }
 
+static bool bfloat16_swiglu_scratch_shape(uint32_t intermediate_columns, bool router_gate,
+                                          uint64_t rows, uint64_t& fused_columns) noexcept
+{
+    if (intermediate_columns == 0 || rows == 0)
+        return false;
+    fused_columns = saturating_add_u64(saturating_multiply_u64(intermediate_columns, 2), router_gate ? 1 : 0);
+    return fused_columns != UINT64_MAX
+           && saturating_multiply_u64(fused_columns, rows) != UINT64_MAX;
+}
+
+std::vector<uint64_t> Bfloat16Linear_vulkan::swiglu_scratch_elements(uint32_t intermediate_columns,
+                                                                    bool router_gate, uint64_t rows)
+{
+    uint64_t fused_columns = 0;
+    if (!bfloat16_swiglu_scratch_shape(intermediate_columns, router_gate, rows, fused_columns))
+        return intermediate_columns == 0 || rows == 0 ? std::vector<uint64_t>{}
+                                                       : std::vector<uint64_t>{UINT64_MAX};
+    return {saturating_multiply_u64(fused_columns, rows)};
+}
+
 #if NCNN_MOE_WITH_VULKAN
 bool Bfloat16Linear_vulkan::record_swiglu_chain(const ncnn::VkMat& input,
                                                 const Bfloat16Linear_vulkan& down_operator,
@@ -2667,7 +2687,7 @@ bool Bfloat16Linear_vulkan::record_swiglu_chain(const ncnn::VkMat& input,
 {
     const auto& first = *d;
     const auto& down = *down_operator.d;
-    const uint64_t fused_columns = static_cast<uint64_t>(intermediate_columns) * 2 + (apply_router_gate ? 1u : 0u);
+    uint64_t fused_columns = 0;
     if (&input == &output || (activation != ExpertActivation::Silu && activation != ExpertActivation::DeepSeekSwiGlu)
         || !first.vulkan_context || first.vulkan_context != down.vulkan_context || !first.pipeline
         || input.empty() || input.dims != 2 || input.elempack != 1 || input.elemsize != sizeof(float)
@@ -2675,8 +2695,10 @@ bool Bfloat16Linear_vulkan::record_swiglu_chain(const ncnn::VkMat& input,
         || !input.allocator || input.allocator->vkdev != first.vulkan_context->device()
         || static_cast<uint32_t>(input.h) > first.vulkan_context->device()->info.max_workgroup_count_y()
         || vulkan_activation_storage_variant(first.option) != 0 || vulkan_activation_storage_variant(down.option) != 0
+        || !bfloat16_swiglu_scratch_shape(intermediate_columns, apply_router_gate,
+                                          static_cast<uint64_t>(input.h), fused_columns)
         || first.output_columns != fused_columns || down.input_columns != intermediate_columns
-        || intermediate_columns == 0 || intermediate_columns % 128 != 0 || down.packed.empty() || down.bias.empty())
+        || intermediate_columns % 128 != 0 || down.packed.empty() || down.bias.empty())
         return false;
     if (!first.swiglu_down_pipeline
         && !create_bfloat16_swiglu_down_pipeline(first.vulkan_context, first.option, first.swiglu_down_pipeline))
@@ -2971,6 +2993,24 @@ bool Bfloat16Expert_vulkan::forward(const ActivationBuffer& input,
 #endif
 }
 
+static bool bfloat16_expert_scratch_shape(uint32_t gate_output_columns, uint64_t rows,
+                                         uint32_t& fused_columns) noexcept
+{
+    fused_columns = gate_output_columns;
+    return gate_output_columns != 0 && rows != 0
+           && saturating_multiply_u64(gate_output_columns, rows) != UINT64_MAX;
+}
+
+std::vector<uint64_t> Bfloat16Expert_vulkan::scratch_elements(uint32_t gate_output_columns,
+                                                             uint64_t rows)
+{
+    uint32_t fused_columns = 0;
+    if (!bfloat16_expert_scratch_shape(gate_output_columns, rows, fused_columns))
+        return gate_output_columns == 0 || rows == 0 ? std::vector<uint64_t>{}
+                                                      : std::vector<uint64_t>{UINT64_MAX};
+    return {saturating_multiply_u64(fused_columns, rows)};
+}
+
 bool Bfloat16Expert_vulkan::record(const ncnn::VkMat& input, ncnn::VkMat& output,
                                    ncnn::VkCompute& command, std::vector<ncnn::VkMat>& workspace,
                                    std::vector<ncnn::VkMat>& bindings,
@@ -2980,12 +3020,14 @@ bool Bfloat16Expert_vulkan::record(const ncnn::VkMat& input, ncnn::VkMat& output
     const auto& expert = *d;
     const auto& gate = *expert.gate_up->d;
     const auto& down = *expert.down->d;
+    uint32_t fused_columns = 0;
     if (input.empty() || input.dims != 2 || input.elempack != 1 || input.elemsize != sizeof(float)
         || input.w != static_cast<int>(expert.input_columns) || input.h <= 0
-        || !gate.swiglu_down_pipeline || vulkan_activation_storage_variant(gate.option) != 0)
+        || !gate.swiglu_down_pipeline || vulkan_activation_storage_variant(gate.option) != 0
+        || !bfloat16_expert_scratch_shape(gate.output_columns, static_cast<uint64_t>(input.h), fused_columns))
         return false;
     ncnn::VkMat fused;
-    fused.create(static_cast<int>(gate.output_columns), input.h, sizeof(float), expert.vulkan_context->blob_allocator());
+    fused.create(static_cast<int>(fused_columns), input.h, sizeof(float), expert.vulkan_context->blob_allocator());
     if (fused.empty()) return false;
     workspace.push_back(fused);
     if (gate.record_projection(input, fused, static_cast<uint32_t>(input.h), command, bindings, constants))
@@ -3855,6 +3897,68 @@ static bool fill_float8_quantized_staging(const ActivationBuffer& input,
 }
 #endif
 
+static bool float8_linear_scratch_shape(uint32_t input_columns, uint64_t rows,
+                                        uint32_t& scratch_columns) noexcept
+{
+    scratch_columns = input_columns;
+    return input_columns != 0 && rows != 0
+           && saturating_multiply_u64(input_columns, rows) != UINT64_MAX;
+}
+
+std::vector<uint64_t> Float8Linear_vulkan::scratch_elements(uint32_t input_columns,
+                                                           uint64_t rows)
+{
+    uint32_t scratch_columns = 0;
+    if (!float8_linear_scratch_shape(input_columns, rows, scratch_columns))
+        return input_columns == 0 || rows == 0 ? std::vector<uint64_t>{}
+                                                : std::vector<uint64_t>{UINT64_MAX};
+    return {saturating_multiply_u64(scratch_columns, rows)};
+}
+
+static size_t float8_swiglu_scratch_shapes(uint32_t input_columns, uint32_t intermediate_columns,
+                                           uint64_t rows, bool device_input,
+                                           uint64_t columns[3]) noexcept
+{
+    if (intermediate_columns == 0 || rows == 0)
+        return 0;
+    if (device_input)
+    {
+        uint32_t quantized_columns = 0;
+        if (!float8_linear_scratch_shape(input_columns, rows, quantized_columns))
+            return 0;
+        columns[0] = quantized_columns;
+        columns[1] = intermediate_columns;
+        columns[2] = intermediate_columns;
+        return 3;
+    }
+    columns[0] = intermediate_columns;
+    columns[1] = intermediate_columns;
+    return 2;
+}
+
+std::vector<uint64_t> Float8Linear_vulkan::swiglu_scratch_elements(uint32_t input_columns,
+                                                                   uint32_t intermediate_columns,
+                                                                   uint64_t rows,
+                                                                   bool device_input)
+{
+    if (input_columns == 0 || intermediate_columns == 0 || rows == 0)
+        return {};
+    uint64_t columns[3]{};
+    const size_t count = float8_swiglu_scratch_shapes(input_columns, intermediate_columns,
+                                                      rows, device_input, columns);
+    if (count != (device_input ? 3u : 2u))
+        return {UINT64_MAX};
+    std::vector<uint64_t> result;
+    result.reserve(count);
+    for (size_t index = 0; index < count; ++index)
+    {
+        const uint64_t elements = saturating_multiply_u64(columns[index], rows);
+        if (elements == UINT64_MAX) return {UINT64_MAX};
+        if (elements != 0) result.push_back(elements);
+    }
+    return result;
+}
+
 #if NCNN_MOE_WITH_VULKAN
 const std::shared_ptr<VulkanContext>& Float8Linear_vulkan::vulkan_context() const noexcept
 {
@@ -3912,10 +4016,13 @@ bool Float8Linear_vulkan::record_forward(const ncnn::VkMat& input,
                                          uint32_t output_column_offset,
                                          uint32_t output_stride) const
 {
+    uint32_t scratch_columns = 0;
+    const uint64_t rows = input.h > 0 ? static_cast<uint64_t>(input.h) : 0;
     if (!d->vulkan_context || !d->pipeline || !d->quantize_pipeline
         || input.empty() || input.dims != 2 || input.elempack != 1
         || input.elemsize != sizeof(float) || input.h <= 0
         || input.w != static_cast<int>(d->logical_input_columns)
+        || !float8_linear_scratch_shape(d->logical_input_columns, rows, scratch_columns)
         || d->logical_input_columns % 128 != 0)
         return false;
     if (output_stride == 0)
@@ -3943,17 +4050,17 @@ bool Float8Linear_vulkan::record_forward(const ncnn::VkMat& input,
     if (quantized.empty() || output.empty())
         return false;
     std::vector<ncnn::vk_constant_type> constants(2);
-    constants[0].u32 = d->logical_input_columns;
-    constants[1].u32 = static_cast<uint32_t>(input.h);
+    constants[0].u32 = scratch_columns;
+    constants[1].u32 = static_cast<uint32_t>(rows);
     ncnn::VkMat dispatcher;
-    dispatcher.w = static_cast<int>((static_cast<uint64_t>(d->logical_input_columns) / 128)
+    dispatcher.w = static_cast<int>((static_cast<uint64_t>(scratch_columns) / 128)
                                     * d->quantize_pipeline->local_size_x());
-    dispatcher.h = input.h;
+    dispatcher.h = static_cast<int>(rows);
     dispatcher.c = 1;
     command.record_pipeline(d->quantize_pipeline.get(), {quantized}, constants, dispatcher);
     d->record_projection(quantized,
                          output,
-                         static_cast<uint32_t>(input.h),
+                         static_cast<uint32_t>(rows),
                          command,
                          output_stride,
                          output_column_offset);
@@ -4982,23 +5089,30 @@ bool Float8Linear_vulkan::record_swiglu_chain(const ncnn::VkMat& input,
     const auto& gate = *d;
     const auto& up = *up_operator.d;
     const auto& down = *down_operator.d;
+    uint64_t scratch_columns[3]{};
+    const size_t scratch_count = float8_swiglu_scratch_shapes(gate.logical_input_columns,
+                                                              gate.output_columns,
+                                                              input.h > 0 ? static_cast<uint64_t>(input.h) : 0,
+                                                              true,
+                                                              scratch_columns);
     if (&input == &output || activation != ExpertActivation::DeepSeekSwiGlu
         || !gate.vulkan_context || gate.vulkan_context != up.vulkan_context || gate.vulkan_context != down.vulkan_context
         || !gate.pipeline || !gate.quantize_pipeline || !up.pipeline || !down.pipeline || !gate.swiglu_quantize_pipeline
         || gate.input_group_count != 1 || up.input_group_count != 1 || down.input_group_count != 1
         || input.empty() || input.dims != 2 || input.elempack != 1 || input.elemsize != sizeof(float)
-        || input.h <= 0 || input.w != static_cast<int>(gate.logical_input_columns)
+        || input.h <= 0 || scratch_count != 3 || input.w != static_cast<int>(scratch_columns[0])
         || !input.allocator || input.allocator->vkdev != gate.vulkan_context->device()
         || static_cast<uint32_t>(input.h) > gate.vulkan_context->device()->info.max_workgroup_count_y()
         || gate.logical_input_columns != up.logical_input_columns || gate.output_columns != up.output_columns
-        || gate.output_columns != down.logical_input_columns || gate.output_columns % 128 != 0)
+        || gate.output_columns != down.logical_input_columns || gate.output_columns != scratch_columns[1]
+        || up.output_columns != scratch_columns[2] || gate.output_columns % 128 != 0)
         return false;
     workspace.reserve(workspace.size() + 4);
     ncnn::VkMat gate_gpu, up_gpu, result;
     if (!record_forward(input, gate_gpu, command, workspace)) return false;
     const ncnn::VkMat quantized = workspace.back();
     workspace.push_back(gate_gpu);
-    up_gpu.create(static_cast<int>(up.output_columns), input.h, sizeof(float), gate.vulkan_context->blob_allocator());
+    up_gpu.create(static_cast<int>(scratch_columns[2]), input.h, sizeof(float), gate.vulkan_context->blob_allocator());
     result.create(static_cast<int>(down.output_columns), input.h, sizeof(float), gate.vulkan_context->blob_allocator());
     if (up_gpu.empty() || result.empty()) return false;
     workspace.push_back(up_gpu);
@@ -6591,6 +6705,47 @@ uint32_t QnkExpert_vulkan::record_dispatches() const noexcept
 #endif
 }
 
+static size_t qnk_expert_scratch_shapes(uint32_t intermediate_columns, uint32_t output_columns,
+                                        bool separate_up, bool router_gate, uint64_t columns[5]) noexcept
+{
+    if (intermediate_columns == 0 || output_columns == 0)
+        return 0;
+    size_t count = 0;
+    columns[count++] = separate_up ? intermediate_columns
+                                   : saturating_multiply_u64(intermediate_columns, 2);
+    if (separate_up)
+        columns[count++] = intermediate_columns;
+    columns[count++] = intermediate_columns;
+    if (router_gate)
+    {
+        columns[count++] = output_columns;
+        columns[count++] = 1;
+    }
+    return count;
+}
+
+std::vector<uint64_t> QnkExpert_vulkan::scratch_elements(uint32_t intermediate_columns,
+                                                         uint32_t output_columns,
+                                                         bool separate_up,
+                                                         bool router_gate,
+                                                         uint64_t rows)
+{
+    if (intermediate_columns == 0 || output_columns == 0 || rows == 0)
+        return {};
+    uint64_t columns[5]{};
+    const size_t count = qnk_expert_scratch_shapes(intermediate_columns, output_columns,
+                                                   separate_up, router_gate, columns);
+    std::vector<uint64_t> result;
+    result.reserve(count);
+    for (size_t index = 0; index < count; ++index)
+    {
+        const uint64_t elements = saturating_multiply_u64(columns[index], rows);
+        if (elements == UINT64_MAX) return {UINT64_MAX};
+        if (elements != 0) result.push_back(elements);
+    }
+    return result;
+}
+
 bool QnkExpert_vulkan::record(const ncnn::VkMat& input, ncnn::VkMat& output,
                               ncnn::VkCompute& command,
                               std::vector<ncnn::VkMat>& workspace,
@@ -6609,15 +6764,29 @@ bool QnkExpert_vulkan::record(const ncnn::VkMat& input, ncnn::VkMat& output,
         return false;
     const QnkLinear_vulkan::Implementation& gate = *implementation.gate_up->d;
     const uint32_t rows = input.dims == 1 ? 1u : static_cast<uint32_t>(input.h);
+    uint64_t scratch_columns[5]{};
+    const size_t scratch_count = qnk_expert_scratch_shapes(implementation.intermediate_columns,
+                                                           implementation.output_columns,
+                                                           static_cast<bool>(implementation.up),
+                                                           static_cast<bool>(implementation.router_gate),
+                                                           scratch_columns);
+    if (scratch_count != (implementation.up ? (implementation.router_gate ? 5u : 3u)
+                                            : (implementation.router_gate ? 4u : 2u))
+        || gate.output_columns != scratch_columns[0])
+        return false;
+    size_t scratch_index = 0;
+    const auto create_scratch = [&](ncnn::VkMat& value, uint64_t columns) {
+        if (columns == 0 || columns > static_cast<uint64_t>(std::numeric_limits<int>::max())) return false;
+        value.create(static_cast<int>(columns), static_cast<int>(rows), sizeof(float), implementation.vulkan_context->blob_allocator());
+        return !value.empty();
+    };
     ncnn::VkMat gate_gpu;
-    gate_gpu.create(static_cast<int>(gate.output_columns), static_cast<int>(rows), sizeof(float), implementation.vulkan_context->blob_allocator());
+    if (!create_scratch(gate_gpu, scratch_columns[scratch_index++])) return false;
     ncnn::VkMat up_gpu;
     if (implementation.up)
-        up_gpu.create(static_cast<int>(implementation.intermediate_columns), static_cast<int>(rows), sizeof(float), implementation.vulkan_context->blob_allocator());
+        if (!create_scratch(up_gpu, scratch_columns[scratch_index++])) return false;
     ncnn::VkMat intermediate_gpu;
-    intermediate_gpu.create(static_cast<int>(implementation.intermediate_columns), static_cast<int>(rows), sizeof(float), implementation.vulkan_context->blob_allocator());
-    if (gate_gpu.empty() || intermediate_gpu.empty() || (implementation.up && up_gpu.empty()))
-        return false;
+    if (!create_scratch(intermediate_gpu, scratch_columns[scratch_index++])) return false;
     workspace.push_back(gate_gpu);
     workspace.push_back(intermediate_gpu);
     if (implementation.up)
@@ -6645,10 +6814,8 @@ bool QnkExpert_vulkan::record(const ncnn::VkMat& input, ncnn::VkMat& output,
     ncnn::VkMat router_logits;
     if (implementation.router_gate)
     {
-        unscaled_output.create(static_cast<int>(implementation.output_columns), static_cast<int>(rows), sizeof(float), implementation.vulkan_context->blob_allocator());
-        router_logits.create(1, static_cast<int>(rows), sizeof(float), implementation.vulkan_context->blob_allocator());
-        if (unscaled_output.empty() || router_logits.empty())
-            return false;
+        if (!create_scratch(unscaled_output, scratch_columns[scratch_index++])
+            || !create_scratch(router_logits, scratch_columns[scratch_index++])) return false;
         workspace.push_back(unscaled_output);
         workspace.push_back(router_logits);
     }

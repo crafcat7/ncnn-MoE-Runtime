@@ -322,6 +322,11 @@ static void test_model_graph_lifetimes_and_shapes()
                  "same-node uploaded inputs and produced outputs cannot share the destination range");
     memory_check(total_model_peak(planned.value().prefill) > total_model_peak(planned.value().decode),
                  "prefill rows must produce a larger working set than single-sequence decode");
+    CompiledModel oversized_attention_scratch = model;
+    oversized_attention_scratch.graph.layer_plans[0].attention.head_count = std::numeric_limits<uint32_t>::max();
+    const auto rejected_attention_scratch = plan_model_graph_memory(oversized_attention_scratch, 8, 1, 64);
+    memory_check(!rejected_attention_scratch && rejected_attention_scratch.error().code == ErrorCode::InvalidArgument,
+                 "graph planning must reject an overflowing Gated Delta Net scratch shape");
     const auto larger_rows = plan_model_graph_memory(model, 16, 3, 64);
     memory_check(larger_rows && total_model_peak(larger_rows.value().prefill) > total_model_peak(planned.value().prefill)
                      && total_model_peak(larger_rows.value().decode) > total_model_peak(planned.value().decode),
@@ -370,6 +375,33 @@ static void test_model_graph_lifetimes_and_shapes()
                  "CPU-only graphs must not reserve GPU activation or Session state arenas");
     memory_check(!plan_model_graph_memory(model, 0, 1, 64) && !plan_model_graph_memory(model, 8, 0, 64),
                  "zero-sized execution variants must be rejected before planning their graph");
+}
+
+static void test_mixed_expert_scratch()
+{
+    CompiledModel model = model_memory_fixture();
+    model.graph.nodes[3].type = ExecutionNodeType::ExpertGroup;
+    auto& moe = model.graph.layer_plans[1].moe;
+    moe.top_k = 1;
+    moe.experts.resize(1);
+    TensorData gate, down;
+    gate.dtype = down.dtype = DType::BFloat16;
+    gate.shape = {256, 16};
+    down.shape = {16, 128};
+    const auto gate_handle = model.weights.add("scratch_gate", std::move(gate));
+    const auto down_handle = model.weights.add("scratch_down", std::move(down));
+    memory_check(gate_handle && down_handle, "mixed Expert metadata fixture failed");
+    moe.experts[0].gate_up_weight = gate_handle.value();
+    moe.experts[0].down_weight = down_handle.value();
+    const auto fused = plan_model_graph_memory(model, 8, 1, 64);
+    model.weights.at_mutable(down_handle.value()).dtype = DType::Float32;
+    const auto mixed = plan_model_graph_memory(model, 8, 1, 64);
+    memory_check(fused && mixed, "mixed Expert workspace planning failed");
+    // A mixed-precision down projection uses QNK, whose activation is a
+    // separate allocation; fused BF16 consumes gate/up directly.
+    memory_check(mixed.value().prefill.allocations.size() == fused.value().prefill.allocations.size() + 1
+                     && total_model_peak(mixed.value().prefill) > total_model_peak(fused.value().prefill),
+                 "mixed BF16 Expert omitted the QNK activation workspace");
 }
 
 static void test_host_output_planning()
@@ -427,6 +459,7 @@ int main()
         ncnn::moe::test_devices_empty_buffers_and_validation();
         ncnn::moe::test_overflow();
         ncnn::moe::test_model_graph_lifetimes_and_shapes();
+        ncnn::moe::test_mixed_expert_scratch();
         ncnn::moe::test_host_output_planning();
         std::cout << "Graph memory lifetime tests passed\n";
         return 0;

@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <vector>
 
 namespace ncnn {
 #if NCNN_MOE_WITH_VULKAN
@@ -112,6 +113,12 @@ struct AttentionBatchEntry_vulkan
 class Attention_vulkan
 {
 public:
+    // Metadata-only private FP32 allocation sizes; excludes graph outputs,
+    // projection-owned clones, cache/state and decode_workspace_bytes().
+    // direct_ring may be true only when the prepared recorder proves support.
+    [[nodiscard]] static std::vector<uint64_t> scratch_elements(const AttentionConfig_vulkan& config, uint32_t rows,
+                                                               uint32_t context_tokens, uint32_t sequence_count,
+                                                               uint64_t kv_element_size, bool direct_ring = false);
     ~Attention_vulkan();
 
     [[nodiscard]] static std::shared_ptr<Attention_vulkan> create(const TensorData& norm_weight, const TensorData* sinks,
@@ -147,6 +154,7 @@ public:
 #if NCNN_MOE_WITH_VULKAN
     [[nodiscard]] const std::shared_ptr<VulkanContext>& vulkan_context() const noexcept;
     [[nodiscard]] const ncnn::Option& option() const noexcept;
+    [[nodiscard]] bool uses_qkv_ring(size_t token_count) const noexcept;
     // Upper bound for the selected decode path's retained private workspace.
     [[nodiscard]] bool decode_workspace_bytes(uint32_t context_tokens, uint64_t& bytes) const noexcept;
     // Caller owns the command lock and retains work through its fence. The

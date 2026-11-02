@@ -4,6 +4,8 @@
 #include "rmsnorm_vulkan.h"
 #include "vulkancontext.h"
 
+#include <algorithm>
+
 #include "kernels/ops.h"
 #include "kernels/statecache.h"
 
@@ -43,6 +45,52 @@
 
 namespace ncnn {
 namespace moe {
+
+std::vector<uint64_t> Attention_vulkan::scratch_elements(const AttentionConfig_vulkan& config, uint32_t rows,
+                                                        uint32_t context_tokens, uint32_t sequence_count,
+                                                        uint64_t kv_element_size, bool direct_ring)
+{
+    const uint64_t query = saturating_multiply_u64(config.head_count, config.head_dimension);
+    const uint64_t key = saturating_multiply_u64(config.kv_head_count, config.head_dimension);
+    const bool gate = has_flag(config.flags, AttentionOutputGate);
+    // Normalization, fused QKV[/gate], rotated query, attended values and the
+    // projection before residual Add. Add's result belongs to the graph.
+    std::vector<uint64_t> columns = {config.hidden_size,
+        saturating_add_u64(query, saturating_add_u64(saturating_multiply_u64(key, 2), gate ? query : 0)),
+        query, query, config.hidden_size, 1, 1}; // RMSNorm mean and coefficient.
+    if (!direct_ring) columns.insert(columns.end(), {key, key});
+    if (gate) columns.push_back(query);
+    const bool decode_sdpa = rows == 1 && config.head_dimension <= 128
+        && static_cast<uint64_t>(context_tokens) + (has_flag(config.flags, AttentionSink) ? 1 : 0) <= 4096
+        && (config.sliding_window == 0 || context_tokens <= config.sliding_window)
+        && has_flag(config.optimization_flags, OptimizationVulkanDecodeSdpa);
+    std::vector<uint64_t> elements;
+    if (!decode_sdpa)
+    {
+        const uint64_t destinations = saturating_add_u64(context_tokens, has_flag(config.flags, AttentionSink) ? 1 : 0);
+        if (kv_element_size == sizeof(uint16_t))
+        {
+            // General SDPA expands two KV operands per Session, with VkMat's
+            // 16-byte channel alignment. Ring views themselves alias state.
+            const uint64_t head_elements = saturating_multiply_u64(config.head_dimension, destinations);
+            const uint64_t kv_elements = saturating_multiply_u64(saturating_add_u64(head_elements, 3) / 4 * 4,
+                                                                 config.kv_head_count);
+            for (uint64_t operand = 0; operand < static_cast<uint64_t>(std::min(rows, sequence_count)) * 2; ++operand)
+                elements.push_back(kv_elements);
+        }
+        const uint64_t plane = saturating_multiply_u64(destinations, config.head_count);
+        columns.insert(columns.end(), {plane, plane, query}); // qk, mask, head-to-token permute.
+        if (rows % 4 == 0) columns.push_back(query); // packed permute needs pack1 reshape.
+#if NCNN_MOE_USE_NCNN && !NCNN_BATCH
+        else columns.push_back(query);
+#endif
+    }
+    if (!has_flag(config.optimization_flags, OptimizationVulkanDeviceRope))
+        columns.insert(columns.end(), {config.head_dimension, config.head_dimension});
+    for (uint64_t columns_per_row : columns)
+        elements.push_back(saturating_multiply_u64(columns_per_row, rows));
+    return elements;
+}
 
 #if NCNN_MOE_WITH_VULKAN
 static bool create_staging(ncnn::VkMat& m,
@@ -1880,6 +1928,12 @@ const std::shared_ptr<VulkanContext>& Attention_vulkan::vulkan_context() const n
 const ncnn::Option& Attention_vulkan::option() const noexcept
 { return d->option; }
 
+bool Attention_vulkan::uses_qkv_ring(size_t token_count) const noexcept
+{
+    return token_count == 1 && has_flag(d->config.optimization_flags, OptimizationVulkanQkvRing)
+           && support_qkv_rope(token_count);
+}
+
 bool Attention_vulkan::decode_workspace_bytes(uint32_t context_tokens, uint64_t& bytes) const noexcept
 {
     bytes = 0;
@@ -1992,9 +2046,7 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
     const bool use_native = static_cast<bool>(implementation.native_projections[0].qnk
                                               || implementation.native_projections[0].float8);
     const bool use_qkv_rope = support_qkv_rope(token_count);
-    const bool use_qkv_ring = use_qkv_rope
-                              && token_count == 1
-                              && has_flag(config.optimization_flags, OptimizationVulkanQkvRing);
+    const bool use_qkv_ring = uses_qkv_ring(token_count);
     if (!use_qkv_rope && (device_rope || use_norm_rope))
         return false;
     const uint64_t query_columns_u64 = static_cast<uint64_t>(config.head_count)
@@ -2935,8 +2987,7 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
     const Linear* projection = implementation.output_projection.get();
     const Bfloat16Linear_vulkan* projection_bfloat16 = implementation.output_projection_bfloat16.get();
     const bool use_qkv_rope = support_qkv_rope(1);
-    const bool use_qkv_ring = use_qkv_rope
-                              && has_flag(config.optimization_flags, OptimizationVulkanQkvRing);
+    const bool use_qkv_ring = uses_qkv_ring(1);
     if (!use_qkv_rope && use_norm_rope)
         return AttentionBatchResult_vulkan::NotExecuted;
 

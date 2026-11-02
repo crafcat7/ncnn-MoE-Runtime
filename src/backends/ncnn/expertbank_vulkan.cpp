@@ -80,6 +80,42 @@ static uint64_t bank_aligned(uint64_t bytes, uint64_t alignment) noexcept
     return ((bytes + alignment - 1) / alignment) * alignment;
 }
 
+static uint64_t bank_scratch_shapes(const ExpertBankPlan_vulkan& plan, uint64_t rows, uint32_t top_k,
+                                   uint32_t columns[3], uint64_t heights[3]) noexcept
+{
+    const uint64_t route_rows = saturating_multiply_u64(rows, top_k);
+    columns[0] = plan.intermediate_columns;
+    columns[1] = plan.output_columns;
+    columns[2] = plan.output_columns;
+    heights[0] = route_rows;
+    heights[1] = route_rows;
+    heights[2] = rows;
+    return route_rows;
+}
+
+std::vector<uint64_t> ExpertBank_vulkan::scratch_elements(const ExpertBankPlan_vulkan& plan,
+                                                          uint64_t rows, uint32_t top_k)
+{
+    if (rows == 0)
+        return {};
+    if (top_k == 0 || top_k > 64 || top_k > plan.expert_count
+        || plan.intermediate_columns == 0 || plan.output_columns == 0)
+        return {UINT64_MAX};
+    uint32_t columns[3];
+    uint64_t heights[3];
+    if (bank_scratch_shapes(plan, rows, top_k, columns, heights) == UINT64_MAX)
+        return {UINT64_MAX};
+    std::vector<uint64_t> result;
+    result.reserve(2);
+    for (size_t index = 0; index < 2; ++index)
+    {
+        const uint64_t elements = saturating_multiply_u64(columns[index], heights[index]);
+        if (elements == UINT64_MAX) return {UINT64_MAX};
+        if (elements != 0) result.push_back(elements);
+    }
+    return result;
+}
+
 #if NCNN_MOE_WITH_VULKAN
 static bool bank_bias_metadata(const TensorData* bias, uint32_t columns)
 {
@@ -431,7 +467,10 @@ bool ExpertBank_vulkan::record(const ncnn::VkMat& normalized, const ncnn::VkMat&
         || (residual && (residual == &combined || residual == &validation || !valid_tensor(*residual) || residual->dims != 2 || residual->w != static_cast<int>(plan.output_columns) || residual->h != normalized.h || residual->data == validation.data))) return false;
     const uint32_t rows = static_cast<uint32_t>(normalized.h);
     const auto& limits = d->context->device()->info.physicalDeviceProperties().limits;
-    const uint64_t route_rows = static_cast<uint64_t>(rows) * top_k;
+    uint32_t scratch_columns[3];
+    uint64_t scratch_heights[3];
+    const uint64_t route_rows = bank_scratch_shapes(plan, rows, top_k, scratch_columns, scratch_heights);
+    if (route_rows == UINT64_MAX) return false;
     if (route_rows > static_cast<uint64_t>(std::numeric_limits<int>::max()) || rows > limits.maxComputeWorkGroupCount[2]
         || top_k > limits.maxComputeWorkGroupCount[1] || rows > limits.maxComputeWorkGroupCount[1]
         || route_rows > std::numeric_limits<uint32_t>::max() / std::max(plan.input_columns, std::max(plan.intermediate_columns, plan.output_columns))
@@ -441,9 +480,9 @@ bool ExpertBank_vulkan::record(const ncnn::VkMat& normalized, const ncnn::VkMat&
         || static_cast<uint64_t>(rows) * (2 * top_k + 1) * sizeof(float) > limits.maxStorageBufferRange) return false;
     try
     {
-        ncnn::VkMat intermediate(static_cast<int>(plan.intermediate_columns), static_cast<int>(route_rows), sizeof(float), d->context->blob_allocator());
-        ncnn::VkMat outputs(static_cast<int>(plan.output_columns), static_cast<int>(route_rows), sizeof(float), d->context->blob_allocator());
-        ncnn::VkMat destination(static_cast<int>(plan.output_columns), normalized.h, sizeof(float), d->context->blob_allocator());
+        ncnn::VkMat intermediate(static_cast<int>(scratch_columns[0]), static_cast<int>(scratch_heights[0]), sizeof(float), d->context->blob_allocator());
+        ncnn::VkMat outputs(static_cast<int>(scratch_columns[1]), static_cast<int>(scratch_heights[1]), sizeof(float), d->context->blob_allocator());
+        ncnn::VkMat destination(static_cast<int>(scratch_columns[2]), static_cast<int>(scratch_heights[2]), sizeof(float), d->context->blob_allocator());
         if (intermediate.empty() || outputs.empty() || destination.empty()) return false;
         workspace.push_back(intermediate);
         workspace.push_back(outputs);

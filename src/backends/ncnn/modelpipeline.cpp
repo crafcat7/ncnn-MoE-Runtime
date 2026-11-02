@@ -180,20 +180,6 @@ bool support_vulkan_shared_experts(const CompiledOperatorTable& operators,
            && operators.at_weight(shared.down_weight).float8;
 }
 
-static uint64_t saturating_add_u64(uint64_t left, uint64_t right) noexcept
-{
-    return right > std::numeric_limits<uint64_t>::max() - left
-               ? std::numeric_limits<uint64_t>::max()
-               : left + right;
-}
-
-static uint64_t saturating_multiply_u64(uint64_t left, uint64_t right) noexcept
-{
-    return left != 0 && right > std::numeric_limits<uint64_t>::max() / left
-               ? std::numeric_limits<uint64_t>::max()
-               : left * right;
-}
-
 static bool uses_vulkan_dense_operator(const CompiledOperator& executable) noexcept
 {
     return executable.bfloat16
@@ -2565,9 +2551,15 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
     };
     const auto add_projection = [&](TensorHandle weight, uint64_t count = 0) -> Result<void> {
         if (weight == invalid_tensor_handle || model.weights.at(weight).dtype != DType::Float8E4M3) return {};
-        // Float8Linear::record_forward clones its FP32 input before in-place
-        // activation quantization. The clone is distinct from its output.
-        return add(graph_projection_input_columns(model, weight), count);
+        const uint64_t width = graph_projection_input_columns(model, weight);
+        if (width > UINT32_MAX)
+            return Error{ErrorCode::InvalidArgument, "Vulkan projection input exceeds the allocation range"};
+        for (uint64_t elements : Float8Linear_vulkan::scratch_elements(static_cast<uint32_t>(width), count == 0 ? rows : count))
+        {
+            auto ret = add(elements, 1);
+            if (!ret) return ret.error();
+        }
+        return {};
     };
     if (node.type == ExecutionNodeType::LmHead)
     {
@@ -2593,47 +2585,24 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
     const AttentionBlockPlan& attention = layer.attention;
     if (node.type == ExecutionNodeType::Attention)
     {
-        const uint64_t query = saturating_multiply_u64(attention.head_count, attention.head_dimension);
-        const uint64_t key = saturating_multiply_u64(attention.kv_head_count, attention.head_dimension);
-        const uint64_t value = saturating_multiply_u64(attention.head_count, attention.value_head_dimension);
-        std::vector<uint64_t> columns;
+        std::vector<uint64_t> elements;
         if (attention.kind == AttentionKind::GatedDeltaNet)
         {
-            // GatedDeltaWork::fused and recurrent_output. projected is the
-            // logical Attention output and is allocated by the graph walk.
-            columns = {saturating_add_u64(saturating_multiply_u64(key, 2),
-                                          saturating_add_u64(saturating_multiply_u64(value, 2), saturating_multiply_u64(attention.head_count, 2))),
-                       value};
+            elements = GatedDeltaNet_vulkan::scratch_elements(attention.head_count, attention.kv_head_count,
+                attention.head_dimension, attention.value_head_dimension, rows);
         }
         else if (attention.kind == AttentionKind::Standard && !has_flag(attention.flags, AttentionBlockQsa))
         {
-            const bool gate = has_flag(attention.flags, AttentionBlockOutputGate);
-            const bool direct_ring = rows == 1 && has_flag(model.opt.optimization_flags, OptimizationVulkanQkvRing);
-            // normalized, fused QKV[/gate], rotated query, attended values,
-            // and the projection preceding residual Add. The Add result is
-            // the graph output, so it is deliberately absent here.
-            columns = {hidden, saturating_add_u64(query, saturating_add_u64(saturating_multiply_u64(key, 2), gate ? query : 0)), query, query, hidden};
-            // ncnn RMSNorm keeps a mean and a coefficient for every row.
-            columns.insert(columns.end(), {1, 1});
-            if (!direct_ring) columns.insert(columns.end(), {key, key});
-            if (gate) columns.push_back(query);
-            const bool decode_sdpa = rows == 1 && attention.head_dimension <= 128
-                                     && static_cast<uint64_t>(context_tokens) + (has_flag(attention.flags, AttentionBlockSink) ? 1 : 0) <= 4096
-                                     && (attention.sliding_window == 0 || context_tokens <= attention.sliding_window)
-                                     && has_flag(model.opt.optimization_flags, OptimizationVulkanDecodeSdpa);
+            bool direct_ring = false;
 #if NCNN_MOE_WITH_VULKAN
+            const auto& op = model.operators.at(attention.vulkan_attention_operator).attention;
+            direct_ring = op && op->uses_qkv_ring(rows);
             if (rows == 1 || sequence_count > 1)
             {
-                const auto& op = model.operators.at(attention.vulkan_attention_operator).attention;
                 uint64_t workspace_bytes = 0;
-                // A bounded sliding view can use decode even when the Session
-                // capacity exceeds its window. Reserve the same planner's
-                // monotonic bound over that capacity before recording starts.
                 if (op && !op->decode_workspace_bytes(context_tokens, workspace_bytes))
                     return Error{ErrorCode::InternalError, "failed to plan Vulkan Attention decode workspace"};
-                // A multi-Session batch records independent one-row decodes;
-                // each workspace survives until the shared submission fence.
-                // Keep each allocation separate to include per-buffer alignment.
+                // Each independent Session decode retains its own workspace.
                 for (uint32_t index = 0; workspace_bytes != 0 && index < std::min(rows, sequence_count); ++index)
                 {
                     auto ret = add(workspace_bytes / sizeof(float), 1);
@@ -2641,45 +2610,13 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
                 }
             }
 #endif
-            if (!decode_sdpa)
-            {
-                // Both qk_cross and the uploaded additive mask have one plane
-                // per head. A sink adds a real destination column to both.
-                // KV ring views alias Session state.
-                const uint64_t destinations = saturating_add_u64(context_tokens, has_flag(attention.flags, AttentionBlockSink) ? 1 : 0);
-                const uint64_t kv_size = vulkan_kv_size(attention.kv_cache_dtype, device);
-                if (kv_size == UINT64_MAX)
-                    return Error{ErrorCode::InvalidArgument, "Vulkan Attention KV device is invalid"};
-                if (kv_size == sizeof(uint16_t))
-                {
-                    // General SDPA consumes two FP32 KV buffers per Session;
-                    // each head has VkMat's 16-byte channel alignment.
-                    const uint64_t head_elements = saturating_multiply_u64(attention.head_dimension, destinations);
-                    const uint64_t kv_elements = saturating_multiply_u64(saturating_add_u64(head_elements, 3) / 4 * 4,
-                                                                          attention.kv_head_count);
-                    for (uint64_t operand = 0; operand < static_cast<uint64_t>(std::min(rows, sequence_count)) * 2; ++operand)
-                    {
-                        auto ret = add(kv_elements, 1);
-                        if (!ret) return ret.error();
-                    }
-                }
-                const uint64_t attention_plane = saturating_multiply_u64(destinations, attention.head_count);
-                columns.insert(columns.end(), {attention_plane, attention_plane});
-                // SDPA's head-major output is permuted into token-major
-                // storage. Permute packs groups of four token rows; Reshape
-                // then creates a distinct pack1 matrix because this Attention
-                // operator disables packing. Neither allocation aliases SDPA.
-                columns.push_back(query);
-                if (rows % 4 == 0)
-                    columns.push_back(query);
-#if NCNN_MOE_USE_NCNN && !NCNN_BATCH
-                else
-                    columns.push_back(query);
-#endif
-            }
-            if (!has_flag(model.opt.optimization_flags, OptimizationVulkanDeviceRope))
-                columns.insert(columns.end(), {attention.head_dimension, attention.head_dimension});
-            for (TensorHandle weight : {attention.query_weight, attention.key_weight, attention.value_weight, attention.output_gate_weight, attention.output_weight})
+            const uint64_t kv_size = vulkan_kv_size(attention.kv_cache_dtype, device);
+            if (kv_size == UINT64_MAX)
+                return Error{ErrorCode::InvalidArgument, "Vulkan Attention KV device is invalid"};
+            elements = Attention_vulkan::scratch_elements(standard_attention_vulkan_config(model, attention),
+                rows, context_tokens, sequence_count, kv_size, direct_ring);
+            for (TensorHandle weight : {attention.query_weight, attention.key_weight, attention.value_weight,
+                                        attention.output_gate_weight, attention.output_weight})
             {
                 auto ret = add_projection(weight);
                 if (!ret) return ret.error();
@@ -2687,50 +2624,11 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
         }
         else if (attention.kind == AttentionKind::Standard)
         {
-            const uint64_t index = saturating_multiply_u64(static_cast<uint64_t>(attention.index_head_count) + 1, attention.index_head_dimension);
-            const uint64_t blocks = std::max<uint64_t>(1, context_tokens / std::max(1u, attention.compression_ratio));
-            // QSA normalization, projected/rotated Q,K,V,index, optional gate,
-            // pooled selection scores/cutoff, and attended Q. Its final output
-            // is already a graph tensor; persistent caches are separate.
-            columns = {hidden, query, key, key, index, query, key, index, blocks, 2, query};
-            if (attention.output_gate_weight != invalid_tensor_handle) columns.push_back(query);
+            elements = QsaAttention_vulkan::scratch_elements(attention, model.descriptor.hidden_size, rows, context_tokens);
         }
         else if (attention.kind == AttentionKind::MultiHeadLatent)
         {
-            const uint64_t rank = attention.query_lora_rank;
-            columns = {hidden, rank, rank, query, attention.head_dimension, query, query,
-                       saturating_multiply_u64(attention.output_lora_rank, std::max(1u, attention.output_group_count))};
-            if (attention.compression_ratio != 0)
-            {
-                columns.insert(columns.end(), {attention.head_dimension, attention.head_dimension});
-                if (attention.compression_ratio == 4)
-                    columns.insert(columns.end(), {attention.index_head_dimension, attention.index_head_dimension});
-            }
-            const uint64_t compressed = context_tokens / std::max(1u, attention.compression_ratio);
-            // Per-row rope, window update and compressed publication operands
-            // are retained by LatentAttentionRecording until the single wait.
-            columns.insert(columns.end(), {attention.rope_head_dimension, attention.head_dimension});
-            if (attention.compression_ratio != 0)
-            {
-                const uint64_t banks = attention.compression_ratio == 4 ? 4 : 2;
-                columns.insert(columns.end(), {attention.rope_head_dimension, attention.head_dimension,
-                                               saturating_multiply_u64(attention.head_dimension, banks), attention.head_dimension});
-                if (attention.compression_ratio == 4)
-                    columns.insert(columns.end(), {attention.index_head_dimension,
-                                                   saturating_multiply_u64(attention.index_head_dimension, banks), attention.index_head_dimension});
-            }
-            const uint64_t candidates = std::min<uint64_t>(context_tokens, attention.sliding_window)
-                                        + (attention.compression_ratio == 0 ? 0 : std::min<uint64_t>(compressed, attention.index_top_k == 0 ? compressed : attention.index_top_k));
-            if (candidates >= 8) columns.push_back(saturating_multiply_u64(attention.head_count, candidates));
-            if (attention.compression_ratio == 4 && compressed > attention.index_top_k)
-            {
-                const uint64_t index = saturating_multiply_u64(attention.index_head_count, attention.index_head_dimension);
-                columns.insert(columns.end(), {index, attention.index_head_count, index, compressed, attention.index_top_k});
-                const uint64_t runs = (compressed + 1023) / 1024;
-                if (runs > 1)
-                    columns.insert(columns.end(), {saturating_multiply_u64(runs, attention.index_top_k),
-                                                   saturating_multiply_u64((runs + 1) / 2, attention.index_top_k)});
-            }
+            elements = LatentAttention_vulkan::scratch_elements(attention, model.descriptor.hidden_size, rows, context_tokens);
             for (TensorHandle weight : {attention.query_a_weight, attention.query_b_weight, attention.key_value_weight,
                                         attention.output_a_weight, attention.output_b_weight, attention.indexer_query_weight,
                                         attention.indexer_weights_weight, attention.compressor_key_value_weight, attention.compressor_gate_weight,
@@ -2740,9 +2638,9 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
                 if (!ret) return ret.error();
             }
         }
-        for (uint64_t count : columns)
+        for (uint64_t count : elements)
         {
-            auto ret = add(count);
+            auto ret = add(count, 1);
             if (!ret) return ret.error();
         }
         return {};
@@ -2755,13 +2653,9 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
         if (routed && graph_has_expert_banks(model, graph))
         {
             const ExpertBankPlan_vulkan& bank = model.gpu_expert_bank_plans[node.layer_plan_index];
-            const uint64_t routes = saturating_multiply_u64(rows, layer.moe.top_k);
-            // The token-major aggregate is folded into the final Combine
-            // output; only route-major activated gate/up and down results
-            // remain private.
-            for (uint64_t columns : {static_cast<uint64_t>(bank.intermediate_columns), static_cast<uint64_t>(bank.output_columns)})
+            for (uint64_t elements : ExpertBank_vulkan::scratch_elements(bank, rows, layer.moe.top_k))
             {
-                auto ret = add(columns, routes);
+                auto ret = add(elements, 1);
                 if (!ret) return ret.error();
             }
             return {};
@@ -2782,16 +2676,36 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
         const DType dtype = gate == invalid_tensor_handle ? DType::Float32 : model.weights.at(gate).dtype;
         const bool fused_bfloat16 = model.operators.at(expert.vulkan_operator).bfloat16
                                     || (shared && model.operators.at(layer.moe.fused_shared_input_bfloat16_operator).bfloat16)
-                                    || (routed && expert.gate_up_weight != invalid_tensor_handle && dtype == DType::BFloat16);
+                                    || (routed && expert.gate_up_weight != invalid_tensor_handle && dtype == DType::BFloat16
+                                        && model.weights.at(expert.down_weight).dtype == DType::BFloat16);
         const bool qnk = model.operators.at(expert.vulkan_operator).qnk_expert
                          || dtype == DType::Int4 || dtype == DType::MxFp4 || is_qnk_dtype(dtype) || dtype == DType::Float32
                          || (dtype == DType::BFloat16 && !fused_bfloat16);
-        // BF16 fused Expert owns a 2I fused vector. QnkExpert owns gate[/up]
-        // and activated I; the logical H output is excluded from these facts.
-        for (uint64_t columns : qnk ? std::vector<uint64_t>{saturating_multiply_u64(intermediate, 2), intermediate}
-                                    : std::vector<uint64_t>{saturating_multiply_u64(intermediate, 2)})
+        if (intermediate > UINT32_MAX / 2)
+            return Error{ErrorCode::InvalidArgument, "Vulkan FFN intermediate exceeds the allocation range"};
+        const uint32_t width = static_cast<uint32_t>(intermediate);
+        const bool router_gate = shared && layer.moe.shared_expert_gate_weight != invalid_tensor_handle;
+        const bool fp8_chain = !routed && (model.operators.at(expert.vulkan_operator).float8
+            || (shared && !router_gate && expert.activation == ExpertActivation::DeepSeekSwiGlu
+                && model.operators.at_weight(expert.gate_weight).float8
+                && model.operators.at_weight(expert.up_weight).float8
+                && model.operators.at_weight(expert.down_weight).float8));
+        std::vector<uint64_t> scratch;
+        if (qnk)
+            scratch = QnkExpert_vulkan::scratch_elements(width, model.descriptor.hidden_size,
+                expert.gate_up_weight == invalid_tensor_handle, router_gate, count);
+        else if (fp8_chain)
+            scratch = Float8Linear_vulkan::swiglu_scratch_elements(model.descriptor.hidden_size, width, count, shared && resident_input);
+        else if (fused_bfloat16 && !routed)
+            scratch = Bfloat16Linear_vulkan::swiglu_scratch_elements(width, router_gate, count);
+        else if (fused_bfloat16)
+            scratch = Bfloat16Expert_vulkan::scratch_elements(width * 2, count);
+        else
+            // Separate projection outputs connect the unfused FFN operators.
+            scratch = {saturating_multiply_u64(width, count), saturating_multiply_u64(width, count)};
+        for (uint64_t elements : scratch)
         {
-            auto ret = add(columns, count);
+            auto ret = add(elements, 1);
             if (!ret) return ret.error();
         }
         if (routed)
@@ -2835,7 +2749,7 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
                 if (!ret) return ret.error();
             }
         }
-        if (shared && layer.moe.shared_expert_gate_weight != invalid_tensor_handle)
+        if (router_gate && !qnk && !fused_bfloat16)
         {
             for (uint64_t columns : {hidden, UINT64_C(1)})
             {
@@ -2853,9 +2767,8 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
         }
         for (TensorHandle weight : {gate, expert.up_weight, expert.down_weight})
         {
-            // The recorded FP8 shared chain quantizes one cloned input for
-            // both gate/up, then quantizes the gated projection in place.
-            if (shared && segment_input && dtype == DType::Float8E4M3 && weight != gate) continue;
+            // The fused FP8 owner already accounts for its input clone.
+            if (fp8_chain) continue;
             auto ret = add_projection(weight, count);
             if (!ret) return ret.error();
         }

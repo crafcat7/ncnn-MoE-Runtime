@@ -4,6 +4,8 @@
 
 #include "kernels/statecache.h"
 
+#include <limits>
+
 #if NCNN_MOE_WITH_VULKAN
 #include "kernels/vulkan/gated_delta_net.comp.hex.h"
 #endif
@@ -17,7 +19,6 @@
 
 #include <algorithm>
 #include <array>
-#include <limits>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -25,6 +26,51 @@
 
 namespace ncnn {
 namespace moe {
+
+static bool gated_delta_record_columns(uint32_t head_count, uint32_t kv_head_count,
+                                       uint32_t head_dimension, uint32_t value_head_dimension,
+                                       uint32_t& convolution_columns, uint32_t& value_columns,
+                                       uint32_t& fused_columns) noexcept
+{
+    if (head_count == 0 || kv_head_count == 0 || head_count % kv_head_count != 0
+        || head_dimension == 0 || value_head_dimension == 0)
+        return false;
+    const uint64_t key_size = saturating_multiply_u64(kv_head_count, head_dimension);
+    const uint64_t values = saturating_multiply_u64(head_count, value_head_dimension);
+    const uint64_t int_max = static_cast<uint64_t>(std::numeric_limits<int>::max());
+    if (key_size == UINT64_MAX || values == UINT64_MAX || key_size > int_max / 2 || values > int_max)
+        return false;
+    const uint64_t convolution = saturating_add_u64(saturating_multiply_u64(key_size, 2), values);
+    const uint64_t fused = saturating_add_u64(convolution,
+                                               saturating_add_u64(values, saturating_multiply_u64(head_count, 2)));
+    if (convolution == UINT64_MAX || fused == UINT64_MAX || fused > int_max)
+        return false;
+    convolution_columns = static_cast<uint32_t>(convolution);
+    value_columns = static_cast<uint32_t>(values);
+    fused_columns = static_cast<uint32_t>(fused);
+    return true;
+}
+
+std::vector<uint64_t> GatedDeltaNet_vulkan::scratch_elements(uint32_t head_count,
+                                                              uint32_t kv_head_count,
+                                                              uint32_t head_dimension,
+                                                              uint32_t value_head_dimension,
+                                                              uint32_t rows)
+{
+    uint32_t convolution_columns = 0;
+    uint32_t value_columns = 0;
+    uint32_t fused_columns = 0;
+    if (rows > static_cast<uint32_t>(std::numeric_limits<int>::max())
+        || !gated_delta_record_columns(head_count, kv_head_count, head_dimension, value_head_dimension,
+                                       convolution_columns, value_columns, fused_columns))
+        return {UINT64_MAX};
+    (void)convolution_columns;
+    const uint64_t fused_elements = saturating_multiply_u64(fused_columns, rows);
+    const uint64_t recurrent_elements = saturating_multiply_u64(value_columns, rows);
+    if (fused_elements == UINT64_MAX || recurrent_elements == UINT64_MAX)
+        return {UINT64_MAX};
+    return {fused_elements, recurrent_elements};
+}
 
 #if NCNN_MOE_WITH_VULKAN
 
@@ -868,9 +914,6 @@ GatedDeltaNet_vulkan::create_impl(const std::shared_ptr<Bfloat16Linear_vulkan>& 
 #if NCNN_MOE_WITH_VULKAN
     const bool quantized = !quantized_inputs.empty();
     if ((quantized ? quantized_inputs.size() != 4 || !quantized_output : !fused_input || !output_projection)
-        || head_count == 0
-        || kv_head_count == 0 || head_count % kv_head_count != 0
-        || head_dimension == 0 || value_head_dimension == 0
         || convolution_kernel_size == 0)
     {
         return {};
@@ -878,20 +921,12 @@ GatedDeltaNet_vulkan::create_impl(const std::shared_ptr<Bfloat16Linear_vulkan>& 
     for (const auto& projection : quantized_inputs)
         if (!projection)
             return {};
-    const uint64_t key_size = static_cast<uint64_t>(kv_head_count) * head_dimension;
-    const uint64_t value_columns = static_cast<uint64_t>(head_count) * value_head_dimension;
-    if (key_size > static_cast<uint64_t>(std::numeric_limits<int>::max() / 2)
-        || value_columns > static_cast<uint64_t>(std::numeric_limits<int>::max()))
-    {
+    uint32_t convolution_size = 0;
+    uint32_t value_size = 0;
+    uint32_t fused_columns = 0;
+    if (!gated_delta_record_columns(head_count, kv_head_count, head_dimension, value_head_dimension,
+                                    convolution_size, value_size, fused_columns))
         return {};
-    }
-    const uint64_t convolution_columns = key_size * 2 + value_columns;
-    const uint64_t total_columns = convolution_columns + value_columns + static_cast<uint64_t>(head_count) * 2;
-    if (total_columns > static_cast<uint64_t>(std::numeric_limits<int>::max()))
-        return {};
-    const uint32_t value_size = static_cast<uint32_t>(value_columns);
-    const uint32_t convolution_size = static_cast<uint32_t>(convolution_columns);
-    const uint32_t fused_columns = static_cast<uint32_t>(total_columns);
     const std::shared_ptr<VulkanContext>& fused_context = quantized ? quantized_inputs.front()->vulkan_context() : fused_input->vulkan_context();
     const std::shared_ptr<VulkanContext>& output_context = quantized ? quantized_output->vulkan_context() : output_projection->vulkan_context();
     const uint32_t input_columns = quantized ? quantized_inputs.front()->input_columns() : fused_input->input_columns();

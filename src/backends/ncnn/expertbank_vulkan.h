@@ -75,6 +75,8 @@ public:
     // means the existing GPU streaming plan must be selected before execution.
     [[nodiscard]] static Result<ExpertBankPlan_vulkan> plan(std::span<const ExpertBankWeights_vulkan> experts,
                                                             const std::shared_ptr<VulkanContext>& context);
+    [[nodiscard]] static std::vector<uint64_t> scratch_elements(const ExpertBankPlan_vulkan& plan,
+                                                                 uint64_t rows, uint32_t top_k);
     [[nodiscard]] static Result<std::shared_ptr<ExpertBank_vulkan>> create(const ExpertBankPlan_vulkan& plan,
                                                                            const std::shared_ptr<VulkanContext>& context,
                                                                            const ExpertBankLoader_vulkan& loader);

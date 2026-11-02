@@ -333,6 +333,30 @@ std::shared_ptr<QsaAttention_vulkan> QsaAttention_vulkan::create(const WeightSto
 #endif
 }
 
+std::vector<uint64_t> QsaAttention_vulkan::scratch_elements(const AttentionBlockPlan& plan,
+                                                             uint32_t hidden_size,
+                                                             uint32_t rows,
+                                                             uint32_t context_tokens)
+{
+    const uint64_t query = saturating_multiply_u64(plan.head_count, plan.head_dimension);
+    const uint64_t key = saturating_multiply_u64(plan.kv_head_count, plan.head_dimension);
+    const uint64_t index = saturating_multiply_u64(saturating_add_u64(plan.index_head_count, 1),
+                                                   plan.index_head_dimension);
+    if (query == UINT64_MAX || key == UINT64_MAX || index == UINT64_MAX)
+        return {UINT64_MAX};
+    const uint64_t blocks = std::max<uint64_t>(1, context_tokens / std::max(1u, plan.compression_ratio));
+    std::vector<uint64_t> elements = {hidden_size, query, key, key, index, query, key, index, blocks, 2, query};
+    if (plan.output_gate_weight != invalid_tensor_handle)
+        elements.push_back(query);
+    for (uint64_t& count : elements)
+    {
+        count = saturating_multiply_u64(count, rows);
+        if (count == UINT64_MAX)
+            return {UINT64_MAX};
+    }
+    return elements;
+}
+
 uint64_t QsaAttention_vulkan::initial_state_bytes() const noexcept
 {
 #if NCNN_MOE_WITH_VULKAN

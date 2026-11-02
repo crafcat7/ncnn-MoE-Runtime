@@ -249,6 +249,17 @@ static BankResult bank_execute(const ExpertBank_vulkan& bank, const ActivationBu
                       "cannot stage the bank operand fixture");
         const auto before = get_vulkan_statistics(context->runtime());
         segment_check(bank.record(device_input, device_selected, top_k, output, validation, command, workspace), "selected expert bank record failed" + label);
+        const auto planned_scratch = ExpertBank_vulkan::scratch_elements(description, input.rows(), top_k);
+        segment_check(planned_scratch.size() == 2 && workspace.size() == 3
+                          && workspace[0].dims == 2 && workspace[0].w > 0 && workspace[0].h > 0
+                          && workspace[0].elempack == 1 && workspace[0].elemsize == sizeof(float)
+                          && workspace[1].dims == 2 && workspace[1].w > 0 && workspace[1].h > 0
+                          && workspace[1].elempack == 1 && workspace[1].elemsize == sizeof(float)
+                          && planned_scratch[0] == static_cast<uint64_t>(workspace[0].w) * workspace[0].h
+                          && planned_scratch[1] == static_cast<uint64_t>(workspace[1].w) * workspace[1].h
+                          && workspace[2].dims == 2 && workspace[2].w == static_cast<int>(description.output_columns)
+                          && workspace[2].h == static_cast<int>(input.rows()),
+                      "expert-bank scratch query must match the first two logical workspace shapes and exclude the output destination");
         segment_check(get_vulkan_statistics(context->runtime()).compute_submissions == before.compute_submissions
                           && result.output.rows() == 1 && result.output.columns() == 1 && result.output.row(0)[0] == -71.0f,
                       "record-only bank submitted work or published host output before its fence");

@@ -5,11 +5,28 @@
 #include "ncnn/moe/result.h"
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <vector>
 
 namespace ncnn {
 namespace moe {
+
+// Saturated shape arithmetic lets metadata-only workspace queries report overflow.
+// The graph planner rejects UINT64_MAX before allocating any buffer.
+inline uint64_t saturating_add_u64(uint64_t left, uint64_t right) noexcept
+{
+    return right > std::numeric_limits<uint64_t>::max() - left
+               ? std::numeric_limits<uint64_t>::max()
+               : left + right;
+}
+
+inline uint64_t saturating_multiply_u64(uint64_t left, uint64_t right) noexcept
+{
+    return left != 0 && right > std::numeric_limits<uint64_t>::max() / left
+               ? std::numeric_limits<uint64_t>::max()
+               : left * right;
+}
 
 // Opaque ownership token for one model/runtime Vulkan resource domain.
 // Operators created with the same token share command resources; different
