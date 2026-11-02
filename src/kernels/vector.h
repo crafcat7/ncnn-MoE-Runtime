@@ -8,6 +8,7 @@ namespace ncnn {
 namespace moe {
 
 float float_dot(const float* left, const float* right, uint32_t count) noexcept;
+size_t float_argmax(const float* values, size_t count) noexcept;
 void float_gemm_4x4(const float* weights,
                     size_t weight_stride,
                     const float* input,

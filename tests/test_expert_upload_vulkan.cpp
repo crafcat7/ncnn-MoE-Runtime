@@ -1,9 +1,11 @@
 #include "backends/ncnn/expertbackend_vulkan.h"
 #include "backends/ncnn/linear.h"
 #include "backends/ncnn/moecombine_vulkan.h"
+#include "backends/ncnn/residentffn_vulkan.h"
 #include "backends/ncnn/experttransfer_vulkan.h"
 #include "backends/ncnn/vulkancontext.h"
 #include "kernels/ops.h"
+#include "kernels/bfloat16.h"
 
 #include <algorithm>
 #include <array>
@@ -13,7 +15,9 @@
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <string_view>
+#include <vector>
 
 namespace ncnn {
 namespace moe {
@@ -106,6 +110,29 @@ static void weight_physical_ceiling()
     VulkanExpertWeightAllocator too_small(context->device(), block_size, block_bytes - 1);
     upload_check(too_small.fastMalloc(block_size) == nullptr && too_small.physical_bytes() == 0,
                  "first physical allocation cannot exceed a smaller ceiling");
+
+    // Graph descriptor metadata is also used by ordinary Expert allocations.
+    // A handle invalidated by clear is safe to dispose on the CPU after a new
+    // allocation, without returning that new allocation's range to the pool.
+    auto* stale = bounded.fastMalloc(block_size / 2);
+    upload_check(stale != nullptr, "ordinary Expert stale-handle fixture allocation");
+    bounded.clear();
+    upload_check(bounded.physical_bytes() == 0, "ordinary Expert clear releases invalidated backing");
+    auto* replacement = bounded.fastMalloc(block_size / 2);
+    upload_check(replacement != nullptr, "ordinary Expert allocation after clear");
+    const VkBuffer replacement_buffer = replacement->buffer;
+    const size_t replacement_offset = replacement->offset;
+    bounded.fastFree(stale);
+    upload_check(bounded.physical_bytes() == block_bytes && replacement->buffer == replacement_buffer
+                     && replacement->offset == replacement_offset,
+                 "disposing a stale Expert descriptor affected a replacement allocation");
+    auto* adjacent = bounded.fastMalloc(block_size / 2);
+    upload_check(adjacent && adjacent->buffer == replacement_buffer
+                     && adjacent->offset >= replacement->offset + replacement->capacity
+                     && bounded.physical_bytes() == block_bytes,
+                 "ordinary Expert descriptor disposal exposed a live range or exceeded its physical ceiling");
+    bounded.fastFree(adjacent);
+    bounded.fastFree(replacement);
 }
 
 static void demand_physical_recovery(bool mxfp4)
@@ -115,7 +142,6 @@ static void demand_physical_recovery(bool mxfp4)
     upload_check(static_cast<bool>(context), "physical recovery context");
     const size_t alignment = std::max<size_t>(4, context->device()->info.buffer_offset_alignment());
     const uint32_t hidden = static_cast<uint32_t>(std::max<size_t>(64, alignment));
-    const uint64_t cache_size = static_cast<uint64_t>(hidden) * 1024;
     const auto matrix = [](uint32_t rows, uint32_t columns, uint32_t seed) {
         auto value = std::make_shared<TensorData>();
         value->dtype = DType::Float32;
@@ -141,12 +167,17 @@ static void demand_physical_recovery(bool mxfp4)
     };
     const auto new_gate = mxfp4 ? packed(intermediate * 2, hidden) : matrix(intermediate * 2, hidden, 7);
     const auto new_down = mxfp4 ? packed(hidden, intermediate) : matrix(hidden, intermediate, 9);
-    const uint64_t old_bytes = QnkLinear_vulkan::storage_bytes(*old_gate, alignment) + QnkLinear_vulkan::storage_bytes(*old_down, alignment);
+    const uint64_t old_bytes = native_quantized_expert_storage_bytes(*old_gate, nullptr, *old_down,
+                                                                     get_default_gpu_index(), runtime, OptimizationDefaultFlags);
     const auto align = [alignment](uint64_t bytes) { return (bytes + alignment - 1) / alignment * alignment; };
     const uint64_t new_gate_bytes = mxfp4 ? align(new_gate->mxfp4_blocks.size()) + align(new_gate->mxfp4_scales.size()) + align(new_gate->shape[0] * sizeof(float))
                                           : QnkLinear_vulkan::storage_bytes(*new_gate, alignment);
     const uint64_t new_bytes = native_quantized_expert_storage_bytes(*new_gate, nullptr, *new_down,
                                                                      get_default_gpu_index(), runtime, OptimizationDefaultFlags);
+    // Size the block from executable allocations, including aligned zero
+    // biases. After evicting the first old Expert, the free prefix and tail
+    // total exactly new_bytes, but neither can hold the incoming gate.
+    const uint64_t cache_size = old_bytes + new_bytes;
     upload_check(old_bytes * 2 < cache_size && old_bytes + new_bytes <= cache_size
                      && new_gate_bytes > old_bytes && new_gate_bytes > cache_size - old_bytes * 2,
                  "recovery fixture splits sufficient logical free space into unusable fragments");
@@ -256,6 +287,240 @@ static void demand_physical_recovery(bool mxfp4)
                      "recovered device result matches the independent CPU calculation");
 }
 
+static void native_batch_uploads()
+{
+    const uint32_t device = get_default_gpu_index();
+    const auto runtime = create_vulkan_runtime();
+    const uint64_t flags = OptimizationDefaultFlags & ~OptimizationCpuMxfp4Q8 & ~OptimizationCpuFastSilu;
+    const auto context = VulkanContext::acquire(device, runtime, flags);
+    upload_check(static_cast<bool>(context), "native upload batch context");
+    const auto matrix = [](DType dtype, uint32_t rows, uint32_t columns, bool indexed = false) {
+        auto value = std::make_shared<TensorData>();
+        value->dtype = dtype;
+        value->shape = {rows, columns};
+        value->qnk_interleave_rows = false;
+        const size_t count = static_cast<size_t>(rows) * columns;
+        if (dtype == DType::Float32 || dtype == DType::BFloat16)
+        {
+            for (size_t index = 0; index < count; ++index)
+            {
+                const float weight = static_cast<float>(static_cast<int>(index % 7) - 3) / 64.f;
+                if (dtype == DType::Float32)
+                    value->float32_data.push_back(weight);
+                else
+                    value->bfloat16_data.push_back(float_to_bfloat16(weight));
+            }
+        }
+        else if (dtype == DType::Int4)
+        {
+            value->quantization_group_size = 32;
+            value->quantized_data.assign(count / 2, 0x9a);
+            value->quantization_scales.assign(count / 32, 1.f / 64.f);
+            value->quantization_zero_points.assign(count / 32, 8);
+        }
+        else if (dtype == DType::Q8_0)
+        {
+            value->quantized_data.resize(count / 32 * 34);
+            for (size_t block = 0; block < count / 32; ++block)
+            {
+                value->quantized_data[block * 34 + 1] = 0x28; // FP16 scale 1/32.
+                for (size_t lane = 0; lane < 32; ++lane)
+                    value->quantized_data[block * 34 + 2 + lane] = static_cast<uint8_t>(static_cast<int>(lane % 7) - 3);
+            }
+        }
+        else
+        {
+            value->mxfp4_blocks.resize(count / 2);
+            value->mxfp4_scales.resize(count / 32);
+            std::fill_n(value->mxfp4_blocks.data(), value->mxfp4_blocks.size(), uint8_t(0x11));
+            std::fill_n(value->mxfp4_scales.data(), value->mxfp4_scales.size(), uint8_t(120));
+        }
+        if (indexed)
+            for (uint32_t column = 0; column < columns; ++column) value->input_column_indices.push_back(column);
+        return value;
+    };
+    std::vector<std::string> keys = {"bf16-separate", "fp32-separate", "int4", "q8_0", "mxfp4-packed", "mxfp4-native"};
+    std::vector<ExpertDemandRequest> demands;
+    for (size_t index = 0; index < keys.size(); ++index)
+    {
+        const DType dtype = index == 0 ? DType::BFloat16 : index == 1 ? DType::Float32
+                                                       : index == 2   ? DType::Int4
+                                                       : index == 3   ? DType::Q8_0
+                                                                      : DType::MxFp4;
+        const bool separate = index < 2;
+        ExpertDemandRequest demand;
+        demand.gate_up = matrix(dtype, separate ? 32 : 64, 32, index == 5);
+        if (separate) demand.up = matrix(dtype, 32, 32);
+        demand.down = matrix(dtype, 32, 32, index == 5);
+        demand.activation = ExpertActivation::Silu;
+        demands.push_back(std::move(demand));
+    }
+    if (context->device()->info.subgroup_size() == 32)
+    {
+        keys.push_back("bf16-fused");
+        ExpertDemandRequest demand;
+        demand.gate_up = matrix(DType::BFloat16, 256, 32);
+        demand.down = matrix(DType::BFloat16, 32, 128);
+        demand.activation = ExpertActivation::Silu;
+        demands.push_back(std::move(demand));
+    }
+    uint64_t size = 0;
+    for (size_t index = 0; index < demands.size(); ++index)
+    {
+        auto& demand = demands[index];
+        demand.key = keys[index];
+        const uint64_t footprint = native_quantized_expert_storage_bytes(*demand.gate_up, demand.up.get(), *demand.down, device, runtime, flags);
+        upload_check(footprint != 0, "each native upload fixture has executable storage");
+        size += footprint;
+    }
+    auto backend = create_vulkan_expert_backend(size, device, {}, runtime, flags);
+    upload_check(static_cast<bool>(backend), "mixed native upload backend");
+    std::vector<std::shared_ptr<const void>> pins(demands.size());
+    const auto before = get_vulkan_statistics(runtime);
+    upload_check(backend->prepare_demand_batch(demands, pins) == demands.size()
+                     && std::all_of(pins.begin(), pins.end(), [](const auto& pin) { return static_cast<bool>(pin); }),
+                 "one mixed-format batch publishes every completed native Expert");
+    const auto after = get_vulkan_statistics(runtime);
+    upload_check(after.weight_transfer_submissions > before.weight_transfer_submissions
+                     && after.weight_upload_bytes > before.weight_upload_bytes,
+                 "native cache misses must upload their selected weights");
+    upload_check(backend->statistics().resident_size > 0 && backend->statistics().resident_size <= size,
+                 "batched native admissions must stay within the requested cache capacity");
+    upload_check(backend->prepare_demand_batch(demands, pins) == demands.size(), "native batch cache hits remain executable");
+    const auto warm = get_vulkan_statistics(runtime);
+    upload_check(warm.weight_transfer_submissions == after.weight_transfer_submissions
+                     && warm.weight_transfer_fence_waits == after.weight_transfer_fence_waits
+                     && warm.weight_upload_bytes == after.weight_upload_bytes,
+                 "a repeated native demand batch does not upload or wait for GPU copies again");
+
+    ActivationBuffer input(2, 32);
+    for (size_t index = 0; index < input.values().size(); ++index)
+        input.row(index / input.columns())[index % input.columns()] = static_cast<float>(static_cast<int>(index % 11) - 5) / 32.f;
+    std::vector<ActivationBuffer> outputs(demands.size());
+    std::vector<ExpertRequest> requests;
+    for (size_t index = 0; index < demands.size(); ++index) requests.push_back({keys[index], &input, &outputs[index]});
+    auto submission = backend->submit_batch(requests);
+    upload_check(static_cast<bool>(submission), "uploaded native batch reserves GPU execution");
+    const auto results = submission->wait();
+    upload_check(results.size() == demands.size()
+                     && std::all_of(results.begin(), results.end(), [](ExpertStatus status) { return status == ExpertStatus::Executed; })
+                     && submission->commit(),
+                 "every native-format batch executes and publishes on GPU after its shared upload");
+    for (size_t index = 0; index < demands.size(); ++index)
+    {
+        const auto& demand = demands[index];
+        const uint32_t intermediate = demand.down->shape[1];
+        const auto projected = forward_linear(*demand.gate_up, input, flags);
+        const auto up = demand.up ? forward_linear(*demand.up, input, flags) : ActivationBuffer{};
+        ActivationBuffer activated(input.rows(), intermediate);
+        for (size_t row = 0; row < input.rows(); ++row)
+            for (uint32_t column = 0; column < intermediate; ++column)
+            {
+                const float gate = projected.row(row)[column];
+                const float value = demand.up ? up.row(row)[column] : projected.row(row)[intermediate + column];
+                activated.row(row)[column] = gate / (1.f + std::exp(-gate)) * value;
+            }
+        const auto expected = forward_linear(*demand.down, activated, flags);
+        upload_check(outputs[index].rows() == expected.rows() && outputs[index].columns() == expected.columns(), "native upload batch output shape");
+        for (size_t element = 0; element < expected.values().size(); ++element)
+            upload_check(std::isfinite(outputs[index].values()[element])
+                             && std::abs(outputs[index].values()[element] - expected.values()[element]) < 0.0002f,
+                         "batched native upload preserves the independent CPU Expert oracle");
+    }
+
+    TensorData identity;
+    identity.dtype = DType::Float32;
+    identity.shape = {32, 32};
+    identity.float32_data.assign(32 * 32, 0.f);
+    for (uint32_t column = 0; column < 32; ++column) identity.float32_data[column * 32 + column] = 1.f;
+    const auto seed = Linear::create(identity, nullptr, device, runtime, flags);
+    upload_check(static_cast<bool>(seed), "native device-row upload graph seed");
+    const auto device_case = [&](const ActivationBuffer& source, std::span<const ExpertRoute> routes,
+                                 bool use_region) {
+        auto normalized = std::make_shared<DeviceTensor_vulkan>();
+        {
+            auto graph = CommandGraph_vulkan::create(*seed);
+            upload_check(graph && graph->upload(source, *normalized) && graph->submit() && graph->wait(),
+                         "native device-row source upload");
+        }
+        auto region = use_region ? ResidentFfnRegion_vulkan::create(normalized, demands.size(), 32) : nullptr;
+        upload_check(!use_region || static_cast<bool>(region), "single-row native region creation");
+        std::vector<ActivationBuffer> host_outputs(demands.size());
+        std::vector<std::shared_ptr<DeviceTensor_vulkan>> device_outputs(demands.size());
+        std::vector<ExpertRequest> device_requests(demands.size());
+        for (size_t index = 0; index < demands.size(); ++index)
+        {
+            auto& request = device_requests[index];
+            request.key = keys[index];
+            request.output = &host_outputs[index];
+            request.device_input = normalized;
+            request.device_routes = routes;
+            request.device_output = &device_outputs[index];
+            request.input_rows = routes.size();
+            request.input_columns = source.columns();
+            request.region = region;
+            request.region_index = index;
+        }
+        const auto before_device = get_vulkan_statistics(runtime);
+        auto device_submission = backend->submit_batch(device_requests);
+        upload_check(static_cast<bool>(device_submission), "native device-row batch submission");
+        const auto device_results = device_submission->wait();
+        upload_check(device_results.size() == demands.size()
+                         && std::all_of(device_results.begin(), device_results.end(), [](ExpertStatus status) { return status == ExpertStatus::Executed; })
+                         && device_submission->commit(),
+                     "native device-row batch executes and publishes entirely on GPU");
+        const auto after_device = get_vulkan_statistics(runtime);
+        upload_check(after_device.batch_uploads == before_device.batch_uploads
+                         && after_device.batch_downloads == before_device.batch_downloads
+                         && after_device.weight_upload_bytes == before_device.weight_upload_bytes
+                         && after_device.weight_transfer_submissions == before_device.weight_transfer_submissions,
+                     "native device-row reuse adds no activation or weight transfers");
+        ActivationBuffer expected_aggregate(source.rows(), 32);
+        for (size_t index = 0; index < demands.size(); ++index)
+        {
+            upload_check(host_outputs[index].rows() == 0 && device_outputs[index],
+                         "native device-row result remains device-only");
+            ActivationBuffer actual;
+            upload_check(MoeCombine_vulkan::materialize(*device_outputs[index], actual)
+                             && actual.rows() == routes.size() && actual.columns() == 32,
+                         "native device-row result explicit materialization");
+            for (size_t row = 0; row < actual.rows(); ++row)
+                for (uint32_t column = 0; column < actual.columns(); ++column)
+                {
+                    // Every case routes row zero, whose old two-row GPU
+                    // output was independently checked against the CPU above.
+                    upload_check(std::isfinite(actual.row(row)[column])
+                                     && std::abs(actual.row(row)[column] - outputs[index].row(0)[column]) < 0.0002f,
+                                 "shared native device input preserves each CPU-verified Expert result");
+                    expected_aggregate.row(routes[row].token_index)[column] += routes[row].weight * actual.row(row)[column];
+                }
+        }
+        if (region)
+        {
+            std::shared_ptr<const DeviceTensor_vulkan> aggregate;
+            ActivationBuffer actual;
+            upload_check(region->take_device_output(aggregate) && aggregate
+                             && MoeCombine_vulkan::materialize(*aggregate, actual)
+                             && actual.rows() == expected_aggregate.rows() && actual.columns() == expected_aggregate.columns(),
+                         "single-row mixed native families complete their shared device region");
+            for (size_t index = 0; index < actual.values().size(); ++index)
+                upload_check(std::abs(actual.values()[index] - expected_aggregate.values()[index]) < 1e-6f,
+                             "single-row mixed native region preserves canonical Expert summation");
+        }
+        ActivationBuffer preserved;
+        upload_check(MoeCombine_vulkan::materialize(*normalized, preserved)
+                         && preserved.rows() == source.rows() && preserved.columns() == source.columns()
+                         && std::equal(preserved.values().begin(), preserved.values().end(), source.values().begin()),
+                     "all native Experts leave their shared source activation unchanged");
+    };
+    ActivationBuffer single_input(1, input.columns());
+    std::copy_n(input.row(0), input.columns(), single_input.row(0));
+    const std::array<ExpertRoute, 1> single_route = {{{0, 0, 1.f}}};
+    const std::array<ExpertRoute, 2> repeated_route = {{{0, 0, 1.f}, {0, 1, 0.5f}}};
+    device_case(single_input, single_route, true);
+    device_case(input, repeated_route, false);
+}
+
 static void direct_upload_pool()
 {
     auto runtime = create_vulkan_runtime();
@@ -267,6 +532,9 @@ static void direct_upload_pool()
     const auto option = upload_option(context);
     constexpr size_t bytes = 4096;
     ncnn::VkMat first, second;
+    const auto before = get_vulkan_statistics(runtime);
+    const uint64_t visibility = context->device()->info.unified_compute_transfer_queue() ? 0 : 1;
+    const uint64_t waits = 1 + (visibility != 0 && context->device()->info.compute_queue_count() == 1 ? 1 : 0);
     {
         // Recording uses two isolated command pools and independent staging
         // allocators, including while the foreground command mutex is held.
@@ -281,11 +549,17 @@ static void direct_upload_pool()
             a[index] = static_cast<uint8_t>(index * 13 + 1);
             b[index] = static_cast<uint8_t>(index * 13 + 5);
         }
-        upload_check(first_batch.record_prepared_storage(first, option, &weights)
-                         && second_batch.record_prepared_storage(second, option, &weights),
+        upload_check(first_batch.record_prepared_storage(first, &weights)
+                         && second_batch.record_prepared_storage(second, &weights),
                      "record both mapped reservations");
         upload_check(first_batch.submit() && second_batch.submit(), "submit both isolated lanes");
     }
+    const auto submitted = get_vulkan_statistics(runtime);
+    upload_check(submitted.weight_transfer_submissions == before.weight_transfer_submissions + 2
+                     && submitted.weight_visibility_submissions == before.weight_visibility_submissions + visibility * 2
+                     && submitted.weight_transfer_fence_waits == before.weight_transfer_fence_waits + waits * 2
+                     && submitted.weight_upload_bytes == before.weight_upload_bytes + bytes * 2,
+                 "normal queue-family submission uses only its required final fence waits");
     verify_payload(context, first, bytes, 1);
     verify_payload(context, second, bytes, 5);
     first.release();
@@ -299,13 +573,14 @@ static void direct_upload_pool()
             upload_check(mapped.size() == bytes, "reused mapped staging size");
             for (size_t index = 0; index < bytes; ++index)
                 mapped[index] = static_cast<uint8_t>(index * 13 + seed);
-            upload_check(batch.record_prepared_storage(destination, option, &weights) && batch.submit(), "reuse command pool, CB, fences and consumed semaphore");
+            upload_check(batch.record_prepared_storage(destination, &weights) && batch.submit(), "reuse command pool, CB, fences and consumed semaphore");
         }
         verify_payload(context, destination, bytes, seed);
     }
 
     // Abandon a reservation before recording, then a recorded command before
     // submission. Neither case can leave a busy pool lane or submitted copy.
+    const auto before_cancel = get_vulkan_statistics(runtime);
     {
         VulkanWeightUploadBatch cancelled(context, &first_staging);
         upload_check(cancelled.prepare_storage(bytes, &weights).size() == bytes, "cancel unrecorded reservation");
@@ -316,15 +591,31 @@ static void direct_upload_pool()
         auto mapped = cancelled.prepare_storage(bytes, &weights);
         std::fill(mapped.begin(), mapped.end(), uint8_t(77));
         ncnn::VkMat destination;
-        upload_check(cancelled.record_prepared_storage(destination, option, &weights), "cancel recorded unsubmitted batch");
+        upload_check(cancelled.record_prepared_storage(destination, &weights), "cancel recorded unsubmitted batch");
     }
+    {
+        VulkanExpertWeightAllocator exhausted(context->device(), bytes, 1);
+        VulkanWeightUploadBatch rejected(context, &first_staging);
+        auto mapped = rejected.prepare_storage(bytes, &exhausted);
+        upload_check(mapped.size() == bytes, "exhaustion fixture obtains staging before bounded device allocation");
+        ncnn::VkMat destination;
+        upload_check(!rejected.record_prepared_storage(destination, &exhausted) && !rejected.submit()
+                         && destination.empty() && exhausted.physical_bytes() == 0 && exhausted.physical_limit_rejections() != 0,
+                     "physical exhaustion rejects the upload before any queue submission");
+    }
+    const auto cancelled = get_vulkan_statistics(runtime);
+    upload_check(cancelled.weight_transfer_submissions == before_cancel.weight_transfer_submissions
+                     && cancelled.weight_visibility_submissions == before_cancel.weight_visibility_submissions
+                     && cancelled.weight_transfer_fence_waits == before_cancel.weight_transfer_fence_waits
+                     && cancelled.weight_upload_bytes == before_cancel.weight_upload_bytes,
+                 "abort and physical exhaustion neither submit copies nor wait on unsignaled fences");
     {
         VulkanWeightUploadBatch retry(context, &first_staging);
         auto mapped = retry.prepare_storage(bytes, &weights);
         for (size_t index = 0; index < bytes; ++index)
             mapped[index] = static_cast<uint8_t>(index * 13 + 3);
         ncnn::VkMat destination;
-        upload_check(retry.record_prepared_storage(destination, option, &weights) && retry.submit(), "retry resets cancelled command recording");
+        upload_check(retry.record_prepared_storage(destination, &weights) && retry.submit(), "retry resets cancelled command recording");
         verify_payload(context, destination, bytes, 3);
     }
     {
@@ -337,7 +628,7 @@ static void direct_upload_pool()
         upload_check(mapped.size() == bytes, "poison fixture mapped reservation");
         std::fill(mapped.begin(), mapped.end(), uint8_t(33));
         ncnn::VkMat destination;
-        upload_check(poisoned.record_prepared_storage(destination, option, &weights), "poison fixture first records a valid copy");
+        upload_check(poisoned.record_prepared_storage(destination, &weights), "poison fixture first records a valid copy");
         upload_check(poisoned.prepare_storage(7, &weights).empty() && !poisoned.submit(), "illegal reservation poisons existing recorded lane");
     }
     {
@@ -347,7 +638,7 @@ static void direct_upload_pool()
         for (size_t index = 0; index < bytes; ++index)
             mapped[index] = static_cast<uint8_t>(index * 13 + 17);
         ncnn::VkMat destination;
-        upload_check(retry.record_prepared_storage(destination, option, &weights) && retry.submit(), "fresh command resources replace poisoned lane");
+        upload_check(retry.record_prepared_storage(destination, &weights) && retry.submit(), "fresh command resources replace poisoned lane");
         verify_payload(context, destination, bytes, 17);
     }
     {
@@ -479,6 +770,175 @@ static void submission_pool_wait(ExpertSubmission& submission)
     const auto results = submission.wait();
     upload_check(results.size() == 1 && results[0] == ExpertStatus::Executed,
                  "submission pool completed GPU Expert result");
+}
+
+static void resident_mxfp4_indexed_waves()
+{
+    constexpr size_t expert_count = 32;
+    constexpr size_t wave_size = 16;
+    const uint32_t device = get_default_gpu_index();
+    const uint64_t flags = (OptimizationDefaultFlags | OptimizationVulkanIndexedExperts)
+                           & ~OptimizationCpuMxfp4Q8 & ~OptimizationCpuFastSilu
+                           & ~OptimizationVulkanRouteAggregation;
+    const auto runtime = create_vulkan_runtime();
+    std::array<std::string, expert_count> keys;
+    std::array<ExpertDemandRequest, expert_count> demands;
+    uint64_t storage = 0;
+    for (size_t index = 0; index < expert_count; ++index)
+    {
+        keys[index] = "resident-indexed-" + std::to_string(index);
+        auto& demand = demands[index];
+        demand.key = keys[index];
+        demand.gate_up = submission_pool_weight(64, static_cast<uint32_t>(index + 3));
+        demand.down = submission_pool_weight(32, static_cast<uint32_t>(index + 7));
+        demand.activation = ExpertActivation::DeepSeekSwiGlu;
+        demand.activation_limit = 4.0f;
+        const uint64_t footprint = native_quantized_expert_storage_bytes(*demand.gate_up, nullptr, *demand.down,
+                                                                         device, runtime, flags);
+        upload_check(footprint != 0, "resident indexed fixture has executable MXFP4 storage");
+        storage += footprint;
+    }
+    const auto backend = create_vulkan_expert_backend(storage, device, {}, runtime, flags);
+    upload_check(static_cast<bool>(backend), "resident indexed MXFP4 backend");
+    ScopedExpertBackendForeground foreground(backend);
+    std::array<std::shared_ptr<const void>, expert_count> pins;
+    for (size_t begin = 0; begin < expert_count; begin += 8)
+        upload_check(backend->prepare_demand_batch(std::span<const ExpertDemandRequest>(demands).subspan(begin, 8),
+                                                   std::span<std::shared_ptr<const void>>(pins).subspan(begin, 8))
+                         == 8,
+                     "resident indexed MXFP4 weights are fully admitted before execution");
+
+    const ActivationBuffer normalized = submission_pool_input(3, 5);
+    std::array<std::array<ExpertRoute, 2>, expert_count> routes;
+    std::array<ActivationBuffer, expert_count> gathered, outputs, expected_outputs;
+    std::array<ExpertRequest, expert_count> requests;
+    ActivationBuffer expected(normalized.rows(), 32);
+    for (size_t index = 0; index < expert_count; ++index)
+    {
+        routes[index] = {{{static_cast<uint32_t>((index + 1) % normalized.rows()), 1, 0.125f},
+                          {static_cast<uint32_t>((index + 2) % normalized.rows()), 0, 0.0625f}}};
+        gathered[index].reset(routes[index].size(), 32, false);
+        for (size_t row = 0; row < routes[index].size(); ++row)
+            std::copy_n(normalized.row(routes[index][row].token_index), 32, gathered[index].row(row));
+        expected_outputs[index] = submission_pool_oracle(*demands[index].gate_up, *demands[index].down, gathered[index], flags);
+        for (size_t row = 0; row < routes[index].size(); ++row)
+            for (uint32_t column = 0; column < 32; ++column)
+                expected.row(routes[index][row].token_index)[column] += routes[index][row].weight * expected_outputs[index].row(row)[column];
+        requests[index] = {keys[index], &gathered[index], &outputs[index]};
+    }
+    const auto complete_submission = [&](std::span<const ExpertRequest> wave) {
+        auto submission = backend->submit_batch(wave);
+        upload_check(static_cast<bool>(submission), "resident indexed wave reserves selected GPU Experts");
+        const auto result = submission->wait();
+        upload_check(result.size() == wave.size()
+                         && std::all_of(result.begin(), result.end(), [](ExpertStatus status) { return status == ExpertStatus::Executed; })
+                         && submission->commit(),
+                     "resident indexed wave completes on the selected GPU");
+    };
+
+    complete_submission(std::span<const ExpertRequest>(requests).first(wave_size));
+    for (size_t index = 0; index < wave_size; ++index)
+        submission_pool_compare(outputs[index], expected_outputs[index], "indexed MXFP4 projections match the CPU oracle");
+
+    const auto region = ResidentFfnRegion_vulkan::create(normalized, expert_count, 32);
+    upload_check(static_cast<bool>(region), "resident indexed MXFP4 region");
+    std::array<std::shared_ptr<DeviceTensor_vulkan>, expert_count> device_outputs;
+    for (size_t index = 0; index < expert_count; ++index)
+    {
+        auto& request = requests[index];
+        request.input = nullptr;
+        request.device_routes = routes[index];
+        request.device_output = &device_outputs[index];
+        request.input_rows = routes[index].size();
+        request.input_columns = 32;
+        request.region = region;
+        request.region_index = index;
+    }
+    const auto before_region = get_vulkan_statistics(runtime);
+    // Execute later Experts first: retained outputs must still reduce in
+    // canonical Expert order after the second wave.
+    complete_submission(std::span<const ExpertRequest>(requests).subspan(wave_size, wave_size));
+    const auto first_wave = get_vulkan_statistics(runtime);
+    upload_check(!region->complete()
+                     && first_wave.batch_uploads == before_region.batch_uploads + 1
+                     && first_wave.batch_downloads == before_region.batch_downloads,
+                 "an incomplete resident wave uploads its source once without downloading partial results");
+    complete_submission(std::span<const ExpertRequest>(requests).first(wave_size));
+    const auto final_wave = get_vulkan_statistics(runtime);
+    upload_check(region->complete()
+                     && final_wave.batch_uploads == before_region.batch_uploads + 1
+                     && final_wave.batch_downloads == before_region.batch_downloads + 1
+                     && std::all_of(device_outputs.begin(), device_outputs.end(), [](const auto& value) { return static_cast<bool>(value); }),
+                 "resident indexed MXFP4 publishes and downloads only the completed aggregate");
+    ActivationBuffer actual;
+    upload_check(region->take_output(actual), "resident indexed MXFP4 publishes the final aggregate");
+    submission_pool_compare(actual, expected, "resident indexed MXFP4 canonical aggregate matches the CPU oracle");
+
+    TensorData identity;
+    identity.dtype = DType::Float32;
+    identity.shape = {32, 32};
+    identity.float32_data.assign(32 * 32, 0.0f);
+    for (uint32_t column = 0; column < 32; ++column)
+        identity.float32_data[column * 32 + column] = 1.0f;
+    const auto seed = Linear::create(identity, nullptr, device, runtime, flags);
+    upload_check(static_cast<bool>(seed), "resident indexed device-input graph seed");
+    auto normalized_device = std::make_shared<DeviceTensor_vulkan>();
+    {
+        auto graph = CommandGraph_vulkan::create(*seed);
+        upload_check(graph && graph->upload(normalized, *normalized_device),
+                     "resident indexed device input records its source upload");
+        upload_check(!ResidentFfnRegion_vulkan::create(normalized_device, expert_count, 32),
+                     "resident FFN rejects an unsubmitted device input");
+        upload_check(graph->submit(), "resident indexed device input submission");
+        upload_check(!ResidentFfnRegion_vulkan::create(normalized_device, expert_count, 32),
+                     "resident FFN requires explicit device input completion");
+        upload_check(graph->wait(), "resident indexed device input completion");
+    }
+    auto device_region = ResidentFfnRegion_vulkan::create(normalized_device, expert_count, 32);
+    upload_check(static_cast<bool>(device_region), "resident indexed region imports a completed device input");
+    const std::weak_ptr<const DeviceTensor_vulkan> weak_source = normalized_device;
+    normalized_device.reset();
+    upload_check(!weak_source.expired(), "resident region retains its imported device input");
+    for (size_t index = 0; index < expert_count; ++index)
+        requests[index].region = device_region;
+    std::shared_ptr<const DeviceTensor_vulkan> aggregate = device_outputs[0];
+    const auto previous = aggregate;
+    upload_check(!device_region->take_device_output(aggregate) && aggregate == previous,
+                 "an incomplete device region leaves the caller's committed device output unchanged");
+    const auto before_device_region = get_vulkan_statistics(runtime);
+    complete_submission(std::span<const ExpertRequest>(requests).subspan(wave_size, wave_size));
+    const auto partial_device_region = get_vulkan_statistics(runtime);
+    upload_check(!device_region->complete() && !device_region->take_device_output(aggregate) && aggregate == previous
+                     && partial_device_region.batch_uploads == before_device_region.batch_uploads
+                     && partial_device_region.batch_downloads == before_device_region.batch_downloads,
+                 "the first device-input indexed wave publishes no aggregate and performs no activation transfer");
+    complete_submission(std::span<const ExpertRequest>(requests).first(wave_size));
+    const auto final_device_region = get_vulkan_statistics(runtime);
+    upload_check(device_region->complete()
+                     && final_device_region.batch_uploads == before_device_region.batch_uploads
+                     && final_device_region.batch_downloads == before_device_region.batch_downloads,
+                 "two device-input waves retain indexed projections and leave the final aggregate on the GPU");
+    ActivationBuffer unchanged_host(1, 3);
+    std::fill_n(unchanged_host.row(0), unchanged_host.columns(), -19.0f);
+    const ActivationBuffer preserved_host = unchanged_host;
+    upload_check(!device_region->take_output(unchanged_host), "device-output mode must not implicitly materialize a host aggregate");
+    submission_pool_compare(unchanged_host, preserved_host, "device-only take leaves host output unchanged", 0.0f);
+    upload_check(device_region->take_device_output(aggregate) && aggregate && !aggregate->empty()
+                     && aggregate != previous && aggregate->rows() == normalized.rows() && aggregate->columns() == 32,
+                 "the completed device region publishes the full token-major aggregate");
+    const auto published = aggregate;
+    upload_check(!device_region->take_device_output(aggregate) && aggregate == published,
+                 "a device aggregate is consumed exactly once without changing a prior publication");
+    upload_check(weak_source.expired(), "taking the device aggregate releases its imported input owner");
+    ActivationBuffer materialized;
+    upload_check(MoeCombine_vulkan::materialize(*aggregate, materialized),
+                 "an explicit CPU boundary materializes the resident aggregate");
+    submission_pool_compare(materialized, expected, "device-input indexed aggregate matches the canonical CPU oracle");
+    const auto materialized_statistics = get_vulkan_statistics(runtime);
+    upload_check(materialized_statistics.compute_submissions == final_device_region.compute_submissions + 1
+                     && materialized_statistics.batch_uploads == final_device_region.batch_uploads
+                     && materialized_statistics.batch_downloads == final_device_region.batch_downloads + 1,
+                 "only explicit host materialization adds the unique aggregate download");
 }
 
 static void expert_submission_pool()
@@ -705,8 +1165,10 @@ int main()
         ncnn::moe::weight_physical_ceiling();
         ncnn::moe::demand_physical_recovery(false);
         ncnn::moe::demand_physical_recovery(true);
+        ncnn::moe::native_batch_uploads();
         ncnn::moe::direct_upload_pool();
         ncnn::moe::factory_direct_staging_ab();
+        ncnn::moe::resident_mxfp4_indexed_waves();
         ncnn::moe::expert_submission_pool();
         std::cout << "Expert direct staging, transfer and submission resource reuse passed\n";
         return 0;

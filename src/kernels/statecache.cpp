@@ -2,7 +2,7 @@
 
 #include "backends/ncnn/gateddeltanet_vulkan.h"
 #include "backends/ncnn/qsaattention_vulkan.h"
-#include "backends/ncnn/qwenlayer_vulkan.h"
+#include "backends/ncnn/gatedresiduallayer_vulkan.h"
 
 namespace ncnn {
 namespace moe {

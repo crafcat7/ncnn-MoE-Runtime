@@ -10,6 +10,7 @@
 #include "ncnn/moe/option.h"
 #include "ncnn/moe/types.h"
 #include "backends/ncnn/vulkan.h"
+#include "backends/ncnn/expertbank_vulkan.h"
 #include "storage/weightstore.h"
 
 #include <cstdint>
@@ -26,7 +27,9 @@ class Model;
 class ExpertCache;
 class ExpertBackend;
 class Tokenizer;
-class QwenLayer_vulkan;
+class GatedResidualLayer_vulkan;
+class GpuSegment_vulkan;
+class GraphResources;
 
 // Runtime settings after hardware/resource Auto values have been resolved;
 // policy modes such as ExpertIoMode::Auto retain their adaptive meaning.
@@ -98,6 +101,7 @@ struct CompiledModel
     ExecutionGraph graph;
     ExecutionSchedule schedule;
     ModelMemoryPlan memory_plan;
+    std::shared_ptr<GraphResources> graph_resources;
     uint64_t released_dense_host_size = 0;
     WeightStore weights;
     CompiledOperatorTable operators;
@@ -108,8 +112,18 @@ struct CompiledModel
     TensorHandle hyper_head_base = invalid_tensor_handle;
     TensorHandle hyper_head_scale = invalid_tensor_handle;
     GatedResidualPlan gated_residual_head;
-    std::shared_ptr<QwenLayer_vulkan> qwen_device_head;
-    bool qwen_device_chain = false;
+    std::shared_ptr<GatedResidualLayer_vulkan> gated_residual_device_head;
+    bool gated_residual_chain = false;
+    // Prepared from operator capabilities and the graph's device placement.
+    // Entries share the main graph's layer-plan indices.
+    std::vector<std::shared_ptr<GpuSegment_vulkan>> gpu_segments;
+    std::shared_ptr<GpuSegment_vulkan> gpu_head;
+    // Full-resident selection is model-wide. Metadata is published before
+    // arena planning; executable banks are published only after all uploads.
+    std::vector<ExpertBankPlan_vulkan> gpu_expert_bank_plans;
+    std::vector<std::shared_ptr<ExpertBank_vulkan>> gpu_expert_banks;
+    uint32_t bank_submission_rows = 0;
+    uint64_t gpu_expert_bank_size = 0;
     SpeculativeModelPlan speculative;
     std::shared_ptr<ExpertCache> expert_cache;
     std::shared_ptr<ExpertBackend> expert_backend;

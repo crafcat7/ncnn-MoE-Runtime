@@ -1,5 +1,5 @@
 #include "backends/ncnn/gatedresidual_vulkan.h"
-#include "backends/ncnn/qwen_vulkan_internal.h"
+#include "backends/ncnn/gatedresidual_vulkan_internal.h"
 #include "graph/compiledoperator.h"
 #include "kernels/attention.h"
 #include "kernels/gatedresidual.h"
@@ -241,13 +241,13 @@ static void qwen_ple_case(uint32_t device, DType dtype)
     std::shared_ptr<ncnn::Pipeline> pipeline;
     {
         const std::lock_guard<std::mutex> lock(context->command_mutex());
-        pipeline = qwen_pipeline(context, opt);
+        pipeline = residual_pipeline(context, opt);
         qwen_check(static_cast<bool>(pipeline), "create PLE shader");
         {
             ncnn::VkMat probe;
-            qwen_check(qwen_allocate(probe, 128, 2, context), "allocate Qwen refcount probe");
+            qwen_check(residual_allocate(probe, 128, 2, context), "allocate Qwen refcount probe");
             ncnn::VkCompute probe_cmd(context->device());
-            qwen_record(pipeline.get(), 0, 32, 4, 2, 128, descriptor.norm_epsilon, descriptor.norm_weight_offset,
+            residual_record(pipeline.get(), 0, 32, 4, 2, 128, descriptor.norm_epsilon, descriptor.norm_weight_offset,
                         {probe, probe, probe, probe, probe, probe}, probe_cmd);
             qwen_check(probe.refcount && *probe.refcount == 1, "Qwen record releases binding references");
         }
@@ -255,10 +255,10 @@ static void qwen_ple_case(uint32_t device, DType dtype)
         ncnn::Mat zero(6 * 128, sizeof(float));
         zero.fill(0.0f);
         cmd.record_upload(zero, state, opt);
-        qwen_check(qwen_float_weight(weights.at(plan.key_norm_weight), key_norm, cmd, opt)
-                       && qwen_float_weight(weights.at(plan.query_norm_weight), query_norm, cmd, opt)
-                       && qwen_float_weight(weights.at(plan.convolution_norm_weight), conv_norm, cmd, opt)
-                       && qwen_float_weight(weights.at(plan.convolution_weight), conv_weight, cmd, opt)
+        qwen_check(residual_float_weight(weights.at(plan.key_norm_weight), key_norm, cmd, opt)
+                       && residual_float_weight(weights.at(plan.query_norm_weight), query_norm, cmd, opt)
+                       && residual_float_weight(weights.at(plan.convolution_norm_weight), conv_norm, cmd, opt)
+                       && residual_float_weight(weights.at(plan.convolution_weight), conv_weight, cmd, opt)
                        && submit_compute_and_wait(cmd, context->device()) == 0,
                    "upload PLE constants");
     }
@@ -295,27 +295,27 @@ static void qwen_ple_case(uint32_t device, DType dtype)
                        && qwen_upload(key, key_gpu, key_staging, cmd, context, opt)
                        && qwen_upload(value, value_gpu, value_staging, cmd, context, opt)
                        && qwen_upload(packed, raw_gpu, raw_staging, cmd, context, opt)
-                       && qwen_allocate(decoded, plan.embedding_dimension, rows, context)
-                       && qwen_allocate(key_normalized, 128, rows, context)
-                       && qwen_allocate(query_normalized, 128, rows, context)
-                       && qwen_allocate(gated, 128, rows, context)
-                       && qwen_allocate(convolution_input, 128, rows, context)
-                       && qwen_allocate(output, 128, rows, context),
+                       && residual_allocate(decoded, plan.embedding_dimension, rows, context)
+                       && residual_allocate(key_normalized, 128, rows, context)
+                       && residual_allocate(query_normalized, 128, rows, context)
+                       && residual_allocate(gated, 128, rows, context)
+                       && residual_allocate(convolution_input, 128, rows, context)
+                       && residual_allocate(output, 128, rows, context),
                    "PLE stage allocations");
         for (const auto& constant : {key_norm, query_norm, conv_norm, conv_weight, state})
-            qwen_prepare_read(constant);
-        qwen_record(pipeline.get(), 7, plan.embedding_dimension, 4, rows, plan.embedding_dimension, 0, 0,
+            residual_prepare_read(constant);
+        residual_record(pipeline.get(), 7, plan.embedding_dimension, 4, rows, plan.embedding_dimension, 0, 0,
                     {raw_gpu, raw_gpu, raw_gpu, raw_gpu, raw_gpu, decoded}, cmd,
                     encoding, dimension, stride);
-        qwen_record(pipeline.get(), 0, 32, 4, rows, 128, descriptor.norm_epsilon, 1,
+        residual_record(pipeline.get(), 0, 32, 4, rows, 128, descriptor.norm_epsilon, 1,
                     {key_gpu, key_norm, key_gpu, key_gpu, key_gpu, key_normalized}, cmd);
-        qwen_record(pipeline.get(), 0, 32, 4, rows, 128, descriptor.norm_epsilon, 1,
+        residual_record(pipeline.get(), 0, 32, 4, rows, 128, descriptor.norm_epsilon, 1,
                     {input_gpu, query_norm, input_gpu, input_gpu, input_gpu, query_normalized}, cmd);
-        qwen_record(pipeline.get(), 5, 32, 4, rows, 128, 0, 0,
+        residual_record(pipeline.get(), 5, 32, 4, rows, 128, 0, 0,
                     {key_normalized, query_normalized, value_gpu, value_gpu, value_gpu, gated}, cmd);
-        qwen_record(pipeline.get(), 0, 32, 4, rows, 128, descriptor.norm_epsilon, 1,
+        residual_record(pipeline.get(), 0, 32, 4, rows, 128, descriptor.norm_epsilon, 1,
                     {gated, conv_norm, gated, gated, gated, convolution_input}, cmd);
-        qwen_record(pipeline.get(), 6, 32, 4, rows, 128, 0, 0,
+        residual_record(pipeline.get(), 6, 32, 4, rows, 128, 0, 0,
                     {convolution_input, gated, conv_weight, input_gpu, state, output}, cmd, 3, 3, 6, slot);
         qwen_check(prepare_staging_batch(output_staging, rows, 128, context->staging_allocator())
                        && prepare_staging_batch(decode_staging, rows, plan.embedding_dimension, context->staging_allocator())

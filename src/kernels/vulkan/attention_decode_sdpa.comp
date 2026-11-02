@@ -1,5 +1,12 @@
 #version 450
 
+#if ncnn_subgroup_basic && ncnn_subgroup_shuffle
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#endif
+
+layout(constant_id = 0) const uint use_subgroup_reductions = 0;
+
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) readonly buffer query_blob
@@ -38,13 +45,126 @@ layout(push_constant) uniform parameter
 p;
 
 shared float reduction[128];
+shared float cached_query[128];
+shared float scores[16];
+shared float weights[16];
 shared float online_maximum;
 shared float online_sum;
 shared float previous_scale;
-shared float current_weight;
+shared float next_maximum;
+
+#if ncnn_subgroup_basic && ncnn_subgroup_shuffle
+void subgroup_decode()
+{
+    // Address work by subgroup IDs rather than assuming a particular mapping
+    // from local invocation IDs to lanes. Selection requires full groups of
+    // at least sixteen lanes in this 128-invocation workgroup.
+    const uint lane = gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID;
+    const uint head = gl_WorkGroupID.z;
+    if (head >= p.head_count)
+        return;
+    const uint key_value_head = head / (p.head_count / p.key_value_head_count);
+    const uint query_base = head * p.query_cstep;
+    const uint key_base = key_value_head * p.key_cstep;
+    const uint value_base = key_value_head * p.value_cstep;
+    const uint token_lane = lane >> 3;
+    const uint dimension_lane = gl_SubgroupInvocationID & 7u;
+    const uint score_lane = gl_SubgroupInvocationID & 15u;
+    float maximum = -3.402823466e+38;
+    float denominator = 0.0;
+    float numerator = 0.0;
+    if (lane < p.head_dimension)
+        cached_query[lane] = query_data[query_base + lane];
+    barrier();
+
+    for (uint block = 0; block < p.destination_count; block += 16)
+    {
+        const uint token = block + token_lane;
+        const bool valid_token = token < p.destination_count;
+        const bool sink_token = p.use_attention_sink != 0 && token + 1 == p.destination_count;
+        float partial = 0.0;
+        if (valid_token && !sink_token)
+            for (uint dimension = dimension_lane; dimension < p.head_dimension; dimension += 8)
+                partial += cached_query[dimension]
+                           * buffer_ld1(key_data, key_base + token * p.head_dimension + dimension);
+        // XOR offsets stay within each eight-lane QK cluster.
+        partial += subgroupShuffleXor(partial, 4u);
+        partial += subgroupShuffleXor(partial, 2u);
+        partial += subgroupShuffleXor(partial, 1u);
+        if (dimension_lane == 0)
+            scores[token_lane] = !valid_token ? -3.402823466e+38
+                                 : sink_token ? sink_data[head]
+                                              : partial * p.scale;
+        barrier();
+
+        // Every sixteen-lane cluster reads the complete block. Max, sum and
+        // online state are replicated, removing the lane-zero serial loops
+        // and their shared-state synchronization.
+        const float score = scores[score_lane];
+        float block_maximum = score;
+        block_maximum = max(block_maximum, subgroupShuffleXor(block_maximum, 8u));
+        block_maximum = max(block_maximum, subgroupShuffleXor(block_maximum, 4u));
+        block_maximum = max(block_maximum, subgroupShuffleXor(block_maximum, 2u));
+        block_maximum = max(block_maximum, subgroupShuffleXor(block_maximum, 1u));
+        const float next_max = max(maximum, block_maximum);
+        const float old_scale = denominator == 0.0 ? 0.0 : exp(maximum - next_max);
+        if (lane < 16)
+            weights[lane] = block + lane < p.destination_count ? exp(scores[lane] - next_max) : 0.0;
+        barrier();
+        float block_sum = weights[score_lane];
+        block_sum += subgroupShuffleXor(block_sum, 8u);
+        block_sum += subgroupShuffleXor(block_sum, 4u);
+        block_sum += subgroupShuffleXor(block_sum, 2u);
+        block_sum += subgroupShuffleXor(block_sum, 1u);
+        denominator = denominator * old_scale + block_sum;
+        maximum = next_max;
+
+        if (lane < p.head_dimension)
+        {
+            // Prefetch four independent V addresses, then retain the original
+            // ascending-token scalar accumulation and online-update order.
+            const uint value_count = min(16u, p.destination_count - block
+                                                  - (p.use_attention_sink != 0u ? 1u : 0u));
+            const uint complete_values = value_count & ~3u;
+            float block_numerator = 0.0;
+            uint index = 0u;
+            for (; index < complete_values; index += 4u)
+            {
+                const float value0 = buffer_ld1(value_data, value_base + (block + index) * p.head_dimension + lane);
+                const float value1 = buffer_ld1(value_data, value_base + (block + index + 1u) * p.head_dimension + lane);
+                const float value2 = buffer_ld1(value_data, value_base + (block + index + 2u) * p.head_dimension + lane);
+                const float value3 = buffer_ld1(value_data, value_base + (block + index + 3u) * p.head_dimension + lane);
+                block_numerator += weights[index] * value0;
+                block_numerator += weights[index + 1u] * value1;
+                block_numerator += weights[index + 2u] * value2;
+                block_numerator += weights[index + 3u] * value3;
+            }
+            for (; index < 16 && block + index < p.destination_count; ++index)
+            {
+                const uint value_token = block + index;
+                if (p.use_attention_sink == 0 || value_token + 1 != p.destination_count)
+                    block_numerator += weights[index]
+                                       * buffer_ld1(value_data, value_base + value_token * p.head_dimension + lane);
+            }
+            numerator = numerator * old_scale + block_numerator;
+        }
+        // Protect shared scores/weights from the next block's writers.
+        barrier();
+    }
+    if (lane < p.head_dimension)
+        output_data[head * p.head_dimension + lane] = numerator / denominator;
+}
+#endif
 
 void main()
 {
+#if ncnn_subgroup_basic && ncnn_subgroup_shuffle
+    if (use_subgroup_reductions != 0u)
+    {
+        subgroup_decode();
+        return;
+    }
+#endif
     const uint lane = gl_LocalInvocationID.x;
     const uint head = gl_WorkGroupID.z;
     if (head >= p.head_count)
@@ -57,6 +177,8 @@ void main()
     const uint value_base = key_value_head * p.value_cstep;
     float numerator = 0.0;
 
+    if (lane < p.head_dimension)
+        cached_query[lane] = query_data[query_base + lane];
     if (lane == 0)
     {
         online_maximum = -3.402823466e+38;
@@ -64,47 +186,72 @@ void main()
     }
     barrier();
 
-    for (uint token = 0; token < p.destination_count; ++token)
+    // Eight lanes cooperate on each QK dot product, while sixteen KV rows
+    // advance together. Keep Q in shared memory and normalize one block at
+    // a time; no intermediate score matrix or global scratch is needed.
+    const uint token_lane = lane >> 3;
+    const uint dimension_lane = lane & 7;
+    for (uint block = 0; block < p.destination_count; block += 16)
     {
+        const uint token = block + token_lane;
+        const bool valid_token = token < p.destination_count;
         const bool sink_token = p.use_attention_sink != 0 && token + 1 == p.destination_count;
         float partial = 0.0;
-        if (lane < p.head_dimension && !sink_token)
+        if (valid_token && !sink_token)
         {
-            partial = query_data[query_base + lane]
-                      * buffer_ld1(key_data, key_base + token * p.head_dimension + lane);
+            for (uint dimension = dimension_lane; dimension < p.head_dimension; dimension += 8)
+                partial += cached_query[dimension]
+                           * buffer_ld1(key_data, key_base + token * p.head_dimension + dimension);
         }
         reduction[lane] = partial;
         barrier();
-        for (uint stride = gl_WorkGroupSize.x >> 1; stride > 0; stride >>= 1)
+        for (uint stride = 4; stride > 0; stride >>= 1)
         {
-            if (lane < stride)
+            if (dimension_lane < stride)
                 reduction[lane] += reduction[lane + stride];
             barrier();
         }
+        if (dimension_lane == 0)
+            scores[token_lane] = !valid_token ? -3.402823466e+38
+                                 : sink_token ? sink_data[head]
+                                              : reduction[lane] * p.scale;
+        barrier();
 
         if (lane == 0)
         {
-            const float score = reduction[0] * p.scale
-                                + (sink_token ? sink_data[head] : 0.0);
-            const float next_maximum = max(online_maximum, score);
+            float block_maximum = scores[0];
+            for (uint index = 1; index < 16; ++index)
+                block_maximum = max(block_maximum, scores[index]);
+            next_maximum = max(online_maximum, block_maximum);
             previous_scale = online_sum == 0.0 ? 0.0 : exp(online_maximum - next_maximum);
-            current_weight = exp(score - next_maximum);
-            online_sum = online_sum * previous_scale + current_weight;
+        }
+        barrier();
+        if (lane < 16)
+            weights[lane] = block + lane < p.destination_count ? exp(scores[lane] - next_maximum) : 0.0;
+        barrier();
+        if (lane == 0)
+        {
+            float block_sum = 0.0;
+            for (uint index = 0; index < 16; ++index)
+                block_sum += weights[index];
+            online_sum = online_sum * previous_scale + block_sum;
             online_maximum = next_maximum;
         }
         barrier();
 
         if (lane < p.head_dimension)
         {
-            numerator = numerator * previous_scale
-                        + (sink_token
-                               ? 0.0
-                               : current_weight
-                                     * buffer_ld1(value_data,
-                                                  value_base
-                                                      + token * p.head_dimension
-                                                      + lane));
+            float block_numerator = 0.0;
+            for (uint index = 0; index < 16 && block + index < p.destination_count; ++index)
+            {
+                const uint value_token = block + index;
+                if (p.use_attention_sink == 0 || value_token + 1 != p.destination_count)
+                    block_numerator += weights[index]
+                                       * buffer_ld1(value_data, value_base + value_token * p.head_dimension + lane);
+            }
+            numerator = numerator * previous_scale + block_numerator;
         }
+        barrier();
     }
 
     if (lane < p.head_dimension)

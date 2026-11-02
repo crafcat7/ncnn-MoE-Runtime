@@ -562,9 +562,9 @@ def hybrid_dense_host_release(tensors: dict, packed_sizes: dict[str, int], *,
     """Independently count the fixture weights owned by resident Vulkan ops.
 
     INT4/Qn_K storage remains resident on host. Ordinary unquantized Shared
-    Expert router gates are separate projections and can be reclaimed. The
-    Qwen4 continuous chain owns its router gates inside the Expert operation,
-    so their host copies remain, while QSA owns and releases query/key norms.
+    Expert router gates can be reclaimed after either their separate Vulkan
+    projection or the complete Expert chain owns the device copy. QSA owns
+    and releases query/key norms.
     Native Standard GQA Attention owns its pre-attention norm, sinks, and
     (for Qwen) query/key norms for each complete Vulkan layer, as well as its
     unquantized projection copies. Q8_0 dense Linear operators release their
@@ -623,8 +623,8 @@ def hybrid_dense_host_release(tensors: dict, packed_sizes: dict[str, int], *,
     for name, (dtype, values) in tensors.items():
         if not fp8:
             qsa_owned_norm = family == "qwen4_exp" and bool(re.search(r"\.self_attn\.[qk]_norm\.weight$", name))
-            separate_router_gate = family != "qwen4_exp" and name.endswith("mlp.shared_expert_gate.weight")
-            if (qsa_owned_norm or separate_router_gate) and name not in packed_sizes:
+            owned_router_gate = name.endswith("mlp.shared_expert_gate.weight")
+            if (qsa_owned_norm or owned_router_gate) and name not in packed_sizes:
                 released += values.size * {"BF16": 2, "F32": 4}[dtype]
             continue
         if name not in packed_sizes:
@@ -1724,9 +1724,12 @@ class NativeQuantizedTests(unittest.TestCase):
                 }
                 packed = {"lm_head.weight": dimension * 3}
                 self.assertEqual(hybrid_dense_host_release(tensors, packed, family="qwen4_exp"),
-                                 query_norm.nbytes + key_norm.nbytes)
+                                 query_norm.nbytes + key_norm.nbytes + first_gate.nbytes + second_gate.nbytes)
                 self.assertEqual(hybrid_dense_host_release(tensors, packed, family="qwen"),
                                  first_gate.nbytes + second_gate.nbytes)
+                packed_gate = {**packed, PREFIX + "layers.0.mlp.shared_expert_gate.weight": dimension + 4}
+                self.assertEqual(hybrid_dense_host_release(tensors, packed_gate, family="qwen4_exp"),
+                                 query_norm.nbytes + key_norm.nbytes + second_gate.nbytes)
 
     def test_mapped_ple_expected_accounting(self):
         model_config = config(True)

@@ -16,13 +16,18 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -106,8 +111,10 @@ public:
             initial = owner.submission_count++ == 0;
             if (live)
             {
+                owner.compute_wave_sizes.push_back(static_cast<size_t>(std::count_if(entries.begin(), entries.end(), [](const auto& entry) { return static_cast<bool>(entry); })));
                 ++owner.in_flight;
                 if (initial) owner.initial_in_flight = true;
+                if (owner.compute_submit_observer) owner.compute_submit_observer(requests);
             }
         }
 
@@ -238,6 +245,7 @@ public:
 
     std::unique_ptr<ExpertDemandSubmission> begin_demand_batch(std::span<const ExpertDemandRequest> requests) override
     {
+        demand_wave_sizes.push_back(requests.size());
         if (in_flight != 0) ++overlap_begins;
         if (initial_in_flight) ++initial_overlap_begins;
         if (synchronous_default) return ExpertBackend::begin_demand_batch(requests);
@@ -297,6 +305,8 @@ public:
     bool pause_admission_aliases = false;
     bool drain_outside_foreground = false;
     std::vector<std::pair<std::shared_ptr<const TensorData>, std::shared_ptr<const TensorData>>> pending_admissions;
+    std::vector<size_t> demand_wave_sizes;
+    std::vector<size_t> compute_wave_sizes;
     std::string failed_key;
     bool fail_commit = false;
     bool fail_initial_commit = false;
@@ -308,10 +318,73 @@ public:
     std::function<void(const std::string&)> admit_observer;
     std::function<void()> demand_wait_observer;
     std::function<void()> compute_wait_observer;
+    std::function<void(std::span<const ExpertRequest>)> compute_submit_observer;
 
 private:
     size_t capacity = 0;
     std::unordered_map<std::string, std::shared_ptr<Entry>> resident;
+};
+
+class PipelineBlockedReadMiss final : public ExpertVictimCache
+{
+public:
+    explicit PipelineBlockedReadMiss(std::string _blocked_key)
+        : blocked_key(std::move(_blocked_key))
+    {
+    }
+
+    void admit(std::string, std::shared_ptr<const TensorData>, std::shared_ptr<const TensorData>, ExpertVictimExecutionMetadata) override
+    {
+    }
+
+    std::optional<ExpertVictimPair> restore(const std::string& key, const TensorData&, const TensorData&) override
+    {
+        // Only gate a miss; the actual file reader must produce every pair.
+        std::unique_lock<std::mutex> lock(mutex);
+        if (key == blocked_key)
+        {
+            entered = true;
+            changed.notify_all();
+            changed.wait(lock, [&] { return released; });
+        }
+        else
+            changed.wait(lock, [&] { return entered || released; });
+        return std::nullopt;
+    }
+
+    bool blocked()
+    {
+        const std::lock_guard<std::mutex> lock(mutex);
+        return entered && !released;
+    }
+
+    void release()
+    {
+        const std::lock_guard<std::mutex> lock(mutex);
+        released = true;
+        changed.notify_all();
+    }
+
+    void wait_for_background_work() override
+    {
+    }
+
+    ExpertVictimCacheStatistics statistics() const override
+    {
+        return {};
+    }
+
+    uint64_t capacity() const noexcept override
+    {
+        return 0;
+    }
+
+private:
+    std::string blocked_key;
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool entered = false;
+    bool released = false;
 };
 
 static TensorData pipeline_weight(uint32_t rows, uint32_t columns, uint32_t seed)
@@ -406,11 +479,27 @@ static void pipeline_engine(size_t capacity, bool fail_commit = false, bool inva
         };
     }
     bool threw = false;
-    const size_t submissions_before = backend->submission_count;
+    const bool expected_error = capacity == 0 || fail_commit || invalid_demand || reject_one || fail_initial_commit;
     try
     {
         auto result = forward_moe(model, moe, state, &statistics, scratch, 0, ExecutionBackend::Vulkan, false, shared_work);
-        pipeline_check(static_cast<bool>(result) && state.experts_executed, "pipeline forward completed");
+        if (throw_shared)
+        {
+            pipeline_check(!result && result.error().message.find("injected Shared failure") != std::string::npos,
+                           "Shared exception propagates as an execution error");
+            threw = true;
+        }
+        else if (expected_error)
+        {
+            pipeline_check(!result && result.error().code == ErrorCode::InternalError && !state.experts_executed,
+                           "failed GPU pipeline reports an error without publishing a completed Expert group");
+            pipeline_check(statistics.expert_cpu_routes == 0 && statistics.expert_cpu_batches == 0
+                               && statistics.expert_cpu_fallbacks == 0,
+                           "failed GPU pipeline never recovers through CPU compute");
+        }
+        else
+            pipeline_check(static_cast<bool>(result) && state.experts_executed,
+                           result ? "pipeline forward completed" : result.error().message.c_str());
     }
     catch (const std::runtime_error& exception)
     {
@@ -424,41 +513,33 @@ static void pipeline_engine(size_t capacity, bool fail_commit = false, bool inva
         pipeline_check(shared_calls == (resident_all ? 0 : 1),
                        "independent Shared runs once only when a cold demand ticket exists");
     if (throw_shared) return;
-    for (const auto& active : state.active_experts())
+    if (!expected_error)
     {
-        ActivationBuffer activated;
-        forward_gate_up_mxfp4(model.weights.at(gate.value()), nullptr, active.input,
-                              ExpertActivation::DeepSeekSwiGlu, 4.0f, activated, backend->flags);
-        const auto expected = forward_linear(model.weights.at(down.value()), activated, backend->flags);
-        pipeline_check(active.output.rows() == 1 && active.output.columns() == 32, "pipeline output shape");
-        for (size_t index = 0; index < expected.values().size(); ++index)
-            pipeline_check(std::isfinite(active.output.values()[index])
-                               && std::abs(active.output.values()[index] - expected.values()[index]) < 0.000001f,
-                           "pipeline output matches independent CPU oracle including fallback");
+        for (const auto& active : state.active_experts())
+        {
+            ActivationBuffer activated;
+            forward_gate_up_mxfp4(model.weights.at(gate.value()), nullptr, active.input,
+                                  ExpertActivation::DeepSeekSwiGlu, 4.0f, activated, backend->flags);
+            const auto expected = forward_linear(model.weights.at(down.value()), activated, backend->flags);
+            pipeline_check(active.output.rows() == 1 && active.output.columns() == 32, "pipeline output shape");
+            for (size_t index = 0; index < expected.values().size(); ++index)
+                pipeline_check(std::isfinite(active.output.values()[index])
+                                   && std::abs(active.output.values()[index] - expected.values()[index]) < 0.000001f,
+                               "pipeline output matches independent CPU oracle with GPU execution");
+        }
+        pipeline_check(backend->in_flight == 0 && backend->maximum_wave <= 8, "pipeline drains bounded compute and upload waves");
+        pipeline_check(backend->executed == expert_count, "every selected Expert executes on GPU");
+        pipeline_check(statistics.expert_cpu_fallbacks == 0 && statistics.expert_cpu_routes == 0
+                           && statistics.expert_cpu_batches == 0 && statistics.expert_gpu_routes == expert_count,
+                       "successful GPU pipelines do not execute CPU recovery work");
+        if (capacity != 0 && !invalid_demand && !resident_all)
+            pipeline_check(backend->overlap_begins != 0, "next upload begins before current compute wait");
+        if (capacity == 1 && !invalid_demand)
+            pipeline_check(backend->capacity_retries != 0, "one-pair GPU cache exercises release and retry");
+        if (resident_first)
+            pipeline_check(backend->initial_overlap_begins == 1,
+                           "first bounded cold upload starts before initial resident compute wait");
     }
-    pipeline_check(backend->in_flight == 0 && backend->maximum_wave <= 8, "pipeline drains bounded compute and upload waves");
-    const uint64_t expected_gpu = capacity == 0 || invalid_demand
-                                      ? (resident_first ? 1 : 0)
-                                      : expert_count - (reject_one ? 1 : 0);
-    pipeline_check(backend->executed == expected_gpu, "transient capacity pressure cannot cause CPU fallback");
-    if (resident_first && fail_initial_commit)
-    {
-        pipeline_check(statistics.expert_cpu_fallbacks == 1 && statistics.expert_cpu_routes == 1,
-                       "failed resident Expert falls back to CPU once");
-        const size_t wave_capacity = std::max<size_t>(1, std::min(capacity, size_t(8)));
-        const size_t expected_submissions = 1 + (expert_count - 1 + wave_capacity - 1) / wave_capacity;
-        pipeline_check(backend->submission_count - submissions_before == expected_submissions,
-                       "failed resident Expert is not resubmitted after its CPU recovery");
-        pipeline_check(statistics.expert_gpu_routes == expert_count - 1,
-                       "only successfully committed demand Experts count as GPU routes");
-    }
-    if (capacity != 0 && !invalid_demand && !resident_all)
-        pipeline_check(backend->overlap_begins != 0, "next upload begins before current compute wait");
-    if (capacity == 1 && !invalid_demand)
-        pipeline_check(backend->capacity_retries != 0, "one-pair GPU cache exercises release and retry");
-    if (resident_first)
-        pipeline_check(backend->initial_overlap_begins == 1,
-                       "first bounded cold upload starts before initial resident compute wait");
 
     if (prefill)
     {
@@ -570,14 +651,9 @@ static void pipeline_engine(size_t capacity, bool fail_commit = false, bool inva
                     active.output.reset(65, 32, false);
                     std::fill_n(active.output.row(0), active.output.rows() * active.output.columns(), -123.0f);
                 }
-                const size_t aborts_before = prefill_backend->abort_count;
-                const size_t rejected_before = prefill_backend->rejected_requests;
-                const size_t commits_before = prefill_backend->commit_attempts;
-                const size_t submissions_before = prefill_backend->submission_count;
-                const uint64_t executed_before = prefill_backend->executed;
                 const uint64_t cpu_fallbacks_before = prefill_statistics.expert_cpu_fallbacks;
                 const uint64_t cpu_routes_before = prefill_statistics.expert_cpu_routes;
-                const uint64_t gpu_routes_before = prefill_statistics.expert_gpu_routes;
+                const uint64_t cpu_batches_before = prefill_statistics.expert_cpu_batches;
                 const auto prefill_result = forward_moe(prefill_model,
                                                         prefill_moe,
                                                         prefill_state,
@@ -586,32 +662,25 @@ static void pipeline_engine(size_t capacity, bool fail_commit = false, bool inva
                                                         0,
                                                         ExecutionBackend::Vulkan,
                                                         false);
-                pipeline_check(static_cast<bool>(prefill_result) && prefill_state.experts_executed,
-                               prefill_result ? "hybrid prefill fallback completes" : prefill_result.error().message.c_str());
-                pipeline_check(prefill_backend->in_flight == 0 && prefill_scratch.cache_leases.empty(),
-                               "hybrid prefill fallback drains submissions and leaves no scratch pins");
-                pipeline_check(prefill_backend->abort_count > aborts_before,
-                               "rejected or uncommitted Expert GPU work is cancelled before CPU fallback");
-                if (fail_commit_case)
-                    pipeline_check(prefill_backend->commit_attempts == commits_before + 1
-                                       && prefill_backend->executed == executed_before + 1,
-                                   "first resident Expert executes and its failed commit reaches CPU fallback");
-                if (fail_unresident_result_case)
-                {
-                    pipeline_check(prefill_backend->submission_count == submissions_before + 1
-                                       && prefill_backend->executed == executed_before + 1,
-                                   "final Failed statuses do not resubmit resident or cold Experts");
-                    pipeline_check(prefill_statistics.expert_cpu_fallbacks - cpu_fallbacks_before == 2
-                                       && prefill_statistics.expert_cpu_routes - cpu_routes_before == 2 * route_count
-                                       && prefill_statistics.expert_gpu_routes == gpu_routes_before,
-                                   "resident and NotResident-to-Failed Experts each use CPU fallback once");
-                }
-                if (reject_second_expert)
-                    pipeline_check(prefill_backend->rejected_requests - rejected_before == 1,
-                                   "second whole-Expert request is rejected on every route-count pass");
-                else
-                    pipeline_check(prefill_backend->rejected_requests == rejected_before,
-                                   "cold and single-resident cases submit no rejected Expert request");
+                pipeline_check(!prefill_result && prefill_result.error().code == ErrorCode::InternalError
+                                   && !prefill_state.experts_executed,
+                               "failed GPU prefill reports an execution error");
+                pipeline_check(prefill_backend->in_flight == 0 && prefill_backend->demands_in_flight == 0
+                                   && prefill_scratch.cache_leases.empty(),
+                               "failed GPU prefill drains submissions and releases scratch pins");
+                pipeline_check(prefill_statistics.expert_cpu_fallbacks == cpu_fallbacks_before
+                                   && prefill_statistics.expert_cpu_routes == cpu_routes_before
+                                   && prefill_statistics.expert_cpu_batches == cpu_batches_before,
+                               "failed GPU prefill does not perform CPU recovery");
+                for (const ExpertState& active : prefill_state.active_experts())
+                    pipeline_check(std::all_of(active.output.values().begin(), active.output.values().end(),
+                                               [](float value) { return value == -123.0f; }),
+                                   "failed GPU prefill leaves uncommitted outputs unpublished");
+                prefill_state.reset();
+                const auto cpu_result = forward_moe(prefill_model, prefill_moe, prefill_state, &prefill_statistics,
+                                                    prefill_scratch, 0, ExecutionBackend::Cpu, false);
+                pipeline_check(static_cast<bool>(cpu_result) && prefill_state.experts_executed,
+                               "an explicitly selected CPU prefill executes normally");
                 for (size_t expert_index = 0; expert_index < 2; ++expert_index)
                 {
                     const ExpertState& active = prefill_state.active_experts()[expert_index];
@@ -790,23 +859,37 @@ static void pipeline_engine(size_t capacity, bool fail_commit = false, bool inva
                 std::fill_n(active.output.row(0), active.output.rows() * active.output.columns(), -91.0f);
             }
 
+            const uint64_t cpu_routes_before = file_statistics.expert_cpu_routes;
+            const uint64_t cpu_batches_before = file_statistics.expert_cpu_batches;
             const auto result = forward_moe(file_model,
                                             file_moe,
                                             file_state,
                                             &file_statistics,
                                             file_scratch,
                                             0,
-                                            ExecutionBackend::Vulkan,
+                                            pass < 3 ? ExecutionBackend::Cpu : ExecutionBackend::Vulkan,
                                             false);
+            if (pass >= 3)
+            {
+                pipeline_check(!result && result.error().code == ErrorCode::InternalError
+                                   && !file_state.experts_executed,
+                               "failed file-backed GPU commit reports an execution error");
+                pipeline_check(file_statistics.expert_cpu_fallbacks == 0
+                                   && file_statistics.expert_cpu_routes == cpu_routes_before
+                                   && file_statistics.expert_cpu_batches == cpu_batches_before,
+                               "failed file-backed GPU commit does not recover through CPU");
+                pipeline_check(pass_backend->in_flight == 0 && file_scratch.cache_leases.empty(),
+                               "failed file-backed GPU work releases active submissions and pins");
+                for (const ExpertState& active : file_state.active_experts())
+                    pipeline_check(std::all_of(active.output.values().begin(), active.output.values().end(),
+                                               [](float value) { return value == -91.0f; }),
+                                   "failed file-backed GPU work leaves outputs unpublished");
+                continue;
+            }
             pipeline_check(static_cast<bool>(result) && file_state.experts_executed,
-                           pass < 3 ? "file-backed hybrid CPU fallback completes with a one-pair cache"
-                                    : "failed GPU commit retries both file-backed Experts with a one-pair cache");
+                           "explicit file-backed CPU execution completes with a one-pair cache");
             pipeline_check(pass_backend->in_flight == 0 && file_scratch.cache_leases.empty(),
                            "file-backed fallback drains submissions and leaves scratch unpinned");
-            if (pass >= 3)
-                pipeline_check(pass_backend->commit_attempts == pass - 2
-                                   && pass_backend->abort_count >= pass - 2,
-                               "failed GPU commits are aborted before sequential host-cache retries");
             for (size_t expert_index = 0; expert_index < 2; ++expert_index)
             {
                 const ExpertState& active = file_state.active_experts()[expert_index];
@@ -843,11 +926,113 @@ static void pipeline_engine(size_t capacity, bool fail_commit = false, bool inva
         }
         const ExpertCacheStatistics file_cache_statistics = file_model.expert_cache->statistics();
         pipeline_check(file_cache_statistics.resident_size <= file_pair_size
-                           && file_cache_statistics.misses >= 12
+                           && file_cache_statistics.misses >= 6
                            && file_cache_statistics.bytes_read >= file_pair_size * 2,
                        "one-pair host cache sequentially admits distinct file-backed Experts");
-        pipeline_check(file_statistics.expert_route_rank_demands[0] == 450,
+        pipeline_check(file_statistics.expert_route_rank_demands[0] == 225,
                        "hybrid fallback preserves per-route cache queue feedback");
+
+        const auto run_ready_before_slow_case = [&](size_t pair_count) {
+            const uint32_t original_flags = file_model.opt.flags;
+            file_model.opt.flags = 0;
+            MoeBlockPlan wave_moe;
+            wave_moe.experts.resize(pair_count);
+            for (size_t index = 0; index < pair_count; ++index)
+            {
+                wave_moe.experts[index] = file_moe.experts[index % 2];
+                wave_moe.experts[index].cache_key = "pipeline-ready-before-slow-" + std::to_string(index);
+            }
+            auto wave_backend = std::make_shared<PipelineTestBackend>(pair_count);
+            file_model.expert_backend = wave_backend;
+            auto blocked_miss = std::make_shared<PipelineBlockedReadMiss>(wave_moe.experts[1].cache_key);
+            file_model.expert_cache = std::make_shared<ExpertCache>(file_pair_size * pair_count, 2, blocked_miss, ExpertIoMode::Buffered);
+            LayerState wave_state;
+            wave_state.normalized.reset(pair_count, 32, false);
+            wave_state.resize_experts(pair_count);
+            for (size_t row = 0; row < pair_count; ++row)
+            {
+                for (uint32_t column = 0; column < wave_state.normalized.columns(); ++column)
+                    wave_state.normalized.row(row)[column] = static_cast<float>(static_cast<int>((row * 7 + column * 3) % 19) - 9) * 0.015625f;
+                ExpertState& active = wave_state.active_experts()[row];
+                active.batch.expert_id = static_cast<uint32_t>(row);
+                active.batch.routes = {{static_cast<uint32_t>(row), 0, 1.0f}};
+            }
+            const size_t target = pair_count > 8 ? 8 : 0;
+            std::promise<void> fast_submitted;
+            auto progress = fast_submitted.get_future();
+            bool signaled = false;
+            bool fast_before_slow = false;
+            size_t queued_before_first_compute = 0;
+            wave_backend->compute_submit_observer = [&](std::span<const ExpertRequest> requests) {
+                if (queued_before_first_compute == 0)
+                    queued_before_first_compute = file_model.expert_cache->statistics().queued_reads;
+                if (signaled || std::none_of(requests.begin(), requests.end(), [&](const ExpertRequest& request) {
+                        return request.key == wave_moe.experts[target].cache_key;
+                    })) return;
+                fast_before_slow = blocked_miss->blocked()
+                                   && std::none_of(requests.begin(), requests.end(), [&](const ExpertRequest& request) {
+                                          return request.key == wave_moe.experts[1].cache_key;
+                                      });
+                signaled = true;
+                blocked_miss->release();
+                fast_submitted.set_value();
+            };
+            ExpertScratch wave_scratch;
+            SessionStatistics wave_statistics;
+            auto execution = std::async(std::launch::async, [&] {
+                return forward_moe(file_model, wave_moe, wave_state, &wave_statistics,
+                                   wave_scratch, 0, ExecutionBackend::Vulkan, false);
+            });
+            const auto release_read = [&](void*) { blocked_miss->release(); };
+            std::unique_ptr<void, decltype(release_read)> cleanup(reinterpret_cast<void*>(1), release_read);
+            // A watchdog only prevents a broken head-of-line policy hanging
+            // the suite. Successful scheduling is driven by the submit signal.
+            const bool progressed = progress.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+            blocked_miss->release();
+            const auto result = execution.get();
+            pipeline_check(progressed && fast_before_slow,
+                           "a ready file-backed Expert must submit on GPU before an unrelated blocked read completes");
+            pipeline_check(queued_before_first_compute == pair_count,
+                           "host-budget read-ahead must enqueue beyond the first eight GPU upload candidates");
+            pipeline_check(static_cast<bool>(result) && wave_state.experts_executed && wave_backend->executed == pair_count,
+                           "all admitted cold file-backed Experts complete on the selected GPU backend");
+            if (pair_count == 2)
+                pipeline_check(wave_backend->demand_wave_sizes == std::vector<size_t>({1, 1})
+                                   && wave_backend->compute_wave_sizes == std::vector<size_t>({1, 1}),
+                               "fast and gated file-backed Experts execute as separate ready waves");
+            pipeline_check(wave_backend->maximum_wave <= 8,
+                           "host read-ahead must retain bounded GPU upload waves");
+            const auto cache_statistics = file_model.expert_cache->statistics();
+            pipeline_check(cache_statistics.queued_reads == pair_count
+                               && cache_statistics.bytes_read == file_pair_size * pair_count
+                               && cache_statistics.resident_size == file_pair_size * pair_count,
+                           "ready-wave scheduling loads every real file pair within the host capacity");
+            pipeline_check(wave_statistics.expert_gpu_routes == pair_count && wave_statistics.expert_cpu_routes == 0
+                               && wave_statistics.expert_cpu_batches == 0 && wave_statistics.expert_cpu_fallbacks == 0
+                               && wave_scratch.cache_leases.empty() && wave_backend->in_flight == 0,
+                           "ready file-backed waves drain GPU work without CPU execution or retained host pins");
+            for (size_t expert_index = 0; expert_index < pair_count; ++expert_index)
+            {
+                ActivationBuffer gathered(1, 32);
+                std::copy_n(wave_state.normalized.row(expert_index), 32, gathered.row(0));
+                ActivationBuffer activated;
+                forward_gate_up_mxfp4(gate_sources[expert_index % 2], nullptr, gathered,
+                                      ExpertActivation::DeepSeekSwiGlu, 4.0f, activated,
+                                      file_model.opt.optimization_flags);
+                const ActivationBuffer expected = forward_linear(down_sources[expert_index % 2], activated,
+                                                                 file_model.opt.optimization_flags);
+                const ActivationBuffer& actual = wave_state.active_experts()[expert_index].output;
+                pipeline_check(actual.rows() == expected.rows() && actual.columns() == expected.columns(),
+                               "ready file-backed waves preserve the independent CPU oracle shape");
+                for (size_t index = 0; index < expected.values().size(); ++index)
+                    pipeline_check(std::isfinite(actual.values()[index])
+                                       && std::abs(actual.values()[index] - expected.values()[index]) < 0.000001f,
+                                   "ready file-backed waves match the independent CPU oracle");
+            }
+            file_model.opt.flags = original_flags;
+        };
+        run_ready_before_slow_case(2);
+        run_ready_before_slow_case(10);
 
         const auto run_alias_capacity_case = [&](size_t pair_capacity, bool gpu_priority, bool fail_commit) {
             const size_t resident_id = fail_commit ? 1 : 0;
@@ -928,6 +1113,19 @@ static void pipeline_engine(size_t capacity, bool fail_commit = false, bool inva
                                      0,
                                      ExecutionBackend::Vulkan,
                                      false);
+            }
+            if (fail_commit)
+            {
+                pipeline_check(!result && result.error().code == ErrorCode::InternalError
+                                   && !alias_state.experts_executed,
+                               "failed resident GPU publication reports an execution error");
+                pipeline_check(alias_statistics.expert_cpu_batches == 0 && alias_statistics.expert_cpu_routes == 0
+                                   && alias_statistics.expert_cpu_fallbacks == 0 && alias_scratch.cache_leases.empty(),
+                               "failed resident GPU publication does not compute on CPU or retain host pins");
+                pipeline_check(backend->foreground_depth == 0 && backend->in_flight == 0,
+                               "failed resident GPU publication releases foreground compute owners");
+                backend->pending_admissions.clear();
+                return;
             }
             pipeline_check(static_cast<bool>(result) && alias_state.experts_executed,
                            "host cache recovers from aliases retained by backend admission");
@@ -1028,31 +1226,27 @@ static void pipeline_engine(size_t capacity, bool fail_commit = false, bool inva
             ExpertScratch throwing_scratch;
             SessionStatistics throwing_statistics;
             bool hook_called_with_pinned_wave = false;
-            bool caught_hook_exception = false;
-            try
+            Result<void> hook_result;
             {
                 ScopedExpertBackendForeground foreground(throwing_backend);
-                (void)forward_moe(file_model,
-                                  file_moe,
-                                  throwing_state,
-                                  &throwing_statistics,
-                                  throwing_scratch,
-                                  0,
-                                  ExecutionBackend::Vulkan,
-                                  false,
-                                  [&] {
-                                      hook_called_with_pinned_wave = true;
-                                      pipeline_check(throwing_state.active_experts()[0].lease.gate_up
-                                                         && throwing_backend->in_flight == 1,
-                                                     "exception hook runs with a host lease and resident GPU work in flight");
-                                      throw std::runtime_error("injected pinned-wave exception");
-                                  });
+                hook_result = forward_moe(file_model,
+                                          file_moe,
+                                          throwing_state,
+                                          &throwing_statistics,
+                                          throwing_scratch,
+                                          0,
+                                          ExecutionBackend::Vulkan,
+                                          false,
+                                          [&] {
+                                              hook_called_with_pinned_wave = true;
+                                              pipeline_check(throwing_state.active_experts()[0].lease.gate_up
+                                                                 && throwing_backend->in_flight == 1,
+                                                             "exception hook runs with a host lease and resident GPU work in flight");
+                                              throw std::runtime_error("injected pinned-wave exception");
+                                          });
             }
-            catch (const std::runtime_error& exception)
-            {
-                if (std::string(exception.what()) != "injected pinned-wave exception") throw;
-                caught_hook_exception = true;
-            }
+            const bool caught_hook_exception = !hook_result
+                                               && hook_result.error().message.find("injected pinned-wave exception") != std::string::npos;
             pipeline_check(hook_called_with_pinned_wave && caught_hook_exception,
                            "pinned-wave exception propagates from the existing independent-work hook");
             pipeline_check(throwing_backend->in_flight == 0
@@ -1078,8 +1272,8 @@ static void pipeline_engine(size_t capacity, bool fail_commit = false, bool inva
         file_model.expert_cache = std::make_shared<ExpertCache>(file_pair_size, 1, nullptr, ExpertIoMode::Buffered);
 
         auto error_backend = std::make_shared<PipelineTestBackend>(1);
-        error_backend->reject_second_request = true;
-        error_backend->fail_commit = true;
+        error_backend->reject_second_request = false;
+        error_backend->fail_commit = false;
         const ExpertDemandRequest resident_request{file_moe.experts[0].cache_key,
                                                    std::make_shared<const TensorData>(gate_sources[0]),
                                                    nullptr,
@@ -1091,20 +1285,15 @@ static void pipeline_engine(size_t capacity, bool fail_commit = false, bool inva
         std::array<std::shared_ptr<const void>, 1> resident_pins;
         pipeline_check(error_backend->prepare_demand_batch(std::span<const ExpertDemandRequest>(&resident_request, 1), resident_pins) == 1,
                        "file-backed error case seeds the first GPU Expert");
-        bool missing_source_installed = false;
-        const std::string missing_path = (file_root / "missing-expert-0.bin").string();
-        error_backend->admit_observer = [&](const std::string& key) {
-            if (key != file_moe.experts[1].cache_key) return;
-            auto gate_storage = std::make_shared<MxFp4FileStorage>(*file_model.weights.at(file_gates[0]).mxfp4_file_storage);
-            gate_storage->blocks_path = missing_path;
-            gate_storage->scales_path = missing_path;
-            file_model.weights.at_mutable(file_gates[0]).mxfp4_file_storage = std::move(gate_storage);
-            auto down_storage = std::make_shared<MxFp4FileStorage>(*file_model.weights.at(file_downs[0]).mxfp4_file_storage);
-            down_storage->blocks_path = missing_path;
-            down_storage->scales_path = missing_path;
-            file_model.weights.at_mutable(file_downs[0]).mxfp4_file_storage = std::move(down_storage);
-            missing_source_installed = true;
-        };
+        const std::string missing_path = (file_root / "missing-expert-1.bin").string();
+        auto missing_gate = std::make_shared<MxFp4FileStorage>(*file_model.weights.at(file_gates[1]).mxfp4_file_storage);
+        missing_gate->blocks_path = missing_path;
+        missing_gate->scales_path = missing_path;
+        file_model.weights.at_mutable(file_gates[1]).mxfp4_file_storage = std::move(missing_gate);
+        auto missing_down = std::make_shared<MxFp4FileStorage>(*file_model.weights.at(file_downs[1]).mxfp4_file_storage);
+        missing_down->blocks_path = missing_path;
+        missing_down->scales_path = missing_path;
+        file_model.weights.at_mutable(file_downs[1]).mxfp4_file_storage = std::move(missing_down);
         file_model.expert_backend = error_backend;
         file_state.reset();
         for (size_t row = 0; row < file_state.normalized.rows(); ++row)
@@ -1120,7 +1309,7 @@ static void pipeline_engine(size_t capacity, bool fail_commit = false, bool inva
             active.output.reset(65, 32, false);
             std::fill_n(active.output.row(0), active.output.rows() * active.output.columns(), -73.0f);
         }
-        const size_t aborts_before = error_backend->abort_count;
+        const uint64_t cpu_routes_before = file_statistics.expert_cpu_routes;
         const auto error_result = forward_moe(file_model,
                                               file_moe,
                                               file_state,
@@ -1129,10 +1318,12 @@ static void pipeline_engine(size_t capacity, bool fail_commit = false, bool inva
                                               0,
                                               ExecutionBackend::Vulkan,
                                               false);
-        pipeline_check(missing_source_installed && !error_result && error_result.error().code == ErrorCode::IoError,
-                       "missing Expert 0 file during sequential CPU fallback reports the cache read error");
-        pipeline_check(error_backend->in_flight == 0 && error_backend->abort_count > aborts_before,
-                       "file-backed error drains and cancels the already submitted GPU Expert");
+        pipeline_check(!error_result && error_result.error().code == ErrorCode::IoError,
+                       "missing cold Expert file reports its GPU staging read error");
+        pipeline_check(error_backend->in_flight == 0 && error_backend->demands_in_flight == 0
+                           && file_statistics.expert_cpu_routes == cpu_routes_before
+                           && file_statistics.expert_cpu_fallbacks == 0,
+                       "file-backed staging error drains GPU work without CPU recovery");
         pipeline_check(file_scratch.cache_leases.empty(),
                        "file-backed error leaves no transient scratch cache pins");
         for (const ExpertState& active : file_state.active_experts())

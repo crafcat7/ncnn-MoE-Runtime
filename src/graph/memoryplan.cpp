@@ -5,6 +5,7 @@
 #include "kernels/mxfp4.h"
 #include "kernels/qnk.h"
 #include "kernels/int4.h"
+#include "models/modeladapter.h"
 
 #include <algorithm>
 #include <charconv>
@@ -17,6 +18,23 @@
 
 namespace ncnn {
 namespace moe {
+
+Result<uint64_t> plan_host_output_slot_size(uint64_t rows, uint32_t columns)
+{
+    constexpr uint64_t alignment = 64;
+    constexpr uint64_t maximum = std::numeric_limits<uint64_t>::max();
+    if (rows == 0 || columns == 0 || rows > static_cast<uint64_t>(std::numeric_limits<int>::max())
+        || columns > static_cast<uint32_t>(std::numeric_limits<int>::max())
+        || rows > maximum / columns / sizeof(float))
+        return Error{ErrorCode::InvalidArgument, "Vulkan host output shape exceeds the allocation range"};
+    const uint64_t bytes = rows * columns * sizeof(float);
+    if (bytes > maximum - (alignment - 1))
+        return Error{ErrorCode::InvalidArgument, "Vulkan host output alignment exceeds the allocation range"};
+    const uint64_t aligned = (bytes + alignment - 1) / alignment * alignment;
+    if (aligned > std::numeric_limits<size_t>::max())
+        return Error{ErrorCode::InvalidArgument, "Vulkan host output size exceeds the addressable range"};
+    return aligned;
+}
 
 static constexpr uint64_t gibibyte = 1024ull * 1024ull * 1024ull;
 static constexpr uint64_t mebibyte = 1024ull * 1024ull;
@@ -882,13 +900,6 @@ static Result<uint64_t> packed_expert_pair_size(const MoeModelDescriptor& descri
     return checked_add(gate_up.value(), down.value(), "packed expert pair");
 }
 
-enum class QnkExpertEncoding
-{
-    None,
-    FileBacked,
-    Unsupported
-};
-
 static bool mapped_ple_embedding_shard(const std::string& name, const TensorData& tensor,
                                        const MoeModelDescriptor& descriptor) noexcept
 {
@@ -924,7 +935,7 @@ static bool mapped_ple_embedding_shard(const std::string& name, const TensorData
     return ple.embedding_dimension % heads == 0 && tensor.shape[1] == ple.embedding_dimension / heads;
 }
 
-static Result<uint64_t> qwen_vulkan_releasable_dense_size(const MoeModelDescriptor& descriptor,
+static Result<uint64_t> gated_residual_vulkan_releasable_dense_size(const MoeModelDescriptor& descriptor,
                                                           const Option& opt, const WeightMapping& weights)
 {
     const uint64_t required_flags = OptimizationVulkanAttention | OptimizationVulkanQnK
@@ -1022,10 +1033,10 @@ static Result<uint64_t> qwen_vulkan_releasable_dense_size(const MoeModelDescript
         const uint64_t width = tensor.dtype == DType::Float32    ? sizeof(float)
                                : tensor.dtype == DType::BFloat16 ? sizeof(uint16_t)
                                                                  : 1;
-        auto bytes = checked_multiply(count, width, "resident Qwen owned dense release");
+        auto bytes = checked_multiply(count, width, "resident gated residual owned dense release");
         if (!bytes)
             return bytes.error();
-        auto total = checked_add(released, bytes.value(), "resident Qwen dense release");
+        auto total = checked_add(released, bytes.value(), "resident gated residual dense release");
         if (!total)
             return total.error();
         released = total.value();
@@ -1037,7 +1048,7 @@ static Result<uint64_t> qwen_vulkan_releasable_dense_size(const MoeModelDescript
         {
             // A tied embedding or any other surviving alias retains the
             // complete owner, exactly as final host-release accounting does.
-            auto total = checked_add(released, state.bytes, "resident Qwen mapped dense release");
+            auto total = checked_add(released, state.bytes, "resident gated residual mapped dense release");
             if (!total)
                 return total.error();
             released = total.value();
@@ -1048,8 +1059,7 @@ static Result<uint64_t> qwen_vulkan_releasable_dense_size(const MoeModelDescript
 
 static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeModelDescriptor& descriptor,
                                         ModelMemoryPlan& plan, uint64_t& expert_fixed_size,
-                                        uint64_t& max_qnk_cache_pair_size,
-                                        QnkExpertEncoding& qnk_encoding)
+                                        uint64_t& max_cache_pair_size)
 {
     struct MappedExpertSize
     {
@@ -1059,9 +1069,6 @@ static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeM
     };
     // WeightMapping owns these names for the lifetime of this local aggregation.
     std::map<std::string_view, MappedExpertSize> expert_sizes;
-    bool found = false;
-    bool qnk_only = true;
-    bool file_backed = true;
     for (const auto& [name, tensor] : weights)
     {
         uint64_t bytes = tensor.dtype == DType::Int4
@@ -1102,19 +1109,6 @@ static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeM
         const size_t marker = name.find(".experts.");
         if (marker != std::string::npos)
         {
-            if (name.ends_with(".weight"))
-            {
-                if (is_qnk_dtype(tensor.dtype))
-                {
-                    found = true;
-                    file_backed = file_backed && static_cast<bool>(tensor.mxfp4_file_storage);
-                }
-                else
-                {
-                    qnk_only = false;
-                }
-            }
-
             const size_t end = name.find('.', marker + 9);
             if (end == std::string::npos)
                 return Error{ErrorCode::InvalidModel, "invalid canonical Expert tensor name: " + name};
@@ -1123,7 +1117,9 @@ static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeM
             if (!total)
                 return total.error();
             expert_size.total = total.value();
-            if (tensor.dtype == DType::MxFp4 || is_qnk_dtype(tensor.dtype))
+            const bool mapped_bfloat16 = name.ends_with(".weight")
+                                         && tensor.dtype == DType::BFloat16 && tensor.mapped_data;
+            if (tensor.dtype == DType::MxFp4 || is_qnk_dtype(tensor.dtype) || mapped_bfloat16)
             {
                 if (tensor.input_column_indices.size()
                     > std::numeric_limits<uint64_t>::max() / sizeof(uint32_t))
@@ -1145,7 +1141,16 @@ static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeM
 
                 if (metadata > bytes)
                     return Error{ErrorCode::InvalidModel, "Expert metadata exceeds its storage"};
-                const uint64_t raw_size = tensor.mxfp4_file_storage ? file_size : bytes - metadata;
+                const uint64_t raw_size = mapped_bfloat16
+                                              ? tensor.mapped_size
+                                              : (tensor.mxfp4_file_storage ? file_size : bytes - metadata);
+                if (raw_size > bytes - metadata)
+                    return Error{ErrorCode::InvalidModel, "Expert pageable storage exceeds its byte count"};
+                auto owned = checked_add(expert_fixed_size, bytes - metadata - raw_size,
+                                         "retained Expert allocations");
+                if (!owned)
+                    return owned.error();
+                expert_fixed_size = owned.value();
                 auto raw = checked_add(expert_size.raw, raw_size, "native Expert blocks");
                 if (!raw)
                     return raw.error();
@@ -1153,7 +1158,7 @@ static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeM
             }
             else
             {
-                auto resident = checked_add(expert_fixed_size, bytes, "resident non-Qn_K Expert weights");
+                auto resident = checked_add(expert_fixed_size, bytes, "fixed Expert storage");
                 if (!resident)
                     return resident.error();
                 expert_fixed_size = resident.value();
@@ -1167,9 +1172,6 @@ static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeM
             plan.estimated_dense_size = total.value();
         }
     }
-    qnk_encoding = !found ? QnkExpertEncoding::None
-                          : (qnk_only && file_backed ? QnkExpertEncoding::FileBacked
-                                                     : QnkExpertEncoding::Unsupported);
     for (const auto& [name, expert_size] : expert_sizes)
     {
         (void)name;
@@ -1187,7 +1189,7 @@ static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeM
                                          "resident Qn_K Expert pair");
         if (!resident_pair)
             return resident_pair.error();
-        max_qnk_cache_pair_size = std::max(max_qnk_cache_pair_size, resident_pair.value());
+        max_cache_pair_size = std::max(max_cache_pair_size, resident_pair.value());
     }
     plan.expert_pair_resident_size = plan.expert_pair_size;
     plan.estimated_expert_resident_size = plan.estimated_expert_size;
@@ -1198,13 +1200,16 @@ static Result<void> mapped_weight_sizes(const WeightMapping& weights, const MoeM
     return {};
 }
 
-Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, const Option& opt, uint64_t physical_memory_size,
+Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& input_descriptor, const Option& opt, uint64_t physical_memory_size,
                                           bool use_vulkan_dense,
                                           uint64_t available_memory_size,
                                           bool reserve_cpu_packed_weights,
                                           const WeightMapping* weights,
                                           bool use_vulkan_attention)
 {
+    MoeModelDescriptor descriptor = input_descriptor;
+    if (weights)
+        normalize_expert_storage(descriptor, *weights);
     if (opt.expert_memory_mode != ExpertMemoryMode::Auto
         && opt.expert_memory_mode != ExpertMemoryMode::Eager
         && opt.expert_memory_mode != ExpertMemoryMode::OnDemand)
@@ -1215,8 +1220,7 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
     ModelMemoryPlan plan;
     bool budget_limited_by_available_memory = false;
     uint64_t expert_fixed_size = 0;
-    uint64_t max_qnk_cache_pair_size = 0;
-    QnkExpertEncoding qnk_encoding = QnkExpertEncoding::None;
+    uint64_t max_cache_pair_size = 0;
     plan.requested_mode = opt.expert_memory_mode;
     plan.physical_memory_size = physical_memory_size;
     plan.available_memory_size = available_memory_size;
@@ -1255,8 +1259,7 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
             return Error{ErrorCode::UnsupportedModel, "native imported weights require CpuPackedWeightMode::Disabled"};
         auto sizes = mapped_weight_sizes(*weights, descriptor, plan,
                                          expert_fixed_size,
-                                         max_qnk_cache_pair_size,
-                                         qnk_encoding);
+                                         max_cache_pair_size);
         if (!sizes)
             return sizes.error();
     }
@@ -1283,8 +1286,6 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
         return !layer.dense.enabled();
     });
     const MoeDescriptor& moe = first_moe->moe;
-    const bool has_qnk_experts = qnk_encoding != QnkExpertEncoding::None;
-    const bool file_backed_qnk_experts = qnk_encoding == QnkExpertEncoding::FileBacked;
     const auto add_expert_layers = [&](const MoeDescriptor& layer_moe,
                                        uint64_t layer_count) -> Result<void> {
         auto pair_size = expert_pair_size(descriptor, layer_moe.expert_weight_dtype);
@@ -1372,12 +1373,12 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
     {
         eager_capacity = plan.host_memory_budget - plan.estimated_dense_size - safety_reserve;
     }
-    const auto supports_file_backed_experts = [has_qnk_experts, file_backed_qnk_experts](const MoeDescriptor& descriptor) {
-        if (has_qnk_experts)
-            return file_backed_qnk_experts;
-        return descriptor.expert_weight_dtype == DType::MxFp4
-               || (descriptor.expert_weight_dtype == DType::BFloat16
-                   && has_flag(descriptor.flags, MoeDescriptorFileBackedExperts));
+    const auto supports_file_backed_experts = [weights](const MoeDescriptor& moe) {
+        if (weights)
+            return has_flag(moe.flags, MoeDescriptorFileBackedExperts);
+        return moe.expert_weight_dtype == DType::MxFp4
+               || (moe.expert_weight_dtype == DType::BFloat16
+                   && has_flag(moe.flags, MoeDescriptorFileBackedExperts));
     };
     if (!supports_file_backed_experts(moe))
     {
@@ -1458,7 +1459,7 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
         if (weights && descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
         {
             if (use_vulkan_attention)
-                releasable = qwen_vulkan_releasable_dense_size(descriptor, opt, *weights);
+                releasable = gated_residual_vulkan_releasable_dense_size(descriptor, opt, *weights);
         }
         else
             releasable = latent_vulkan_releasable_dense_size(descriptor);
@@ -1473,16 +1474,15 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
             eager_capacity = plan.host_memory_budget - plan.estimated_dense_size - cache_safety_reserve;
         }
     }
-    if (plan.selected_mode == ExpertMemoryMode::OnDemand
-        && (file_backed_qnk_experts || (weights && moe.expert_weight_dtype == DType::MxFp4)))
+    if (plan.selected_mode == ExpertMemoryMode::OnDemand && weights)
     {
         auto fixed_resident = checked_add(plan.estimated_dense_size, expert_fixed_size,
-                                          "fixed Qn_K Expert weights");
+                                          "fixed Expert storage");
         if (!fixed_resident)
             return fixed_resident.error();
         plan.estimated_dense_size = fixed_resident.value();
 
-        plan.expert_pair_resident_size = max_qnk_cache_pair_size;
+        plan.expert_pair_resident_size = max_cache_pair_size;
         auto active = checked_multiply(plan.expert_pair_resident_size,
                                        descriptor.experts_per_token,
                                        "mapped active Experts");

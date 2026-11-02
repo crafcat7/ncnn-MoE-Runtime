@@ -25,6 +25,14 @@ struct MoeCombineInput_vulkan
     std::span<const ExpertRoute> routes;
 };
 
+#if NCNN_MOE_WITH_VULKAN
+struct MoeCombineDeviceInput_vulkan
+{
+    const ncnn::VkMat* value = nullptr;
+    std::span<const ExpertRoute> routes;
+};
+#endif
+
 // Owns every activation and route needed by an unsubmitted Combine. Device
 // results are retained; host results are copied only when a device result is absent.
 class MoeCombinePending_vulkan
@@ -48,6 +56,7 @@ public:
     MoeCombine_vulkan(const MoeCombine_vulkan&) = delete;
     MoeCombine_vulkan& operator=(const MoeCombine_vulkan&) = delete;
     [[nodiscard]] static std::shared_ptr<MoeCombine_vulkan> create(std::shared_ptr<VulkanContext> context);
+    [[nodiscard]] bool supports_grouped_single_row() const noexcept;
     [[nodiscard]] bool combine(std::span<const MoeCombineInput_vulkan> inputs,
                                size_t rows, uint32_t columns,
                                const ActivationBuffer* shared_host,
@@ -65,6 +74,15 @@ public:
     [[nodiscard]] bool record(const MoeCombinePending_vulkan& pending, ncnn::VkMat& output,
                               ncnn::VkCompute& command, std::vector<ncnn::VkMat>& storage,
                               uint64_t& uploads) const;
+    // Raw results may have been recorded earlier in this same command. They
+    // are private operands, not published completed DeviceTensors.
+    // Routes are indexed by token with stable CSR insertion; input order and
+    // repeated routes' order are preserved in the floating-point reduction.
+    [[nodiscard]] bool record_device_inputs(std::span<const MoeCombineDeviceInput_vulkan> inputs,
+                                            size_t rows, uint32_t columns, ncnn::VkMat& output,
+                                            ncnn::VkCompute& command, std::vector<ncnn::VkMat>& storage,
+                                            const ncnn::VkMat* shared = nullptr,
+                                            uint64_t* recorded_dispatches = nullptr) const;
     [[nodiscard]] const std::shared_ptr<ncnn::Pipeline>& pipeline() const noexcept;
 #endif
     // Inputs and their route spans must be in the CPU executor's canonical order.

@@ -23,6 +23,7 @@ namespace moe {
 class ExpertVictimCache;
 class ExpertResidencyCoordinator;
 class DeviceTensor_vulkan;
+class ResidentFfnRegion_vulkan;
 
 struct ExpertKeyHash
 {
@@ -43,7 +44,7 @@ enum class ExpertStatus : uint8_t
 
 inline constexpr size_t vulkan_expert_gpu_min_rows = 2;
 
-// Admission is asynchronous; CPU remains available while weights upload.
+// Admission is asynchronous; independent work can proceed while weights upload.
 inline constexpr size_t vulkan_expert_gpu_admission_min_rows = 2;
 
 inline constexpr size_t vulkan_expert_gpu_victim_min_rows = 32;
@@ -99,7 +100,7 @@ struct ExpertRequest
     uint64_t weight_size = 0;
     RouteAggregation route_aggregation;
     // Optional completed normalized batch. Host input may be absent until
-    // the caller actually needs CPU fallback.
+    // independent host work needs a materialized operand.
     std::shared_ptr<const DeviceTensor_vulkan> device_input;
     std::span<const ExpertRoute> device_routes;
     // Optional completed FP32 output, published only by successful commit().
@@ -109,6 +110,10 @@ struct ExpertRequest
     // gathered host tensor. Legacy callers can continue providing input only.
     size_t input_rows = 0;
     uint32_t input_columns = 0;
+    // A forward-private region uploads the complete normalized batch once,
+    // retaining routed outputs until its canonical final-wave reduction.
+    std::shared_ptr<ResidentFfnRegion_vulkan> region;
+    size_t region_index = 0;
 
     [[nodiscard]] size_t rows() const noexcept
     {
@@ -185,7 +190,7 @@ public:
 
     // commit() is the sole publication point. It must publish all successful
     // outputs atomically from the caller's perspective; false leaves every
-    // reserved request eligible for CPU fallback.
+    // reserved request unpublished; the caller reports a selected-backend error.
     [[nodiscard]] virtual bool commit() = 0;
 
     // abort() makes the submission non-publishable and is idempotent.
@@ -197,12 +202,18 @@ class ExpertBackend
 public:
     virtual ~ExpertBackend() = default;
 
+    [[nodiscard]] virtual bool supports_resident_region() const noexcept
+    {
+        return false;
+    }
+
     // Weight ownership is retained until asynchronous admission completes.
     virtual void admit(const ExpertDemandRequest& request) = 0;
 
     // Complete a bounded current-wave upload. On success, pin keeps the
     // resident pair alive until submit_batch captures its selected entries.
-    // Unsupported or exhausted backends leave pin empty for CPU fallback.
+    // Unsupported or exhausted backends leave pin empty. The caller handles
+    // missing capacity according to the selected execution backend.
     [[nodiscard]] virtual bool prepare_demand(const ExpertDemandRequest& request,
                                               std::shared_ptr<const void>& pin)
     {
@@ -214,7 +225,8 @@ public:
     // Return a prepared contiguous prefix. Each successful request owns a
     // nonempty pin; every unprepared pin is empty. Capacity-limited callers
     // execute and release their current wave before retrying the remainder.
-    // A zero prefix leaves the first request eligible for CPU fallback.
+    // A zero prefix leaves the first request unprepared; the caller handles
+    // missing capacity according to the selected execution backend.
     [[nodiscard]] virtual size_t prepare_demand_batch(std::span<const ExpertDemandRequest> requests,
                                                       std::span<std::shared_ptr<const void>> pins);
 

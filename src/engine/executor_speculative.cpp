@@ -16,6 +16,7 @@
 #include "ncnn/moe/session.h"
 
 #include <algorithm>
+#include <exception>
 #include <limits>
 #include <utility>
 
@@ -181,6 +182,22 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
     if (!dispatched)
         return dispatched.error();
     prepare_experts(moe, layer_state, statistics);
+    const auto execute_shared = [&]() -> Result<void> {
+        if (execution.shared_expert_group >= graph.nodes.size())
+            return Error{ErrorCode::InternalError, "speculative execution graph has no shared Expert binding"};
+        const bool require_gpu = graph.nodes[execution.shared_expert_group].backend == ExecutionBackend::Vulkan
+                                 && model.opt.hybrid_mode == HybridMode::HybridExperts;
+        try
+        {
+            forward_shared_expert(model, moe, layer_state.normalized, layer_state.shared_expert_output,
+                                  layer_state.shared_expert_workspace, {}, nullptr, false, require_gpu);
+        }
+        catch (const std::exception& error)
+        {
+            return Error{ErrorCode::InternalError, error.what()};
+        }
+        return {};
+    };
 
     if (has_flag(graph.nodes[execution.expert_dispatch].flags, ExecutionNodeRequestExperts))
     {
@@ -193,8 +210,8 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
                                          layer.layer_id);
         if (!requested)
             return requested.error();
-        forward_shared_expert(model, moe, layer_state.normalized, layer_state.shared_expert_output,
-                              layer_state.shared_expert_workspace);
+        auto shared = execute_shared();
+        if (!shared) return shared.error();
     }
 
     auto executed = forward_moe(model,
@@ -209,11 +226,8 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
         return executed.error();
     if (moe.has_shared_expert && layer_state.shared_expert_output.rows() == 0)
     {
-        forward_shared_expert(model,
-                              moe,
-                              layer_state.normalized,
-                              layer_state.shared_expert_output,
-                              layer_state.shared_expert_workspace);
+        auto shared = execute_shared();
+        if (!shared) return shared.error();
     }
     ActivationBuffer& moe_output = layer_state.normalized;
     const bool has_backend_aggregation = init_moe_output(scratch,

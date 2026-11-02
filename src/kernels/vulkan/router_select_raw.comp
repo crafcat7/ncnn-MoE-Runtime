@@ -1,0 +1,151 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint EXPERTS_PER_LANE = 1;
+
+layout(binding = 0) readonly buffer logits_blob
+{ float logits[]; };
+layout(binding = 1) writeonly buffer selected_blob
+{ float selected[]; };
+
+layout(push_constant) uniform parameter
+{
+    uint expert_count;
+    uint top_k;
+    float scaling;
+}
+p;
+
+float approximate_exp(float value)
+{
+    if (value >= 104.0)
+        return uintBitsToFloat(0x7f800000u);
+    if (value <= -104.0)
+        return 0.0;
+    const bool negative = value < 0.0;
+    const float magnitude = abs(value);
+    // Preserve the FP32 rounding step in range reduction.
+    precise float exponent = fma(magnitude, 1.4426950408889634, 12582912.0) - 12582912.0;
+    const float remainder = fma(exponent, -0.693145751953125,
+                                fma(exponent, -0.000001428606765330187, magnitude));
+    float polynomial = 0.00137805939;
+    polynomial = fma(polynomial, remainder, 0.00837312452);
+    polynomial = fma(polynomial, remainder, 0.0416695364);
+    polynomial = fma(polynomial, remainder, 0.166664720);
+    polynomial = fma(polynomial, remainder, 0.499999851);
+    polynomial = fma(polynomial, remainder, 1.0);
+    polynomial = fma(polynomial, remainder, 1.0);
+    const int exponent_integer = int(exponent);
+    const uint exponent_bits = uint(exponent_integer) << 23;
+    const uint underflow_bias = exponent_integer > 0 ? 0u : 0x83000000u;
+    const float scale_high = uintBitsToFloat(0x7f000000u + underflow_bias);
+    const float scale_low = uintBitsToFloat(exponent_bits - underflow_bias);
+    const float result = (polynomial * scale_high) * scale_low;
+    return negative ? 1.0 / result : result;
+}
+
+void main()
+{
+    const uint lane = gl_SubgroupInvocationID;
+    const uint subgroup = gl_SubgroupSize;
+    const uint row = gl_WorkGroupID.y;
+    const uint input_base = row * p.expert_count;
+    const uint output_base = row * (p.top_k * 2 + 1);
+    const float negative_infinity = -uintBitsToFloat(0x7f800000u);
+    float candidates[EXPERTS_PER_LANE];
+    uint invalid = 0;
+    for (uint slot = 0; slot < EXPERTS_PER_LANE; ++slot)
+    {
+        const uint expert = slot * subgroup + lane;
+        const float value = expert < p.expert_count ? logits[input_base + expert] : negative_infinity;
+        candidates[slot] = value;
+        if (expert < p.expert_count && (isnan(value) || isinf(value)))
+            invalid = 1;
+    }
+    for (uint mask = subgroup / 2; mask != 0; mask /= 2)
+        invalid |= subgroupShuffleXor(invalid, mask);
+    if (invalid != 0)
+    {
+        if (lane == 0)
+            selected[output_base + p.top_k * 2] = 1.0;
+        return;
+    }
+
+    // K is at most 64 and a full subgroup has at least 32 lanes. Retain at
+    // most two selected ranks per lane rather than lane-zero private arrays.
+    float selected_score0 = 0.0;
+    float selected_score1 = 0.0;
+    uint selected_id0 = 0;
+    uint selected_id1 = 0;
+    for (uint rank = 0; rank < p.top_k; ++rank)
+    {
+        float winner_score = negative_infinity;
+        uint winner_id = 0xffffffffu;
+        for (uint slot = 0; slot < EXPERTS_PER_LANE; ++slot)
+        {
+            const uint expert = slot * subgroup + lane;
+            const float candidate = candidates[slot];
+            if (expert < p.expert_count
+                && (candidate > winner_score || (candidate == winner_score && expert < winner_id)))
+            {
+                winner_score = candidate;
+                winner_id = expert;
+            }
+        }
+        for (uint mask = subgroup / 2; mask != 0; mask /= 2)
+        {
+            const float other_score = subgroupShuffleXor(winner_score, mask);
+            const uint other_id = subgroupShuffleXor(winner_id, mask);
+            if (other_score > winner_score || (other_score == winner_score && other_id < winner_id))
+            {
+                winner_score = other_score;
+                winner_id = other_id;
+            }
+        }
+        if (rank == lane)
+        {
+            selected_score0 = winner_score;
+            selected_id0 = winner_id;
+        }
+        if (rank == lane + subgroup)
+        {
+            selected_score1 = winner_score;
+            selected_id1 = winner_id;
+        }
+        if (winner_id % subgroup == lane)
+            candidates[winner_id / subgroup] = negative_infinity;
+    }
+
+    const float maximum = subgroupShuffle(selected_score0, 0u);
+    const float weight0 = lane < p.top_k ? approximate_exp(selected_score0 - maximum) : 0.0;
+    const float weight1 = lane + subgroup < p.top_k ? approximate_exp(selected_score1 - maximum) : 0.0;
+    // Preserve the generic shader's ascending-rank FP32 addition order.
+    // Replacing this with a tree sum can perturb downstream expert weights.
+    float selected_sum = 0.0;
+    for (uint rank = 0; rank < p.top_k; ++rank)
+    {
+        const float local_weight = rank < subgroup ? weight0 : weight1;
+        selected_sum += subgroupShuffle(local_weight, rank % subgroup);
+    }
+    if (selected_sum <= 0.0)
+    {
+        if (lane == 0)
+            selected[output_base + p.top_k * 2] = 2.0;
+        return;
+    }
+    if (lane < p.top_k)
+    {
+        selected[output_base + lane] = float(selected_id0);
+        selected[output_base + p.top_k + lane] = (weight0 / selected_sum) * p.scaling;
+    }
+    if (lane + subgroup < p.top_k)
+    {
+        selected[output_base + lane + subgroup] = float(selected_id1);
+        selected[output_base + p.top_k + lane + subgroup] = (weight1 / selected_sum) * p.scaling;
+    }
+    if (lane == 0)
+        selected[output_base + p.top_k * 2] = 0.0;
+}

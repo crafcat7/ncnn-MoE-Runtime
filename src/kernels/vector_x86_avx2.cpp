@@ -6,6 +6,7 @@
 #include <bit>
 #include <cmath>
 #include <immintrin.h>
+#include <limits>
 
 #if defined(__clang__)
 #pragma clang attribute push(__attribute__((target("avx2,fma"))), apply_to = function)
@@ -667,6 +668,59 @@ void avx2_bfloat16_weighted_scale(float* output, const float* input, const uint1
         const float value = std::bit_cast<float>(static_cast<uint32_t>(weight[index]) << 16);
         output[index] = input[index] * scale * (value + weight_offset);
     }
+}
+
+size_t avx2_float_argmax(const float* values, size_t count) noexcept
+{
+    if (count == 0)
+        return 0;
+
+    const __m256 negative_infinity = _mm256_set1_ps(-std::numeric_limits<float>::infinity());
+    __m256 maxima = negative_infinity;
+    size_t index = 0;
+    for (; count - index >= 8; index += 8)
+    {
+        const __m256 current = _mm256_loadu_ps(values + index);
+        const __m256i exponent = _mm256_and_si256(_mm256_castps_si256(current),
+                                                  _mm256_set1_epi32(0x7f800000));
+        const __m256i nonfinite = _mm256_cmpeq_epi32(exponent, _mm256_set1_epi32(0x7f800000));
+        const __m256i finite = _mm256_andnot_si256(nonfinite, _mm256_set1_epi32(-1));
+        const __m256 sanitized = _mm256_blendv_ps(negative_infinity, current,
+                                                  _mm256_castsi256_ps(finite));
+        maxima = _mm256_max_ps(maxima, sanitized);
+    }
+
+    const __m128 low = _mm256_castps256_ps128(maxima);
+    const __m128 high = _mm256_extractf128_ps(maxima, 1);
+    alignas(16) float lanes[4];
+    _mm_store_ps(lanes, _mm_max_ps(low, high));
+    float maximum = lanes[0];
+    for (size_t lane = 1; lane < 4; ++lane)
+        if (lanes[lane] > maximum)
+            maximum = lanes[lane];
+    for (; index < count; ++index)
+    {
+        const float current = values[index];
+        if (std::isfinite(current) && current > maximum)
+            maximum = current;
+    }
+    if (maximum == -std::numeric_limits<float>::infinity())
+        return count;
+
+    const __m256 target = _mm256_set1_ps(maximum);
+    index = 0;
+    for (; count - index >= 8; index += 8)
+    {
+        const __m256 current = _mm256_loadu_ps(values + index);
+        const __m256 equal = _mm256_cmp_ps(current, target, _CMP_EQ_OQ);
+        const unsigned lanes_equal = static_cast<unsigned>(_mm256_movemask_ps(equal));
+        if (lanes_equal != 0)
+            return index + std::countr_zero(lanes_equal);
+    }
+    for (; index < count; ++index)
+        if (values[index] == maximum)
+            return index;
+    return count;
 }
 
 } // namespace moe

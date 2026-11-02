@@ -24,6 +24,8 @@ namespace moe {
 class VulkanContext;
 class VulkanWeightUploadBatch;
 class GatedDeltaNet_vulkan;
+class SharedFfn_vulkan;
+struct FfnRecordStatistics_vulkan;
 
 class Linear
 {
@@ -40,6 +42,9 @@ public:
                                                               const VulkanRuntimePtr& vulkan_runtime,
                                                               uint64_t optimization_flags);
     [[nodiscard]] bool forward(const ActivationBuffer& input, ActivationBuffer& output) const;
+    // Records a device projection without submitting or publishing counters.
+    // The caller holds the context lock and retains inputs/outputs until completion.
+    [[nodiscard]] int forward(const ncnn::VkMat& input, ncnn::VkMat& output, ncnn::VkCompute& cmd, const ncnn::Option& opt) const;
 
 private:
     friend class CommandGraph_vulkan;
@@ -47,9 +52,9 @@ private:
     friend class Router_vulkan;
     friend class LatentAttention_vulkan;
     friend class LayerHead_vulkan;
+    friend class GpuSegment_vulkan;
+    friend class GpuSegmentContinuation_vulkan;
 
-    // Records a device projection; the caller holds the Vulkan context lock.
-    [[nodiscard]] int forward(const ncnn::VkMat& input, ncnn::VkMat& output, ncnn::VkCompute& cmd, const ncnn::Option& opt) const;
     [[nodiscard]] const std::shared_ptr<VulkanContext>& vulkan_context() const noexcept;
     [[nodiscard]] const ncnn::Option& option() const noexcept;
     [[nodiscard]] uint32_t input_columns() const noexcept;
@@ -93,8 +98,12 @@ private:
     friend class LatentAttention_vulkan;
     friend class LayerHead_vulkan;
     friend class QsaAttention_vulkan;
-    friend class QwenLayer_vulkan;
+    friend class GatedResidualLayer_vulkan;
     friend class GatedResidual_vulkan;
+    friend class GpuSegment_vulkan;
+    friend class GpuSegmentContinuation_vulkan;
+    friend class GpuSegmentWorkspace_vulkan;
+    friend class ResidentFfnRegion_vulkan;
 
     // Wraps a completed unpacked FP32 device result without materializing it.
     [[nodiscard]] bool assign_completed(const ncnn::VkMat& value,
@@ -153,6 +162,8 @@ public:
                                                                              uint32_t vulkan_device_index,
                                                                              const VulkanRuntimePtr& vulkan_runtime,
                                                                              uint64_t optimization_flags);
+    [[nodiscard]] static std::vector<uint64_t> swiglu_scratch_elements(uint32_t intermediate_columns,
+                                                                       bool router_gate, uint64_t rows);
     [[nodiscard]] bool prepare_rms_norm(const TensorData& weight,
                                         float epsilon,
                                         float weight_offset = 0.0f);
@@ -160,6 +171,9 @@ public:
     [[nodiscard]] bool prepare_input_rms_norm(const TensorData& weight, float epsilon);
     [[nodiscard]] bool prepare_output_rms_norm(const TensorData& weight, float epsilon);
     [[nodiscard]] bool forward(const ActivationBuffer& input, ActivationBuffer& output) const;
+    // Records a device projection without submitting or publishing counters.
+    // The caller holds the context lock and retains inputs/outputs until completion.
+    [[nodiscard]] int forward(const ncnn::VkMat& input, ncnn::VkMat& output, ncnn::VkCompute& cmd, const ncnn::Option& opt) const;
     // Executes two independent BF16 projections from one input batch in a
     // single command buffer.  The outputs are downloaded separately, while
     // the input upload and submit/wait are shared.
@@ -190,6 +204,12 @@ public:
     [[nodiscard]] bool materialize(const DeviceTensor_vulkan& input, ActivationBuffer& output) const;
 
 #if NCNN_MOE_WITH_VULKAN
+    // Records the prepared RMSNorm and BF16 projection as one dispatch.
+    // The caller holds the context lock, retains input/output until completion,
+    // and owns submission and success counters. False does not change output.
+    [[nodiscard]] bool record_rms_norm_chain(const ncnn::VkMat& input,
+                                             ncnn::VkMat& output,
+                                             ncnn::VkCompute& command) const;
     // Caller owns the command, holds the context lock and retains workspace until submission.
     [[nodiscard]] bool record_input_normalization(const ncnn::VkMat& input, ncnn::VkMat& output, ncnn::VkCompute& cmd) const;
     [[nodiscard]] bool record_rms_norm_chain_parallel(const ncnn::VkMat& input,
@@ -209,9 +229,22 @@ private:
     friend class GatedDeltaNet_vulkan;
     friend class Attention_vulkan;
     friend class Bfloat16Expert_vulkan;
+    friend class SharedFfn_vulkan;
+    friend class GpuSegment_vulkan;
+    friend class GpuSegmentContinuation_vulkan;
 
-    // Records a scalar device projection; the caller holds the Vulkan context lock.
-    [[nodiscard]] int forward(const ncnn::VkMat& input, ncnn::VkMat& output, ncnn::VkCompute& cmd, const ncnn::Option& opt) const;
+#if NCNN_MOE_WITH_VULKAN
+    // Internal record-only path: caller owns submission, operand/workspace
+    // lifetime, and publication of the collected statistics after completion.
+    [[nodiscard]] bool record_swiglu_chain(const ncnn::VkMat& input,
+                                           const Bfloat16Linear_vulkan& down,
+                                           uint32_t intermediate_columns, ExpertActivation activation,
+                                           float activation_limit, bool apply_router_gate,
+                                           ncnn::VkMat& output, ncnn::VkCompute& command,
+                                           std::vector<ncnn::VkMat>& workspace,
+                                           FfnRecordStatistics_vulkan& statistics) const;
+#endif
+
     // Caller provides allocated outputs and holds the context lock; scalar uses readonly bindings.
     void record_scalar_projection(const ncnn::VkMat& input,
                                   ncnn::VkMat& output,
@@ -229,7 +262,8 @@ private:
                                                                                       uint32_t vulkan_device_index,
                                                                                       ncnn::VkAllocator* weight_allocator,
                                                                                       const VulkanRuntimePtr& vulkan_runtime,
-                                                                                      uint64_t optimization_flags);
+                                                                                      uint64_t optimization_flags,
+                                                                                      VulkanWeightUploadBatch* upload_batch = nullptr);
 
     class Implementation;
 
@@ -254,6 +288,8 @@ public:
                                                                        ExpertActivation activation,
                                                                        const VulkanRuntimePtr& vulkan_runtime,
                                                                        uint64_t optimization_flags);
+    [[nodiscard]] static std::vector<uint64_t> scratch_elements(uint32_t gate_output_columns,
+                                                                 uint64_t rows);
     [[nodiscard]] bool forward(const ActivationBuffer& input,
                                ActivationBuffer& output) const;
 
@@ -269,7 +305,8 @@ private:
                                                                                       ncnn::VkAllocator* weight_allocator,
                                                                                       ExpertActivation activation,
                                                                                       const VulkanRuntimePtr& vulkan_runtime,
-                                                                                      uint64_t optimization_flags);
+                                                                                      uint64_t optimization_flags,
+                                                                                      VulkanWeightUploadBatch* upload_batch = nullptr);
     [[nodiscard]] static bool forward_batch(std::span<const Bfloat16Expert_vulkan*> experts,
                                             std::span<const ActivationBuffer*> inputs,
                                             std::span<ActivationBuffer*> outputs);
@@ -296,6 +333,13 @@ public:
                                                                      uint32_t vulkan_device_index,
                                                                      const VulkanRuntimePtr& vulkan_runtime,
                                                                      uint64_t optimization_flags);
+    [[nodiscard]] static std::vector<uint64_t> scratch_elements(uint32_t input_columns,
+                                                                 uint64_t rows);
+    // Device input includes its FP32 clone; host input quantizes and uploads before recording.
+    [[nodiscard]] static std::vector<uint64_t> swiglu_scratch_elements(uint32_t input_columns,
+                                                                       uint32_t intermediate_columns,
+                                                                       uint64_t rows,
+                                                                       bool device_input = true);
     [[nodiscard]] bool prepare_rms_norm(const TensorData& weight, float epsilon);
     [[nodiscard]] bool prepare_input_rms_norm(const TensorData& weight, float epsilon);
     [[nodiscard]] bool forward(const ActivationBuffer& input, ActivationBuffer& output) const;
@@ -358,8 +402,23 @@ public:
 
 private:
     friend class Attention_vulkan;
+    friend class GpuSegment_vulkan;
+    friend class GpuSegmentContinuation_vulkan;
     friend class LatentAttention_vulkan;
     friend class LayerHead_vulkan;
+    friend class SharedFfn_vulkan;
+
+#if NCNN_MOE_WITH_VULKAN
+    // Internal record-only path: caller owns submission, operand/workspace
+    // lifetime, and publication of the collected statistics after completion.
+    [[nodiscard]] bool record_swiglu_chain(const ncnn::VkMat& input,
+                                           const Float8Linear_vulkan& up, const Float8Linear_vulkan& down,
+                                           ExpertActivation activation, float activation_limit,
+                                           ncnn::VkMat& output, ncnn::VkCompute& command,
+                                           std::vector<ncnn::VkMat>& workspace,
+                                           FfnRecordStatistics_vulkan& statistics) const;
+#endif
+
     [[nodiscard]] const std::shared_ptr<VulkanContext>& vulkan_context() const noexcept;
     [[nodiscard]] const ncnn::Option& option() const noexcept;
     [[nodiscard]] uint32_t input_columns() const noexcept;
@@ -438,13 +497,15 @@ public:
     [[nodiscard]] uint64_t device_bytes() const noexcept;
 
 private:
+    friend class GpuSegment_vulkan;
+    friend class GpuSegmentContinuation_vulkan;
     friend class QnkExpert_vulkan;
     friend class GatedDeltaNet_vulkan;
     friend class HyperConnection_vulkan;
     friend class LayerHead_vulkan;
     friend class Attention_vulkan;
     friend class QsaAttention_vulkan;
-    friend class QwenLayer_vulkan;
+    friend class GatedResidualLayer_vulkan;
     friend class GatedResidual_vulkan;
 
     friend class LatentAttention_vulkan;
@@ -468,7 +529,8 @@ private:
                                                                                  const VulkanRuntimePtr& vulkan_runtime,
                                                                                  uint64_t optimization_flags,
                                                                                  uint32_t input_group_count = 1,
-                                                                                 const TensorData* extra = nullptr);
+                                                                                 const TensorData* extra = nullptr,
+                                                                                 VulkanWeightUploadBatch* upload_batch = nullptr);
     class Implementation;
 
     QnkLinear_vulkan();
@@ -501,12 +563,28 @@ public:
                                                                            ExpertActivation activation,
                                                                            const VulkanRuntimePtr& vulkan_runtime,
                                                                            uint64_t optimization_flags);
+    [[nodiscard]] static std::vector<uint64_t> scratch_elements(uint32_t intermediate_columns,
+                                                                 uint32_t output_columns,
+                                                                 bool separate_up,
+                                                                 bool router_gate,
+                                                                 uint64_t rows);
     [[nodiscard]] bool forward(const ActivationBuffer& input, ActivationBuffer& output) const;
     [[nodiscard]] bool forward_device(const DeviceTensor_vulkan& input, DeviceTensor_vulkan& output) const;
     [[nodiscard]] bool prepare_router_gate(const TensorData& weight);
     [[nodiscard]] bool has_router_gate() const noexcept;
     [[nodiscard]] bool materialize(const DeviceTensor_vulkan& input, ActivationBuffer& output) const;
     [[nodiscard]] uint64_t device_bytes() const noexcept;
+    [[nodiscard]] uint32_t input_columns() const noexcept;
+    [[nodiscard]] uint32_t output_columns() const noexcept;
+    [[nodiscard]] uint32_t int4_operations() const noexcept;
+    [[nodiscard]] uint32_t record_dispatches() const noexcept;
+    [[nodiscard]] const std::shared_ptr<VulkanContext>& vulkan_context() const noexcept;
+    // Caller holds the context lock and retains all operands until completion.
+    [[nodiscard]] bool record(const ncnn::VkMat& input, ncnn::VkMat& output,
+                              ncnn::VkCompute& command,
+                              std::vector<ncnn::VkMat>& workspace,
+                              std::vector<ncnn::VkMat>& bindings,
+                              std::vector<ncnn::vk_constant_type>& constants) const;
 
 private:
     friend class VulkanExpertBackend;
@@ -523,16 +601,11 @@ private:
                                                                        ncnn::VkAllocator* staging_allocator,
                                                                        ExpertActivation activation,
                                                                        const VulkanRuntimePtr& vulkan_runtime,
-                                                                       uint64_t optimization_flags);
+                                                                       uint64_t optimization_flags,
+                                                                       VulkanWeightUploadBatch* upload_batch = nullptr);
     [[nodiscard]] static bool forward_batch(std::span<const QnkExpert_vulkan*> experts,
                                             std::span<const ActivationBuffer*> inputs,
                                             std::span<ActivationBuffer*> outputs);
-    [[nodiscard]] uint32_t output_columns() const noexcept;
-    [[nodiscard]] bool record(const ncnn::VkMat& input, ncnn::VkMat& output,
-                              ncnn::VkCompute& command,
-                              std::vector<ncnn::VkMat>& workspace,
-                              std::vector<ncnn::VkMat>& bindings,
-                              std::vector<ncnn::vk_constant_type>& constants) const;
     class Implementation;
 
     QnkExpert_vulkan();

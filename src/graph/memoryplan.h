@@ -4,11 +4,28 @@
 #include "ncnn/moe/option.h"
 #include "ncnn/moe/modeldescriptor.h"
 #include "ncnn/moe/result.h"
+#include "resourceplan.h"
+#include "graphmemory.h"
 
 #include <cstdint>
+#include <vector>
 
 namespace ncnn {
 namespace moe {
+
+struct ModelGraphMemoryPlan
+{
+    uint32_t prefill_rows = 0;
+    uint32_t sequence_count = 1;
+    uint32_t context_tokens = 0;
+    // Host-visible final logits have their own per-workspace double buffer.
+    // These bounds are independent of device-local activation arena peaks.
+    uint64_t host_output_slot_size = 0;
+    uint64_t host_output_workspace_size = 0;
+    GraphMemoryPlan prefill;
+    GraphMemoryPlan decode;
+    std::vector<GraphMemoryDevice> session_state;
+};
 
 struct ModelMemoryPlan
 {
@@ -26,9 +43,14 @@ struct ModelMemoryPlan
     uint64_t minimum_active_expert_size = 0;
     uint64_t expert_cache_size = 0;
     uint64_t available_memory_size = 0;
+    std::vector<GpuResourcePlan> gpu_devices;
 };
 
 struct Option;
+
+// Capacity of one contiguous FP32 output slot, including host-buffer padding.
+// Shared by graph planning and standalone Vulkan graph execution clients.
+[[nodiscard]] Result<uint64_t> plan_host_output_slot_size(uint64_t rows, uint32_t columns);
 
 // Vulkan dense availability grants conservative cache credit for automatically
 // reclaimed host copies. CPU fallback storage never contributes to that credit.

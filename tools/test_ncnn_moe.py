@@ -1117,6 +1117,40 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(client.stats_payloads, [])
         self.assertEqual(len(client.generate_payloads), 1)
 
+    def test_status_after_reports_only_confirmed_generation_limits(self) -> None:
+        app, _, _ = self._app("gpt_oss", arguments=_arguments(max_new_tokens=8))
+        statuses: list[str] = []
+        app._status = statuses.append  # type: ignore[method-assign]
+        terminal = dict(generated_tokens=8, stopped_by_stop_token=False, stopped_by_callback=False, cancelled=False)
+        cases = (
+            ("token_limit", 8, {}, "generated 8/8 tokens"),
+            ("eos_at_limit", 8, {"stopped_by_stop_token": True}, None),
+            ("callback_stop", 8, {"stopped_by_callback": True}, None),
+            ("cancelled", 8, {"cancelled": True}, None),
+            ("short_output", 8, {"generated_tokens": 7}, None),
+            ("missing_count", 8, {"generated_tokens": None}, None),
+            ("missing_stop", 8, {"stopped_by_stop_token": None}, None),
+            ("missing_cancel", 8, {"cancelled": None}, None),
+            ("invalid_count", 8, {"generated_tokens": True}, None),
+            ("context_uncommitted_last", 0, {"sequence_length": 4095}, "reached the context limit"),
+            ("context_committed_last", 0, {"sequence_length": 4096}, "reached the context limit"),
+            ("context_not_full", 0, {"sequence_length": 4094}, None),
+            ("context_eos", 0, {"sequence_length": 4095, "stopped_by_stop_token": True}, None),
+            ("missing_context_count", 0, {}, None),
+            ("missing_limit", None, {}, None),
+        )
+        for name, budget, changes, expected in cases:
+            with self.subTest(case=name):
+                app.arguments.max_new_tokens = budget
+                statuses.clear()
+                app.status_after({**terminal, **changes}, reused=False)
+                self.assertEqual(len(statuses), 1)
+                if expected is None:
+                    self.assertNotIn("Response may be incomplete", statuses[0])
+                else:
+                    self.assertIn("Response may be incomplete", statuses[0])
+                    self.assertIn(expected, statuses[0])
+
     def test_streaming_handles_harmony_thinking_without_open_marker_and_unicode(self) -> None:
         harmony_events = [
             (200006, "<|start|>"),

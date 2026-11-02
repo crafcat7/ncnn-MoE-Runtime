@@ -412,11 +412,8 @@ Result<MoeModelDescriptor> Qwen3_5MoeModelAdapter::parse_model(const ModelPackag
                     layer.moe.layout = native_mxfp4 ? ExpertLayout::InterleavedGateUpDown : ExpertLayout::GateUpDown;
                     if (native_mxfp4)
                     {
-                        layer.moe.flags |= MoeDescriptorFileBackedExperts;
                         layer.moe.expert_weight_dtype = DType::MxFp4;
                     }
-                    else
-                        layer.moe.flags &= ~MoeDescriptorFileBackedExperts;
                     for (uint32_t expert_id = 0; expert_id < moe.expert_count; ++expert_id)
                     {
                         for (const char* projection : {"gate_proj.weight", "up_proj.weight", "down_proj.weight"})

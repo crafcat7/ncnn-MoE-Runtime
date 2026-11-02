@@ -6,6 +6,7 @@
 #include "ncnn/moe/modeladapter.h"
 #include "safetensors.h"
 #include "storage/mappedfile.h"
+#include "tensornames.h"
 
 #include <algorithm>
 #include <array>
@@ -24,6 +25,96 @@
 
 namespace ncnn {
 namespace moe {
+
+static bool mapped_bfloat16_expert(const TensorData& tensor) noexcept
+{
+    if (tensor.dtype != DType::BFloat16 || tensor.shape.size() != 2
+        || !tensor.mapped_data || tensor.shape[0] == 0 || tensor.shape[1] == 0)
+        return false;
+    const uint64_t elements = static_cast<uint64_t>(tensor.shape[0]) * tensor.shape[1];
+    return elements <= std::numeric_limits<uint64_t>::max() / sizeof(uint16_t)
+           && tensor.mapped_size == elements * sizeof(uint16_t)
+           && tensor.bfloat16_values().size() == elements;
+}
+
+static bool deferred_quantized_expert(const TensorData& tensor) noexcept
+{
+    return (tensor.dtype == DType::MxFp4 || is_qnk_dtype(tensor.dtype))
+           && tensor.shape.size() == 2 && tensor.shape[0] != 0 && tensor.shape[1] != 0
+           && tensor.mxfp4_file_storage && !tensor.mxfp4_file_storage->blocks_path.empty();
+}
+
+static bool managed_expert_storage(const WeightMapping& weights, const std::string& prefix)
+{
+    const auto find = [&](const char* role) -> const TensorData* {
+        const auto found = weights.find(prefix + role + ".weight");
+        return found == weights.end() ? nullptr : &found->second;
+    };
+    const TensorData* down = find("down");
+    const TensorData* gate_up = find("gate_up");
+    if (!down || down->shape.size() != 2)
+        return false;
+    if (gate_up)
+    {
+        if (gate_up->shape.size() != 2 || gate_up->shape[0] % 2 != 0
+            || gate_up->shape[1] != down->shape[0] || gate_up->shape[0] / 2 != down->shape[1])
+            return false;
+        if (mapped_bfloat16_expert(*gate_up) && mapped_bfloat16_expert(*down))
+            return true;
+        const bool matching_encoding = (gate_up->dtype == DType::MxFp4 && down->dtype == DType::MxFp4)
+                                       || (is_qnk_dtype(gate_up->dtype) && is_qnk_dtype(down->dtype));
+        return matching_encoding && deferred_quantized_expert(*gate_up) && deferred_quantized_expert(*down);
+    }
+
+    // The compiler can join separate native quantized file ranges. Separate
+    // BF16 matrices remain resident GPU candidates, but the managed host cache
+    // does not have a lossless gate/up pair representation for them.
+    const TensorData* gate = find("gate");
+    const TensorData* up = find("up");
+    if (!gate || !up || gate->shape.size() != 2 || gate->shape != up->shape
+        || gate->shape[1] != down->shape[0] || gate->shape[0] != down->shape[1]
+        || !is_qnk_dtype(gate->dtype) || gate->dtype != up->dtype || !is_qnk_dtype(down->dtype)
+        || gate->input_column_indices != up->input_column_indices
+        || !deferred_quantized_expert(*gate) || !deferred_quantized_expert(*up) || !deferred_quantized_expert(*down)
+        || gate->shape[0] > std::numeric_limits<uint32_t>::max() / 2)
+        return false;
+    const MxFp4FileStorage& gate_storage = *gate->mxfp4_file_storage;
+    const MxFp4FileStorage& up_storage = *up->mxfp4_file_storage;
+    const uint64_t packed_size = qnk_storage_bytes(gate->dtype, gate->shape[0] * 2, gate->shape[1]);
+    return packed_size != 0 && gate_storage.secondary_blocks_path.empty() && up_storage.secondary_blocks_path.empty()
+           && gate_storage.blocks_size == up_storage.blocks_size
+           && gate_storage.blocks_size <= std::numeric_limits<uint64_t>::max() / 2
+           && gate_storage.blocks_size * 2 == packed_size;
+}
+
+void normalize_expert_storage(MoeModelDescriptor& descriptor, const WeightMapping& weights)
+{
+    const auto normalize = [&](MoeDescriptor& moe, const std::string& prefix) {
+        moe.flags &= ~MoeDescriptorFileBackedExperts;
+        if (moe.expert_count == 0)
+            return;
+        for (uint32_t expert = 0; expert < moe.expert_count; ++expert)
+            if (!managed_expert_storage(weights, prefix + "experts." + std::to_string(expert) + "."))
+                return;
+        moe.flags |= MoeDescriptorFileBackedExperts;
+    };
+    for (uint32_t index = 0; index < descriptor.layers.size(); ++index)
+    {
+        LayerDescriptor& layer = descriptor.layers[index];
+        if (!layer.dense.enabled())
+            normalize(layer.moe, layer_prefix(index));
+    }
+    if (!descriptor.layers.empty())
+    {
+        for (uint32_t index = 0; index < descriptor.speculative_layer_count; ++index)
+        {
+            MoeDescriptor speculative = descriptor.layers.back().moe;
+            normalize(speculative, speculative_layer_prefix(index));
+            if (!has_flag(speculative.flags, MoeDescriptorFileBackedExperts))
+                descriptor.layers.back().moe.flags &= ~MoeDescriptorFileBackedExperts;
+        }
+    }
+}
 
 static bool is_json_digit(char value) noexcept
 {

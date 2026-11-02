@@ -2,6 +2,7 @@
 #define NCNN_MOE_COMPILER_H
 
 #include "compiledmodel.h"
+#include "resourceplan.h"
 
 namespace ncnn {
 namespace moe {
@@ -31,18 +32,17 @@ struct CompilerOption
     uint32_t flags = BackendCpuExecution | BackendMxfp4CpuKernel;
     uint32_t device_index = automatic_vulkan_device_index;
     uint32_t num_concurrent_sessions = 1;
-    // Total heap budget available to the selected Vulkan placement.  The
-    // compiler uses this as a conservative admission limit for optional GPU
-    // attention state and BF16 Qwen dense weights; zero disables these
-    // budget-based promotions.
+    // Direct-compiler allocation allowance, measured from this compilation's
+    // live usage baseline. Zero uses the live device heap. Runtime loading
+    // supplies absolute, independent snapshots and leaves this allowance zero.
     uint64_t gpu_heap_budget = 0;
     // Preserve explicitly requested executable/victim cache capacity while
     // placing persistent attention and output projections.
     uint64_t gpu_expert_cache_reserve = 0;
-    // A fixed executable or victim Expert cache requires a smaller optional
-    // attention allowance. Automatic caches use the live heap after dense
-    // operators are allocated and do not require this extra reserve.
-    bool explicit_expert_gpu_cache = false;
+    std::vector<GpuResourceSnapshot> gpu_resources;
+    // Parallel to gpu_resources; includes explicit executable/victim caches
+    // and the minimum GPU Expert working set retained during preparation.
+    std::vector<uint64_t> gpu_expert_cache_reserves;
     uint64_t optimization_flags = OptimizationDefaultFlags;
     VulkanRuntimePtr vulkan_runtime;
     std::vector<uint32_t> device_indices;

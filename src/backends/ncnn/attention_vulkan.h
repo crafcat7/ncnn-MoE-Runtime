@@ -15,10 +15,12 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <vector>
 
 namespace ncnn {
 #if NCNN_MOE_WITH_VULKAN
 class VkCompute;
+class Option;
 #endif
 namespace moe {
 
@@ -27,6 +29,27 @@ class Linear;
 class Bfloat16Linear_vulkan;
 class QnkLinear_vulkan;
 class Float8Linear_vulkan;
+class VulkanContext;
+
+class AttentionWork_vulkan
+{
+public:
+    AttentionWork_vulkan();
+    ~AttentionWork_vulkan();
+    AttentionWork_vulkan(const AttentionWork_vulkan&) = delete;
+    AttentionWork_vulkan& operator=(const AttentionWork_vulkan&) = delete;
+    [[nodiscard]] bool commit() noexcept;
+    void mark_submit_failed() noexcept;
+    // The owner has drained/reset every referencing command and handled cache
+    // publication or failure. Release all operands now, retain empty CPU slots.
+    // As with recording, the caller holds the Context command mutex.
+    void retire() noexcept;
+
+private:
+    friend class Attention_vulkan;
+    class Implementation;
+    std::unique_ptr<Implementation> d;
+};
 
 #if NCNN_MOE_WITH_VULKAN
 class AttentionCache_vulkan
@@ -90,11 +113,21 @@ struct AttentionBatchEntry_vulkan
 class Attention_vulkan
 {
 public:
+    // Metadata-only private FP32 allocation sizes; excludes graph outputs,
+    // projection-owned clones, cache/state and decode_workspace_bytes().
+    // direct_ring may be true only when the prepared recorder proves support.
+    [[nodiscard]] static std::vector<uint64_t> scratch_elements(const AttentionConfig_vulkan& config, uint32_t rows,
+                                                               uint32_t context_tokens, uint32_t sequence_count,
+                                                               uint64_t kv_element_size, bool direct_ring = false);
     ~Attention_vulkan();
 
     [[nodiscard]] static std::shared_ptr<Attention_vulkan> create(const TensorData& norm_weight, const TensorData* sinks,
                                                                   std::shared_ptr<Linear> fused_qkv,
                                                                   std::shared_ptr<Linear> output_projection,
+                                                                  const AttentionConfig_vulkan& config);
+    [[nodiscard]] static std::shared_ptr<Attention_vulkan> create(const TensorData& norm_weight, const TensorData* sinks,
+                                                                  std::shared_ptr<Bfloat16Linear_vulkan> fused_qkv,
+                                                                  std::shared_ptr<Bfloat16Linear_vulkan> output_projection,
                                                                   const AttentionConfig_vulkan& config);
     [[nodiscard]] static std::shared_ptr<Attention_vulkan> create(const TensorData& norm_weight,
                                                                   const TensorData& query_norm_weight,
@@ -118,11 +151,28 @@ public:
     [[nodiscard]] bool materialize_device_cache(LayerCache& cache) const;
     // Independent one-row Session caches recorded into one queue submission.
     [[nodiscard]] AttentionBatchResult_vulkan forward_batch(std::span<const AttentionBatchEntry_vulkan> entries) const;
+#if NCNN_MOE_WITH_VULKAN
+    [[nodiscard]] const std::shared_ptr<VulkanContext>& vulkan_context() const noexcept;
+    [[nodiscard]] const ncnn::Option& option() const noexcept;
+    [[nodiscard]] bool uses_qkv_ring(size_t token_count) const noexcept;
+    // Upper bound for the selected decode path's retained private workspace.
+    [[nodiscard]] bool decode_workspace_bytes(uint32_t context_tokens, uint64_t& bytes) const noexcept;
+    // Caller owns the command lock and retains work through its fence. The
+    // branch-only form lets a generic residual operator compose the block.
+    [[nodiscard]] bool record_forward(uint64_t position_offset, LayerCache& cache,
+                                      const ncnn::VkMat& input, ncnn::VkMat& output,
+                                      ncnn::VkCompute& command, AttentionWork_vulkan& work,
+                                      bool add_residual = true) const;
+#endif
 
 private:
     class Implementation;
 
 #if NCNN_MOE_WITH_VULKAN
+    [[nodiscard]] bool record_decode(const ncnn::VkMat& query, const ncnn::VkMat& key,
+                                     const ncnn::VkMat& value, uint64_t destination_count,
+                                     ncnn::VkMat& output, ncnn::VkCompute& command,
+                                     std::vector<ncnn::VkMat>& workspace) const;
     [[nodiscard]] bool support_qkv_rope(size_t token_count) const noexcept;
 
     [[nodiscard]] bool record_native_qkv(const ncnn::VkMat& input,

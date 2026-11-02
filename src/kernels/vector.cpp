@@ -7,6 +7,7 @@
 
 #include <bit>
 #include <cmath>
+#include <limits>
 
 #if defined(__aarch64__) || defined(_M_ARM64)
 #include <arm_neon.h>
@@ -838,6 +839,31 @@ float float_dot(const float* left, const float* right, uint32_t count) noexcept
     static const FloatDotFunction function = select_float_dot();
 #endif
     return function(left, right, count);
+}
+
+size_t float_argmax(const float* values, size_t count) noexcept
+{
+    if (count == 0)
+        return 0;
+#if defined(NCNN_MOE_VECTOR_X86_SIMD)
+    const uint64_t isa = cpu_isa_flags();
+    if ((isa & CpuIsaX86Avx512) != 0)
+        return avx512_float_argmax(values, count);
+    if ((isa & CpuIsaX86Avx2Fma) != 0)
+        return avx2_float_argmax(values, count);
+#endif
+    size_t selected = count;
+    float selected_value = -std::numeric_limits<float>::infinity();
+    for (size_t index = 0; index < count; ++index)
+    {
+        const float value = values[index];
+        if (value > selected_value && std::isfinite(value))
+        {
+            selected = index;
+            selected_value = value;
+        }
+    }
+    return selected;
 }
 
 void float_gemm_4x4(const float* weights,

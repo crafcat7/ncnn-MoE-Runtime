@@ -13,6 +13,7 @@
 #include "storage/weightstore.h"
 #include "backends/ncnn/linear.h"
 #include "backends/ncnn/modelpipeline.h"
+#include "backends/ncnn/residentffn_vulkan.h"
 #include "ncnn/moe/session.h"
 
 #include <algorithm>
@@ -23,6 +24,7 @@
 #include <limits>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
 
@@ -418,6 +420,18 @@ static std::shared_ptr<const TensorData> borrow_resident_tensor(const TensorData
     return std::shared_ptr<const TensorData>(std::shared_ptr<const TensorData>{}, &tensor);
 }
 
+static std::string gpu_expert_error(const CompiledModel& model, uint32_t group,
+                                    const char* operation, const char* reason)
+{
+    uint32_t device = model.opt.vulkan_device_index;
+    if (group < model.graph.layer_plans.size())
+        device = model.graph.layer_plans[group].vulkan_device_index;
+    else if (group - model.graph.layer_plans.size() < model.speculative.graph.layer_plans.size())
+        device = model.speculative.graph.layer_plans[group - model.graph.layer_plans.size()].vulkan_device_index;
+    return std::string(reason) + " (layer " + std::to_string(group) + ", op " + operation
+           + ", Vulkan device " + std::to_string(device) + ")";
+}
+
 static bool forward_cached_dense_ffn(const CompiledModel& model,
                                      const ExpertPlan& ffn,
                                      const ActivationBuffer& input,
@@ -484,7 +498,8 @@ static bool forward_cached_dense_ffn(const CompiledModel& model,
         demand.up = borrow_resident_tensor(model.weights.at(ffn.up_weight));
         demand.up_bias = ffn.up_bias == invalid_tensor_handle ? nullptr : &model.weights.at(ffn.up_bias);
     }
-    if (!has_flag(model.opt.optimization_flags, OptimizationVulkanExpertGpuPriority))
+    if (model.opt.hybrid_mode != HybridMode::HybridExperts
+        && !has_flag(model.opt.optimization_flags, OptimizationVulkanExpertGpuPriority))
     {
         if (input.rows() < vulkan_expert_gpu_admission_min_rows)
             return false;
@@ -513,11 +528,16 @@ void forward_dense_ffn(const CompiledModel& model,
                        ExpertWorkspace& workspace,
                        ExecutionBackend backend)
 {
+    const bool require_gpu_execution = backend == ExecutionBackend::Vulkan
+                                       && model.opt.hybrid_mode == HybridMode::HybridExperts;
     if (ffn.use_gpu_cache)
     {
         if (backend == ExecutionBackend::Vulkan
             && forward_cached_dense_ffn(model, ffn, input, output))
             return;
+        if (require_gpu_execution)
+            throw std::runtime_error(gpu_expert_error(model, ffn.residency_group, "DenseFfn",
+                                                      "Vulkan dense FFN demand upload, execution or publication failed"));
         forward_expert(model, ffn, nullptr, input, output, workspace, false);
         return;
     }
@@ -528,7 +548,18 @@ void forward_dense_ffn(const CompiledModel& model,
         {
             if (fused.qnk_expert->forward(input, output))
                 return;
-            throw std::runtime_error("Vulkan dense FFN execution failed");
+            throw std::runtime_error(gpu_expert_error(model, ffn.residency_group, "DenseFfn", "Vulkan dense FFN execution failed"));
+        }
+        const auto& float8_up = model.operators.at_weight(ffn.up_weight).float8;
+        const auto& float8_down = model.operators.at_weight(ffn.down_weight).float8;
+        if (fused.float8 && float8_up && float8_down)
+        {
+            // Unclamped SwiGLU has identical Silu and DeepSeek semantics.
+            const float limit = ffn.activation == ExpertActivation::Silu ? 0.f : ffn.activation_limit;
+            if (fused.float8->forward_swiglu_chain(input, *float8_up, *float8_down,
+                                                   ExpertActivation::DeepSeekSwiGlu, limit, output))
+                return;
+            throw std::runtime_error(gpu_expert_error(model, ffn.residency_group, "DenseFfn", "Vulkan FP8 FFN execution failed"));
         }
         const CompiledOperator& down = model.operators.at_weight(ffn.down_weight);
         if (fused.bfloat16 && down.bfloat16)
@@ -537,8 +568,10 @@ void forward_dense_ffn(const CompiledModel& model,
                                                      model.weights.at(ffn.up_weight).shape[0],
                                                      ffn.activation, ffn.activation_limit, false, output))
                 return;
-            throw std::runtime_error("Vulkan dense FFN execution failed");
+            throw std::runtime_error(gpu_expert_error(model, ffn.residency_group, "DenseFfn", "Vulkan dense FFN execution failed"));
         }
+        if (require_gpu_execution)
+            throw std::runtime_error(gpu_expert_error(model, ffn.residency_group, "DenseFfn", "Vulkan dense FFN has no complete GPU operator"));
         if (ffn.gate_up_weight == invalid_tensor_handle)
         {
             const uint64_t flags = model.opt.optimization_flags;
@@ -569,7 +602,8 @@ void forward_shared_expert(const CompiledModel& model,
                            ExpertWorkspace& workspace,
                            const std::shared_ptr<const DeviceTensor_vulkan>& device_input,
                            std::shared_ptr<const DeviceTensor_vulkan>* device_output,
-                           bool require_device_execution)
+                           bool require_device_execution,
+                           bool require_gpu_execution)
 {
     assert(&input != &output);
     if (device_output)
@@ -579,7 +613,7 @@ void forward_shared_expert(const CompiledModel& model,
     const bool has_router_gate = moe.shared_expert_gate_weight != invalid_tensor_handle;
     const auto& qnk_shared = model.operators.at(expert.vulkan_operator).qnk_expert;
     if (require_device_execution && (!device_output || !device_input || device_input->empty()))
-        throw std::runtime_error("Vulkan Shared Expert requires a completed device input and output");
+        throw std::runtime_error(gpu_expert_error(model, expert.residency_group, "SharedExpert", "Vulkan Shared Expert requires a completed device input and output"));
     if (qnk_shared && (!has_router_gate || qnk_shared->has_router_gate()))
     {
         if (device_output && device_input && !device_input->empty())
@@ -591,13 +625,13 @@ void forward_shared_expert(const CompiledModel& model,
                 *device_output = std::move(completed);
                 return;
             }
-            throw std::runtime_error("Vulkan native Shared Expert device execution failed");
+            throw std::runtime_error(gpu_expert_error(model, expert.residency_group, "SharedExpert", "Vulkan native Shared Expert device execution failed"));
         }
         if (!require_device_execution)
         {
             if (qnk_shared->forward(input, output))
                 return;
-            throw std::runtime_error("Vulkan native Shared Expert execution failed");
+            throw std::runtime_error(gpu_expert_error(model, expert.residency_group, "SharedExpert", "Vulkan native Shared Expert execution failed"));
         }
     }
     const auto& float8_gate = model.operators.at_weight(expert.gate_weight).float8;
@@ -650,7 +684,9 @@ void forward_shared_expert(const CompiledModel& model,
             }
         }
     }
-    if (!require_device_execution && fused_shared_operator.bfloat16)
+    if (require_gpu_execution || require_device_execution)
+        throw std::runtime_error(gpu_expert_error(model, expert.residency_group, "SharedExpert", "Vulkan Shared Expert has no completed GPU chain or router gate"));
+    if (fused_shared_operator.bfloat16)
     {
         ActivationBuffer& fused = workspace.projection;
         if (fused_shared_operator.bfloat16->forward(input,
@@ -1159,11 +1195,13 @@ bool support_vulkan_expert(const ExpertPlan& expert,
             return true;
         if (weight.dtype == DType::Int4)
             return weight.shape.size() == 2 && weight.quantization_group_size != 0;
+        if (weight.dtype == DType::MxFp4)
+            return weight.shape.size() == 2;
         return has_flag(optimization_flags, OptimizationVulkanQnK)
                && is_qnk_dtype(weight.dtype)
                && qnk_shape_supported(weight.dtype, weight.shape[0], weight.shape[1]);
     };
-    const auto quantized = [](DType dtype) { return dtype == DType::Int4 || is_qnk_dtype(dtype); };
+    const auto quantized = [](DType dtype) { return dtype == DType::Int4 || dtype == DType::MxFp4 || is_qnk_dtype(dtype); };
     const bool separate_floating = up
                                    && (gate_up.dtype == DType::BFloat16 || gate_up.dtype == DType::Float32)
                                    && (up->dtype == DType::BFloat16 || up->dtype == DType::Float32)
@@ -1270,6 +1308,12 @@ Result<void> request_experts(const CompiledModel& model,
 {
     if (!model.expert_cache)
         return {};
+    // GPU residency is resolved by the first Expert submission. Starting host
+    // reads here would fault/copy every routed pair even on a GPU cache hit.
+    // forward_moe stages only the missing pairs after that resident probe.
+    if (model.opt.hybrid_mode == HybridMode::HybridExperts && model.expert_backend
+        && !has_flag(model.opt.flags, OptionDisableGpuExpertExecution))
+        return {};
     std::vector<ExpertCachePairRequest>& requests = scratch.cache_requests;
     requests.clear();
     requests.reserve(layer_state.active_experts().size());
@@ -1301,6 +1345,7 @@ Result<void> forward_moe(const CompiledModel& model,
                          ExecutionBackend backend,
                          bool prefetch,
                          const std::function<void()>& independent_work)
+try
 {
     // Declare before submission owners so exception/early-return cleanup
     // releases retained weights only after in-flight work has been drained.
@@ -1331,9 +1376,13 @@ Result<void> forward_moe(const CompiledModel& model,
         independent_work_started = true;
         independent_work();
     };
+    const bool require_gpu_execution = backend == ExecutionBackend::Vulkan
+                                       && model.opt.hybrid_mode == HybridMode::HybridExperts;
+    const auto gpu_error = [&](const char* reason) {
+        return Error{ErrorCode::InternalError, gpu_expert_error(model, residency_group, "ExpertGroup", reason)};
+    };
     const bool gpu_priority = backend == ExecutionBackend::Vulkan
                               && model.opt.hybrid_mode == HybridMode::HybridExperts
-                              && has_flag(model.opt.optimization_flags, OptimizationVulkanExpertGpuPriority)
                               && !has_flag(model.opt.flags, OptionDisableGpuExpertExecution);
     const size_t active_expert_count = layer_state.active_experts().size();
     const bool direct_input = active_expert_count != 0
@@ -1352,15 +1401,17 @@ Result<void> forward_moe(const CompiledModel& model,
                                    && model.expert_backend
                                    && gpu_expert_batch_eligible
                                    && !has_flag(model.opt.flags, OptionDisableGpuExpertExecution);
+    if (require_gpu_execution && !use_backend_batch)
+        return gpu_error("Selected Vulkan Expert backend is unavailable");
     if (layer_state.require_device_execution
         && (!gpu_priority || !use_backend_batch || !layer_state.normalized_device || layer_state.normalized_device->empty()))
-        return Error{ErrorCode::InternalError, "Vulkan routed Experts require GPU-priority execution and completed device input"};
+        return gpu_error("Vulkan routed Experts require GPU-priority execution and completed device input");
     Result<void> device_execution_status;
     const auto forward_cpu = [&](std::span<const size_t> indices, const char* reason) {
         if (indices.empty()) return;
-        if (layer_state.require_device_execution)
+        if (require_gpu_execution || layer_state.require_device_execution)
         {
-            device_execution_status = Error{ErrorCode::InternalError, reason};
+            device_execution_status = gpu_error(reason);
             return;
         }
         forward_experts(model, moe, layer_state, indices, scratch, prefetch);
@@ -1374,7 +1425,8 @@ Result<void> forward_moe(const CompiledModel& model,
         }
     };
     const auto can_use_device_input = [&](const ExpertState& active) {
-        if (!use_backend_batch || !layer_state.normalized_device || layer_state.normalized_device->empty()) return false;
+        if (!use_backend_batch
+            || (!layer_state.region && (!layer_state.normalized_device || layer_state.normalized_device->empty()))) return false;
         const ExpertPlan& expert = moe.experts[active.batch.expert_id];
         const TensorHandle gate_handle = expert.gate_up_weight != invalid_tensor_handle ? expert.gate_up_weight : expert.gate_weight;
         if (gate_handle == invalid_tensor_handle || expert.down_weight == invalid_tensor_handle) return false;
@@ -1393,7 +1445,7 @@ Result<void> forward_moe(const CompiledModel& model,
     if (layer_state.require_device_execution)
         for (const ExpertState& active : layer_state.active_experts())
             if (!can_use_device_input(active))
-                return Error{ErrorCode::InternalError, "Vulkan routed Expert does not support device input for its native weight format or shape"};
+                return gpu_error("Vulkan routed Expert does not support device input for its native weight format or shape");
 #if defined(_OPENMP)
     int expert_team_size = 1;
     bool parallelize_regroup = false;
@@ -1523,6 +1575,8 @@ Result<void> forward_moe(const CompiledModel& model,
             request.route_aggregation.completed = &backend_aggregated[active_index];
             request.device_input = layer_state.normalized_device;
             request.device_routes = active.batch.routes;
+            request.region = layer_state.region;
+            request.region_index = active_index;
             if (can_use_device_input(active))
             {
                 request.device_output = &active.device_output;
@@ -1661,8 +1715,8 @@ Result<void> forward_moe(const CompiledModel& model,
             if (backend_status[active_index] == ExpertStatus::Failed)
                 recovery_indices.push_back(active_index);
 
-        if (layer_state.require_device_execution && !recovery_indices.empty())
-            return Error{ErrorCode::InternalError, "Vulkan resident Expert execution or publication failed"};
+        if ((require_gpu_execution || layer_state.require_device_execution) && !recovery_indices.empty())
+            return gpu_error("Vulkan resident Expert execution or publication failed");
         if (!recovery_indices.empty())
         {
             size_t uncached_count = 0;
@@ -1772,12 +1826,18 @@ Result<void> forward_moe(const CompiledModel& model,
         {
             const auto& active = layer_state.active_experts()[active_index];
             const auto& expert = moe.experts[active.batch.expert_id];
+            const TensorHandle gate = expert.gate_up_weight != invalid_tensor_handle ? expert.gate_up_weight : expert.gate_weight;
+            const bool separate = expert.gate_up_weight == invalid_tensor_handle;
             prestaged_demands.push_back({expert.cache_key,
-                                         active.lease.gate_up ? active.lease.gate_up : borrow_resident_tensor(model.weights.at(expert.gate_up_weight)),
-                                         expert.gate_up_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.gate_up_bias),
+                                         active.lease.gate_up ? active.lease.gate_up : borrow_resident_tensor(model.weights.at(gate)),
+                                         (separate ? expert.gate_bias : expert.gate_up_bias) == invalid_tensor_handle
+                                             ? nullptr
+                                             : &model.weights.at(separate ? expert.gate_bias : expert.gate_up_bias),
                                          active.lease.down ? active.lease.down : borrow_resident_tensor(model.weights.at(expert.down_weight)),
                                          expert.down_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.down_bias),
-                                         residency_group, expert.activation_limit, expert.activation});
+                                         residency_group, expert.activation_limit, expert.activation,
+                                         separate ? borrow_resident_tensor(model.weights.at(expert.up_weight)) : nullptr,
+                                         expert.up_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.up_bias)});
         }
         if (!prestaged_demands.empty())
         {
@@ -2008,9 +2068,9 @@ Result<void> forward_moe(const CompiledModel& model,
             if (!supported)
             {
                 active.device_output.reset();
-                if (layer_state.require_device_execution)
+                if (require_gpu_execution || layer_state.require_device_execution)
                 {
-                    device_execution_status = Error{ErrorCode::InternalError, "Vulkan Expert weights, shape, cache key or placement is unsupported"};
+                    device_execution_status = gpu_error("Vulkan Expert weights, shape, cache key or placement is unsupported");
                     return;
                 }
                 cpu_indices.push_back(active_index);
@@ -2063,9 +2123,9 @@ Result<void> forward_moe(const CompiledModel& model,
                     if (!device_execution_status) return;
                     continue; // Retry after both current host/device pins release.
                 }
-                if (layer_state.require_device_execution)
+                if (require_gpu_execution || layer_state.require_device_execution)
                 {
-                    device_execution_status = Error{ErrorCode::InternalError, "Vulkan Expert demand upload could not reserve device cache capacity or prepare native weights"};
+                    device_execution_status = gpu_error("Vulkan Expert demand upload could not reserve device cache capacity or prepare native weights");
                     return;
                 }
                 const size_t active_index = demand_indices[cursor++];
@@ -2094,6 +2154,8 @@ Result<void> forward_moe(const CompiledModel& model,
                 request.input_columns = layer_state.normalized.columns();
                 request.device_input = layer_state.normalized_device;
                 request.device_routes = active.batch.routes;
+                request.region = layer_state.region;
+                request.region_index = active_index;
                 if (can_use_device_input(active))
                     request.device_output = &active.device_output;
                 next_indices.push_back(active_index);
@@ -2148,9 +2210,10 @@ Result<void> forward_moe(const CompiledModel& model,
         std::vector<ExpertCacheLease>& leases = scratch.cache_leases;
         requests.clear();
         leases.clear();
-        // Coalesce at most one bounded GPU wave. Never wait on a tail that
-        // cannot be admitted while this prefix owns host-cache capacity.
-        const size_t requested_count = gpu_priority ? std::min(pending.size(), size_t(8)) : pending.size();
+        // Let host I/O see all misses that fit its budget, independently of
+        // the bounded GPU upload wave. Start on the first ready pair and
+        // coalesce every other currently-ready pair without waiting for it.
+        const size_t requested_count = pending.size();
         requests.reserve(requested_count);
         leases.resize(requested_count);
         for (size_t active_index : std::span<const size_t>(pending).first(requested_count))
@@ -2166,11 +2229,12 @@ Result<void> forward_moe(const CompiledModel& model,
         }
 
         const auto cache_wait_start = expert_cache_wait_start(model);
-        // Wait for admitted reads while current compute remains in flight. If
-        // capacity blocked admission, release its pins before draining/retry.
+        // Do not hold ready GPU work behind a slower read merely to fill a
+        // batch. Ready pairs still coalesce without delaying the first one.
         auto acquired = model.expert_cache->wait_acquire_ready_pairs(requests, leases, true, 1, true, false);
         if (!acquired) return acquired.error();
         bool drained = false;
+        uint32_t stalled_attempts = 0;
         while (acquired.value() == 0)
         {
             if (!current_wave_requests.empty())
@@ -2184,6 +2248,8 @@ Result<void> forward_moe(const CompiledModel& model,
                 acquired = model.expert_cache->wait_acquire_ready_pairs(requests, leases, true);
                 break;
             }
+            if (require_gpu_execution && ++stalled_attempts > 2)
+                return gpu_error("Vulkan Expert host staging made no progress after draining uploads");
             if (drained)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             model.expert_backend->wait_for_background_work();
@@ -2239,6 +2305,54 @@ Result<void> forward_moe(const CompiledModel& model,
     finish_current_wave();
     if (!device_execution_status) return device_execution_status.error();
 
+    if (require_gpu_execution
+        && (backend_status.size() != active_expert_count
+            || std::any_of(backend_status.begin(), backend_status.end(), [](ExpertStatus status) {
+                   return status != ExpertStatus::Executed;
+               })))
+        return gpu_error("Vulkan Expert group completed without publishing every selected route");
+
+    if (layer_state.region)
+    {
+        // Only committed waves may publish their aggregate. A resident graph
+        // passes the device owner to its next segment without a Host copy.
+        if (layer_state.gpu_segment)
+        {
+            if (!layer_state.region->take_device_output(layer_state.combined_device)
+                || !layer_state.combined_device || layer_state.combined_device->empty()
+                || layer_state.combined_device->rows() != layer_state.normalized.rows()
+                || layer_state.combined_device->columns() != model.descriptor.hidden_size)
+                return gpu_error("Vulkan resident FFN region did not publish its device aggregate");
+        }
+        else
+        {
+            if (!layer_state.region->take_output(scratch.backend_aggregated_output)
+                || scratch.backend_aggregated_output.rows() != layer_state.normalized.rows()
+                || scratch.backend_aggregated_output.columns() != model.descriptor.hidden_size)
+                return gpu_error("Vulkan resident FFN region did not publish its complete aggregate");
+            scratch.backend_aggregated_output_valid = true;
+        }
+        backend_aggregated.assign(active_expert_count, 1);
+        for (ExpertState& active : layer_state.active_experts())
+            active.device_output.reset();
+        layer_state.region.reset();
+    }
+
+    if (require_gpu_execution)
+    {
+        const bool aggregate_valid = layer_state.combined_device || (scratch.backend_aggregated_output_valid && scratch.backend_aggregated_output.rows() == layer_state.normalized.rows() && scratch.backend_aggregated_output.columns() == model.descriptor.hidden_size);
+        for (size_t index = 0; index < active_expert_count; ++index)
+        {
+            const ExpertState& active = layer_state.active_experts()[index];
+            if (aggregate_valid && index < backend_aggregated.size() && backend_aggregated[index]) continue;
+            if (active.device_output && !active.device_output->empty()
+                && active.device_output->rows() == active.batch.routes.size()
+                && active.device_output->columns() == model.descriptor.hidden_size) continue;
+            if (active.output.rows() != active.batch.routes.size() || active.output.columns() != model.descriptor.hidden_size)
+                return gpu_error("Vulkan Expert backend did not publish a complete route output");
+        }
+    }
+
     if (!gpu_priority)
     {
         auto finalized = finalize_backend();
@@ -2265,14 +2379,24 @@ Result<void> forward_moe(const CompiledModel& model,
             }
         }
     }
-    if (layer_state.require_device_execution)
+    if (layer_state.require_device_execution && !layer_state.combined_device)
         for (const ExpertState& active : layer_state.active_experts())
             if (!active.device_output || active.device_output->empty()
                 || active.device_output->rows() != active.batch.routes.size())
-                return Error{ErrorCode::InternalError, "Vulkan Expert completed without publishing its device output"};
+                return gpu_error("Vulkan Expert completed without publishing its device output");
     layer_state.experts_executed = true;
     wave_cleanup.completed = true;
     return {};
+}
+catch (const std::exception& error)
+{
+    if (backend == ExecutionBackend::Vulkan && model.opt.hybrid_mode == HybridMode::HybridExperts)
+        return Error{ErrorCode::InternalError, gpu_expert_error(model, residency_group, "ExpertGroup", error.what())};
+    return Error{ErrorCode::InternalError, error.what()};
+}
+catch (...)
+{
+    return Error{ErrorCode::InternalError, gpu_expert_error(model, residency_group, "ExpertGroup", "Expert backend raised an unknown execution error")};
 }
 
 bool init_moe_output(ExpertScratch& scratch,

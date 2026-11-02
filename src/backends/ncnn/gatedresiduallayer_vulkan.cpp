@@ -1,8 +1,8 @@
-#include "qwenlayer_vulkan.h"
+#include "gatedresiduallayer_vulkan.h"
 #include "gatedresidual_vulkan.h"
 #include "gateddeltanet_vulkan.h"
 #include "qsaattention_vulkan.h"
-#include "qwen_vulkan_internal.h"
+#include "gatedresidual_vulkan_internal.h"
 #include "router_vulkan.h"
 #include "rmsnorm_vulkan.h"
 #include "moecombine_vulkan.h"
@@ -58,7 +58,7 @@ uint64_t PleState_vulkan::allocated_bytes() const noexcept
 #endif
 }
 
-class QwenLayerWorkspace_vulkan::Implementation
+class GatedResidualWorkspace_vulkan::Implementation
 {
 public:
     std::shared_ptr<const DeviceTensor_vulkan> normalized;
@@ -77,8 +77,8 @@ public:
     {
         if (!pending || !post || !combiner) return false;
         ncnn::VkMat combined;
-        qwen_prepare_read(residual);
-        qwen_prepare_read(injection);
+        residual_prepare_read(residual);
+        residual_prepare_read(injection);
         if (!combiner->record(*pending, combined, cmd, storage, uploads)
             || !post->record_post(combined, residual, injection, result, cmd)) return false;
         storage.push_back(combined);
@@ -97,12 +97,12 @@ public:
     }
 #endif
 };
-QwenLayerWorkspace_vulkan::QwenLayerWorkspace_vulkan() : d(new Implementation)
+GatedResidualWorkspace_vulkan::GatedResidualWorkspace_vulkan() : d(new Implementation)
 {
 }
-QwenLayerWorkspace_vulkan::~QwenLayerWorkspace_vulkan()
+GatedResidualWorkspace_vulkan::~GatedResidualWorkspace_vulkan()
 { reset(); }
-void QwenLayerWorkspace_vulkan::reset()
+void GatedResidualWorkspace_vulkan::reset()
 {
 #if NCNN_MOE_WITH_VULKAN
     const auto context = d->context;
@@ -120,7 +120,7 @@ void QwenLayerWorkspace_vulkan::reset()
     d->context.reset();
 #endif
 }
-bool QwenLayerWorkspace_vulkan::active() const noexcept
+bool GatedResidualWorkspace_vulkan::active() const noexcept
 {
 #if NCNN_MOE_WITH_VULKAN
     return d->context && d->post && !d->residual.empty();
@@ -128,10 +128,10 @@ bool QwenLayerWorkspace_vulkan::active() const noexcept
     return false;
 #endif
 }
-const std::shared_ptr<const DeviceTensor_vulkan>& QwenLayerWorkspace_vulkan::device_input() const noexcept
+const std::shared_ptr<const DeviceTensor_vulkan>& GatedResidualWorkspace_vulkan::device_input() const noexcept
 { return d->normalized; }
 
-class QwenLayer_vulkan::Implementation
+class GatedResidualLayer_vulkan::Implementation
 {
 public:
 #if NCNN_MOE_WITH_VULKAN
@@ -159,10 +159,10 @@ public:
     }
 #endif
 };
-QwenLayer_vulkan::QwenLayer_vulkan() : d(new Implementation)
+GatedResidualLayer_vulkan::GatedResidualLayer_vulkan() : d(new Implementation)
 {
 }
-QwenLayer_vulkan::~QwenLayer_vulkan()
+GatedResidualLayer_vulkan::~GatedResidualLayer_vulkan()
 {
 #if NCNN_MOE_WITH_VULKAN
     if (d->context)
@@ -172,10 +172,10 @@ QwenLayer_vulkan::~QwenLayer_vulkan()
     }
 #endif
 }
-std::shared_ptr<QwenLayer_vulkan> QwenLayer_vulkan::create(const CompiledModel& model, const CompiledLayerPlan& layer)
+std::shared_ptr<GatedResidualLayer_vulkan> GatedResidualLayer_vulkan::create(const CompiledModel& model, const CompiledLayerPlan& layer)
 {
 #if NCNN_MOE_WITH_VULKAN
-    auto result = std::shared_ptr<QwenLayer_vulkan>(new QwenLayer_vulkan);
+    auto result = std::shared_ptr<GatedResidualLayer_vulkan>(new GatedResidualLayer_vulkan);
     auto& impl = *result->d;
     impl.weights = &model.weights;
     impl.ple = layer.ple;
@@ -219,13 +219,13 @@ std::shared_ptr<QwenLayer_vulkan> QwenLayer_vulkan::create(const CompiledModel& 
                     && table.dtype != DType::BFloat16 && table.dtype != DType::Float32)) return {};
         }
         const std::lock_guard<std::mutex> lock(impl.context->command_mutex());
-        impl.pipeline = qwen_pipeline(impl.context, impl.opt);
+        impl.pipeline = residual_pipeline(impl.context, impl.opt);
         if (!impl.pipeline) return {};
         ncnn::VkCompute cmd(impl.context->device());
-        if (!qwen_float_weight(model.weights.at(impl.ple.key_norm_weight), impl.key_norm, cmd, impl.opt)
-            || !qwen_float_weight(model.weights.at(impl.ple.query_norm_weight), impl.query_norm, cmd, impl.opt)
-            || !qwen_float_weight(model.weights.at(impl.ple.convolution_norm_weight), impl.conv_norm, cmd, impl.opt)
-            || !qwen_float_weight(model.weights.at(impl.ple.convolution_weight), impl.convolution_weight, cmd, impl.opt)
+        if (!residual_float_weight(model.weights.at(impl.ple.key_norm_weight), impl.key_norm, cmd, impl.opt)
+            || !residual_float_weight(model.weights.at(impl.ple.query_norm_weight), impl.query_norm, cmd, impl.opt)
+            || !residual_float_weight(model.weights.at(impl.ple.convolution_norm_weight), impl.conv_norm, cmd, impl.opt)
+            || !residual_float_weight(model.weights.at(impl.ple.convolution_weight), impl.convolution_weight, cmd, impl.opt)
             || submit_compute_and_wait(cmd, impl.context->device()) != 0) return {};
     }
     return result;
@@ -236,10 +236,10 @@ std::shared_ptr<QwenLayer_vulkan> QwenLayer_vulkan::create(const CompiledModel& 
 #endif
 }
 
-std::shared_ptr<QwenLayer_vulkan> QwenLayer_vulkan::create_head(const CompiledModel& model)
+std::shared_ptr<GatedResidualLayer_vulkan> GatedResidualLayer_vulkan::create_head(const CompiledModel& model)
 {
 #if NCNN_MOE_WITH_VULKAN
-    auto result = std::shared_ptr<QwenLayer_vulkan>(new QwenLayer_vulkan);
+    auto result = std::shared_ptr<GatedResidualLayer_vulkan>(new GatedResidualLayer_vulkan);
     auto& impl = *result->d;
     impl.attention_hyper = GatedResidual_vulkan::create(model.weights, model.gated_residual_head,
                                                         model.descriptor, model.opt.vulkan_device_index, model.vulkan_runtime, model.opt.optimization_flags);
@@ -267,7 +267,7 @@ std::shared_ptr<QwenLayer_vulkan> QwenLayer_vulkan::create_head(const CompiledMo
 }
 
 #if NCNN_MOE_WITH_VULKAN
-static bool qwen_ple_rows(const WeightStore& weights, const PleBlockPlan& plan,
+static bool ple_rows(const WeightStore& weights, const PleBlockPlan& plan,
                           std::span<const int32_t> tokens, const LayerCache& cache, ActivationBuffer& packed,
                           uint32_t& encoding, uint32_t& stride, std::vector<int32_t>& next_history)
 {
@@ -391,9 +391,9 @@ static bool qwen_ple_rows(const WeightStore& weights, const PleBlockPlan& plan,
 }
 #endif
 
-bool QwenLayer_vulkan::forward(const ActivationBuffer& initial_hidden, std::span<const int32_t> tokens,
+bool GatedResidualLayer_vulkan::forward(const ActivationBuffer& initial_hidden, std::span<const int32_t> tokens,
                                uint64_t position, LayerCache& cache, const ExpertDispatchOptions& options,
-                               ExpertDispatchPlan& routes, QwenLayerWorkspace_vulkan& workspace, std::string& error) const
+                               ExpertDispatchPlan& routes, GatedResidualWorkspace_vulkan& workspace, std::string& error) const
 {
 #if NCNN_MOE_WITH_VULKAN
     error.clear();
@@ -407,7 +407,7 @@ bool QwenLayer_vulkan::forward(const ActivationBuffer& initial_hidden, std::span
     uint32_t encoding = 0, stride = 0;
     auto& packed = previous.packed;
     auto& history = previous.history;
-    if (impl.ple.enabled() && ((!cache.ple_device_state && !cache.ple_convolution_state.empty()) || !qwen_ple_rows(*impl.weights, impl.ple, tokens, cache, packed, encoding, stride, history))) return fail("PLE row selection or incompatible prefix");
+    if (impl.ple.enabled() && ((!cache.ple_device_state && !cache.ple_convolution_state.empty()) || !ple_rows(*impl.weights, impl.ple, tokens, cache, packed, encoding, stride, history))) return fail("PLE row selection or incompatible prefix");
     auto transfer = impl.context->acquire_transfer_slot();
     auto& slot = transfer.slot();
     const auto previous_post = previous.post;
@@ -461,33 +461,33 @@ bool QwenLayer_vulkan::forward(const ActivationBuffer& initial_hidden, std::span
         }
         if (!fill_staging_upload(packed, packed_staging, slot.staging_allocator)
             || !record_mapped_upload(packed_staging, packed_gpu, cmd, impl.opt)
-            || !qwen_allocate(ple_norm, impl.ple.embedding_dimension, input.h, impl.context)) return fail("PLE selected-row upload or workspace allocation");
+            || !residual_allocate(ple_norm, impl.ple.embedding_dimension, input.h, impl.context)) return fail("PLE selected-row upload or workspace allocation");
         ++uploads;
-        qwen_record(impl.pipeline.get(), 7, impl.ple.embedding_dimension, heads, input.h, impl.ple.embedding_dimension,
+        residual_record(impl.pipeline.get(), 7, impl.ple.embedding_dimension, heads, input.h, impl.ple.embedding_dimension,
                     0, 0, {packed_gpu, packed_gpu, packed_gpu, packed_gpu, packed_gpu, ple_norm}, cmd,
                     encoding, impl.ple.embedding_dimension / heads, stride);
         if (!impl.ple_key->record_forward(ple_norm, ple_key, cmd, buffers)
             || !impl.ple_value->record_forward(ple_norm, ple_value, cmd, buffers)) return fail("PLE key/value projection");
         ncnn::VkMat key_normalized, query_normalized;
-        if (!qwen_allocate(key_normalized, expanded, input.h, impl.context)
-            || !qwen_allocate(query_normalized, expanded, input.h, impl.context)
-            || !qwen_allocate(gated, expanded, input.h, impl.context)
-            || !qwen_allocate(conv_input, expanded, input.h, impl.context)
-            || !qwen_allocate(ple_query, expanded, input.h, impl.context)) return fail("PLE workspace allocation");
-        qwen_prepare_read(impl.key_norm);
-        qwen_prepare_read(impl.query_norm);
-        qwen_prepare_read(impl.conv_norm);
-        qwen_prepare_read(impl.convolution_weight);
-        qwen_prepare_read(ple_state->d->convolution);
-        qwen_record(impl.pipeline.get(), 0, impl.hidden, impl.copies, input.h, expanded, impl.epsilon, impl.offset,
+        if (!residual_allocate(key_normalized, expanded, input.h, impl.context)
+            || !residual_allocate(query_normalized, expanded, input.h, impl.context)
+            || !residual_allocate(gated, expanded, input.h, impl.context)
+            || !residual_allocate(conv_input, expanded, input.h, impl.context)
+            || !residual_allocate(ple_query, expanded, input.h, impl.context)) return fail("PLE workspace allocation");
+        residual_prepare_read(impl.key_norm);
+        residual_prepare_read(impl.query_norm);
+        residual_prepare_read(impl.conv_norm);
+        residual_prepare_read(impl.convolution_weight);
+        residual_prepare_read(ple_state->d->convolution);
+        residual_record(impl.pipeline.get(), 0, impl.hidden, impl.copies, input.h, expanded, impl.epsilon, impl.offset,
                     {ple_key, impl.key_norm, ple_key, ple_key, ple_key, key_normalized}, cmd);
-        qwen_record(impl.pipeline.get(), 0, impl.hidden, impl.copies, input.h, expanded, impl.epsilon, impl.offset,
+        residual_record(impl.pipeline.get(), 0, impl.hidden, impl.copies, input.h, expanded, impl.epsilon, impl.offset,
                     {input, impl.query_norm, input, input, input, query_normalized}, cmd);
-        qwen_record(impl.pipeline.get(), 5, impl.hidden, impl.copies, input.h, expanded, 0, 0,
+        residual_record(impl.pipeline.get(), 5, impl.hidden, impl.copies, input.h, expanded, 0, 0,
                     {key_normalized, query_normalized, ple_value, ple_value, ple_value, gated}, cmd);
-        qwen_record(impl.pipeline.get(), 0, impl.hidden, impl.copies, input.h, expanded, impl.epsilon, impl.offset,
+        residual_record(impl.pipeline.get(), 0, impl.hidden, impl.copies, input.h, expanded, impl.epsilon, impl.offset,
                     {gated, impl.conv_norm, gated, gated, gated, conv_input}, cmd);
-        qwen_record(impl.pipeline.get(), 6, impl.hidden, impl.copies, input.h, expanded, 0, 0,
+        residual_record(impl.pipeline.get(), 6, impl.hidden, impl.copies, input.h, expanded, 0, 0,
                     {conv_input, gated, impl.convolution_weight, input, ple_state->d->convolution, ple_query}, cmd,
                     impl.ple.convolution_kernel_size, impl.ple.ngram_size, length, ple_state->d->slot);
         next_slot = length == 0 ? 0 : static_cast<uint32_t>((ple_state->d->slot + tokens.size()) % length);
@@ -587,8 +587,8 @@ bool QwenLayer_vulkan::forward(const ActivationBuffer& initial_hidden, std::span
 #endif
 }
 
-bool QwenLayer_vulkan::defer_combine(std::span<const MoeCombineInput_vulkan> inputs,
-                                     size_t rows, uint32_t columns, std::shared_ptr<const DeviceTensor_vulkan> shared, QwenLayerWorkspace_vulkan& workspace)
+bool GatedResidualLayer_vulkan::defer_combine(std::span<const MoeCombineInput_vulkan> inputs,
+                                     size_t rows, uint32_t columns, std::shared_ptr<const DeviceTensor_vulkan> shared, GatedResidualWorkspace_vulkan& workspace)
 {
 #if NCNN_MOE_WITH_VULKAN
     if (!workspace.active()) return false;
@@ -611,13 +611,13 @@ bool QwenLayer_vulkan::defer_combine(std::span<const MoeCombineInput_vulkan> inp
 #endif
 }
 
-bool QwenLayer_vulkan::finish(const CompiledModel& model, bool produce_logits, bool last_only,
-                              ActivationBuffer& logits, QwenLayerWorkspace_vulkan& workspace)
+bool GatedResidualLayer_vulkan::finish(const CompiledModel& model, bool produce_logits, bool last_only,
+                              ActivationBuffer& logits, GatedResidualWorkspace_vulkan& workspace)
 {
 #if NCNN_MOE_WITH_VULKAN
-    if (!workspace.active() || !model.qwen_device_head) return false;
+    if (!workspace.active() || !model.gated_residual_device_head) return false;
     if (!produce_logits) return true;
-    auto& head = *model.qwen_device_head->d;
+    auto& head = *model.gated_residual_device_head->d;
     if (head.context != workspace.d->context) return false;
     auto transfer = head.context->acquire_transfer_slot();
     auto& slot = transfer.slot();

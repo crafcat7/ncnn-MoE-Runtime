@@ -1,0 +1,47 @@
+#version 450
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer source_blob_0
+{ float source_0[]; };
+layout(binding = 1) readonly buffer source_blob_1
+{ float source_1[]; };
+layout(binding = 2) readonly buffer source_blob_2
+{ float source_2[]; };
+layout(binding = 3) readonly buffer source_blob_3
+{ float source_3[]; };
+layout(binding = 4) buffer output_blob
+{ float output_data[]; };
+layout(push_constant) uniform parameter
+{
+    uint columns;
+    uint source_count;
+    uint initialize;
+    float weight_0;
+    float weight_1;
+    float weight_2;
+    float weight_3;
+}
+p;
+void main()
+{
+    const uint column = gl_GlobalInvocationID.x;
+    if (column >= p.columns) return;
+    precise float sum = p.initialize != 0 ? 0.0 : output_data[column];
+    precise float product_0 = p.weight_0 * source_0[column];
+    sum += product_0;
+    if (p.source_count > 1)
+    {
+        precise float product_1 = p.weight_1 * source_1[column];
+        sum += product_1;
+    }
+    if (p.source_count > 2)
+    {
+        precise float product_2 = p.weight_2 * source_2[column];
+        sum += product_2;
+    }
+    if (p.source_count > 3)
+    {
+        precise float product_3 = p.weight_3 * source_3[column];
+        sum += product_3;
+    }
+    output_data[column] = sum;
+}

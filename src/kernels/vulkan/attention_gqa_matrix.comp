@@ -1,0 +1,272 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_NV_cooperative_matrix2 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// One workgroup shares each K/V tile across a group of query heads. All
+// intermediate scores, softmax state, and output accumulators remain matrices.
+layout(constant_id = 0) const uint QUERY_TILE = 32;
+layout(constant_id = 1) const uint KV_TILE = 32;
+layout(constant_id = 2) const uint HEAD_DIM = 64;
+layout(constant_id = 3) const uint KV_BFLOAT16_STORAGE = 1;
+
+// Hardware matrix tiles and online reduction blocks are independent. Keep
+// softmax/value updates at 16 tokens while using the supported 32-column
+// cooperative tile; the remaining columns are masked to contribute zero.
+const uint LOGICAL_KV_TILE = 16;
+
+layout(binding = 0) readonly buffer query_blob
+{ float query_data[]; };
+layout(binding = 1) readonly buffer key_blob
+{ uint key_data[]; };
+layout(binding = 2) readonly buffer value_blob
+{ uint value_data[]; };
+layout(binding = 3) readonly buffer sink_blob
+{ float sink_data[]; };
+layout(binding = 4) writeonly buffer partial_blob
+{ float partial_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    uint head_dimension;
+    uint token_count;
+    uint head_count;
+    uint kv_head_count;
+    uint query_cstep;
+    uint key_cstep;
+    uint value_cstep;
+    uint use_sink;
+    float scale;
+    uint split_count;
+    uint split_tokens;
+}
+p;
+
+#define SCORE_MATRIX  coopmat<float, gl_ScopeWorkgroup, QUERY_TILE, KV_TILE, gl_MatrixUseAccumulator>
+#define OUTPUT_MATRIX coopmat<float, gl_ScopeWorkgroup, QUERY_TILE, HEAD_DIM, gl_MatrixUseAccumulator>
+
+float reduce_max(const in float a, const in float b)
+{
+    return max(a, b);
+}
+
+float reduce_sum(const in float a, const in float b)
+{
+    return a + b;
+}
+
+float round_bfloat16(const in uint row, const in uint column, const in float value)
+{
+    const uint bits = floatBitsToUint(value);
+    const uint rounded = bits + 0x7fffu + ((bits >> 16) & 1u);
+    return uintBitsToFloat(rounded & 0xffff0000u);
+}
+
+// Each input row has identical elements. This reduction broadcasts that row
+// state to a matrix with a different column count without a shared-memory copy.
+float broadcast_row(const in float a, const in float b)
+{
+    return a;
+}
+
+float element_max(const in uint row, const in uint column,
+                  const in float a, const in float b)
+{
+    return max(a, b);
+}
+
+float element_exp(const in uint row, const in uint column, const in float value)
+{
+    return exp(value);
+}
+
+float mask_padding(const in uint row, const in uint column,
+                   const in float value, const in float replacement,
+                   const in uint rows, const in uint columns)
+{
+    return row < rows && column < columns ? value : replacement;
+}
+
+float load_sink(const in uint row, const in uint column,
+                const in float value, const in uint first_head,
+                const in uint rows)
+{
+    return row < rows ? sink_data[first_head + row] : uintBitsToFloat(0xff800000u);
+}
+
+float store_numerator(const in uint row, const in uint column,
+                      const in float value, const in uint first_head,
+                      const in uint rows)
+{
+    if (row < rows)
+    {
+        const uint offset = (gl_WorkGroupID.x * p.head_count + first_head + row)
+                            * (p.head_dimension + 2);
+        partial_data[offset + column] = value;
+    }
+    return value;
+}
+
+float store_statistic(const in uint row, const in uint column,
+                      const in float value, const in uint first_head,
+                      const in uint rows, const in uint statistic)
+{
+    if (row < rows && column == 0)
+    {
+        const uint offset = (gl_WorkGroupID.x * p.head_count + first_head + row)
+                            * (p.head_dimension + 2);
+        partial_data[offset + p.head_dimension + statistic] = value;
+    }
+    return value;
+}
+
+void main()
+{
+    const uint group_size = p.head_count / p.kv_head_count;
+    const uint group_row = gl_WorkGroupID.y * QUERY_TILE;
+    const uint first_head = gl_WorkGroupID.z * group_size + group_row;
+    const uint rows = min(QUERY_TILE, group_size - group_row);
+    const uint split_begin = gl_WorkGroupID.x * p.split_tokens;
+    const uint split_end = min(p.token_count, split_begin + p.split_tokens);
+    const float negative_max = uintBitsToFloat(0xfeffffffu);
+
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> query_layout = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    query_layout = setTensorLayoutDimensionNV(query_layout, rows, HEAD_DIM);
+    query_layout = setTensorLayoutStrideNV(query_layout, p.query_cstep, 1);
+
+    coopmat<float, gl_ScopeWorkgroup, QUERY_TILE, HEAD_DIM, gl_MatrixUseAccumulator> query;
+    coopMatLoadTensorNV(query, query_data, first_head * p.query_cstep,
+                        sliceTensorLayoutNV(query_layout, 0, QUERY_TILE, 0, HEAD_DIM));
+    // Represent the FP32 query with three BF16 terms. Form each residual
+    // after explicit nearest-even rounding, and scale the completed
+    // dot product rather than rounding a scaled query before multiplication.
+    OUTPUT_MATRIX query_high;
+    coopMatPerElementNV(query_high, query, round_bfloat16);
+    query -= query_high;
+    OUTPUT_MATRIX query_middle;
+    coopMatPerElementNV(query_middle, query, round_bfloat16);
+    query -= query_middle;
+    coopmat<bfloat16_t, gl_ScopeWorkgroup, QUERY_TILE, HEAD_DIM, gl_MatrixUseA> query_bf16_high = coopmat<bfloat16_t, gl_ScopeWorkgroup, QUERY_TILE, HEAD_DIM, gl_MatrixUseA>(query_high);
+    coopmat<bfloat16_t, gl_ScopeWorkgroup, QUERY_TILE, HEAD_DIM, gl_MatrixUseA> query_bf16_middle = coopmat<bfloat16_t, gl_ScopeWorkgroup, QUERY_TILE, HEAD_DIM, gl_MatrixUseA>(query_middle);
+    coopmat<bfloat16_t, gl_ScopeWorkgroup, QUERY_TILE, HEAD_DIM, gl_MatrixUseA> query_bf16_low = coopmat<bfloat16_t, gl_ScopeWorkgroup, QUERY_TILE, HEAD_DIM, gl_MatrixUseA>(query);
+
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> kv_layout = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    kv_layout = setTensorLayoutDimensionNV(kv_layout, split_end, HEAD_DIM);
+    tensorViewNV<2, false, 1, 0> transpose = createTensorViewNV(2, false, 1, 0);
+
+    OUTPUT_MATRIX numerator = OUTPUT_MATRIX(0.0);
+    SCORE_MATRIX row_max = SCORE_MATRIX(negative_max);
+    SCORE_MATRIX row_sum = SCORE_MATRIX(0.0);
+
+    for (uint token = split_begin; token < split_end; token += LOGICAL_KV_TILE)
+    {
+        coopmat<bfloat16_t, gl_ScopeWorkgroup, HEAD_DIM, KV_TILE, gl_MatrixUseB> key;
+        // Tensor elementOffset is in uint words; layout strides are measured
+        // in the destination matrix's component type. BF16 logical KV can
+        // reside in either native BF16 buffers or existing FP32 cache buffers.
+        if (KV_BFLOAT16_STORAGE != 0)
+        {
+            coopMatLoadTensorNV(key, key_data, (gl_WorkGroupID.z * p.key_cstep) / 2,
+                                sliceTensorLayoutNV(kv_layout, int(token), KV_TILE, 0, HEAD_DIM),
+                                transpose);
+        }
+        else
+        {
+            coopmat<float, gl_ScopeWorkgroup, HEAD_DIM, KV_TILE, gl_MatrixUseAccumulator> key_float;
+            coopMatLoadTensorNV(key_float, key_data, gl_WorkGroupID.z * p.key_cstep,
+                                sliceTensorLayoutNV(kv_layout, int(token), KV_TILE, 0, HEAD_DIM),
+                                transpose);
+            key = coopmat<bfloat16_t, gl_ScopeWorkgroup, HEAD_DIM, KV_TILE, gl_MatrixUseB>(key_float);
+        }
+        SCORE_MATRIX scores = SCORE_MATRIX(0.0);
+        scores = coopMatMulAdd(query_bf16_high, key, scores);
+        scores = coopMatMulAdd(query_bf16_middle, key, scores);
+        scores = coopMatMulAdd(query_bf16_low, key, scores);
+        scores *= p.scale;
+
+        const uint columns = min(LOGICAL_KV_TILE, split_end - token);
+        if (rows != QUERY_TILE || columns != KV_TILE)
+            coopMatPerElementNV(scores, scores, mask_padding, negative_max, rows, columns);
+
+        SCORE_MATRIX tile_max;
+        coopMatReduceNV(tile_max, scores, gl_CooperativeMatrixReduceRowNV, reduce_max);
+        const SCORE_MATRIX old_max = row_max;
+        coopMatPerElementNV(row_max, tile_max, element_max, old_max);
+        SCORE_MATRIX probabilities;
+        SCORE_MATRIX rescale;
+        coopMatPerElementNV(probabilities, scores - row_max, element_exp);
+        coopMatPerElementNV(rescale, old_max - row_max, element_exp);
+        if (rows != QUERY_TILE || columns != KV_TILE)
+            coopMatPerElementNV(probabilities, probabilities, mask_padding, 0.0, rows, columns);
+
+        // Keep the denominator in FP32. Three BF16 terms also preserve the
+        // probability's low bits in the matrix value product.
+        SCORE_MATRIX tile_sum;
+        coopMatReduceNV(tile_sum, probabilities, gl_CooperativeMatrixReduceRowNV, reduce_sum);
+        row_sum = rescale * row_sum + tile_sum;
+        SCORE_MATRIX probability_high;
+        coopMatPerElementNV(probability_high, probabilities, round_bfloat16);
+        probabilities -= probability_high;
+        SCORE_MATRIX probability_middle;
+        coopMatPerElementNV(probability_middle, probabilities, round_bfloat16);
+        probabilities -= probability_middle;
+        coopmat<bfloat16_t, gl_ScopeWorkgroup, QUERY_TILE, KV_TILE, gl_MatrixUseA> probability_bf16_high = coopmat<bfloat16_t, gl_ScopeWorkgroup, QUERY_TILE, KV_TILE, gl_MatrixUseA>(probability_high);
+        coopmat<bfloat16_t, gl_ScopeWorkgroup, QUERY_TILE, KV_TILE, gl_MatrixUseA> probability_bf16_middle = coopmat<bfloat16_t, gl_ScopeWorkgroup, QUERY_TILE, KV_TILE, gl_MatrixUseA>(probability_middle);
+        coopmat<bfloat16_t, gl_ScopeWorkgroup, QUERY_TILE, KV_TILE, gl_MatrixUseA> probability_bf16_low = coopmat<bfloat16_t, gl_ScopeWorkgroup, QUERY_TILE, KV_TILE, gl_MatrixUseA>(probabilities);
+
+        OUTPUT_MATRIX output_rescale;
+        coopMatReduceNV(output_rescale, rescale, gl_CooperativeMatrixReduceRowNV, broadcast_row);
+
+        coopmat<bfloat16_t, gl_ScopeWorkgroup, KV_TILE, HEAD_DIM, gl_MatrixUseB> value;
+        if (KV_BFLOAT16_STORAGE != 0)
+        {
+            coopMatLoadTensorNV(value, value_data, (gl_WorkGroupID.z * p.value_cstep) / 2,
+                                sliceTensorLayoutNV(kv_layout, int(token), KV_TILE, 0, HEAD_DIM));
+        }
+        else
+        {
+            coopmat<float, gl_ScopeWorkgroup, KV_TILE, HEAD_DIM, gl_MatrixUseAccumulator> value_float;
+            coopMatLoadTensorNV(value_float, value_data, gl_WorkGroupID.z * p.value_cstep,
+                                sliceTensorLayoutNV(kv_layout, int(token), KV_TILE, 0, HEAD_DIM));
+            value = coopmat<bfloat16_t, gl_ScopeWorkgroup, KV_TILE, HEAD_DIM, gl_MatrixUseB>(value_float);
+        }
+        // Accumulate each logical block from zero before adding the rescaled
+        // history. This keeps small block contributions from being rounded
+        // against a large previous numerator during individual matrix products.
+        OUTPUT_MATRIX tile_numerator = OUTPUT_MATRIX(0.0);
+        tile_numerator = coopMatMulAdd(probability_bf16_high, value, tile_numerator);
+        tile_numerator = coopMatMulAdd(probability_bf16_middle, value, tile_numerator);
+        tile_numerator = coopMatMulAdd(probability_bf16_low, value, tile_numerator);
+        numerator = numerator * output_rescale + tile_numerator;
+    }
+
+    // A sink has no value vector. Add it once, after probability rounding, so
+    // its magnitude cannot change the BF16 probabilities used by P*V.
+    if (p.use_sink != 0 && gl_WorkGroupID.x == 0)
+    {
+        SCORE_MATRIX sink = SCORE_MATRIX(negative_max);
+        coopMatPerElementNV(sink, sink, load_sink, first_head, rows);
+        const SCORE_MATRIX old_max = row_max;
+        coopMatPerElementNV(row_max, row_max, element_max, sink);
+        SCORE_MATRIX rescale;
+        SCORE_MATRIX sink_probability;
+        coopMatPerElementNV(rescale, old_max - row_max, element_exp);
+        coopMatPerElementNV(sink_probability, sink - row_max, element_exp);
+        row_sum = rescale * row_sum + sink_probability;
+        OUTPUT_MATRIX output_rescale;
+        coopMatReduceNV(output_rescale, rescale, gl_CooperativeMatrixReduceRowNV, broadcast_row);
+        numerator *= output_rescale;
+    }
+
+    // Empty splits remain (zero numerator, finite minimum max, zero sum).
+    // The reduction shader explicitly ignores them, including fully empty input.
+    coopMatPerElementNV(numerator, numerator, store_numerator, first_head, rows);
+    coopMatPerElementNV(row_max, row_max, store_statistic, first_head, rows, 0u);
+    coopMatPerElementNV(row_sum, row_sum, store_statistic, first_head, rows, 1u);
+}

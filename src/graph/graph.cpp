@@ -310,7 +310,7 @@ static bool use_vulkan_attention(const CompiledModel& compiled,
     {
         return false;
     }
-    return compiled.qwen_device_chain || support_vulkan_attention(compiled.operators, attention);
+    return compiled.gated_residual_chain || support_vulkan_attention(compiled.operators, attention);
 }
 
 static ExecutionNodeId add_moe_nodes(ExecutionGraph& graph,
@@ -322,14 +322,16 @@ static ExecutionNodeId add_moe_nodes(ExecutionGraph& graph,
                                      bool use_vulkan_experts)
 {
     const CompiledLayerPlan& layer = graph.layer_plans[plan_index];
+    const bool resident = &graph == &compiled.graph && plan_index < compiled.gpu_segments.size()
+                          && compiled.gpu_segments[plan_index];
     const ExecutionTensorId router_scores = add_tensor(graph,
                                                        prefix + "router.scores",
                                                        DType::Float32,
                                                        {0, static_cast<uint32_t>(layer.moe.experts.size())});
     const ExecutionNodeId router = add_node(graph,
                                             ExecutionNodeType::Router,
-                                            ExecutionBackend::Cpu,
-                                            ExecutionBackendCpu,
+                                            resident ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu,
+                                            resident ? ExecutionBackendVulkan : ExecutionBackendCpu,
                                             prefix + "router",
                                             {previous},
                                             {hidden},
@@ -412,8 +414,8 @@ static ExecutionNodeId add_moe_nodes(ExecutionGraph& graph,
     }
     const ExecutionNodeId combine = add_node(graph,
                                              ExecutionNodeType::Combine,
-                                             ExecutionBackend::Cpu,
-                                             ExecutionBackendCpu,
+                                             resident ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu,
+                                             resident ? ExecutionBackendVulkan : ExecutionBackendCpu,
                                              prefix + "combine",
                                              std::move(combine_dependencies),
                                              std::move(combine_inputs),
@@ -642,7 +644,8 @@ Result<void> build_graph(CompiledModel& compiled, bool use_vulkan_experts)
     }
 
     const ExecutionTensorId normalized = add_tensor(graph, "final_norm.hidden", compiled.descriptor.activation_dtype, {0, compiled.descriptor.hidden_size});
-    previous = add_node(graph, ExecutionNodeType::FinalNorm, ExecutionBackend::Cpu, ExecutionBackendCpu, "final_norm",
+    previous = add_node(graph, ExecutionNodeType::FinalNorm, compiled.gpu_head ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu,
+                        compiled.gpu_head ? ExecutionBackendVulkan : ExecutionBackendCpu, "final_norm",
                         {previous}, {hidden}, {normalized},
                         invalid_execution_layer_id, 0);
     graph.nodes[previous].weight_inputs = compiled.final_norm_weight == invalid_tensor_handle

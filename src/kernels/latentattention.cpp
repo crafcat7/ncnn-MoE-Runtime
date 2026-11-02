@@ -18,6 +18,7 @@
 #include <cassert>
 #include <cmath>
 #include <limits>
+#include <stdexcept>
 #include <vector>
 
 #if defined(_OPENMP)
@@ -392,19 +393,23 @@ static void append_compressed_value(const WeightStore& weights,
         const TensorData& gate_weight = weights.at(gate_handle);
         const CompiledOperator& value_operator = operators.at_weight(value_handle);
         const CompiledOperator& gate_operator = operators.at_weight(gate_handle);
-        const bool used_vulkan_pair = vulkan_latent_compressor_enabled(backend, optimization_flags)
-                                      && value_operator.bfloat16
-                                      && gate_operator.bfloat16
+        const bool attempt_vulkan_pair = vulkan_latent_compressor_enabled(backend, optimization_flags)
+                                         && value_operator.bfloat16
+                                         && gate_operator.bfloat16;
+        const bool used_vulkan_pair = attempt_vulkan_pair
                                       && value_operator.bfloat16->forward_parallel(input,
                                                                                    *gate_operator.bfloat16,
                                                                                    compressor_values,
                                                                                    compressor_scores);
+        if (attempt_vulkan_pair && !used_vulkan_pair)
+            throw std::runtime_error("Vulkan latent compressor projection failed");
         if (!used_vulkan_pair
-            && !forward_linear({&value_weight, &gate_weight}, input,
-                               {&compressor_values, &compressor_scores}, optimization_flags,
-                               {operators.find_weight(value_handle),
-                                operators.find_weight(gate_handle)},
-                               &scratch.quantized_input))
+            && (backend != ExecutionBackend::Cpu
+                || !forward_linear({&value_weight, &gate_weight}, input,
+                                   {&compressor_values, &compressor_scores}, optimization_flags,
+                                   {operators.find_weight(value_handle),
+                                    operators.find_weight(gate_handle)},
+                                   &scratch.quantized_input)))
         {
             forward_linear(value_weight, input, compressor_values, optimization_flags,
                            operators.find_weight(value_handle), backend, &scratch.quantized_input);
@@ -704,10 +709,13 @@ static Result<void> forward_output(const WeightStore& weights,
     {
         if (output_a_operator.float8->forward_chain(attention_output, *output_b_operator.float8, output))
             return {};
+        return Error{ErrorCode::InternalError, "Vulkan latent attention output projection chain failed"};
     }
     ActivationBuffer& output_rank = scratch.projected;
     const bool device_projected = backend == ExecutionBackend::Vulkan && output_a_operator.qnk
                                   && output_a_operator.qnk->forward(attention_output, output_rank);
+    if (backend == ExecutionBackend::Vulkan && output_a_operator.qnk && !device_projected)
+        return Error{ErrorCode::InternalError, "Vulkan latent attention output projection failed"};
     if (!device_projected && backend == ExecutionBackend::Vulkan && output_a_operator.float8)
     {
         forward_linear(output_a, attention_output, output_rank, optimization_flags,
@@ -716,6 +724,8 @@ static Result<void> forward_output(const WeightStore& weights,
     }
     else if (!device_projected)
     {
+        if (backend == ExecutionBackend::Vulkan)
+            return Error{ErrorCode::InternalError, "Vulkan latent attention output projection has no device operator"};
         output_rank.reset(attention_output.rows(), plan.output_group_count * plan.output_lora_rank, false);
         const uint32_t heads_per_group = plan.head_count / plan.output_group_count;
         const uint32_t group_columns = heads_per_group * plan.head_dimension;
@@ -788,15 +798,21 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
         return Error{ErrorCode::InvalidArgument, "latent attention input/output must be distinct"};
 
     const auto& prepared_latent_operator = operators.at_weight(plan.query_a_weight).latent_attention;
+    if (backend == ExecutionBackend::Vulkan
+        && (!prepared_latent_operator || !has_flag(optimization_flags, OptimizationVulkanAttention)))
+        return Error{ErrorCode::InternalError, "Vulkan latent Attention was selected without an enabled device core"};
     if (backend == ExecutionBackend::Vulkan && prepared_latent_operator
 #if NCNN_MOE_WITH_VULKAN
         && prepared_latent_operator->can_record()
 #endif
         && has_flag(optimization_flags, OptimizationVulkanAttention)
         && has_flag(optimization_flags, OptimizationVulkanLatentInputRmsNorm)
-        && (plan.compression_ratio == 0 || vulkan_latent_compressor_enabled(backend, optimization_flags))
-        && prepared_latent_operator->forward_projected_batch(input, positions, caches, output))
-        return {};
+        && (plan.compression_ratio == 0 || vulkan_latent_compressor_enabled(backend, optimization_flags)))
+    {
+        if (prepared_latent_operator->forward_projected_batch(input, positions, caches, output))
+            return {};
+        return Error{ErrorCode::InternalError, "Vulkan latent attention projected batch execution failed"};
+    }
 
     ActivationBuffer& normalized = scratch.normalized;
     ActivationBuffer& query_rank = scratch.projected;
@@ -814,6 +830,27 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
                 break;
             }
         }
+    }
+    if (backend == ExecutionBackend::Vulkan && !independent_caches)
+    {
+        // The segmented core operates on independent cache rows. A prefill
+        // with repeated caches still uses that GPU core in token order when
+        // the optional complete command recorder is unavailable or disabled.
+        ActivationBuffer completed(input.rows(), weights.at(plan.output_b_weight).shape[0]);
+        ActivationBuffer row_input(1, input.columns());
+        ActivationBuffer row_output;
+        for (size_t row = 0; row < input.rows(); ++row)
+        {
+            std::copy_n(input.row(row), input.columns(), row_input.row(0));
+            const auto executed = forward_latent_attention_batch(weights, operators, plan, backend,
+                                                                 positions.subspan(row, 1), caches.subspan(row, 1),
+                                                                 scratch, row_input, row_output, optimization_flags);
+            if (!executed)
+                return executed.error();
+            std::copy_n(row_output.row(0), completed.columns(), completed.row(row));
+        }
+        output.swap(completed);
+        return {};
     }
     const auto& latent_operator = operators.at_weight(plan.query_a_weight).latent_attention;
     const bool use_vulkan_core = backend == ExecutionBackend::Vulkan && independent_caches
@@ -988,6 +1025,8 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
                                                                                                    query,
                                                                                                    key_value, retained_query_output);
                     key_value_ready = chained_query;
+                    if (!chained_query)
+                        return Error{ErrorCode::InternalError, "Vulkan latent attention input-normalized query chain failed"};
                 }
                 if (!chained_query)
                 {
@@ -1018,6 +1057,8 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
             }
             chained_query = query_a_operator.float8->forward_rms_norm_chain(normalized, *query_b_operator.float8, query);
         }
+        if (!chained_query)
+            return Error{ErrorCode::InternalError, "Vulkan latent attention query projection chain failed"};
     }
     if (!chained_query
         && backend == ExecutionBackend::Vulkan
@@ -1056,6 +1097,8 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
                         && graph->submit()
                         && graph->wait();
         key_value_ready = chained_query;
+        if (!chained_query)
+            return Error{ErrorCode::InternalError, "Vulkan latent attention query command graph failed"};
     }
     if (!chained_query)
     {
@@ -1066,11 +1109,12 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
                              plan.norm_epsilon, normalized, 0.0f);
             normalized_ready = true;
         }
-        const bool paired_projection = forward_linear({&query_a, &key_value_weight}, normalized,
-                                                      {&query_rank, &key_value}, optimization_flags,
-                                                      {operators.find_weight(plan.query_a_weight),
-                                                       operators.find_weight(plan.key_value_weight)},
-                                                      &scratch.quantized_input);
+        const bool paired_projection = backend == ExecutionBackend::Cpu
+                                       && forward_linear({&query_a, &key_value_weight}, normalized,
+                                                         {&query_rank, &key_value}, optimization_flags,
+                                                         {operators.find_weight(plan.query_a_weight),
+                                                          operators.find_weight(plan.key_value_weight)},
+                                                         &scratch.quantized_input);
         if (!paired_projection)
         {
             forward_linear(query_a, normalized, query_rank, optimization_flags,
@@ -1080,7 +1124,7 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
         else
             key_value_ready = true;
         query_rank_ready = true;
-        const bool query_projection_fused = query_rank_not_required
+        const bool query_projection_fused = backend == ExecutionBackend::Cpu && query_rank_not_required
                                             && forward_linear_rms_norm_float8(query_b, query_rank,
                                                                               weights.at(plan.query_norm_weight), plan.norm_epsilon, query,
                                                                               optimization_flags, operators.find_weight(plan.query_b_weight),
@@ -1418,11 +1462,7 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
             const DeviceTensor_vulkan* device_query = retained_query.empty() ? nullptr : &retained_query;
             if (latent_operator->forward_batch(positions, caches, row_contexts, query, device_query, output))
                 return {};
-            // Query retention skipped its download; materialize only for CPU fallback.
-            if (device_query
-                && (!query_a_operator.float8 || !query_a_operator.float8->materialize(retained_query, query)))
-                return Error{ErrorCode::InternalError, "failed to materialize latent query for CPU fallback"};
-            attention_output.reset(input.rows(), plan.head_count * plan.head_dimension, true);
+            return Error{ErrorCode::InternalError, "Vulkan latent attention batch execution failed"};
         }
         const int64_t task_count = static_cast<int64_t>(input.rows()) * plan.head_count;
 #if defined(_OPENMP)
@@ -1565,6 +1605,8 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
                                                                                                query,
                                                                                                key_value);
                 key_value_ready = chained_query;
+                if (!chained_query)
+                    return Error{ErrorCode::InternalError, "Vulkan DSpark input-normalized query chain failed"};
             }
             if (!chained_query)
             {
@@ -1591,6 +1633,8 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
             normalized_ready = true;
             chained_query = query_a_operator.float8->forward_rms_norm_chain(normalized, *query_b_operator.float8, query);
         }
+        if (!chained_query)
+            return Error{ErrorCode::InternalError, "Vulkan DSpark query projection chain failed"};
     }
     if (!chained_query)
     {
@@ -1601,11 +1645,12 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
                              plan.norm_epsilon, normalized, 0.0f);
             normalized_ready = true;
         }
-        const bool paired_projection = forward_linear({&query_a, &key_value_weight}, normalized,
-                                                      {&query_rank, &key_value}, optimization_flags,
-                                                      {operators.find_weight(plan.query_a_weight),
-                                                       operators.find_weight(plan.key_value_weight)},
-                                                      &scratch.quantized_input);
+        const bool paired_projection = backend == ExecutionBackend::Cpu
+                                       && forward_linear({&query_a, &key_value_weight}, normalized,
+                                                         {&query_rank, &key_value}, optimization_flags,
+                                                         {operators.find_weight(plan.query_a_weight),
+                                                          operators.find_weight(plan.key_value_weight)},
+                                                         &scratch.quantized_input);
         if (!paired_projection)
         {
             forward_linear(query_a, normalized, query_rank, optimization_flags,
@@ -1614,9 +1659,10 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
         }
         else
             key_value_ready = true;
-        if (!forward_linear_rms_norm_float8(query_b, query_rank, weights.at(plan.query_norm_weight),
-                                            plan.norm_epsilon, query, optimization_flags,
-                                            operators.find_weight(plan.query_b_weight), &scratch.quantized_input))
+        if (backend != ExecutionBackend::Cpu
+            || !forward_linear_rms_norm_float8(query_b, query_rank, weights.at(plan.query_norm_weight),
+                                               plan.norm_epsilon, query, optimization_flags,
+                                               operators.find_weight(plan.query_b_weight), &scratch.quantized_input))
         {
             forward_rms_norm(query_rank, weights.at(plan.query_norm_weight),
                              plan.norm_epsilon, query_rank, 0.0f);

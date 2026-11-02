@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -2583,13 +2584,41 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
 
     if (family == Family::GptOss)
     {
+        if (messages.empty())
+            throw std::invalid_argument("GPT-OSS chat requires at least one message");
         std::vector<int32_t> prompt;
         const auto append_raw = [&](std::string_view text) {
             encode_impl(text, false, scratch, prompt);
         };
-        static constexpr std::string_view default_system = "You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.";
-        for (const Message& message : messages)
+        const auto append_message = [&](std::string_view role, std::string_view content, std::string_view channel = {}) {
+            prompt.push_back(200006);
+            append_raw(role);
+            if (!channel.empty())
+            {
+                prompt.push_back(200005);
+                append_raw(channel);
+            }
+            prompt.push_back(200008);
+            append_raw(content);
+            prompt.push_back(200007);
+        };
+        const std::time_t now = std::time(nullptr);
+        std::tm local_date{};
+#if defined(_WIN32)
+        const bool valid_date = localtime_s(&local_date, &now) == 0;
+#else
+        const bool valid_date = localtime_r(&now, &local_date) != nullptr;
+#endif
+        char date[11];
+        if (!valid_date || std::strftime(date, sizeof(date), "%Y-%m-%d", &local_date) == 0)
+            throw std::runtime_error("cannot format the GPT-OSS chat date");
+        // Match the model's inference template: the default system is always
+        // present, and caller instructions belong to the developer message.
+        append_message("system", std::string("You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: ")
+                                     + date + "\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.");
+        for (size_t index = 0; index < messages.size(); ++index)
         {
+            const Message& message = messages[index];
             std::string role = message.role;
             for (char& character : role)
             {
@@ -2600,11 +2629,19 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
                 throw std::invalid_argument("Tools should have a name!");
             if (role != "system" && role != "developer" && role != "user" && role != "assistant")
                 throw std::invalid_argument("Unknown Harmony role");
-            prompt.push_back(200006);
-            append_raw(role);
-            prompt.push_back(200008);
-            append_raw(role == "system" && message.content.empty() ? default_system : std::string_view(message.content));
-            prompt.push_back(200007);
+            if (role == "system" || role == "developer")
+            {
+                if (index != 0)
+                    throw std::invalid_argument("GPT-OSS instructions must precede the conversation");
+                if (!message.content.empty())
+                    append_message("developer", "# Instructions\n\n" + message.content + "\n\n");
+                continue;
+            }
+            if (role == "assistant"
+                && (message.content.find("<|channel|>analysis<|message|>") != std::string::npos
+                    || message.content.find("<|channel|>final<|message|>") != std::string::npos))
+                throw std::invalid_argument("GPT-OSS assistant content must not contain channel headers");
+            append_message(role, message.content, role == "assistant" ? "final" : "");
         }
         prompt.push_back(200006);
         append_raw("assistant");

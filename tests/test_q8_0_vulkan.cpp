@@ -409,7 +409,14 @@ static void bfloat16_device_expert(uint32_t device)
     std::array<std::shared_ptr<const void>, 1> pins;
     q8_check(upload && upload->wait(pins) == 1 && pins.front(), "BF16 cold device Expert admission on device " + std::to_string(device));
     upload.reset();
-    const uint64_t expected_charge = static_cast<uint64_t>(gate_up->bfloat16_data.size() + down->bfloat16_data.size()) * sizeof(uint16_t);
+    const uint64_t alignment = std::max<uint64_t>(4, context->device()->info.buffer_offset_alignment());
+    const auto aligned = [alignment](uint64_t bytes) {
+        return bytes + (alignment - bytes % alignment) % alignment;
+    };
+    const uint64_t expected_charge = aligned(gate_up->element_count() * sizeof(uint16_t))
+                                     + aligned(down->element_count() * sizeof(uint16_t))
+                                     + aligned(static_cast<uint64_t>(gate_up->shape[0]) * sizeof(float))
+                                     + aligned(static_cast<uint64_t>(down->shape[0]) * sizeof(float));
     q8_check(native_quantized_expert_storage_bytes(*gate_up, nullptr, *down, device, runtime, OptimizationDefaultFlags) == expected_charge
                  && backend->statistics().resident_size == expected_charge,
              "BF16 eager cache planning and admission share the same payload charge");
@@ -452,6 +459,12 @@ static void bfloat16_device_expert(uint32_t device)
 static void mxfp4_storage_billing(uint32_t device)
 {
     const auto runtime = create_vulkan_runtime();
+    const auto context = VulkanContext::acquire(device, runtime, OptimizationDefaultFlags);
+    q8_check(static_cast<bool>(context), "MXFP4 storage billing context");
+    const uint64_t alignment = std::max<uint64_t>(4, context->device()->info.buffer_offset_alignment());
+    const auto aligned = [alignment](uint64_t bytes) {
+        return bytes + (alignment - bytes % alignment) % alignment;
+    };
     const auto matrix = [](uint32_t rows, uint32_t columns) {
         auto weight = std::make_shared<TensorData>();
         weight->dtype = DType::MxFp4;
@@ -472,16 +485,17 @@ static void mxfp4_storage_billing(uint32_t device)
     down_bias.dtype = DType::Float32;
     down_bias.shape = {128};
     down_bias.float32_data.assign(128, -0.125f);
-    const uint64_t payload = gate->mxfp4_blocks.size() + gate->mxfp4_scales.size()
-                             + down->mxfp4_blocks.size() + down->mxfp4_scales.size();
-    const uint64_t expected_charge = payload + (gate_bias.float32_data.size() + down_bias.float32_data.size()) * sizeof(float);
-    q8_check(native_quantized_expert_storage_bytes(*gate, nullptr, *down, device, runtime, OptimizationDefaultFlags) == payload,
-             "MXFP4 eager storage planning uses the original packed payload");
+    const uint64_t expected_charge = aligned(gate->mxfp4_blocks.size()) + aligned(gate->mxfp4_scales.size())
+                                     + aligned(down->mxfp4_blocks.size()) + aligned(down->mxfp4_scales.size())
+                                     + aligned(static_cast<uint64_t>(gate->shape[0]) * sizeof(float))
+                                     + aligned(static_cast<uint64_t>(down->shape[0]) * sizeof(float));
+    q8_check(native_quantized_expert_storage_bytes(*gate, nullptr, *down, device, runtime, OptimizationDefaultFlags) == expected_charge,
+             "MXFP4 eager storage planning includes aligned original packed payload and zero FP32 biases");
     q8_check(native_quantized_expert_storage_bytes(*gate, nullptr, *down, device, runtime, OptimizationDefaultFlags,
                                                    &gate_bias, nullptr, &down_bias, ExpertActivation::Silu, 0.f)
                  == expected_charge,
-             "MXFP4 storage planning includes explicit biases");
-    auto backend = create_vulkan_expert_backend(1024 * 1024, device, nullptr, runtime, OptimizationDefaultFlags);
+             "MXFP4 explicit biases reuse the same allocated FP32 bias segments");
+    auto backend = create_vulkan_expert_backend(expected_charge, device, nullptr, runtime, OptimizationDefaultFlags);
     std::shared_ptr<const void> pin;
     q8_check(backend && backend->prepare_demand(ExpertDemandRequest{"mxfp4-billing", gate, &gate_bias, down, &down_bias, 0, 0.f, ExpertActivation::Silu}, pin)
                  && pin && backend->statistics().resident_size == expected_charge,

@@ -76,6 +76,15 @@ void record_vulkan_delta(SessionStatistics& stats,
     stats.vulkan_compute_submissions += after.compute_submissions - before.compute_submissions;
     stats.vulkan_batch_uploads += after.batch_uploads - before.batch_uploads;
     stats.vulkan_batch_downloads += after.batch_downloads - before.batch_downloads;
+    stats.vulkan_weight_upload_bytes += after.weight_upload_bytes - before.weight_upload_bytes;
+    stats.vulkan_weight_transfer_submissions += after.weight_transfer_submissions - before.weight_transfer_submissions;
+    stats.vulkan_weight_visibility_submissions += after.weight_visibility_submissions - before.weight_visibility_submissions;
+    stats.vulkan_weight_transfer_fence_waits += after.weight_transfer_fence_waits - before.weight_transfer_fence_waits;
+    stats.vulkan_weight_transfer_wait_microseconds += after.weight_transfer_wait_microseconds - before.weight_transfer_wait_microseconds;
+    stats.vulkan_resident_graph_submissions += after.resident_graph_submissions - before.resident_graph_submissions;
+    stats.vulkan_resident_graph_activation_upload_bytes += after.resident_graph_activation_upload_bytes - before.resident_graph_activation_upload_bytes;
+    stats.vulkan_resident_graph_activation_download_bytes += after.resident_graph_activation_download_bytes - before.resident_graph_activation_download_bytes;
+    stats.vulkan_resident_graph_route_download_bytes += after.resident_graph_route_download_bytes - before.resident_graph_route_download_bytes;
     stats.vulkan_attention_qkv_rope_fusions += after.attention_qkv_rope_fusions - before.attention_qkv_rope_fusions;
     stats.vulkan_attention_device_rope_fusions += after.attention_device_rope_fusions - before.attention_device_rope_fusions;
     stats.vulkan_attention_qkv_ring_fusions += after.attention_qkv_ring_fusions - before.attention_qkv_ring_fusions;
@@ -202,6 +211,15 @@ RuntimeMetricCounters metric_counters(const SessionStatistics& stats,
                                                 start.vulkan_batch_uploads);
     result.vulkan_batch_downloads = counter_delta(stats.vulkan_batch_downloads,
                                                   start.vulkan_batch_downloads);
+    result.vulkan_weight_upload_bytes = counter_delta(stats.vulkan_weight_upload_bytes, start.vulkan_weight_upload_bytes);
+    result.vulkan_weight_transfer_submissions = counter_delta(stats.vulkan_weight_transfer_submissions, start.vulkan_weight_transfer_submissions);
+    result.vulkan_weight_visibility_submissions = counter_delta(stats.vulkan_weight_visibility_submissions, start.vulkan_weight_visibility_submissions);
+    result.vulkan_weight_transfer_fence_waits = counter_delta(stats.vulkan_weight_transfer_fence_waits, start.vulkan_weight_transfer_fence_waits);
+    result.vulkan_weight_transfer_wait_microseconds = counter_delta(stats.vulkan_weight_transfer_wait_microseconds, start.vulkan_weight_transfer_wait_microseconds);
+    result.vulkan_resident_graph_submissions = counter_delta(stats.vulkan_resident_graph_submissions, start.vulkan_resident_graph_submissions);
+    result.vulkan_resident_graph_activation_upload_bytes = counter_delta(stats.vulkan_resident_graph_activation_upload_bytes, start.vulkan_resident_graph_activation_upload_bytes);
+    result.vulkan_resident_graph_activation_download_bytes = counter_delta(stats.vulkan_resident_graph_activation_download_bytes, start.vulkan_resident_graph_activation_download_bytes);
+    result.vulkan_resident_graph_route_download_bytes = counter_delta(stats.vulkan_resident_graph_route_download_bytes, start.vulkan_resident_graph_route_download_bytes);
     result.vulkan_attention_qkv_rope_fusions = counter_delta(stats.vulkan_attention_qkv_rope_fusions,
                                                              start.vulkan_attention_qkv_rope_fusions);
     result.vulkan_attention_device_rope_fusions = counter_delta(stats.vulkan_attention_device_rope_fusions,

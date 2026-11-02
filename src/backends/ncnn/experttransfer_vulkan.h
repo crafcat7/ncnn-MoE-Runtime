@@ -37,12 +37,20 @@ public:
     void clear() override;
     [[nodiscard]] uint64_t physical_bytes() const;
     [[nodiscard]] uint64_t physical_limit_rejections() const;
+    // The graph arena retains reusable blocks and permits physical growth only
+    // during explicit preparation/reservation. Expert-cache pools never call it.
+    void configure_graph_pool(bool allow_growth);
+    // Explicit graph replanning may discard free backing. Keep the smallest
+    // wholly free block that can cover the new reservation, and all live blocks.
+    void trim_graph_pool(uint64_t reservation_bytes);
 
 private:
+    struct Allocation;
     struct Range
     {
         size_t offset;
         size_t size;
+        Allocation* allocation = nullptr;
     };
     struct Block
     {
@@ -53,13 +61,30 @@ private:
         std::list<Range> free;
         std::list<Range> used;
     };
+    // Every allocation, including ordinary Expert storage, uses this header.
+    // Stable Block addresses and list iterators avoid scans during retirement.
+    struct Allocation : ncnn::VkBufferMemory
+    {
+        Block* block = nullptr;
+        std::list<Range>::iterator range;
+        Allocation* next = nullptr;
+    };
+    void recycle_range(std::list<Range>& ranges, std::list<Range>::iterator range) noexcept;
     const size_t block_size;
     const size_t alignment;
     const uint64_t physical_limit;
     uint64_t allocated_bytes = 0;
     uint64_t limit_rejections = 0;
+    bool retain_free_blocks = false;
+    bool allow_physical_growth = true;
     mutable std::mutex mutex;
     std::vector<std::unique_ptr<Block>> blocks;
+    // Graph-only metadata reuse is bounded by peak simultaneously live
+    // allocations, independently of token count and physical arena capacity.
+    Allocation* spare_allocations = nullptr;
+    std::list<Range> spare_ranges;
+    size_t live_allocations = 0;
+    size_t peak_live_allocations = 0;
 };
 
 // Two isolated admission lanes retain pools, command buffers, fences and
@@ -84,7 +109,9 @@ private:
 
 // Each in-flight batch exclusively leases a transfer lane. A completed copy
 // semaphore is consumed by a short compute visibility command before weights
-// are published. Success and unsubmitted cancellation permit pool reuse.
+// are published. Multiple compute queues permit waiting only for the final
+// visibility fence; one compute queue remains available during copying.
+// Success and unsubmitted cancellation permit pool reuse.
 class VulkanIndependentWeightTransfer
 {
 public:

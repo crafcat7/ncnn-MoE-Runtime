@@ -176,7 +176,7 @@ static void compare_graphs(const CompiledModel& reference, const CompiledModel& 
     for (const auto& statistics : actual_statistics)
         check(statistics.expert_cpu_routes + statistics.expert_gpu_routes == statistics.expert_assignments,
               family + ": per-session CPU/GPU routes do not cover all Expert assignments after batched decode");
-    if (candidate.qwen_device_chain)
+    if (candidate.gated_residual_chain)
     {
         for (const auto& statistics : actual_statistics)
         {

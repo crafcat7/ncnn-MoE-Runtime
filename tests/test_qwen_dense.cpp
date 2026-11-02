@@ -95,9 +95,10 @@ static void check_budget_admission(const MoeModelDescriptor& descriptor, const W
         if (budget == 0)
         {
             check(static_cast<bool>(compiled), compiled ? "" : compiled.error().message);
-            for (const ExecutionNode& node : model.graph.nodes)
-                check(node.backend == ExecutionBackend::Cpu, "unbudgeted dense node must execute on CPU");
-            check(model.released_dense_host_size == 0, "unbudgeted CPU model released host weights");
+            check(std::any_of(model.graph.nodes.begin(), model.graph.nodes.end(), [](const ExecutionNode& node) {
+                      return node.backend == ExecutionBackend::Vulkan;
+                  }),
+                  "automatic live-heap planning did not place supported dense work on Vulkan");
             continue;
         }
         check(!compiled, "required Vulkan attention was admitted without a GPU budget");
@@ -311,16 +312,12 @@ static bool test_partial_gpu_budget(const std::filesystem::path& root, const Gpu
     const std::string device = "device=" + std::to_string(device_index) + " (" + gpu.device_name + ")";
     if (gpu.compute_queue_count == 0 || gpu.heap_available == 0)
     {
-        std::cout << "SKIP dense GPU budget " << device
-                  << (gpu.compute_queue_count == 0 ? ": no Vulkan compute queue\n" : ": device reports no available Vulkan heap\n");
+        std::cout << "SKIP dense GPU budget " << device << ": no compute queue or available Vulkan heap\n";
         return false;
     }
-    std::cout << "Dense GPU budget testing " << device << '\n';
     DenseTestDimensions dims;
     dims.hidden = 256;
     dims.intermediate = 1024;
-    // The head must exceed both attention groups, including their dedicated
-    // constant allocators, so admission can skip it and still use attention.
     dims.vocabulary = 65536;
     dims.full_head_dimension = 4;
     dims.linear_head_dimension = 4;
@@ -338,8 +335,6 @@ static bool test_partial_gpu_budget(const std::filesystem::path& root, const Gpu
     check(static_cast<bool>(status), status ? "" : status.error().message);
     const DenseBudgetTrace expected = execute_budget_model(cpu);
     cpu.vulkan_runtime = create_vulkan_runtime();
-    // Every large fixture buffer is a multiple of 64 KiB; 256 also bounds
-    // Vulkan's required storage-buffer alignment for the smaller segments.
     constexpr uint64_t alignment = 256;
     TensorData oversized_head;
     oversized_head.dtype = DType::Float32;
@@ -353,136 +348,69 @@ static bool test_partial_gpu_budget(const std::filesystem::path& root, const Gpu
     check(bias_free_storage > 0
               && dense_vulkan_weight_storage_size(cpu, biased_projection, alignment, device_index, true) > bias_free_storage,
           "generic FP32 projection budget omitted its bias allocation");
-    const auto compile_budget = [&](CompiledModel& model, uint64_t budget, bool attention) {
+    const uint64_t projection_storage = dense_vulkan_weight_storage_size(cpu, cpu.weights.at(cpu.graph.layer_plans.front().dense_ffn.gate_weight),
+                                                                         alignment, device_index);
+    if (projection_storage == 0)
+    {
+        std::cout << "SKIP dense GPU budget " << device << ": no supported FFN projection\n";
+        return false;
+    }
+    // A supported GPU group must report an insufficient budget. It cannot
+    // conceal the failure by publishing a partial GPU group and running CPU.
+    for (uint64_t budget : {UINT64_C(1), projection_storage + projection_storage / 2})
+    {
         CompilerOption opt;
         opt.flags = BackendCpuExecution | BackendVulkanDense;
-        if (attention)
-            opt.flags |= BackendVulkanAttention;
         opt.device_index = device_index;
         opt.gpu_heap_budget = budget;
         opt.vulkan_runtime = create_vulkan_runtime();
-        auto compiled = compile_model(descriptor.value(), mapping.value(), model, HybridMode::HybridExperts, opt);
-        check(static_cast<bool>(compiled), compiled ? "" : compiled.error().message);
-        const CompiledOperator& head = model.operators.at_weight(model.lm_head_weight);
-        check(!head.bfloat16 && !head.linear,
-              "oversize LM head consumed the limited GPU budget");
-        check(!model.weights.at(model.lm_head_weight).bfloat16_values().empty(),
-              "CPU LM head lost host weights under partial residency");
-    };
+        CompiledModel model;
+        const auto compiled = compile_model(descriptor.value(), mapping.value(), model, HybridMode::HybridExperts, opt);
+        check(!compiled && compiled.error().code == ErrorCode::InvalidArgument,
+              "insufficient dense GPU capacity silently selected CPU or partial projection execution");
+        check(compiled.error().message.find("Vulkan resource plan cannot allocate") != std::string::npos,
+              "dense GPU admission failure did not identify the failed resource plan");
+    }
+    check_budget_trace(execute_budget_model(cpu), expected, device + " CPU after rejected GPU admission");
 
     uint64_t attention_storage = 0;
-    bool attention_supported = true;
     for (const CompiledLayerPlan& layer : cpu.graph.layer_plans)
-    {
-        const uint64_t size = dense_vulkan_attention_storage_size(cpu, layer, alignment, device_index);
-        if (size == 0)
-            attention_supported = false;
-        attention_storage += size;
-    }
-    // Invert the small-budget workspace reserve, leaving only enough capacity
-    // for the two attention groups, ahead of any dense FFN projection.
-    const uint64_t attention_budget = (attention_storage * 4 + 2) / 3;
-    const uint64_t projection_storage = dense_vulkan_weight_storage_size(cpu, cpu.weights.at(cpu.graph.layer_plans.front().dense_ffn.gate_weight),
-                                                                         alignment, device_index);
+        attention_storage += dense_vulkan_attention_storage_size(cpu, layer, alignment, device_index);
     const uint64_t head_storage = dense_vulkan_weight_storage_size(cpu, cpu.weights.at(cpu.lm_head_weight), alignment, device_index);
-    if (projection_storage == 0)
+    if (gpu.heap_available < attention_storage + head_storage + projection_storage * 6)
     {
-        std::cout << "SKIP dense GPU budget partial FFN " << device
-                  << ": device cannot represent the FFN projection fixture\n";
-        return false;
+        std::cout << "SKIP complete dense GPU budget " << device << ": fixture exceeds available heap\n";
+        return true;
     }
-    const uint64_t partial_budget = projection_storage + projection_storage / 2;
-    check(head_storage == 0 || head_storage > partial_budget, "budget fixture head does not exceed the partial FFN budget");
-    bool tested_attention = false;
-    if (attention_supported && gpu.heap_available >= attention_budget)
+    CompilerOption full;
+    full.flags = BackendCpuExecution | BackendVulkanDense | BackendVulkanAttention;
+    full.device_index = device_index;
+    full.vulkan_runtime = create_vulkan_runtime();
+    CompiledModel model;
+    const auto compiled = compile_model(descriptor.value(), mapping.value(), model, HybridMode::HybridExperts, full);
+    check(static_cast<bool>(compiled), compiled ? "" : compiled.error().message);
+    for (const CompiledLayerPlan& layer : model.graph.layer_plans)
+        check(support_vulkan_ffn(model.operators, layer.dense_ffn),
+              "sufficient dense GPU capacity did not prepare a complete FFN operator");
+    if (head_storage != 0)
     {
-        check(attention_storage > 0 && (head_storage == 0 || head_storage > attention_budget),
-              "budget fixture head does not exceed the attention budget");
-        // Successful resident projections release host copies without a caller flag.
-        {
-            CompiledModel model;
-            compile_budget(model, attention_budget, true);
-            size_t attention_count = 0;
-            for (const CompiledLayerPlan& layer : model.graph.layer_plans)
-            {
-                check(support_vulkan_attention(model.operators, layer.attention),
-                      "limited budget did not prioritize every attention layer");
-                ++attention_count;
-            }
-            check(attention_count == 2 && resident_ffn_projections(model) == 0,
-                  "attention-only budget admitted a dense FFN projection");
-            const DenseBudgetTrace actual = execute_budget_model(model);
-            check_budget_trace(actual, expected, device + " attention-priority budget");
-            check(actual.counters.attention_blocks > 0 && actual.counters.gated_delta_fusions > 0,
-                  "resident attention groups did not execute both Vulkan attention kinds");
-            check(actual.counters.attention_cpu_fallbacks == 0,
-                  "budgeted attention unexpectedly fell back during execution");
-            check(actual.gated_delta_state_bytes > 0
-                      && dense_vulkan_pending_state_size(model, device_index) >= actual.gated_delta_state_bytes,
-                  "pending DeltaNet reservation does not cover the real decode state allocation");
-            std::cout << "Dense budget attention " << device << ": groups=" << attention_count << "/2 FFN projections=0/6 head_gpu=0 automatic_host_release=1"
-                      << " attention=" << actual.counters.attention_blocks
-                      << " DeltaNet=" << actual.counters.gated_delta_fusions << '\n';
-        }
-        tested_attention = true;
+        const CompiledOperator& head = model.operators.at_weight(model.lm_head_weight);
+        check(head.bfloat16 || head.linear || head.qnk || head.float8,
+              "a supported LM head was left on CPU with available GPU capacity");
     }
-    else
-    {
-        std::cout << "SKIP dense GPU budget attention " << device
-                  << (attention_supported ? ": available heap is below the attention fixture budget\n"
-                                          : ": device does not support every attention kind in the fixture\n");
-    }
-
-    if (gpu.heap_available < partial_budget)
-    {
-        std::cout << "SKIP dense GPU budget partial FFN " << device
-                  << ": available heap is below the partial FFN fixture budget\n";
-        return tested_attention;
-    }
-
-    // Partial residency retains only the CPU fallback projections on the host.
-    {
-        CompiledModel model;
-        compile_budget(model, partial_budget, false);
-        check(resident_ffn_projections(model) == 1,
-              "partial FFN budget did not retain exactly one projection");
-        check(model.released_dense_host_size > 0, "resident FFN projection did not reclaim host storage automatically");
-        size_t gpu_ffn_nodes = 0;
-        for (const ExecutionNode& node : model.graph.nodes)
-            if (node.type == ExecutionNodeType::DenseFfn && node.backend == ExecutionBackend::Vulkan)
-                ++gpu_ffn_nodes;
-        check(gpu_ffn_nodes == 1, "partially resident FFN was not scheduled on Vulkan");
-        for (const CompiledLayerPlan& layer : model.graph.layer_plans)
-        {
-            check(!support_vulkan_attention(model.operators, layer.attention),
-                  "disabled attention consumed the partial FFN budget");
-            for (TensorHandle handle : {layer.dense_ffn.gate_weight, layer.dense_ffn.up_weight, layer.dense_ffn.down_weight})
-            {
-                const CompiledOperator& projection = model.operators.at_weight(handle);
-                const bool resident = projection.bfloat16 || projection.linear;
-                const bool host_present = !model.weights.at(handle).bfloat16_values().empty();
-                check(host_present == !resident,
-                      "partial host release removed a fallback or retained resident-only FFN weights");
-            }
-        }
-        const DenseBudgetTrace actual = execute_budget_model(model);
-        check_budget_trace(actual, expected, device + " automatically released partial FFN budget");
-        // Head and attention are CPU-only here, so these dispatches can only
-        // come from the one admitted FFN projection, across prefill and decode.
-        check(actual.counters.dispatches >= 2 && actual.counters.compute_submissions >= 2,
-              "partially resident FFN projection was uploaded but not executed");
-        check(actual.counters.attention_blocks == 0 && actual.counters.gated_delta_fusions == 0,
-              "disabled attention unexpectedly executed on Vulkan");
-        check(actual.gated_delta_state_bytes == 0 && dense_vulkan_pending_state_size(model, device_index) == 0,
-              "unprepared attention contributed a pending GPU state reservation");
-        const CompiledOperator& projection = model.operators.at_weight(model.graph.layer_plans.front().dense_ffn.gate_weight);
-        check(projection.bfloat16 || projection.linear, "first admitted FFN projection has no Vulkan operator");
-        std::cout << "Dense budget partial FFN " << device
-                  << ": path=" << (projection.bfloat16 ? "BF16" : "FP32")
-                  << " projections=1/6 head_gpu=0 automatic_host_release=1"
-                  << " dispatches=" << actual.counters.dispatches
-                  << " submissions=" << actual.counters.compute_submissions << '\n';
-    }
+    const DenseBudgetTrace actual = execute_budget_model(model);
+    check_budget_trace(actual, expected, device + " complete GPU placement");
+    check(actual.counters.dispatches > 0 && actual.counters.compute_submissions > 0,
+          "admitted dense operators did not execute on GPU");
+    check(actual.counters.attention_cpu_fallbacks == 0,
+          "a selected GPU attention operator retried through CPU");
+    check(dense_vulkan_pending_state_size(model, device_index) >= actual.gated_delta_state_bytes,
+          "published resource plan omitted allocated GatedDelta state");
+    check(model.released_dense_host_size > 0,
+          "resident dense GPU operators retained all host payloads");
+    std::cout << "Dense GPU budget " << device << ": insufficient capacity errors; supported FFN groups=2/2"
+              << " dispatches=" << actual.counters.dispatches
+              << " submissions=" << actual.counters.compute_submissions << '\n';
     return true;
 }
 
@@ -490,7 +418,8 @@ enum class DenseCacheFault
 {
     Demand,
     Execution,
-    Commit
+    Commit,
+    Publication
 };
 
 class FailingDenseBackend final : public ExpertBackend
@@ -550,9 +479,9 @@ public:
         bool commit() override
         {
             ++owner.commits;
-            // No submission publishes output. A successful reservation or wait
-            // must not prevent the dense executor from running CPU fallback.
-            return false;
+            // Publication deliberately violates the contract: success without
+            // an output must be detected before the executor consumes it.
+            return owner.fault == DenseCacheFault::Publication;
         }
 
         void abort() noexcept override
@@ -746,18 +675,9 @@ static bool test_dynamic_gpu_cache(const std::filesystem::path& root, const GpuI
         Option insufficient = opt;
         insufficient.expert_gpu_cache_size = entry_size - 1;
         auto loaded = runtime.load_model(root, insufficient);
-        check(static_cast<bool>(loaded), loaded ? "" : loaded.error().message);
-        const CompiledModel& model = model_compiled(*loaded.value());
-        check_dynamic_dense_plan(model, entry_size, false);
-        check(model.opt.expert_gpu_cache_size == 0,
-              "undersized dense cache reported a GPU capacity without constructing a backend");
-        check_budget_trace(execute_budget_model(model), expected, context + " insufficient cache");
-        if (model.expert_backend)
-        {
-            const auto statistics = model.expert_backend->statistics();
-            check(statistics.executions == 0 && statistics.bytes_uploaded == 0 && statistics.resident_size == 0 && statistics.pending_size == 0,
-                  "undersized dense GPU cache uploaded or executed an entry");
-        }
+        check(!loaded, "an explicit dense GPU cache smaller than one entry silently selected CPU execution");
+        check(loaded.error().code == ErrorCode::InvalidArgument,
+              "an insufficient dense GPU cache did not return an admission error");
     }
     {
         // Direct compilation and Runtime use the same automatic host policy,
@@ -772,10 +692,11 @@ static bool test_dynamic_gpu_cache(const std::filesystem::path& root, const GpuI
         check(static_cast<bool>(compiled), compiled ? "" : compiled.error().message);
         check_dynamic_dense_plan(model, entry_size, false);
         const CompiledOperator& head = model.operators.at_weight(model.lm_head_weight);
-        check((head.bfloat16 || head.linear) && model.weights.at(model.lm_head_weight).bfloat16_values().empty(),
+        check((head.bfloat16 || head.linear || head.qnk || head.float8)
+                  && model.weights.at(model.lm_head_weight).bfloat16_values().empty(),
               "host-release fixture did not release a persistent Vulkan projection");
     }
-    for (DenseCacheFault fault : {DenseCacheFault::Demand, DenseCacheFault::Execution, DenseCacheFault::Commit})
+    for (DenseCacheFault fault : {DenseCacheFault::Demand, DenseCacheFault::Execution, DenseCacheFault::Commit, DenseCacheFault::Publication})
     {
         CompilerOption failing_opt;
         failing_opt.flags = BackendCpuExecution | BackendVulkanDense | BackendVulkanExperts;
@@ -787,7 +708,15 @@ static bool test_dynamic_gpu_cache(const std::filesystem::path& root, const GpuI
         auto backend = std::make_shared<FailingDenseBackend>(fault);
         model.expert_backend = backend;
         check_dynamic_dense_plan(model, entry_size, true);
-        check_budget_trace(execute_budget_model(model), expected, context + " failed cache stage=" + std::to_string(static_cast<int>(fault)));
+        SessionState failed_state;
+        SessionStatistics failed_statistics;
+        const std::array<int32_t, 2> failed_ids = {1, 2};
+        const auto failed = forward_model(model, failed_ids, failed_statistics, failed_state, 0, LogitsOutput::Last);
+        check(!failed && failed.error().code == ErrorCode::InternalError,
+              "a failed GPU dense cache stage silently completed through CPU execution");
+        check(failed_statistics.expert_cpu_batches == 0 && failed_statistics.expert_cpu_routes == 0
+                  && failed_statistics.expert_cpu_fallbacks == 0,
+              "a failed GPU dense cache stage recorded CPU recovery work");
         ActivationBuffer input(2, dims.hidden);
         for (size_t row = 0; row < input.rows(); ++row)
             for (uint32_t column = 0; column < input.columns(); ++column)
@@ -795,22 +724,98 @@ static bool test_dynamic_gpu_cache(const std::filesystem::path& root, const GpuI
         ActivationBuffer expected_ffn;
         ActivationBuffer actual_ffn(input.rows(), dims.hidden);
         std::fill_n(actual_ffn.row(0), actual_ffn.values().size(), 123.0f);
+        if (fault == DenseCacheFault::Publication)
+            actual_ffn.clear();
         ExpertWorkspace cpu_workspace;
         ExpertWorkspace failing_workspace;
         forward_dense_ffn(cpu, first, input, expected_ffn, cpu_workspace, ExecutionBackend::Cpu);
+        bool raised = false;
+        try
+        {
+            forward_dense_ffn(model, model.graph.layer_plans.front().dense_ffn, input, actual_ffn,
+                              failing_workspace, ExecutionBackend::Vulkan);
+        }
+        catch (const std::runtime_error&)
+        {
+            raised = true;
+        }
+        check(raised, "a failed GPU dense cache operation did not propagate its error");
+        check(failing_workspace.gate.rows() == 0 && failing_workspace.projection.rows() == 0,
+              "a failed GPU dense cache operation computed a CPU activation");
+        check(std::all_of(actual_ffn.values().begin(), actual_ffn.values().end(), [](float value) { return value == 123.0f; }),
+              "a failed GPU dense cache operation published uncommitted output");
+        ExpertWorkspace explicit_cpu_workspace;
         forward_dense_ffn(model, model.graph.layer_plans.front().dense_ffn, input, actual_ffn,
-                          failing_workspace, ExecutionBackend::Vulkan);
+                          explicit_cpu_workspace, ExecutionBackend::Cpu);
         for (size_t row = 0; row < input.rows(); ++row)
             check_logits(std::vector<float>(actual_ffn.row(row), actual_ffn.row(row) + actual_ffn.columns()),
                          std::vector<float>(expected_ffn.row(row), expected_ffn.row(row) + expected_ffn.columns()),
-                         context + " unpublished failure output row=" + std::to_string(row));
+                         context + " explicit CPU execution row=" + std::to_string(row));
         check(backend->demands > 0 && backend->submissions > 0 && backend->aborts > 0,
               "dense cache fault fixture did not exercise demand and failed submission cleanup");
         if (fault != DenseCacheFault::Demand)
             check(backend->resident_reservations > 0 && backend->waits > 0,
                   "dense cache execution fault did not reach a resident submission");
-        if (fault == DenseCacheFault::Commit)
+        if (fault == DenseCacheFault::Commit || fault == DenseCacheFault::Publication)
             check(backend->commits > 0, "dense cache commit fault was not reached");
+        for (bool priority_bit : {false, true})
+        {
+            auto routed_backend = std::make_shared<FailingDenseBackend>(fault);
+            model.expert_backend = routed_backend;
+            if (priority_bit)
+                model.opt.optimization_flags |= OptimizationVulkanExpertGpuPriority;
+            else
+                model.opt.optimization_flags &= ~OptimizationVulkanExpertGpuPriority;
+            MoeBlockPlan moe;
+            moe.experts.push_back(model.graph.layer_plans.front().dense_ffn);
+            LayerState routed;
+            routed.resize_experts(1);
+            routed.normalized = input;
+            ExpertState& active = routed.active_experts().front();
+            active.batch.expert_id = 0;
+            active.batch.routes = {{0, 0, 1.0f}, {1, 0, 1.0f}};
+            active.output.reset(input.rows(), dims.hidden, false);
+            std::fill_n(active.output.row(0), active.output.values().size(), 123.0f);
+            if (fault == DenseCacheFault::Publication)
+                active.output.clear();
+            ExpertScratch routed_scratch;
+            SessionStatistics routed_statistics;
+            const auto routed_failure = forward_moe(model, moe, routed, &routed_statistics,
+                                                    routed_scratch, 0, ExecutionBackend::Vulkan, false);
+            check(!routed_failure && routed_failure.error().code == ErrorCode::InternalError,
+                  "a failed routed GPU Expert stage silently completed through CPU");
+            check(routed_failure.error().message.find("op ExpertGroup") != std::string::npos
+                      && routed_failure.error().message.find("Vulkan device") != std::string::npos,
+                  "a routed GPU Expert error omitted operation and device context");
+            check(routed_statistics.expert_cpu_batches == 0 && routed_statistics.expert_cpu_routes == 0
+                      && routed_statistics.expert_cpu_fallbacks == 0 && routed_scratch.decode_tasks.empty(),
+                  "a failed routed GPU Expert stage scheduled CPU compute work");
+            for (const ExpertWorkspace& workspace : routed_scratch.expert_workspaces)
+                check(workspace.gate.rows() == 0 && workspace.projection.rows() == 0,
+                      "a failed routed GPU Expert stage computed a CPU activation");
+            check(std::all_of(active.output.values().begin(), active.output.values().end(), [](float value) { return value == 123.0f; }),
+                  "a failed routed GPU Expert stage published uncommitted output");
+            check(routed_backend->demands > 0, "a cold routed GPU cache fault bypassed demand upload");
+            if (fault != DenseCacheFault::Demand)
+                check(routed_backend->resident_reservations > 0 && routed_backend->waits > 0 && routed_backend->aborts > 0,
+                      "a routed GPU execution fault did not reach the prepared GPU submission");
+            if (fault == DenseCacheFault::Commit || fault == DenseCacheFault::Publication)
+                check(routed_backend->commits > 0, "a routed GPU commit fault was not reached");
+            const uint64_t demands_before_cpu = routed_backend->demands;
+            routed.reset();
+            ExpertScratch cpu_scratch;
+            SessionStatistics cpu_statistics;
+            const auto cpu_status = forward_moe(model, moe, routed, &cpu_statistics, cpu_scratch,
+                                                0, ExecutionBackend::Cpu, false);
+            check(static_cast<bool>(cpu_status), "an explicitly selected CPU Expert path failed");
+            check(cpu_statistics.expert_cpu_batches == 1 && cpu_statistics.expert_cpu_routes == input.rows()
+                      && cpu_statistics.expert_cpu_fallbacks == 0 && routed_backend->demands == demands_before_cpu,
+                  "explicit CPU Expert execution contacted the GPU cache or reported GPU recovery");
+            for (size_t row = 0; row < input.rows(); ++row)
+                check_logits(std::vector<float>(active.output.row(row), active.output.row(row) + active.output.columns()),
+                             std::vector<float>(expected_ffn.row(row), expected_ffn.row(row) + expected_ffn.columns()),
+                             context + " explicitly selected routed CPU output");
+        }
     }
     return true;
 }

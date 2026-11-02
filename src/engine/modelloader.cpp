@@ -3,6 +3,7 @@
 #include "cpu.h"
 #include "expertbackend.h"
 #include "expert.h"
+#include "graphresources.h"
 #include "graph/compiler.h"
 #include "kernels/mxfp4.h"
 #include "models/modeladapter.h"
@@ -105,37 +106,42 @@ static Result<std::vector<uint64_t>> distribute_gpu_cache_size(uint64_t total_si
     return sizes;
 }
 
+static GpuResourcePlan cache_resource_plan(const CompiledModel& model, const GpuInfo& gpu)
+{
+    const auto found = std::find_if(model.memory_plan.gpu_devices.begin(), model.memory_plan.gpu_devices.end(),
+                                    [&](const GpuResourcePlan& plan) { return plan.initial.device_index == gpu.device_index; });
+    if (found != model.memory_plan.gpu_devices.end())
+        return *found;
+    auto plan = make_gpu_resource_plan({gpu.device_index, gpu.heap_budget, gpu.heap_usage},
+                                       model.opt.num_concurrent_sessions);
+    const uint64_t pending = vulkan_pending_reserve(model, gpu.device_index);
+    const uint64_t sessions = plan.num_concurrent_sessions;
+    plan.admitted.workspace_size = pending / sessions + (pending % sessions != 0);
+    return plan;
+}
+
+static uint64_t available_gpu_cache_size(const CompiledModel& model, const GpuInfo& gpu,
+                                         uint64_t minimum_entry_size,
+                                         uint64_t total_size = std::numeric_limits<uint64_t>::max())
+{
+    return gpu_resource_cache_capacity(cache_resource_plan(model, gpu),
+                                       {gpu.device_index, gpu.heap_budget, gpu.heap_usage},
+                                       minimum_entry_size, total_size);
+}
+
 static std::vector<uint64_t> get_auto_gpu_cache_sizes(uint64_t expert_pair_size,
                                                       const std::vector<uint32_t>& device_indices,
                                                       const std::vector<GpuInfo>& gpu_infos,
-                                                      uint32_t num_concurrent_sessions)
+                                                      const CompiledModel& model)
 {
-    const uint64_t conservative_cache_percent = 85;
-    const uint64_t resource_rich_cache_percent = 92;
-    const uint64_t resource_rich_heap_budget = UINT64_C(12) * 1024 * 1024 * 1024;
-    const uint64_t percent_base = 100;
-
     std::vector<uint64_t> sizes(device_indices.size(), 0);
     if (expert_pair_size == 0 || device_indices.empty())
         return sizes;
-
-    // Leave headroom for activations, KV, and Vulkan workspace.
     for (size_t i = 0; i < device_indices.size(); ++i)
     {
         if (device_indices[i] >= gpu_infos.size())
             return {};
-        const GpuInfo& gpu_info = gpu_infos[device_indices[i]];
-        const bool resource_rich_single_session = num_concurrent_sessions == 1
-                                                  && gpu_info.heap_budget >= resource_rich_heap_budget;
-        const uint64_t cache_percent = resource_rich_single_session
-                                           ? resource_rich_cache_percent
-                                           : conservative_cache_percent;
-        const uint64_t available_size = gpu_info.heap_available;
-        const uint64_t available_whole_percent = available_size / percent_base;
-        const uint64_t available_remainder = available_size % percent_base;
-        const uint64_t cache_budget = available_whole_percent * cache_percent
-                                      + available_remainder * cache_percent / percent_base;
-        sizes[i] = cache_budget - cache_budget % expert_pair_size;
+        sizes[i] = available_gpu_cache_size(model, gpu_infos[device_indices[i]], expert_pair_size);
     }
     return sizes;
 }
@@ -370,20 +376,20 @@ Result<void> ModelLoader::plan_memory()
     if (use_native_weights && reserve_cpu_packed_weights)
         return Error{ErrorCode::UnsupportedModel, "native imported weights require CpuPackedWeightMode::Disabled"};
 
-    if (use_native_weights)
-    {
-        const uint32_t old_flags = package.flags;
-        package.flags |= ModelPackageDeferMxfp4Experts;
-        auto mapped = adapter->map_weights(package, descriptor);
-        package.flags = old_flags;
-        if (!mapped)
-            return mapped.error();
-        native_weights = std::move(mapped).value();
-        native_quantized_experts = std::any_of(native_weights->begin(), native_weights->end(), [](const auto& item) {
-            return item.first.find(".experts.") != std::string::npos
-                   && (item.second.dtype == DType::Int4 || is_qnk_dtype(item.second.dtype));
-        });
-    }
+    // Every adapter supplies the same canonical storage inventory before any
+    // resource decision. Deferred ranges avoid loading the Expert working set.
+    const uint32_t old_flags = package.flags;
+    package.flags |= ModelPackageDeferMxfp4Experts;
+    auto mapped = adapter->map_weights(package, descriptor);
+    package.flags = old_flags;
+    if (!mapped)
+        return mapped.error();
+    native_weights = std::move(mapped).value();
+    normalize_expert_storage(descriptor, *native_weights);
+    native_quantized_experts = std::any_of(native_weights->begin(), native_weights->end(), [](const auto& item) {
+        return item.first.find(".experts.") != std::string::npos
+               && (item.second.dtype == DType::Int4 || is_qnk_dtype(item.second.dtype));
+    });
     const bool use_vulkan_compute = opt.hybrid_mode == HybridMode::HybridExperts;
     const bool use_vulkan_dense_host_release = use_vulkan_compute && has_flag(info.flags, RuntimeVulkan);
 
@@ -394,7 +400,7 @@ Result<void> ModelLoader::plan_memory()
                                      use_vulkan_dense_host_release,
                                      available_size,
                                      reserve_cpu_packed_weights,
-                                     native_weights ? &*native_weights : nullptr,
+                                     !reserve_cpu_packed_weights && native_weights ? &*native_weights : nullptr,
                                      use_vulkan_compute && has_flag(info.flags, RuntimeVulkanAttention));
     if (!planned)
         return planned.error();
@@ -477,10 +483,7 @@ Result<void> ModelLoader::plan_memory()
                                                   [](const LayerDescriptor& layer) {
                                                       if (layer.dense.enabled())
                                                           return true;
-                                                      const MoeDescriptor& moe = layer.moe;
-                                                      return moe.expert_weight_dtype == DType::MxFp4
-                                                             || (moe.expert_weight_dtype == DType::BFloat16
-                                                                 && has_flag(moe.flags, MoeDescriptorFileBackedExperts));
+                                                      return has_flag(layer.moe.flags, MoeDescriptorFileBackedExperts);
                                                   });
     if (use_file_backed_mxfp4 || use_file_backed_qnk)
         package.flags |= ModelPackageDeferMxfp4Experts;
@@ -489,12 +492,11 @@ Result<void> ModelLoader::plan_memory()
     if (native_quantized_experts && opt.expert_gpu_victim_cache_size != 0)
         return Error{ErrorCode::UnsupportedModel, "the Expert GPU victim cache requires MXFP4 Expert weights"};
 
-    // Automatic GPU caching is limited to MXFP4. Large BF16 uploads cause a
-    // cold cache to thrash during prefill, but explicit BF16 cache sizes remain
-    // supported.
+    // Storage capability enables a cache; each backend still checks the
+    // actual Expert dtype, layout, activation and device before execution.
     use_auto_gpu_cache = use_vulkan_compute
                          && !has_flag(opt.flags, OptionDisableGpuExpertExecution)
-                         && use_file_backed_mxfp4
+                         && support_gpu_cache
                          && requested_gpu_cache_size == 0;
     if (requested_gpu_cache_size == 0)
         return {};
@@ -509,8 +511,10 @@ Result<void> ModelLoader::plan_memory()
             return Error{ErrorCode::UnsupportedModel, "the Expert GPU victim cache requires file-backed Expert weights"};
         return {};
     }
+    if (!use_vulkan_compute || !has_flag(info.flags, RuntimeVulkan))
+        return Error{ErrorCode::UnsupportedModel, "the Expert GPU cache requires Vulkan mixed execution"};
     if (!use_file_backed_experts)
-        return Error{ErrorCode::InvalidArgument, "the Expert GPU cache requires on-demand Expert memory"};
+        return {}; // Resident tensors use the same remaining device budget.
     if (!support_gpu_cache)
         return Error{ErrorCode::UnsupportedModel, "the Expert GPU cache requires file-backed MXFP4 or BF16 Expert weights"};
     if (!use_vulkan_compute || !has_flag(info.flags, RuntimeVulkanVictim))
@@ -523,16 +527,16 @@ Result<void> ModelLoader::plan_memory()
 
 Result<void> ModelLoader::compile_model()
 {
+    // Capability selection consumes these options during compilation, before
+    // any host/device Expert cache is constructed.
+    model.opt.flags = opt.flags;
+    model.opt.expert_io_mode = opt.expert_io_mode;
     const bool use_vulkan_compute = opt.hybrid_mode == HybridMode::HybridExperts;
     auto weights = native_weights ? Result<WeightMapping>(std::move(*native_weights)) : adapter->map_weights(package, descriptor);
     native_weights.reset();
     if (!weights)
         return weights.error();
     const bool use_file_backed_experts = plan.selected_mode == ExpertMemoryMode::OnDemand;
-    const bool has_dense_ffn = std::any_of(descriptor.layers.begin(), descriptor.layers.end(), [](const LayerDescriptor& layer) {
-        return layer.dense.enabled();
-    });
-
     const GpuInfo* gpu_info = nullptr;
     if (opt.vulkan_device_index != automatic_vulkan_device_index)
         gpu_info = &info.gpu_infos[opt.vulkan_device_index];
@@ -543,25 +547,28 @@ Result<void> ModelLoader::compile_model()
         compiler_opt.vulkan_runtime = create_vulkan_runtime();
     compiler_opt.device_index = opt.vulkan_device_index;
     compiler_opt.num_concurrent_sessions = opt.num_concurrent_sessions;
-    compiler_opt.explicit_expert_gpu_cache = requested_gpu_cache_size != 0;
     compiler_opt.gpu_expert_cache_reserve = requested_gpu_cache_size;
     compiler_opt.gpu_heap_budget = gpu_info ? gpu_info->heap_budget : 0;
 
-    // Use the smallest heap as the common multi-device budget so persistent
-    // operators cannot over-admit on a weaker shard.
+    auto cache_reserves = distribute_gpu_cache_size(requested_gpu_cache_size,
+                                                    std::max<uint64_t>(1, plan.expert_pair_size),
+                                                    opt.vulkan_device_indices,
+                                                    info.gpu_infos,
+                                                    "the combined Expert GPU cache");
+    if (!cache_reserves)
+        return cache_reserves.error();
+    compiler_opt.gpu_expert_cache_reserves = std::move(cache_reserves).value();
+    // Placement keeps a separate budget for every device, including live
+    // allocations which predate this model.
+    std::vector<GpuInfo> live_infos;
+#if defined(NCNN_MOE_WITH_VULKAN) && NCNN_MOE_WITH_VULKAN
+    if (use_vulkan_compute)
+        live_infos = get_gpu_infos();
+#endif
     for (uint32_t device_index : opt.vulkan_device_indices)
     {
-        const uint64_t heap_budget = info.gpu_infos[device_index].heap_budget;
-        if (heap_budget == 0)
-        {
-            compiler_opt.gpu_heap_budget = 0;
-            break;
-        }
-        if (compiler_opt.gpu_heap_budget == 0)
-            compiler_opt.gpu_heap_budget = heap_budget;
-        else
-            compiler_opt.gpu_heap_budget = std::min(compiler_opt.gpu_heap_budget,
-                                                    heap_budget);
+        const GpuInfo& gpu = device_index < live_infos.size() ? live_infos[device_index] : info.gpu_infos[device_index];
+        compiler_opt.gpu_resources.push_back({device_index, gpu.heap_budget, gpu.heap_usage});
     }
 
     compiler_opt.optimization_flags = opt.optimization_flags;
@@ -581,11 +588,7 @@ Result<void> ModelLoader::compile_model()
     {
         compiler_opt.flags |= BackendVulkanAttention;
     }
-    if (requested_gpu_cache_size != 0
-        || use_auto_gpu_cache
-        || (use_vulkan_compute
-            && (has_dense_ffn || has_flag(opt.optimization_flags, OptimizationVulkanQnK))
-            && !has_flag(opt.flags, OptionDisableGpuExpertExecution)))
+    if (use_vulkan_compute && !has_flag(opt.flags, OptionDisableGpuExpertExecution))
     {
         compiler_opt.flags |= BackendVulkanExperts;
     }
@@ -605,6 +608,7 @@ Result<void> ModelLoader::compile_model()
     auto finalized_plan = finalize_model_memory_plan(plan, opt, model.released_dense_host_size);
     if (!finalized_plan)
         return finalized_plan.error();
+    plan.gpu_devices = std::move(model.memory_plan.gpu_devices);
     model.memory_plan = plan;
     return {};
 }
@@ -636,7 +640,7 @@ Result<void> ModelLoader::resolve_gpu_cache_sizes(std::vector<uint64_t>& gpu_cac
     std::vector<GpuInfo> live_gpu_infos;
 
 #if defined(NCNN_MOE_WITH_VULKAN) && NCNN_MOE_WITH_VULKAN
-    if (use_auto_gpu_cache || model.qwen_device_chain)
+    if (model.opt.hybrid_mode == HybridMode::HybridExperts)
     {
         // Dense weights have already been allocated, so use the live budget.
         live_gpu_infos = get_gpu_infos();
@@ -648,27 +652,20 @@ Result<void> ModelLoader::resolve_gpu_cache_sizes(std::vector<uint64_t>& gpu_cac
                                                        return device_index < live_gpu_infos.size();
                                                    });
     const std::vector<GpuInfo>& gpu_infos = use_live_gpu_infos ? live_gpu_infos : info.gpu_infos;
-    if (model.qwen_device_chain && !use_live_gpu_infos)
-        return Error{ErrorCode::UnsupportedModel, "Qwen device execution requires a live Vulkan heap budget for Expert cache admission"};
+    if (model.gated_residual_chain && !use_live_gpu_infos)
+        return Error{ErrorCode::UnsupportedModel, "gated residual device execution requires a live Vulkan heap budget for Expert cache admission"};
 
     // Loading-time free heap predates dense and persistent attention uploads.
     // If the live query is unavailable, leave the automatic cache disabled
     // instead of admitting Experts against stale free-memory information.
     if (use_auto_gpu_cache && use_live_gpu_infos)
     {
-        std::vector<GpuInfo> cache_gpu_infos = gpu_infos;
-        for (uint32_t device : device_indices)
-        {
-            auto& gpu = cache_gpu_infos[device];
-            const uint64_t reserve = vulkan_pending_reserve(model, device, gpu.heap_budget);
-            gpu.heap_available = gpu.heap_available > reserve ? gpu.heap_available - reserve : 0;
-        }
         std::vector<uint64_t> sizes = get_auto_gpu_cache_sizes(plan.expert_pair_size,
                                                                device_indices,
-                                                               cache_gpu_infos,
-                                                               opt.num_concurrent_sessions);
+                                                               gpu_infos,
+                                                               model);
         const bool valid = !sizes.empty()
-                           && std::all_of(sizes.begin(),
+                           && std::any_of(sizes.begin(),
                                           sizes.end(),
                                           [pair_size = plan.expert_pair_size](uint64_t size) {
                                               return size >= pair_size;
@@ -705,6 +702,8 @@ Result<void> ModelLoader::resolve_gpu_cache_sizes(std::vector<uint64_t>& gpu_cac
     {
         const uint64_t cache_size = gpu_cache_sizes[i];
         const uint64_t victim_size = gpu_victim_cache_sizes[i];
+        if (cache_size == 0 && victim_size == 0)
+            continue;
         if (cache_size > std::numeric_limits<uint64_t>::max() - victim_size)
             return Error{ErrorCode::InvalidArgument, "the combined per-device Expert GPU cache capacity overflows"};
 
@@ -712,8 +711,7 @@ Result<void> ModelLoader::resolve_gpu_cache_sizes(std::vector<uint64_t>& gpu_cac
         if (heap_budget == 0 || cache_size + victim_size > heap_budget)
             return Error{ErrorCode::InvalidArgument, "combined per-device Expert GPU caches exceed the Vulkan heap budget"};
         const auto& gpu = gpu_infos[device_indices[i]];
-        const uint64_t pending = vulkan_pending_reserve(model, device_indices[i], heap_budget);
-        if (pending != 0 && (gpu.heap_available <= pending || cache_size + victim_size > gpu.heap_available - pending))
+        if (cache_size + victim_size > available_gpu_cache_size(model, gpu, 1))
             return Error{ErrorCode::InvalidArgument, "combined Expert GPU caches leave insufficient memory for Vulkan attention state and workspace"};
     }
 
@@ -733,7 +731,8 @@ Result<std::shared_ptr<ExpertVictimCache>> ModelLoader::create_expert_victim_cac
         auto shard = create_vulkan_victim_cache(gpu_victim_cache_sizes[i],
                                                 device_indices[i],
                                                 model.vulkan_runtime,
-                                                model.opt.optimization_flags);
+                                                model.opt.optimization_flags,
+                                                gpu_victim_cache_sizes[i]);
         if (!shard)
             return Error{ErrorCode::UnsupportedModel, "cannot create an Expert GPU victim-cache shard"};
         victim_caches.push_back(std::move(shard));
@@ -761,23 +760,28 @@ Result<void> ModelLoader::create_expert_backend(const std::vector<uint64_t>& gpu
 
     const std::vector<uint32_t>& device_indices = model.opt.vulkan_device_indices;
     std::vector<std::shared_ptr<ExpertBackend>> backends;
+    std::vector<uint32_t> cache_devices;
     backends.reserve(device_indices.size());
     for (size_t i = 0; i < device_indices.size(); ++i)
     {
+        if (gpu_cache_sizes[i] == 0 && !use_victim_source)
+            continue;
         auto backend = create_vulkan_expert_backend(gpu_cache_sizes[i],
                                                     device_indices[i],
                                                     !use_victim_source ? std::shared_ptr<ExpertVictimCache>() : victim_caches[i],
                                                     model.vulkan_runtime,
-                                                    model.opt.optimization_flags);
+                                                    model.opt.optimization_flags,
+                                                    gpu_cache_sizes[i]);
         if (!backend)
             return Error{ErrorCode::UnsupportedModel, "cannot create a Vulkan Expert execution cache/source backend"};
         backends.push_back(std::move(backend));
+        cache_devices.push_back(device_indices[i]);
     }
 
     if (use_victim_source)
     {
         model.expert_backend = create_key_sharded_expert_backend(std::move(backends),
-                                                                 device_indices);
+                                                                 cache_devices);
     }
     else
     {
@@ -789,7 +793,7 @@ Result<void> ModelLoader::create_expert_backend(const std::vector<uint64_t>& gpu
             group_device_indices.push_back(layer.vulkan_device_index);
 
         model.expert_backend = create_multi_device_expert_backend(std::move(backends),
-                                                                  device_indices,
+                                                                  cache_devices,
                                                                   std::move(group_device_indices));
     }
 
@@ -854,7 +858,7 @@ Result<void> ModelLoader::configure_expert_cache()
     return {};
 }
 
-Result<void> ModelLoader::configure_resident_quantized_backend()
+Result<void> ModelLoader::configure_resident_expert_backend()
 {
     if (opt.hybrid_mode != HybridMode::HybridExperts
         || has_flag(opt.flags, OptionDisableGpuExpertExecution)
@@ -911,7 +915,7 @@ Result<void> ModelLoader::configure_resident_quantized_backend()
                                            : nullptr;
                 const auto quantized = [&](const TensorData& matrix) {
                     return matrix.dtype == DType::Int4 || matrix.dtype == DType::MxFp4 || is_qnk_dtype(matrix.dtype)
-                           || (model.qwen_device_chain && (matrix.dtype == DType::BFloat16 || matrix.dtype == DType::Float32));
+                           || matrix.dtype == DType::BFloat16 || matrix.dtype == DType::Float32;
                 };
                 if (expert.use_gpu_cache
                     || ((quantized(gate_up) || quantized(down) || (up && quantized(*up)))
@@ -927,7 +931,10 @@ Result<void> ModelLoader::configure_resident_quantized_backend()
                                                                                  expert.up_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.up_bias),
                                                                                  expert.down_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.down_bias),
                                                                                  expert.activation, expert.activation_limit);
-                    invalid_storage_size = invalid_storage_size || bytes == 0;
+                    // A storage size of zero also denotes an unsupported
+                    // device/dtype combination. Keep its CPU implementation.
+                    if (bytes == 0)
+                        continue;
                     if (expert.use_gpu_cache && bytes != 0)
                         smallest_dense_entry_size = std::min(smallest_dense_entry_size, bytes);
                     add_size(layer_total, bytes);
@@ -958,7 +965,7 @@ Result<void> ModelLoader::configure_resident_quantized_backend()
     }
     if (active_indices.empty())
     {
-        if (native_quantized_experts && opt.expert_gpu_cache_size != 0)
+        if (opt.expert_gpu_cache_size != 0)
             return Error{ErrorCode::UnsupportedModel, "the Expert GPU cache has no eligible quantized Experts"};
         return {};
     }
@@ -981,7 +988,7 @@ Result<void> ModelLoader::configure_resident_quantized_backend()
                                 && smallest_dense_entry_size != std::numeric_limits<uint64_t>::max();
         const uint64_t minimum_entry_size = pure_dense ? smallest_dense_entry_size : maximum_pair_size;
         if (pure_dense && opt.expert_gpu_cache_size / resident_devices.size() < minimum_entry_size)
-            return {};
+            return Error{ErrorCode::InvalidArgument, "the Expert GPU cache cannot hold one complete GPU FFN allocation"};
         auto distributed = distribute_gpu_cache_size(opt.expert_gpu_cache_size, minimum_entry_size,
                                                      resident_devices, gpu_infos, "the executable quantized Expert GPU cache");
         if (!distributed)
@@ -993,8 +1000,7 @@ Result<void> ModelLoader::configure_resident_quantized_backend()
             if (heap_budget == 0 || cache_sizes[index] > heap_budget)
                 return Error{ErrorCode::InvalidArgument, "the quantized Expert GPU cache exceeds the Vulkan heap budget"};
             const auto& gpu = gpu_infos[resident_devices[index]];
-            const uint64_t pending = vulkan_pending_reserve(model, resident_devices[index], heap_budget);
-            if (pending != 0 && (gpu.heap_available <= pending || cache_sizes[index] > gpu.heap_available - pending))
+            if (cache_sizes[index] > available_gpu_cache_size(model, gpu, 1))
                 return Error{ErrorCode::InvalidArgument, "the quantized Expert GPU cache leaves insufficient memory for Vulkan attention state and workspace"};
             cache_sizes[index] = std::min(cache_sizes[index], total_sizes[active_indices[index]]);
         }
@@ -1003,34 +1009,11 @@ Result<void> ModelLoader::configure_resident_quantized_backend()
     {
         if (!live_budget_available)
             return {};
-        std::vector<GpuInfo> cache_gpu_infos = gpu_infos;
-        for (uint32_t device : resident_devices)
-        {
-            GpuInfo& gpu = cache_gpu_infos[device];
-            const uint64_t reserve = vulkan_pending_reserve(model, device, gpu.heap_budget);
-            gpu.heap_available = gpu.heap_available > reserve ? gpu.heap_available - reserve : 0;
-        }
-        if (smallest_dense_entry_size != std::numeric_limits<uint64_t>::max())
-        {
-            for (uint32_t device : resident_devices)
-            {
-                GpuInfo& gpu = cache_gpu_infos[device];
-                if (model.qwen_device_chain
-                    || vulkan_pending_reserve(model, device, gpu.heap_budget) != 0)
-                {
-                    continue;
-                }
-                const uint64_t reserve = dense_vulkan_workspace_reserve(gpu.heap_budget);
-                gpu.heap_available = gpu.heap_available > reserve ? gpu.heap_available - reserve : 0;
-                const uint64_t state = dense_vulkan_pending_state_size(model, device);
-                gpu.heap_available = gpu.heap_available > state ? gpu.heap_available - state : 0;
-            }
-        }
         for (size_t index = 0; index < cache_sizes.size(); ++index)
         {
             const size_t device = active_indices[index];
             const auto available = get_auto_gpu_cache_sizes(max_pair_sizes[device], {resident_devices[index]},
-                                                            cache_gpu_infos, opt.num_concurrent_sessions);
+                                                            gpu_infos, model);
             if (available.size() != 1)
                 continue;
             cache_sizes[index] = native_quantized_gpu_cache_size(available.front(), total_sizes[device],
@@ -1049,7 +1032,7 @@ Result<void> ModelLoader::configure_resident_quantized_backend()
         if (cache_size > std::numeric_limits<uint64_t>::max() - total_cache_size)
             return Error{ErrorCode::InvalidArgument, "resident quantized Expert GPU capacities overflow"};
         auto backend = create_vulkan_expert_backend(cache_size, resident_devices[index], nullptr,
-                                                    model.vulkan_runtime, model.opt.optimization_flags);
+                                                    model.vulkan_runtime, model.opt.optimization_flags, cache_size);
         if (!backend)
         {
             if (explicit_cache)
@@ -1097,14 +1080,26 @@ Result<void> ModelLoader::load(const std::filesystem::path& model_path)
     if (!ret)
         return ret.error();
 
-    ret = configure_expert_cache();
+    ret = prepare_model_expert_banks(model, SessionOptions{}.prefill_chunk_size, opt.expert_gpu_cache_size);
     if (!ret)
         return ret.error();
-    ret = configure_resident_quantized_backend();
-    if (!ret)
-        return ret.error();
-    if (model.qwen_device_chain && !model.expert_backend)
-        return Error{ErrorCode::UnsupportedModel, "continuous Qwen Vulkan execution requires an executable GPU Expert cache within the remaining memory budget"};
+
+    if (model.gpu_expert_banks.empty())
+    {
+        ret = configure_expert_cache();
+        if (!ret)
+            return ret.error();
+        ret = configure_resident_expert_backend();
+        if (!ret)
+            return ret.error();
+    }
+    if (!model.expert_backend && model.gpu_expert_banks.empty()
+        && std::any_of(model.graph.nodes.begin(), model.graph.nodes.end(), [](const ExecutionNode& node) {
+               return node.type == ExecutionNodeType::ExpertGroup && node.backend == ExecutionBackend::Vulkan;
+           }))
+        return Error{ErrorCode::UnsupportedModel, "GPU Expert placement requires an executable device cache; CPU retry is disabled"};
+    if (model.gated_residual_chain && !model.expert_backend && model.gpu_expert_banks.empty())
+        return Error{ErrorCode::UnsupportedModel, "continuous gated residual Vulkan execution requires an executable GPU Expert cache within the remaining memory budget"};
 
     auto tokenizer = std::make_shared<Tokenizer>();
     if (tokenizer->load((package.weights_path.empty() ? package.root : package.weights_path).string(), model.descriptor.vocabulary_size))

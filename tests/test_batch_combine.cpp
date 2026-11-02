@@ -136,6 +136,9 @@ struct FakeBackendState
     size_t raw_published = 0;
     bool saw_route_aggregation = false;
     bool saw_require_all_requests = false;
+    std::vector<std::string> submitted_keys;
+    std::vector<size_t> submitted_slots;
+    std::vector<std::vector<ExpertRoute>> submitted_routes;
 };
 
 static ActivationBuffer expert_output(const ExpertMatrices& expert,
@@ -299,8 +302,14 @@ public:
     {
         ++state_->submit_count;
         state_->request_count = requests.size();
+        state_->submitted_keys.clear();
+        state_->submitted_slots.clear();
+        state_->submitted_routes.clear();
         for (const ExpertRequest& request : requests)
         {
+            state_->submitted_keys.emplace_back(request.key);
+            state_->submitted_slots.push_back(request.region_index);
+            state_->submitted_routes.emplace_back(request.device_routes.begin(), request.device_routes.end());
             state_->saw_route_aggregation = state_->saw_route_aggregation || request.route_aggregation.output != nullptr;
             state_->saw_require_all_requests = state_->saw_require_all_requests
                                                || request.route_aggregation.require_all_requests;
@@ -425,7 +434,34 @@ static void run_batch_case(const CompiledModel& cpu_model,
         {input_ids[1], &statistics[1], &sessions[1], 0, &actual[1]},
     }};
     auto executed = forward_decode_batch(backend_model, entries, workspace);
-    require(static_cast<bool>(executed), "staged batch execution failed");
+    if (!commit_success)
+    {
+        require(!executed && executed.error().code == ErrorCode::InternalError,
+                "failed staged GPU publication must report an execution error");
+        for (const auto& session : statistics)
+            require(session.expert_cpu_routes == 0 && session.expert_cpu_batches == 0
+                        && session.expert_cpu_fallbacks == 0 && session.expert_gpu_routes == 0,
+                    "failed staged GPU publication must not recover on CPU or publish successful GPU routes");
+        require(state->submit_count == 1 && state->wait_count == 1 && state->commit_count == 1
+                    && state->abort_count == 1,
+                "failed staged GPU publication must drain and abort its only submission");
+        require(state->aggregate_published == 0 && state->raw_published == 0,
+                "failed staged GPU publication exposed uncommitted output");
+        return;
+    }
+    require(static_cast<bool>(executed), executed ? "staged batch execution failed" : executed.error().message.c_str());
+    require(state->submitted_keys.size() == expert_count && workspace.combined_by_expert.size() == expert_count,
+            "staged batch lost its canonical Expert mapping");
+    for (size_t expert_id = 0; expert_id < expert_count; ++expert_id)
+    {
+        require(state->submitted_keys[expert_id] == "batch-combine-expert-" + std::to_string(expert_id)
+                    && state->submitted_slots[expert_id] == expert_id
+                    && workspace.combined_by_expert[expert_id] == expert_id,
+                "staged Expert order and reverse mapping must be canonical despite reverse first-seen order");
+        require(state->submitted_routes[expert_id].size() == 1
+                    && state->submitted_routes[expert_id].front().token_index == 1 - expert_id,
+                "canonical staged reordering changed the route's original Session ownership");
+    }
     compare_logits(actual, expected);
     require(statistics[0].expert_batches != 0 && statistics[1].expert_batches != 0,
             "staged batch did not record expert execution statistics");
@@ -434,12 +470,10 @@ static void run_batch_case(const CompiledModel& cpu_model,
         require(session.expert_assignments > 0
                     && session.expert_cpu_routes + session.expert_gpu_routes == session.expert_assignments,
                 "staged batch did not attribute every route to its Session");
-        require(session.expert_gpu_routes == (commit_success ? session.expert_assignments : 0)
-                    && session.expert_cpu_routes == (commit_success ? 0 : session.expert_assignments),
+        require(session.expert_gpu_routes == session.expert_assignments && session.expert_cpu_routes == 0,
                 "staged batch reported the wrong execution backend after commit");
-        require(session.expert_cpu_batches == (commit_success ? 0 : session.expert_batches)
-                    && session.expert_cpu_fallbacks == session.expert_cpu_batches,
-                "staged batch did not attribute failed GPU publication to CPU fallback");
+        require(session.expert_cpu_batches == 0 && session.expert_cpu_fallbacks == 0,
+                "successful staged GPU publication executed CPU recovery work");
     }
 
     require(state->submit_count == 1, "fake backend was not submitted exactly once");
@@ -448,18 +482,9 @@ static void run_batch_case(const CompiledModel& cpu_model,
     require(state->request_count == expert_count, "staged batch did not submit all active experts");
     require(state->saw_route_aggregation, "staged batch did not request route aggregation");
     require(state->saw_require_all_requests, "staged batch did not require complete backend coverage");
-    if (commit_success)
-    {
-        require(state->aggregate_published == aggregate_count, "successful backend did not publish aggregation");
-        require(state->raw_published == expert_count - aggregate_count, "successful backend published an invalid raw output count");
-        require(state->abort_count == 0, "successful backend submission was aborted");
-    }
-    else
-    {
-        require(state->aggregate_published == 0, "failed backend published an aggregate");
-        require(state->raw_published == 0, "failed backend published raw output");
-        require(state->abort_count == 1, "failed backend submission was not aborted");
-    }
+    require(state->aggregate_published == aggregate_count, "successful backend did not publish aggregation");
+    require(state->raw_published == expert_count - aggregate_count, "successful backend published an invalid raw output count");
+    require(state->abort_count == 0, "successful backend submission was aborted");
 }
 
 void test_batch_combine_backend()

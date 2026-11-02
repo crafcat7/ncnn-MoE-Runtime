@@ -1,0 +1,82 @@
+diff --git a/src/gpu.cpp b/src/gpu.cpp
+--- a/src/gpu.cpp
++++ b/src/gpu.cpp
+@@ -4398,6 +4398,7 @@
+     const uint32_t local_size_xyz[3] = {local_size_x, local_size_y, local_size_z};
+     const bool use_local_size_id = code[1] >= 0x00010600;
+     uint32_t uint_type_id = -1;
++    uint32_t moved_uint_type_id = -1;
+     bool inject_local_size_constants = false;
+     bool inject_local_size_decorations = false;
+ 
+@@ -4416,6 +4417,25 @@
+ 
+         uint16_t wordcount = opcode >> 16;
+         uint16_t op = opcode & 0xffff;
++
++        // Only workgroup-scope cooperative types implicitly use LocalSizeId.
++        // Resolve their scope from preceding constant declarations; subgroup
++        // shaders keep their existing instruction ordering unchanged.
++        bool workgroup_cooperative_matrix = false;
++        if (op == 4456 && inject_local_size_constants) // OpTypeCooperativeMatrixKHR
++        {
++            const uint32_t* q = code + 5;
++            while (q < p)
++            {
++                const uint16_t scope_op = q[0] & 0xffff;
++                if ((scope_op == 43 || scope_op == 50) && q[2] == p[3]) // OpConstant or OpSpecConstant
++                {
++                    workgroup_cooperative_matrix = q[3] == 2; // ScopeWorkgroup
++                    break;
++                }
++                q += q[0] >> 16;
++            }
++        }
+ 
+         // insert the local size SpecId decorations before the types
+         if (op >= 19 && op <= 39 && inject_local_size_decorations)
+@@ -4460,6 +4480,11 @@
+         }
+         else if (op == 21) // OpTypeInt
+         {
++            if (p[1] == moved_uint_type_id)
++            {
++                p += wordcount;
++                continue;
++            }
+             if (p[2] == 32 && p[3] == 0)
+                 uint_type_id = p[1];
+         }
+@@ -4506,12 +4531,29 @@
+                 }
+             }
+         }
+-        else if (op == 54 && inject_local_size_constants) // OpFunction
+-        {
++        else if ((workgroup_cooperative_matrix || op == 54) && inject_local_size_constants) // OpFunction
++        {
++            // Workgroup cooperative matrix types require these definitions
++            // before the type, rather than only before the first function.
+             // adreno needs LocalSizeId to reference specialization constants
+             if (uint_type_id == (uint32_t)-1)
+             {
+-                uint_type_id = dstcode[3]++;
++                // The scope and dimensions may use signed integers. Reuse a
++                // later unsigned type by moving its declaration here, avoiding
++                // both a forward type reference and a duplicate scalar type.
++                const uint32_t* q = p + wordcount;
++                while ((const unsigned char*)q < (const unsigned char*)code + size)
++                {
++                    if ((q[0] & 0xffff) == 21 && q[2] == 32 && q[3] == 0)
++                    {
++                        uint_type_id = q[1];
++                        moved_uint_type_id = uint_type_id;
++                        break;
++                    }
++                    q += q[0] >> 16;
++                }
++                if (uint_type_id == (uint32_t)-1)
++                    uint_type_id = dstcode[3]++;
+                 dp[0] = (4 << 16) | 21; // OpTypeInt
+                 dp[1] = uint_type_id;
+                 dp[2] = 32;

@@ -39,7 +39,14 @@ ncnn::VkBufferMemory* VulkanExpertWeightAllocator::fastMalloc(size_t size)
     const size_t aligned = ((size + alignment - 1) / alignment) * alignment;
     const std::lock_guard<std::mutex> lock(mutex);
     const auto allocate_range = [&](Block& block, std::list<Range>::iterator range) {
-        auto result = std::make_unique<ncnn::VkBufferMemory>();
+        std::unique_ptr<Allocation> result;
+        if (retain_free_blocks && spare_allocations)
+        {
+            result.reset(spare_allocations);
+            spare_allocations = spare_allocations->next;
+        }
+        else
+            result = std::make_unique<Allocation>();
         result->buffer = block.buffer;
         result->offset = range->offset;
         result->capacity = aligned;
@@ -49,17 +56,65 @@ ncnn::VkBufferMemory* VulkanExpertWeightAllocator::fastMalloc(size_t size)
         result->access_flags = 0;
         result->stage_flags = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
         result->refcount = 0;
-        // Allocate the range node before changing free-space accounting.
-        // fastFree can then splice it without allocating from a destructor.
-        block.used.push_back({range->offset, aligned});
-        range->offset += aligned;
-        range->size -= aligned;
-        if (range->size == 0) block.free.erase(range);
-        return result.release();
+        result->next = nullptr;
+        if (range->size == aligned)
+        {
+            // An exact hole already owns the required bookkeeping node.
+            block.used.splice(block.used.end(), block.free, range);
+            result->range = range;
+        }
+        else
+        {
+            // Obtain the node before changing free-space accounting. Splice
+            // and descriptor publication then cannot allocate or throw.
+            if (retain_free_blocks && !spare_ranges.empty())
+            {
+                auto reused = spare_ranges.begin();
+                *reused = {range->offset, aligned};
+                block.used.splice(block.used.end(), spare_ranges, reused);
+            }
+            else
+                block.used.push_back({range->offset, aligned});
+            result->range = std::prev(block.used.end());
+            range->offset += aligned;
+            range->size -= aligned;
+        }
+        result->block = &block;
+        result->range->allocation = result.get();
+        ++live_allocations;
+        peak_live_allocations = std::max(peak_live_allocations, live_allocations);
+        return static_cast<ncnn::VkBufferMemory*>(result.release());
     };
-    for (const auto& block : blocks)
-        for (auto range = block->free.begin(); range != block->free.end(); ++range)
-            if (range->size >= aligned) return allocate_range(*block, range);
+    if (retain_free_blocks)
+    {
+        // Match the graph planner's best-fit hole selection. The graph arena
+        // cannot create another backing block to hide runtime fragmentation.
+        Block* best_block = nullptr;
+        std::list<Range>::iterator best_range;
+        for (const auto& block : blocks)
+            for (auto range = block->free.begin(); range != block->free.end(); ++range)
+                if (range->size >= aligned
+                    && (!best_block || range->size < best_range->size
+                        || (range->size == best_range->size && range->offset < best_range->offset)))
+                {
+                    best_block = block.get();
+                    best_range = range;
+                }
+        if (best_block)
+            return allocate_range(*best_block, best_range);
+    }
+    else
+    {
+        for (const auto& block : blocks)
+            for (auto range = block->free.begin(); range != block->free.end(); ++range)
+                if (range->size >= aligned) return allocate_range(*block, range);
+    }
+
+    if (!allow_physical_growth)
+    {
+        if (limit_rejections != std::numeric_limits<uint64_t>::max()) ++limit_rejections;
+        return nullptr;
+    }
 
     auto block = std::make_unique<Block>();
     block->capacity = std::max(block_size, aligned);
@@ -132,62 +187,81 @@ ncnn::VkBufferMemory* VulkanExpertWeightAllocator::fastMalloc(size_t size)
     return allocate_range(*blocks.back(), blocks.back()->free.begin());
 }
 
+void VulkanExpertWeightAllocator::recycle_range(std::list<Range>& ranges,
+                                                std::list<Range>::iterator range) noexcept
+{
+    if (retain_free_blocks && spare_ranges.size() < peak_live_allocations)
+    {
+        range->allocation = nullptr;
+        spare_ranges.splice(spare_ranges.end(), ranges, range);
+    }
+    else
+        ranges.erase(range);
+}
+
 void VulkanExpertWeightAllocator::fastFree(ncnn::VkBufferMemory* buffer)
 {
     if (!buffer) return;
     const std::lock_guard<std::mutex> lock(mutex);
-    for (const auto& block : blocks)
+    auto* allocation = static_cast<Allocation*>(buffer);
+    Block* block = allocation->block;
+    if (!block)
     {
-        if (block->buffer != buffer->buffer) continue;
-        auto next = block->free.begin();
-        while (next != block->free.end() && next->offset < buffer->offset) ++next;
-        auto used = block->used.begin();
-        while (used != block->used.end() && used->offset != buffer->offset) ++used;
-        if (used == block->used.end())
-        {
-            delete buffer;
-            return;
-        }
-        block->free.splice(next, block->used, used);
-        auto inserted = used;
-        if (inserted != block->free.begin())
-        {
-            auto previous = std::prev(inserted);
-            if (previous->offset + previous->size == inserted->offset)
-            {
-                previous->size += inserted->size;
-                block->free.erase(inserted);
-                inserted = previous;
-            }
-        }
-        next = std::next(inserted);
-        if (next != block->free.end() && inserted->offset + inserted->size == next->offset)
-        {
-            inserted->size += next->size;
-            block->free.erase(next);
-        }
-        delete buffer;
-        if (block->used.empty())
-        {
-            const bool another_free = std::any_of(blocks.begin(), blocks.end(), [&](const auto& other) {
-                return other.get() != block.get() && other->used.empty();
-            });
-            // Retain at most one ordinary warm block. Oversized fully free
-            // buffers are returned immediately, so shape churn is bounded.
-            if (block->capacity > block_size || another_free)
-            {
-                const Block* released = block.get();
-                vkDestroyBuffer(vkdev->vkdevice(), block->buffer, nullptr);
-                vkFreeMemory(vkdev->vkdevice(), block->memory, nullptr);
-                allocated_bytes -= block->memory_size;
-                blocks.erase(std::remove_if(blocks.begin(), blocks.end(),
-                                            [released](const auto& candidate) { return candidate.get() == released; }),
-                             blocks.end());
-            }
-        }
+        // clear() invalidates backing, but disarms outstanding metadata so
+        // releasing such an old handle never dereferences a destroyed Block.
+        delete allocation;
         return;
     }
-    delete buffer;
+    auto next = block->free.begin();
+    while (next != block->free.end() && next->offset < buffer->offset) ++next;
+    auto inserted = allocation->range;
+    block->free.splice(next, block->used, inserted);
+    inserted->allocation = nullptr;
+    allocation->block = nullptr;
+    allocation->range = {};
+    --live_allocations;
+    if (inserted != block->free.begin())
+    {
+        auto previous = std::prev(inserted);
+        if (previous->offset + previous->size == inserted->offset)
+        {
+            previous->size += inserted->size;
+            recycle_range(block->free, inserted);
+            inserted = previous;
+        }
+    }
+    next = std::next(inserted);
+    if (next != block->free.end() && inserted->offset + inserted->size == next->offset)
+    {
+        inserted->size += next->size;
+        recycle_range(block->free, next);
+    }
+    if (retain_free_blocks)
+    {
+        // A header is acquired from this list before creating another one;
+        // therefore live + cached headers never exceed the live high-water mark.
+        allocation->next = spare_allocations;
+        spare_allocations = allocation;
+    }
+    else
+        delete allocation;
+    if (block->used.empty() && !retain_free_blocks)
+    {
+        const bool another_free = std::any_of(blocks.begin(), blocks.end(), [&](const auto& other) {
+            return other.get() != block && other->used.empty();
+        });
+        // Retain at most one ordinary warm block. Oversized fully free
+        // buffers are returned immediately, so shape churn is bounded.
+        if (block->capacity > block_size || another_free)
+        {
+            vkDestroyBuffer(vkdev->vkdevice(), block->buffer, nullptr);
+            vkFreeMemory(vkdev->vkdevice(), block->memory, nullptr);
+            allocated_bytes -= block->memory_size;
+            blocks.erase(std::remove_if(blocks.begin(), blocks.end(),
+                                        [block](const auto& candidate) { return candidate.get() == block; }),
+                         blocks.end());
+        }
+    }
 }
 
 ncnn::VkImageMemory* VulkanExpertWeightAllocator::fastMalloc(int, int, int, size_t, int)
@@ -201,10 +275,23 @@ void VulkanExpertWeightAllocator::clear()
     const std::lock_guard<std::mutex> lock(mutex);
     for (const auto& block : blocks)
     {
+        for (const auto& range : block->used)
+        {
+            range.allocation->block = nullptr;
+            range.allocation->range = {};
+        }
         vkDestroyBuffer(vkdev->vkdevice(), block->buffer, nullptr);
         vkFreeMemory(vkdev->vkdevice(), block->memory, nullptr);
     }
     blocks.clear();
+    while (spare_allocations)
+    {
+        auto* next = spare_allocations->next;
+        delete spare_allocations;
+        spare_allocations = next;
+    }
+    spare_ranges.clear();
+    live_allocations = peak_live_allocations = 0;
     allocated_bytes = 0;
 }
 
@@ -218,6 +305,37 @@ uint64_t VulkanExpertWeightAllocator::physical_limit_rejections() const
 {
     const std::lock_guard<std::mutex> lock(mutex);
     return limit_rejections;
+}
+
+void VulkanExpertWeightAllocator::configure_graph_pool(bool allow_growth)
+{
+    const std::lock_guard<std::mutex> lock(mutex);
+    retain_free_blocks = true;
+    allow_physical_growth = allow_growth;
+}
+
+void VulkanExpertWeightAllocator::trim_graph_pool(uint64_t reservation_bytes)
+{
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (!retain_free_blocks)
+        return;
+    const Block* retained = nullptr;
+    for (const auto& block : blocks)
+        if (block->used.empty() && block->capacity >= reservation_bytes
+            && (!retained || block->capacity < retained->capacity))
+            retained = block.get();
+    for (auto block = blocks.begin(); block != blocks.end();)
+    {
+        if (!(*block)->used.empty() || block->get() == retained)
+        {
+            ++block;
+            continue;
+        }
+        vkDestroyBuffer(vkdev->vkdevice(), (*block)->buffer, nullptr);
+        vkFreeMemory(vkdev->vkdevice(), (*block)->memory, nullptr);
+        allocated_bytes -= (*block)->memory_size;
+        block = blocks.erase(block);
+    }
 }
 
 struct VulkanExpertTransferPool::Lane
@@ -398,10 +516,13 @@ struct VulkanIndependentWeightTransfer::Implementation
     std::vector<ncnn::VkMat> destinations;
     ncnn::VkMat pending_storage;
     size_t pending_bytes = 0;
+    uint64_t copy_bytes = 0;
     bool independent_queue = false;
     bool attempted = false;
     bool transfer_submitted = false;
     bool compute_submitted = false;
+    bool visibility_only_wait = false;
+    bool copy_accounted = false;
     bool settled = false;
     bool failed = false;
 
@@ -429,7 +550,7 @@ struct VulkanIndependentWeightTransfer::Implementation
     bool submit_command(uint32_t family, VkCommandBuffer command, VkFence fence, bool wait, bool signal, VkQueue& queue)
     {
         ncnn::VulkanDevice* device = context->device();
-        queue = device->acquire_queue(family);
+        if (!queue) queue = device->acquire_queue(family);
         if (!queue) return false;
         const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
         VkSubmitInfo submit_info{};
@@ -466,18 +587,28 @@ struct VulkanIndependentWeightTransfer::Implementation
         queue = VK_NULL_HANDLE;
     }
 
+    VkResult wait_for_fence(VkFence fence)
+    {
+        const auto started = std::chrono::steady_clock::now();
+        const VkResult result = vkWaitForFences(context->device()->vkdevice(), 1, &fence, VK_TRUE, UINT64_MAX);
+        VulkanRuntimeState& state = context->runtime_state();
+        ++state.weight_transfer_fence_waits;
+        state.weight_transfer_wait_microseconds += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+        return result;
+    }
+
     bool wait_fence(VkFence fence, uint32_t family, VkQueue& queue)
     {
-        const VkResult result = vkWaitForFences(context->device()->vkdevice(), 1, &fence, VK_TRUE, UINT64_MAX);
+        const VkResult result = wait_for_fence(fence);
         if (result == VK_SUCCESS || result == VK_ERROR_DEVICE_LOST)
             reclaim_queue(family, queue);
         return result == VK_SUCCESS;
     }
 
-    void settle_queue(VkFence fence, uint32_t family, VkQueue& queue) noexcept
+    bool settle_queue(VkFence fence, uint32_t family, VkQueue& queue) noexcept
     {
-        if (!queue) return; // Its successful fence wait already settled it.
-        VkResult result = vkWaitForFences(context->device()->vkdevice(), 1, &fence, VK_TRUE, UINT64_MAX);
+        if (!queue) return false; // Its successful fence wait already settled it.
+        VkResult result = wait_for_fence(fence);
         while (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST)
         {
             result = vkQueueWaitIdle(queue); // Queue lease supplies external synchronization.
@@ -487,6 +618,31 @@ struct VulkanIndependentWeightTransfer::Implementation
         // An OOM/UNKNOWN return does not prove completion. Keep all tensors,
         // the command lane and queue lease alive until completion or loss.
         reclaim_queue(family, queue);
+        return result == VK_SUCCESS;
+    }
+
+    bool settle_unfenced_queue(uint32_t family, VkQueue& queue) noexcept
+    {
+        if (!queue) return false;
+        VkResult result;
+        do
+        {
+            result = vkQueueWaitIdle(queue);
+            if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        } while (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST);
+        reclaim_queue(family, queue);
+        return result == VK_SUCCESS;
+    }
+
+    void account_copy() noexcept
+    {
+        if (copy_accounted) return;
+        // Count only VkBufferCopy bytes whose completion has been proved,
+        // including a safely drained failed publication. Allocation padding
+        // outside recorded copies and unsubmitted commands contribute none.
+        context->runtime_state().weight_upload_bytes += copy_bytes;
+        copy_accounted = true;
     }
 
     bool record_staging(const ncnn::VkMat& source, size_t bytes, ncnn::VkMat& destination,
@@ -538,6 +694,7 @@ struct VulkanIndependentWeightTransfer::Implementation
             vkCmdPipelineBarrier(independent_queue ? lane->compute : lane->transfer,
                                  independent_queue ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT,
                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &visible, 0, nullptr);
+            copy_bytes += bytes;
             return true;
         }
         catch (...)
@@ -553,9 +710,19 @@ struct VulkanIndependentWeightTransfer::Implementation
         if (!context) return;
         if (lane && !settled && (transfer_submitted || compute_submitted))
         {
-            if (transfer_submitted) settle_queue(lane->transfer_fence, transfer_family(), transfer_queue);
+            if (transfer_submitted)
+            {
+                const bool copied = visibility_only_wait
+                                        ? settle_unfenced_queue(transfer_family(), transfer_queue)
+                                        : settle_queue(lane->transfer_fence, transfer_family(), transfer_queue);
+                if (copied) account_copy();
+            }
             if (compute_submitted) settle_queue(lane->compute_fence, context->device()->info.compute_queue_family_index(), compute_queue);
         }
+        // A failed copy submit can still own the compute lease acquired first
+        // for the chained path; no command references that unused lease.
+        reclaim_queue(transfer_family(), transfer_queue);
+        reclaim_queue(context->device()->info.compute_queue_family_index(), compute_queue);
         pending_storage.release();
         staging.clear();
         destinations.clear();
@@ -655,35 +822,57 @@ bool VulkanIndependentWeightTransfer::submit_and_wait()
         return false;
     }
     const auto& info = d->context->device()->info;
+    d->visibility_only_wait = d->independent_queue && info.compute_queue_count() > 1;
+    if (d->visibility_only_wait)
+    {
+        // ncnn's legacy uploader leases compute before transfer. Keep the
+        // same order to avoid an opposite-family lease deadlock. Leave a
+        // single-compute-queue device free to compute throughout its copy.
+        d->compute_queue = d->context->device()->acquire_queue(info.compute_queue_family_index());
+        if (!d->compute_queue)
+        {
+            d->failed = true;
+            return false;
+        }
+    }
     d->transfer_submitted = d->submit_command(d->independent_queue ? info.transfer_queue_family_index() : info.compute_queue_family_index(),
-                                              d->lane->transfer, d->lane->transfer_fence, false, d->independent_queue, d->transfer_queue);
+                                              d->lane->transfer, d->visibility_only_wait ? VK_NULL_HANDLE : d->lane->transfer_fence,
+                                              false, d->independent_queue, d->transfer_queue);
     if (!d->transfer_submitted)
     {
         d->failed = true;
         return false;
     }
-    const bool copied = d->wait_fence(d->lane->transfer_fence, d->transfer_family(), d->transfer_queue);
-    if (!copied)
+    ++d->context->runtime_state().weight_transfer_submissions;
+    if (!d->visibility_only_wait)
     {
-        d->failed = true;
-        return false;
+        if (!d->wait_fence(d->lane->transfer_fence, d->transfer_family(), d->transfer_queue))
+        {
+            d->failed = true;
+            return false;
+        }
+        d->account_copy();
     }
     if (d->independent_queue)
     {
-        // Acquire visibility after copying completes, so unrelated foreground
-        // kernels do not wait behind the upload on a compute queue.
+        // A binary semaphore orders visibility after the copy. With another
+        // compute queue available, the final fence alone proves completion of
+        // both command buffers; no separate copy fence is pending at reuse.
         d->compute_submitted = d->submit_command(info.compute_queue_family_index(), d->lane->compute, d->lane->compute_fence, true, false, d->compute_queue);
         if (!d->compute_submitted)
         {
             d->failed = true;
             return false;
         }
+        ++d->context->runtime_state().weight_visibility_submissions;
         const bool visible = d->wait_fence(d->lane->compute_fence, info.compute_queue_family_index(), d->compute_queue);
         if (!visible)
         {
             d->failed = true;
             return false;
         }
+        d->account_copy();
+        d->reclaim_queue(d->transfer_family(), d->transfer_queue);
     }
     // Fence writes availability -> host wait -> admission publication happens
     // before the consumer queueSubmit. The dependency chain covers later
