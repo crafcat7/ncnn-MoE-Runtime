@@ -337,7 +337,15 @@ def _add_metrics_options(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_generation_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Maximum generated tokens, including reasoning tokens (default: 0); "
+            "0 generates until a stop token or the remaining context limit"
+        ),
+    )
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--top-k", type=int)
     parser.add_argument("--top-p", type=float)
@@ -1304,13 +1312,41 @@ class ConversationApp:
         metrics = done.get("metrics", {})
         self.last_metrics = metrics if isinstance(metrics, dict) else {}
         context_count = self.native_context_count
-        self._status(
+        status = (
             _format_runtime_metrics(self.last_metrics)
             + "\n  Context "
             + f"{context_count}/{self.context_limit or 'auto'}"
             + " tokens"
             + f" · prefix {'reused' if reused else 'replayed'}"
         )
+        generated_tokens = done.get("generated_tokens")
+        max_new_tokens = getattr(self.arguments, "max_new_tokens", None)
+        stop_flags_clear = all(
+            done.get(name) is False
+            for name in ("stopped_by_stop_token", "stopped_by_callback", "cancelled")
+        )
+        if type(generated_tokens) is int and generated_tokens > 0 and stop_flags_clear:
+            if type(max_new_tokens) is int and max_new_tokens > 0 and generated_tokens == max_new_tokens:
+                status += (
+                    f"\n  Response may be incomplete: generated {generated_tokens}/{max_new_tokens} tokens. "
+                    "Set --max-new-tokens 0 to generate until a stop token or the remaining context limit, "
+                    "or increase --max-new-tokens."
+                )
+            elif type(max_new_tokens) is int and max_new_tokens == 0:
+                sequence_length = done.get("sequence_length")
+                worker_context_tokens = self.worker_context_tokens
+                if (
+                    type(sequence_length) is int
+                    and type(worker_context_tokens) is int
+                    and worker_context_tokens > 0
+                    # The last sampled token may not have been committed to KV.
+                    and sequence_length in (worker_context_tokens - 1, worker_context_tokens)
+                ):
+                    status += (
+                        f"\n  Response may be incomplete: reached the context limit after "
+                        f"{generated_tokens} generated tokens. Increase the context limit or shorten the prompt."
+                    )
+        self._status(status)
 
     def show_context(self) -> None:
         tokens = self._prompt_count(self.native_session_id, self.messages) if self.messages else 0
