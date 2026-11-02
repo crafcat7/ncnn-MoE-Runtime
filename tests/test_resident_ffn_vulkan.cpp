@@ -1,3 +1,4 @@
+#include "vulkan_test_support.h"
 #include "backends/ncnn/moecombine_vulkan.h"
 #include "backends/ncnn/residentffn_vulkan.h"
 #include "backends/ncnn/vulkancontext.h"
@@ -29,22 +30,6 @@ static void region_check(bool condition, const char* message)
 }
 
 #if NCNN_MOE_WITH_VULKAN
-static ncnn::Option region_option(const VulkanContext& context)
-{
-    ncnn::Option option;
-    option.use_vulkan_compute = true;
-    option.use_packing_layout = false;
-    option.use_fp16_packed = false;
-    option.use_fp16_storage = false;
-    option.use_fp16_arithmetic = false;
-    option.use_bf16_packed = false;
-    option.use_bf16_storage = false;
-    option.blob_vkallocator = context.blob_allocator();
-    option.workspace_vkallocator = context.blob_allocator();
-    option.staging_vkallocator = context.staging_allocator();
-    return option;
-}
-
 static bool same_io_counters(const VulkanStatistics& first, const VulkanStatistics& second)
 {
     return first.compute_submissions == second.compute_submissions
@@ -54,17 +39,8 @@ static bool same_io_counters(const VulkanStatistics& first, const VulkanStatisti
 
 static ncnn::VkMat upload_fixture(const std::shared_ptr<VulkanContext>& context, const ActivationBuffer& source)
 {
-    const std::lock_guard<std::mutex> lock(context->command_mutex());
-    const auto option = region_option(*context);
-    ncnn::VkCompute command(context->device());
-    ncnn::VkMat staging;
     ncnn::VkMat result;
-    region_check(fill_staging_upload(source, staging, option.staging_vkallocator)
-                     && record_mapped_upload(staging, result, command, option)
-                     && submit_compute_and_wait(command, context->device()) == 0,
-                 "resident FFN fixture upload failed");
-    ++context->runtime_state().compute_submissions;
-    ++context->runtime_state().batch_uploads;
+    region_check(vulkan_test_upload_raw(context, source, result), "resident FFN fixture upload failed");
     return result;
 }
 
@@ -156,7 +132,7 @@ static void test_two_waves(const std::shared_ptr<VulkanContext>& context,
     ncnn::VkMat retained_input;
     {
         const std::lock_guard<std::mutex> lock(context->command_mutex());
-        const auto option = region_option(*context);
+        const auto option = vulkan_test_option(*context);
         {
             ncnn::VkCompute aborted(context->device());
             ncnn::VkMat input;
@@ -196,7 +172,7 @@ static void test_two_waves(const std::shared_ptr<VulkanContext>& context,
                  "first partial wave did not keep the expected existing-command transfer counts");
     {
         const std::lock_guard<std::mutex> lock(context->command_mutex());
-        const auto option = region_option(*context);
+        const auto option = vulkan_test_option(*context);
         {
             ncnn::VkCompute aborted(context->device());
             ncnn::VkMat input;
@@ -259,7 +235,7 @@ static void test_single_warm_wave(const std::shared_ptr<VulkanContext>& context,
         ncnn::VkMat input;
         bool uploaded = false;
         bool downloaded = false;
-        const auto option = region_option(*context);
+        const auto option = vulkan_test_option(*context);
         region_check(region->record_input(input, command, option, uploaded) && uploaded,
                      "single warm Expert wave must upload normalized input once");
         const std::array<ResidentFfnRegion_vulkan::Output, 1> outputs = {{{0, device, routes}}};
@@ -324,7 +300,7 @@ static void test_sparse_prefill_routes(const std::shared_ptr<VulkanContext>& con
         ncnn::VkCompute command(context->device());
         ncnn::VkMat input;
         bool uploaded = false, downloaded = false;
-        const auto option = region_option(*context);
+        const auto option = vulkan_test_option(*context);
         region_check(region->record_input(input, command, option, uploaded) && uploaded,
                      "prefill region input recording failed");
         const std::array<ResidentFfnRegion_vulkan::Output, 2> outputs = {{{1, device_values[1], routes[1]},

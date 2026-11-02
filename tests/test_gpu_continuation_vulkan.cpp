@@ -1,3 +1,4 @@
+#include "vulkan_test_support.h"
 #include "gpu_segment_fixture.h"
 
 #include <algorithm>
@@ -6,22 +7,6 @@ namespace ncnn {
 namespace moe {
 
 #if NCNN_MOE_WITH_VULKAN
-static ncnn::Option continuation_option(const VulkanContext& context)
-{
-    ncnn::Option option;
-    option.use_vulkan_compute = true;
-    option.use_packing_layout = false;
-    option.use_fp16_packed = false;
-    option.use_fp16_storage = false;
-    option.use_fp16_arithmetic = false;
-    option.use_bf16_packed = false;
-    option.use_bf16_storage = false;
-    option.blob_vkallocator = context.blob_allocator();
-    option.workspace_vkallocator = context.blob_allocator();
-    option.staging_vkallocator = context.staging_allocator();
-    return option;
-}
-
 static ExpertDispatchOptions continuation_options()
 {
     ExpertDispatchOptions options;
@@ -33,16 +18,8 @@ static ExpertDispatchOptions continuation_options()
 static ncnn::VkMat continuation_upload(const CompiledModel& gpu, const ActivationBuffer& source)
 {
     const auto context = gpu.gpu_segments.front()->context();
-    const std::lock_guard<std::mutex> lock(context->command_mutex());
-    const auto option = continuation_option(*context);
-    ncnn::VkCompute command(context->device());
-    ncnn::VkMat staging, output;
-    segment_check(fill_staging_upload(source, staging, option.staging_vkallocator)
-                      && record_mapped_upload(staging, output, command, option)
-                      && submit_compute_and_wait(command, context->device()) == 0,
-                  "cannot upload a continuation operand fixture");
-    ++context->runtime_state().compute_submissions;
-    ++context->runtime_state().batch_uploads;
+    ncnn::VkMat output;
+    segment_check(vulkan_test_upload_raw(context, source, output), "cannot upload a continuation operand fixture");
     return output;
 }
 
@@ -109,7 +86,7 @@ static std::shared_ptr<ResidentFfnRegion_vulkan> continuation_wave(const Compile
         for (size_t index = first; index < last; ++index)
             selected.push_back({index, outputs.values[index], outputs.routes[index]});
         const std::lock_guard<std::mutex> lock(context->command_mutex());
-        const auto option = continuation_option(*context);
+        const auto option = vulkan_test_option(*context);
         ncnn::VkCompute command(context->device());
         ncnn::VkMat input;
         bool uploaded = true;
@@ -287,7 +264,7 @@ static void continuation_abort(const CompiledModel& gpu, size_t target_layer)
         {
             const std::lock_guard<std::mutex> lock(context->command_mutex());
             ncnn::VkCompute command(context->device());
-            segment_check(pending->record(aggregate, command, continuation_option(*context)),
+            segment_check(pending->record(aggregate, command, vulkan_test_option(*context)),
                           "an unsubmitted aborted state could not be recorded again");
             ExpertDispatchPlan sentinel;
             sentinel.assignment_count = 95;
@@ -325,7 +302,7 @@ static void continuation_abort(const CompiledModel& gpu, size_t target_layer)
     {
         const std::lock_guard<std::mutex> lock(context->command_mutex());
         ncnn::VkCompute command(context->device());
-        segment_check(!retry->record(aggregate, command, continuation_option(*context)),
+        segment_check(!retry->record(aggregate, command, vulkan_test_option(*context)),
                       "submitted but unpublished Standard/GDN state was silently reused");
         segment_check(command.reset() == 0, "cannot reset rejected terminal state recording");
     }

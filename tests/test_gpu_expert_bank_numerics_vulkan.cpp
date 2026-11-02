@@ -1,9 +1,16 @@
-#include "gpu_segment_fixture.h"
+#include "vulkan_test_support.h"
 #include "backends/ncnn/expertbank_vulkan.h"
 
+#include <algorithm>
+#include <array>
 #include <bit>
+#include <cmath>
+#include <cstdint>
+#include <iostream>
 #include <limits>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace ncnn {
 namespace moe {

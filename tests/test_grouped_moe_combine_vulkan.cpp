@@ -1,3 +1,4 @@
+#include "vulkan_test_support.h"
 #include "backends/ncnn/moecombine_vulkan.h"
 #include "backends/ncnn/residentffn_vulkan.h"
 #include "backends/ncnn/vulkancontext.h"
@@ -32,19 +33,6 @@ static void grouped_check(bool condition, const std::string& message)
 #if NCNN_MOE_WITH_VULKAN
 static constexpr uint32_t grouped_columns = 37;
 
-static ncnn::Option grouped_option(const VulkanContext& context)
-{
-    ncnn::Option option;
-    option.use_vulkan_compute = true;
-    option.use_packing_layout = false;
-    option.use_fp16_packed = option.use_fp16_storage = option.use_fp16_arithmetic = false;
-    option.use_bf16_packed = option.use_bf16_storage = false;
-    option.blob_vkallocator = context.blob_allocator();
-    option.workspace_vkallocator = context.blob_allocator();
-    option.staging_vkallocator = context.staging_allocator();
-    return option;
-}
-
 static bool unchanged_io(const VulkanStatistics& a, const VulkanStatistics& b)
 {
     return a.compute_submissions == b.compute_submissions && a.batch_uploads == b.batch_uploads && a.batch_downloads == b.batch_downloads;
@@ -52,16 +40,8 @@ static bool unchanged_io(const VulkanStatistics& a, const VulkanStatistics& b)
 
 static ncnn::VkMat grouped_upload(const std::shared_ptr<VulkanContext>& context, const ActivationBuffer& source)
 {
-    const std::lock_guard<std::mutex> lock(context->command_mutex());
-    const auto option = grouped_option(*context);
-    ncnn::VkCompute command(context->device());
-    ncnn::VkMat staging, output;
-    grouped_check(fill_staging_upload(source, staging, option.staging_vkallocator)
-                      && record_mapped_upload(staging, output, command, option)
-                      && submit_compute_and_wait(command, context->device()) == 0,
-                  "grouped fixture upload failed");
-    ++context->runtime_state().compute_submissions;
-    ++context->runtime_state().batch_uploads;
+    ncnn::VkMat output;
+    grouped_check(vulkan_test_upload_raw(context, source, output), "grouped fixture upload failed");
     return output;
 }
 
@@ -128,7 +108,7 @@ static ActivationBuffer grouped_record(const std::shared_ptr<VulkanContext>& con
                                        const ncnn::VkMat* shared = nullptr)
 {
     const std::lock_guard<std::mutex> lock(context->command_mutex());
-    const auto option = grouped_option(*context);
+    const auto option = vulkan_test_option(*context);
     ncnn::VkCompute command(context->device());
     ncnn::VkMat combined, staging;
     std::vector<ncnn::VkMat> storage;
@@ -238,7 +218,7 @@ static void test_grouped_waves(const std::shared_ptr<VulkanContext>& context, co
     const auto initial = get_vulkan_statistics(context->runtime());
     {
         const std::lock_guard<std::mutex> lock(context->command_mutex());
-        const auto option = grouped_option(*context);
+        const auto option = vulkan_test_option(*context);
         ncnn::VkCompute command(context->device());
         ncnn::VkMat input;
         bool uploaded = false, downloaded = true;
@@ -258,7 +238,7 @@ static void test_grouped_waves(const std::shared_ptr<VulkanContext>& context, co
     const auto partial = get_vulkan_statistics(context->runtime());
     {
         const std::lock_guard<std::mutex> lock(context->command_mutex());
-        const auto option = grouped_option(*context);
+        const auto option = vulkan_test_option(*context);
         // A partially appended invalid output set must never be committed.
         ncnn::VkCompute invalid(context->device());
         ncnn::VkMat input;

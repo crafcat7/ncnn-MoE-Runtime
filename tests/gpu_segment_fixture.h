@@ -1,6 +1,8 @@
 #ifndef NCNN_MOE_GPU_SEGMENT_TEST_FIXTURE_H
 #define NCNN_MOE_GPU_SEGMENT_TEST_FIXTURE_H
 
+#include "vulkan_test_support.h"
+
 #include "backends/ncnn/expertbackend_vulkan.h"
 #include "backends/ncnn/gateddeltanet_vulkan.h"
 #include "backends/ncnn/gpusegment_vulkan.h"
@@ -32,18 +34,12 @@
 namespace ncnn {
 namespace moe {
 
-static void segment_check(bool condition, const std::string& message)
-{
-    if (!condition) throw std::runtime_error(message);
-}
-
 #if NCNN_MOE_WITH_VULKAN
 static constexpr uint32_t segment_hidden = 128;
 static constexpr uint32_t segment_intermediate = 128;
 static constexpr uint32_t segment_experts = 2;
 static constexpr uint32_t segment_top_k = 2;
 static constexpr uint32_t segment_layers = 2;
-static constexpr uint64_t segment_flags = OptimizationDefaultFlags & ~OptimizationCpuFastSilu;
 
 static TensorData segment_weight(std::vector<uint32_t> shape, uint32_t seed, bool norm = false)
 {
@@ -201,19 +197,6 @@ static CompiledModel segment_compile(bool gpu, bool native_delta)
     else
         segment_check(model.gpu_segments.empty() && !model.gpu_head, "CPU model unexpectedly owns a resident GPU segment");
     return model;
-}
-
-static void segment_compare(std::span<const float> actual, std::span<const float> expected, const std::string& context)
-{
-    segment_check(actual.size() == expected.size(), context + " shape mismatch");
-    float scale = 0.0f;
-    for (const float value : expected) scale = std::max(scale, std::abs(value));
-    // Both use FP32 activations and BF16 KV; weight kernels differ in reduction order.
-    const float tolerance = 2e-4f + 2e-3f * scale;
-    for (size_t index = 0; index < actual.size(); ++index)
-        segment_check(std::isfinite(actual[index]) && std::abs(actual[index] - expected[index]) <= tolerance,
-                      context + " numerical mismatch at " + std::to_string(index) + ": " + std::to_string(actual[index])
-                          + " vs " + std::to_string(expected[index]) + ", tolerance " + std::to_string(tolerance));
 }
 
 static void segment_gpu_routes(const SessionStatistics& statistics)
