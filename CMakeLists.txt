@@ -57,7 +57,7 @@ set(NCNN_MOE_SOURCES
     src/backends/ncnn/graphallocator_vulkan.cpp
     src/backends/ncnn/gateddeltanet_vulkan.cpp
     src/backends/ncnn/gatedresidual_vulkan.cpp
-    src/backends/ncnn/qwenlayer_vulkan.cpp
+    src/backends/ncnn/gatedresiduallayer_vulkan.cpp
     src/backends/ncnn/gpusegment_vulkan.cpp
     src/backends/ncnn/expertbank_vulkan.cpp
     src/backends/ncnn/sharedffn_vulkan.cpp
@@ -401,7 +401,7 @@ if(NCNN_MOE_WITH_VULKAN)
         src/kernels/vulkan/float8_swiglu_quantize.comp
         src/kernels/vulkan/projection_matvec.comp
         src/kernels/vulkan/gated_delta_net.comp
-        src/kernels/vulkan/qwen_elementwise.comp
+        src/kernels/vulkan/residual_ple.comp
         src/kernels/vulkan/qsa_norm_rope.comp
         src/kernels/vulkan/qsa_cache_write.comp
         src/kernels/vulkan/qsa_pool.comp

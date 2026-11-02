@@ -1,12 +1,12 @@
 #include "gatedresidual_vulkan.h"
 #include "linear.h"
 #include "vulkancontext.h"
-#include "qwen_vulkan_internal.h"
+#include "gatedresidual_vulkan_internal.h"
 #include "storage/weightstore.h"
 #include "kernels/bfloat16.h"
 #include "kernels/ops.h"
 #if NCNN_MOE_WITH_VULKAN
-#include "kernels/vulkan/qwen_elementwise.comp.hex.h"
+#include "kernels/vulkan/residual_ple.comp.hex.h"
 #include <command.h>
 #include <gpu.h>
 #include <pipeline.h>
@@ -21,11 +21,11 @@ namespace moe {
 #if NCNN_MOE_WITH_VULKAN
 // Shared by the residual and PLE record chains. Every operation consumes and
 // produces unpacked FP32 activations; immutable native matrices stay packed.
-std::shared_ptr<ncnn::Pipeline> qwen_pipeline(const std::shared_ptr<VulkanContext>& context, const ncnn::Option& opt)
+std::shared_ptr<ncnn::Pipeline> residual_pipeline(const std::shared_ptr<VulkanContext>& context, const ncnn::Option& opt)
 {
-    auto result = context->find_pipeline(qwen_elementwise_shader, 0);
+    auto result = context->find_pipeline(residual_ple_shader, 0);
     if (result) return result;
-    const auto binary = context->shader_binary(qwen_elementwise_shader, sizeof(qwen_elementwise_shader) - 1, opt, 0);
+    const auto binary = context->shader_binary(residual_ple_shader, sizeof(residual_ple_shader) - 1, opt, 0);
     if (!binary || binary->empty()) return {};
     auto pipeline = std::make_unique<ncnn::Pipeline>(context->device());
     pipeline->set_local_size_xyz(128, 1, 1);
@@ -37,11 +37,11 @@ std::shared_ptr<ncnn::Pipeline> qwen_pipeline(const std::shared_ptr<VulkanContex
         }
         owner.reset();
     });
-    context->cache_pipeline(qwen_elementwise_shader, 0, result);
+    context->cache_pipeline(residual_ple_shader, 0, result);
     return result;
 }
 
-void qwen_record(const ncnn::Pipeline* pipeline, uint32_t mode, uint32_t hidden, uint32_t copies,
+void residual_record(const ncnn::Pipeline* pipeline, uint32_t mode, uint32_t hidden, uint32_t copies,
                  uint32_t rows, uint32_t columns, float epsilon, float offset, std::initializer_list<ncnn::VkMat> values,
                  ncnn::VkCompute& cmd, uint32_t kernel, uint32_t ngram, uint32_t length, uint32_t slot)
 {
@@ -75,7 +75,7 @@ void qwen_record(const ncnn::Pipeline* pipeline, uint32_t mode, uint32_t hidden,
     bindings.clear();
 }
 
-bool qwen_allocate(ncnn::VkMat& value, uint32_t columns, int rows, const std::shared_ptr<VulkanContext>& context)
+bool residual_allocate(ncnn::VkMat& value, uint32_t columns, int rows, const std::shared_ptr<VulkanContext>& context)
 {
     if (columns == 0 || rows <= 0 || columns > static_cast<uint32_t>(std::numeric_limits<int>::max())
         || static_cast<uint64_t>(columns) * rows > std::numeric_limits<uint32_t>::max()) return false;
@@ -83,7 +83,7 @@ bool qwen_allocate(ncnn::VkMat& value, uint32_t columns, int rows, const std::sh
     return !value.empty();
 }
 
-bool qwen_float_weight(const TensorData& tensor, ncnn::VkMat& value,
+bool residual_float_weight(const TensorData& tensor, ncnn::VkMat& value,
                        ncnn::VkCompute& command, const ncnn::Option& opt)
 {
     if (tensor.element_count() == 0 || tensor.element_count() > static_cast<uint64_t>(std::numeric_limits<int>::max())) return false;
@@ -107,7 +107,7 @@ bool qwen_float_weight(const TensorData& tensor, ncnn::VkMat& value,
     return !value.empty();
 }
 
-void qwen_prepare_read(const ncnn::VkMat& value)
+void residual_prepare_read(const ncnn::VkMat& value)
 {
     if (value.data)
     {
@@ -171,10 +171,10 @@ std::shared_ptr<GatedResidual_vulkan> GatedResidual_vulkan::create(const WeightS
         || impl.up->input_columns() != impl.down->output_columns() || impl.up->output_columns() != impl.hidden * impl.copies
         || (impl.inject && (impl.inject->input_columns() != impl.hidden * impl.copies || impl.inject->output_columns() != impl.copies))) return {};
     const std::lock_guard<std::mutex> lock(impl.context->command_mutex());
-    impl.pipeline = qwen_pipeline(impl.context, impl.opt);
+    impl.pipeline = residual_pipeline(impl.context, impl.opt);
     if (!impl.pipeline || weights.at(plan.norm_weight).element_count() != static_cast<uint64_t>(impl.hidden) * impl.copies) return {};
     ncnn::VkCompute command(impl.context->device());
-    if (!qwen_float_weight(weights.at(plan.norm_weight), impl.norm, command, impl.opt)
+    if (!residual_float_weight(weights.at(plan.norm_weight), impl.norm, command, impl.opt)
         || submit_compute_and_wait(command, impl.context->device()) != 0) return {};
     return result;
 #else
@@ -198,23 +198,23 @@ bool GatedResidual_vulkan::record_pre(const ncnn::VkMat& input, ncnn::VkMat& red
     const auto& impl = *d;
     if (input.dims != 2 || input.w != static_cast<int>(impl.hidden * impl.copies) || input.h <= 0 || input.elemsize != sizeof(float) || input.elempack != 1) return false;
     ncnn::VkMat normalized, projected, activated, mixed, raw_inject;
-    if (!qwen_allocate(normalized, input.w, input.h, impl.context)
-        || !qwen_allocate(reduced, impl.hidden, input.h, impl.context)) return false;
-    qwen_prepare_read(impl.norm);
-    qwen_record(impl.pipeline.get(), 0, impl.hidden, impl.copies, input.h, input.w,
+    if (!residual_allocate(normalized, input.w, input.h, impl.context)
+        || !residual_allocate(reduced, impl.hidden, input.h, impl.context)) return false;
+    residual_prepare_read(impl.norm);
+    residual_record(impl.pipeline.get(), 0, impl.hidden, impl.copies, input.h, input.w,
                 impl.epsilon, impl.offset, {input, impl.norm, input, input, input, normalized}, cmd);
     if (!impl.down->record_forward(normalized, projected, cmd, storage)
-        || !qwen_allocate(activated, projected.w, input.h, impl.context)) return false;
-    qwen_record(impl.pipeline.get(), 1, impl.hidden, impl.copies, input.h, projected.w,
+        || !residual_allocate(activated, projected.w, input.h, impl.context)) return false;
+    residual_record(impl.pipeline.get(), 1, impl.hidden, impl.copies, input.h, projected.w,
                 0, 0, {projected, projected, projected, projected, projected, activated}, cmd);
     if (!impl.up->record_forward(activated, mixed, cmd, storage)) return false;
-    qwen_record(impl.pipeline.get(), 3, impl.hidden, impl.copies, input.h, impl.hidden,
+    residual_record(impl.pipeline.get(), 3, impl.hidden, impl.copies, input.h, impl.hidden,
                 0, 0, {normalized, mixed, mixed, mixed, mixed, reduced}, cmd);
     if (impl.inject)
     {
         if (!impl.inject->record_forward(normalized, raw_inject, cmd, storage)
-            || !qwen_allocate(injection, impl.copies, input.h, impl.context)) return false;
-        qwen_record(impl.pipeline.get(), 2, impl.hidden, impl.copies, input.h, impl.copies,
+            || !residual_allocate(injection, impl.copies, input.h, impl.context)) return false;
+        residual_record(impl.pipeline.get(), 2, impl.hidden, impl.copies, input.h, impl.copies,
                     0, 0, {raw_inject, raw_inject, raw_inject, raw_inject, raw_inject, injection}, cmd);
     }
     for (const auto& value : {normalized, projected, activated, mixed, raw_inject})
@@ -226,8 +226,8 @@ bool GatedResidual_vulkan::record_post(const ncnn::VkMat& branch, const ncnn::Vk
 {
     const auto& impl = *d;
     if (branch.w != static_cast<int>(impl.hidden) || branch.h != residual.h || residual.w != static_cast<int>(impl.hidden * impl.copies)
-        || injection.w != static_cast<int>(impl.copies) || injection.h != residual.h || !qwen_allocate(output, residual.w, residual.h, impl.context)) return false;
-    qwen_record(impl.pipeline.get(), 4, impl.hidden, impl.copies, residual.h, residual.w,
+        || injection.w != static_cast<int>(impl.copies) || injection.h != residual.h || !residual_allocate(output, residual.w, residual.h, impl.context)) return false;
+    residual_record(impl.pipeline.get(), 4, impl.hidden, impl.copies, residual.h, residual.w,
                 0, 0, {residual, branch, injection, residual, residual, output}, cmd);
     return true;
 }

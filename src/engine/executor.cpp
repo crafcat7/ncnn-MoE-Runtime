@@ -24,7 +24,7 @@
 #include "backends/ncnn/moecombine_vulkan.h"
 #include "backends/ncnn/residentffn_vulkan.h"
 #include "backends/ncnn/layerhead_vulkan.h"
-#include "backends/ncnn/qwenlayer_vulkan.h"
+#include "backends/ncnn/gatedresiduallayer_vulkan.h"
 #include "backends/ncnn/gpusegment_vulkan.h"
 
 #include "graph/router.h"
@@ -130,12 +130,12 @@ struct ScopedLatentLayerWorkspace
     std::vector<MoeCombineInput_vulkan>& combine_inputs;
 };
 
-struct ScopedQwenLayerWorkspace
+struct ScopedGatedResidualWorkspace
 {
-    QwenLayerWorkspace_vulkan& workspace;
-    explicit ScopedQwenLayerWorkspace(QwenLayerWorkspace_vulkan& value) : workspace(value)
+    GatedResidualWorkspace_vulkan& workspace;
+    explicit ScopedGatedResidualWorkspace(GatedResidualWorkspace_vulkan& value) : workspace(value)
     { workspace.reset(); }
-    ~ScopedQwenLayerWorkspace()
+    ~ScopedGatedResidualWorkspace()
     { workspace.reset(); }
 };
 
@@ -389,11 +389,11 @@ Result<void> forward_model(const CompiledModel& model,
     LatentLayerWorkspace_vulkan& layer_workspace = state.latent_layer;
     const ScopedLatentLayerWorkspace latent_workspace_scope(layer_workspace,
                                                             state.expert_scratch.combine_inputs);
-    const ScopedQwenLayerWorkspace qwen_workspace_scope(state.qwen_layer);
+    const ScopedGatedResidualWorkspace gated_residual_scope(state.gated_residual_layer);
     const ScopedGpuSegmentWorkspace gpu_workspace_scope(state.gpu_segment);
     bool resident_head_finished = false;
-    if (model.qwen_device_chain && (use_speculative_context || has_flag(model.opt.flags, OptionRouterPrediction)))
-        return Error{ErrorCode::InvalidArgument, "continuous Qwen Vulkan execution does not support speculative cache transactions or router prediction"};
+    if (model.gated_residual_chain && (use_speculative_context || has_flag(model.opt.flags, OptionRouterPrediction)))
+        return Error{ErrorCode::InvalidArgument, "continuous gated residual Vulkan execution does not support speculative cache transactions or router prediction"};
     bool fused_router_ready = false;
     bool deferred_gpu_head = false;
     const bool use_layer_fusion = !use_speculative_context
@@ -484,11 +484,11 @@ Result<void> forward_model(const CompiledModel& model,
                 if (!GpuSegment_vulkan::materialize_hidden(state.gpu_segment, hidden, error))
                     return Error{ErrorCode::InternalError, "resident Vulkan head boundary failed: " + error};
             }
-            if (model.qwen_device_chain)
+            if (model.gated_residual_chain)
             {
-                if (!QwenLayer_vulkan::finish(model, logits_output != LogitsOutput::None,
-                                              logits_output == LogitsOutput::Last, state.logits, state.qwen_layer))
-                    return Error{ErrorCode::InternalError, "continuous Qwen Vulkan LM head execution failed"};
+                if (!GatedResidualLayer_vulkan::finish(model, logits_output != LogitsOutput::None,
+                                              logits_output == LogitsOutput::Last, state.logits, state.gated_residual_layer))
+                    return Error{ErrorCode::InternalError, "continuous gated residual Vulkan LM head execution failed"};
                 produced_logits = logits_output != LogitsOutput::None;
                 statistics.vulkan_gated_residual_blocks += logits_output != LogitsOutput::None ? 1 : 0;
                 continue;
@@ -578,7 +578,7 @@ Result<void> forward_model(const CompiledModel& model,
         if (node->type == ExecutionNodeType::LmHead)
         {
             if (resident_head_finished) continue;
-            if (model.qwen_device_chain) continue;
+            if (model.gated_residual_chain) continue;
             const size_t expected_weights = model.descriptor.final_norm == NormType::None ? 1 : 2;
             if (node->weight_inputs.size() != expected_weights)
                 return Error{ErrorCode::InternalError, "LM head node has an invalid weight binding"};
@@ -709,15 +709,15 @@ Result<void> forward_model(const CompiledModel& model,
                 if (!GpuSegment_vulkan::materialize_hidden(state.gpu_segment, hidden, error))
                     return Error{ErrorCode::InternalError, "resident Vulkan graph boundary failed: " + error};
             }
-            if (model.qwen_device_chain)
+            if (model.gated_residual_chain)
             {
-                const auto& fused = model.operators.at_weight(layer.attention.output_weight).qwen_layer;
+                const auto& fused = model.operators.at_weight(layer.attention.output_weight).gated_residual_layer;
                 auto options = latent_router_options(model, moe, input_ids, state.expert_scratch.explicit_expert_ids);
                 std::string device_error;
-                if (!fused || !fused->forward(hidden, input_ids, position_offset, state.layers[layer.layer_id], options, layer_state.dispatch_plan, state.qwen_layer, device_error))
-                    return Error{ErrorCode::InternalError, "continuous Qwen Vulkan layer " + std::to_string(layer.layer_id) + " execution failed: " + device_error};
+                if (!fused || !fused->forward(hidden, input_ids, position_offset, state.layers[layer.layer_id], options, layer_state.dispatch_plan, state.gated_residual_layer, device_error))
+                    return Error{ErrorCode::InternalError, "continuous gated residual Vulkan layer " + std::to_string(layer.layer_id) + " execution failed: " + device_error};
                 layer_state.normalized.reset(input_ids.size(), model.descriptor.hidden_size, false);
-                layer_state.normalized_device = state.qwen_layer.device_input();
+                layer_state.normalized_device = state.gated_residual_layer.device_input();
                 layer_state.require_device_execution = true;
                 fused_router_ready = true;
                 ++statistics.vulkan_qwen_layers;
@@ -1106,20 +1106,20 @@ Result<void> forward_model(const CompiledModel& model,
             if (moe.has_shared_expert && layer_state.shared_expert_output.rows() == 0
                 && !layer_state.shared_expert_device_output)
                 return Error{ErrorCode::InternalError, "Combine executed before Shared Expert group"};
-            if (model.qwen_device_chain)
+            if (model.gated_residual_chain)
             {
                 auto& inputs = state.expert_scratch.combine_inputs;
                 inputs.clear();
                 for (const auto& active : layer_state.active_experts())
                 {
                     if (!active.device_output)
-                        return Error{ErrorCode::InternalError, "continuous Qwen Vulkan Expert output is not resident"};
+                        return Error{ErrorCode::InternalError, "continuous gated residual Vulkan Expert output is not resident"};
                     inputs.push_back({nullptr, active.device_output, active.batch.routes});
                 }
                 if ((moe.has_shared_expert && !layer_state.shared_expert_device_output)
-                    || !QwenLayer_vulkan::defer_combine(inputs, input_ids.size(), model.descriptor.hidden_size,
-                                                        layer_state.shared_expert_device_output, state.qwen_layer))
-                    return Error{ErrorCode::InternalError, "continuous Qwen Vulkan Expert combine failed"};
+                    || !GatedResidualLayer_vulkan::defer_combine(inputs, input_ids.size(), model.descriptor.hidden_size,
+                                                        layer_state.shared_expert_device_output, state.gated_residual_layer))
+                    return Error{ErrorCode::InternalError, "continuous gated residual Vulkan Expert combine failed"};
                 inputs.clear();
                 fused_router_ready = false;
                 layer_state.reset();

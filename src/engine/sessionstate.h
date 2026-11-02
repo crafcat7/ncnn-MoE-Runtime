@@ -3,7 +3,7 @@
 
 #include "backends/ncnn/latentlayer_vulkan.h"
 #include "backends/ncnn/moecombine_vulkan.h"
-#include "backends/ncnn/qwenlayer_vulkan.h"
+#include "backends/ncnn/gatedresiduallayer_vulkan.h"
 #include "backends/ncnn/gpusegment_vulkan.h"
 #include "kernels/attention.h"
 #include "kernels/gateddeltanet.h"
@@ -193,7 +193,7 @@ public:
     HyperConnectionScratch hyper_connection_scratch;
     AttentionScratch attention_scratch;
     LatentLayerWorkspace_vulkan latent_layer;
-    QwenLayerWorkspace_vulkan qwen_layer;
+    GatedResidualWorkspace_vulkan gated_residual_layer;
     GpuSegmentWorkspace_vulkan gpu_segment;
     std::vector<uint64_t> attention_positions;
     std::vector<LayerCache*> attention_caches;

@@ -28,7 +28,7 @@ class Model;
 class ExpertCache;
 class ExpertBackend;
 class Tokenizer;
-class QwenLayer_vulkan;
+class GatedResidualLayer_vulkan;
 class GpuSegment_vulkan;
 class GraphResources;
 
@@ -113,8 +113,8 @@ struct CompiledModel
     TensorHandle hyper_head_base = invalid_tensor_handle;
     TensorHandle hyper_head_scale = invalid_tensor_handle;
     GatedResidualPlan gated_residual_head;
-    std::shared_ptr<QwenLayer_vulkan> qwen_device_head;
-    bool qwen_device_chain = false;
+    std::shared_ptr<GatedResidualLayer_vulkan> gated_residual_device_head;
+    bool gated_residual_chain = false;
     // Prepared from operator capabilities and the graph's device placement.
     // Entries share the main graph's layer-plan indices.
     std::vector<std::shared_ptr<GpuSegment_vulkan>> gpu_segments;

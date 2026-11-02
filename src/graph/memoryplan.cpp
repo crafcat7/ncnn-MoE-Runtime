@@ -935,7 +935,7 @@ static bool mapped_ple_embedding_shard(const std::string& name, const TensorData
     return ple.embedding_dimension % heads == 0 && tensor.shape[1] == ple.embedding_dimension / heads;
 }
 
-static Result<uint64_t> qwen_vulkan_releasable_dense_size(const MoeModelDescriptor& descriptor,
+static Result<uint64_t> gated_residual_vulkan_releasable_dense_size(const MoeModelDescriptor& descriptor,
                                                           const Option& opt, const WeightMapping& weights)
 {
     const uint64_t required_flags = OptimizationVulkanAttention | OptimizationVulkanQnK
@@ -1033,10 +1033,10 @@ static Result<uint64_t> qwen_vulkan_releasable_dense_size(const MoeModelDescript
         const uint64_t width = tensor.dtype == DType::Float32    ? sizeof(float)
                                : tensor.dtype == DType::BFloat16 ? sizeof(uint16_t)
                                                                  : 1;
-        auto bytes = checked_multiply(count, width, "resident Qwen owned dense release");
+        auto bytes = checked_multiply(count, width, "resident gated residual owned dense release");
         if (!bytes)
             return bytes.error();
-        auto total = checked_add(released, bytes.value(), "resident Qwen dense release");
+        auto total = checked_add(released, bytes.value(), "resident gated residual dense release");
         if (!total)
             return total.error();
         released = total.value();
@@ -1048,7 +1048,7 @@ static Result<uint64_t> qwen_vulkan_releasable_dense_size(const MoeModelDescript
         {
             // A tied embedding or any other surviving alias retains the
             // complete owner, exactly as final host-release accounting does.
-            auto total = checked_add(released, state.bytes, "resident Qwen mapped dense release");
+            auto total = checked_add(released, state.bytes, "resident gated residual mapped dense release");
             if (!total)
                 return total.error();
             released = total.value();
@@ -1459,7 +1459,7 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& input_descri
         if (weights && descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
         {
             if (use_vulkan_attention)
-                releasable = qwen_vulkan_releasable_dense_size(descriptor, opt, *weights);
+                releasable = gated_residual_vulkan_releasable_dense_size(descriptor, opt, *weights);
         }
         else
             releasable = latent_vulkan_releasable_dense_size(descriptor);

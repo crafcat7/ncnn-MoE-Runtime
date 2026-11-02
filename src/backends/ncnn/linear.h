@@ -98,7 +98,7 @@ private:
     friend class LatentAttention_vulkan;
     friend class LayerHead_vulkan;
     friend class QsaAttention_vulkan;
-    friend class QwenLayer_vulkan;
+    friend class GatedResidualLayer_vulkan;
     friend class GatedResidual_vulkan;
     friend class GpuSegment_vulkan;
     friend class GpuSegmentContinuation_vulkan;
@@ -483,7 +483,7 @@ private:
     friend class LayerHead_vulkan;
     friend class Attention_vulkan;
     friend class QsaAttention_vulkan;
-    friend class QwenLayer_vulkan;
+    friend class GatedResidualLayer_vulkan;
     friend class GatedResidual_vulkan;
 
     friend class LatentAttention_vulkan;

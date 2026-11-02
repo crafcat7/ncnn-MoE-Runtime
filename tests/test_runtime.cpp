@@ -16853,8 +16853,8 @@ void test_gated_delta_vulkan_budget_admission()
         auto compiled = compile_model(descriptor, mapping, rejected, HybridMode::HybridExperts, opt);
         check(!compiled);
         check(compiled.error().code == ErrorCode::InvalidArgument);
-        check(compiled.error().message.find("Qwen Vulkan persistent weights and minimum working set exceed the GPU heap budget") == 0);
-        check(!rejected.qwen_device_chain);
+        check(compiled.error().message.find("gated residual Vulkan persistent weights and minimum working set exceed the GPU heap budget") == 0);
+        check(!rejected.gated_residual_chain);
     }
 
     if (bf16_supported)
@@ -16882,8 +16882,8 @@ void test_gated_delta_vulkan_budget_admission()
             if (!compiled)
                 throw std::runtime_error(std::string("Qwen complete GPU chain admission failed (")
                                          + (explicit_cache ? "explicit cache" : "automatic cache") + "): " + compiled.error().message);
-            check(model.qwen_device_chain);
-            check(static_cast<bool>(model.qwen_device_head));
+            check(model.gated_residual_chain);
+            check(static_cast<bool>(model.gated_residual_device_head));
             const uint64_t execution_reserve = vulkan_pending_reserve(model, opt.device_index);
             check(execution_reserve > 0);
             const auto resource_plan = std::find_if(model.memory_plan.gpu_devices.begin(), model.memory_plan.gpu_devices.end(), [&](const GpuResourcePlan& plan) {
@@ -16896,7 +16896,7 @@ void test_gated_delta_vulkan_budget_admission()
             for (const CompiledLayerPlan& layer : model.graph.layer_plans)
             {
                 const AttentionBlockPlan& attention = layer.attention;
-                check(static_cast<bool>(model.operators.at_weight(attention.output_weight).qwen_layer));
+                check(static_cast<bool>(model.operators.at_weight(attention.output_weight).gated_residual_layer));
                 check(support_vulkan_attention(model.operators, attention));
                 if (attention.kind == AttentionKind::GatedDeltaNet)
                 {
@@ -16981,7 +16981,7 @@ void test_gated_delta_vulkan_budget_admission()
         }
         if (!compiled)
             throw std::runtime_error(std::string("GDN budget compilation failed (") + test_case.name + "): " + compiled.error().message);
-        check(!model.qwen_device_chain);
+        check(!model.gated_residual_chain);
 
         uint32_t admitted_layers = 0;
         for (const CompiledLayerPlan& layer : model.graph.layer_plans)

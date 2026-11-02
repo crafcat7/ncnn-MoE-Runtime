@@ -652,8 +652,8 @@ Result<void> ModelLoader::resolve_gpu_cache_sizes(std::vector<uint64_t>& gpu_cac
                                                        return device_index < live_gpu_infos.size();
                                                    });
     const std::vector<GpuInfo>& gpu_infos = use_live_gpu_infos ? live_gpu_infos : info.gpu_infos;
-    if (model.qwen_device_chain && !use_live_gpu_infos)
-        return Error{ErrorCode::UnsupportedModel, "Qwen device execution requires a live Vulkan heap budget for Expert cache admission"};
+    if (model.gated_residual_chain && !use_live_gpu_infos)
+        return Error{ErrorCode::UnsupportedModel, "gated residual device execution requires a live Vulkan heap budget for Expert cache admission"};
 
     // Loading-time free heap predates dense and persistent attention uploads.
     // If the live query is unavailable, leave the automatic cache disabled
@@ -1098,8 +1098,8 @@ Result<void> ModelLoader::load(const std::filesystem::path& model_path)
                return node.type == ExecutionNodeType::ExpertGroup && node.backend == ExecutionBackend::Vulkan;
            }))
         return Error{ErrorCode::UnsupportedModel, "GPU Expert placement requires an executable device cache; CPU retry is disabled"};
-    if (model.qwen_device_chain && !model.expert_backend && model.gpu_expert_banks.empty())
-        return Error{ErrorCode::UnsupportedModel, "continuous Qwen Vulkan execution requires an executable GPU Expert cache within the remaining memory budget"};
+    if (model.gated_residual_chain && !model.expert_backend && model.gpu_expert_banks.empty())
+        return Error{ErrorCode::UnsupportedModel, "continuous gated residual Vulkan execution requires an executable GPU Expert cache within the remaining memory budget"};
 
     auto tokenizer = std::make_shared<Tokenizer>();
     if (tokenizer->load((package.weights_path.empty() ? package.root : package.weights_path).string(), model.descriptor.vocabulary_size))
