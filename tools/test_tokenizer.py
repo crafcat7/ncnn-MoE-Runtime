@@ -100,6 +100,17 @@ def load_deepseek_encoding(model_dir: Path):
 def make_oracle(model_dir: Path, family: str) -> dict[str, Any]:
     if family == "gpt_oss":
         harmony, harmony_module = gpt_harmony()
+        try:
+            from transformers import AutoTokenizer
+        except ImportError as error:
+            raise RuntimeError(
+                "Transformers is required for the GPT-OSS chat-template oracle; see the pip command at the top of this script"
+            ) from error
+        tokenizer_config = read_json(model_dir / "tokenizer_config.json")
+        tokenizer = AutoTokenizer.from_pretrained(str(model_dir), local_files_only=True)
+        chat_template = getattr(tokenizer, "chat_template", None)
+        if not isinstance(chat_template, str) or not chat_template:
+            raise RuntimeError(f"the GPT-OSS chat template was not loaded from {model_dir}")
         special_ids: set[int] = set()
         for spelling in harmony.special_tokens_set:
             ids = harmony.encode(spelling, allowed_special="all")
@@ -110,25 +121,46 @@ def make_oracle(model_dir: Path, family: str) -> dict[str, Any]:
             return [int(value) for value in harmony.encode(text, allowed_special="all")]
 
         def chat_encode(messages: list[dict[str, Any]], _thinking: bool) -> list[int]:
-            built = []
-            for message in messages:
-                role_value = message.get("role")
-                if not isinstance(role_value, str):
-                    raise ValueError("message role must be a string")
-                role = getattr(harmony_module.Role, role_value.upper(), None)
-                if role is None:
-                    raise ValueError(f"unsupported Harmony role: {role_value}")
+            if not isinstance(messages, list) or not messages:
+                raise ValueError("GPT-OSS chat requires at least one message")
+            normalized = []
+            for index, message in enumerate(messages):
+                if not isinstance(message, dict) or set(message) != {"role", "content"}:
+                    raise ValueError("GPT-OSS messages need only role and content strings")
+                role = message.get("role")
                 content = message.get("content")
-                if not isinstance(content, str):
-                    raise ValueError("message content must be a string")
-                if role_value.lower() == "system" and not content:
-                    content = harmony_module.SystemContent.new()
-                built.append(harmony_module.Message.from_role_and_content(role, content))
-            conversation = harmony_module.Conversation.from_messages(built)
-            return [
-                int(value)
-                for value in harmony.render_conversation_for_completion(
-                    conversation, harmony_module.Role.ASSISTANT
+                if not isinstance(role, str) or not isinstance(content, str):
+                    raise ValueError("GPT-OSS message role and content must be strings")
+                role = role.lower()
+                if role not in {"system", "developer", "user", "assistant"}:
+                    raise ValueError(f"unsupported GPT-OSS role: {role}")
+                if role in {"system", "developer"} and index != 0:
+                    raise ValueError("GPT-OSS instructions must precede the conversation")
+                normalized.append({"role": role, "content": content})
+            values = tokenizer.apply_chat_template(
+                normalized,
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            return normalize_token_ids(values)
+
+        def literal_user_chat_encode(content: str) -> list[int]:
+            # HF promotes added-token spellings inside rendered user content
+            # into control IDs. Native structured messages intentionally keep
+            # those strings literal, as Harmony's message renderer does.
+            # Keep the default system prefix sourced from the HF template.
+            rendered = tokenizer.apply_chat_template(
+                [{"role": "user", "content": ""}], tokenize=False, add_generation_prompt=True,
+            )
+            prefix, marker, _ = rendered.partition("<|start|>user<|message|>")
+            if not marker:
+                raise RuntimeError("the GPT-OSS template omitted the expected user boundary")
+            conversation = harmony_module.Conversation.from_messages([
+                harmony_module.Message.from_role_and_content(harmony_module.Role.USER, content),
+            ])
+            return [int(value) for value in tokenizer.encode(prefix, add_special_tokens=False)] + [
+                int(value) for value in harmony.render_conversation_for_completion(
+                    conversation, harmony_module.Role.ASSISTANT,
                 )
             ]
 
@@ -139,12 +171,13 @@ def make_oracle(model_dir: Path, family: str) -> dict[str, Any]:
         return {
             "raw_encode": raw_encode,
             "chat_encode": chat_encode,
+            "literal_user_chat_encode": literal_user_chat_encode,
             "decode": decode,
             "stops": stops,
             "special_ids": special_ids,
             "added_token_spellings": sorted(str(value) for value in harmony.special_tokens_set),
-            "tokenizer": None,
-            "config": {},
+            "tokenizer": tokenizer,
+            "config": {**tokenizer_config, "chat_template": chat_template},
         }
 
     if family == "deepseek_v4":
@@ -439,6 +472,20 @@ def make_cases(model_dir: Path, family: str, oracle: dict[str, Any]) -> list[dic
         add_case(cases, f"raw-{name}", "raw", json_line({"op": "encode", "text": text}), expected)
 
     chat_cases = make_chat_cases()
+    if family == "gpt_oss":
+        chat_cases.extend(
+            (
+                ("reported-chinese-self-introduction", [{"role": "user", "content": "hi 介绍下你自己"}], True),
+                (
+                    "assistant-inline-analysis-header",
+                    [
+                        {"role": "user", "content": "Question"},
+                        {"role": "assistant", "content": "<|channel|>analysis<|message|>reasoning"},
+                    ],
+                    True,
+                ),
+            )
+        )
     template = oracle["config"].get("chat_template", "")
     if family == "qwen" and hashlib.sha256(template.encode()).hexdigest() == QWEN38_TEMPLATE_SHA256:
         chat_cases.extend(make_qwen38_chat_cases())
@@ -454,7 +501,10 @@ def make_cases(model_dir: Path, family: str, oracle: dict[str, Any]) -> list[dic
             if defaults != explicit:
                 raise RuntimeError("official Qwen3.8 template defaults differ from xhigh/preserve_thinking=True")
     for name, messages, thinking in chat_cases:
-        expected = captured(lambda value=messages, mode=thinking: oracle["chat_encode"](value, mode))
+        if family == "gpt_oss" and name == "literal-special-body":
+            expected = captured(lambda value=messages[0]["content"]: oracle["literal_user_chat_encode"](value))
+        else:
+            expected = captured(lambda value=messages, mode=thinking: oracle["chat_encode"](value, mode))
         if expected["ok"]:
             expected["decoded"] = oracle["decode"](expected["ids"])
         request = {"op": "chat", "messages": messages, "enable_thinking": thinking}

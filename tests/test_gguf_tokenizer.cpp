@@ -1,5 +1,6 @@
 #include "models/tokenizer.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -784,7 +785,18 @@ static void check_profile(const std::filesystem::path& root, Fixture value, bool
         append("hi");
         expected.insert(expected.end(), {200007, 200006});
         append("assistant");
-        check(tokenizer.encode_chat(R"([{"role":"user","content":"hi"}])", false) == expected, "Harmony chat boundaries changed");
+        const auto chat = tokenizer.encode_chat(R"([{"role":"user","content":"hi"}])", false);
+        const std::string rendered = decode(tokenizer, chat);
+        check(chat.size() > expected.size()
+                  && std::equal(expected.rbegin(), expected.rend(), chat.rbegin())
+                  && rendered.starts_with("<|start|>system<|message|>You are ChatGPT,")
+                  && rendered.find("\nCurrent date: ") != std::string::npos
+                  && rendered.find("\n\nReasoning: medium\n\n# Valid channels:") != std::string::npos,
+              "Harmony chat omitted its default system or changed user boundaries");
+        const std::string history = decode(tokenizer, tokenizer.encode_chat(R"([{"role":"system","content":"Be concise."},{"role":"assistant","content":"Hello"},{"role":"user","content":"hi"}])", true));
+        check(history.find("<|start|>developer<|message|># Instructions\n\nBe concise.\n\n<|end|>") != std::string::npos
+                  && history.find("<|start|>assistant<|channel|>final<|message|>Hello<|end|>") != std::string::npos,
+              "Harmony chat lost developer instructions or the final answer channel");
         const auto text_ids = tokenizer.encode(text);
         for (uint32_t padding : {200000u, 199999u, 200017u})
         {
@@ -794,7 +806,7 @@ static void check_profile(const std::filesystem::path& root, Fixture value, bool
             check(tokenizer.load(path.string(), value.tokens.size()) == (padding != 200000),
                   "GPT-OSS padding admission changed: " + std::to_string(padding));
             check(tokenizer.encode(text) == text_ids, "GPT-OSS padding changed text encoding");
-            check(tokenizer.encode_chat(R"([{"role":"user","content":"hi"}])", false) == expected,
+            check(tokenizer.encode_chat(R"([{"role":"user","content":"hi"}])", false) == chat,
                   "GPT-OSS padding changed chat encoding");
             check(tokenizer.stop_tokens() == std::vector<int32_t>({200002, 200012}),
                   "GPT-OSS padding changed Harmony stop tokens");
