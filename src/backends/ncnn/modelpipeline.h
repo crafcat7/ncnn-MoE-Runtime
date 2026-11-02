@@ -3,11 +3,9 @@
 
 #include "ncnn/moe/result.h"
 #include "ncnn/moe/types.h"
-#include "graph/resourceplan.h"
 #include "graph/memoryplan.h"
 
 #include <cstdint>
-#include <map>
 
 namespace ncnn {
 namespace moe {
@@ -20,22 +18,6 @@ struct AttentionBlockPlan;
 struct CompilerOption;
 struct ExpertPlan;
 struct CompiledLayerPlan;
-
-// One model-wide ledger shared by persistent preparation and Expert caching.
-// Shape-specific operators supply requests; policy is independent of family.
-class PipelineResourcePlanner
-{
-public:
-    PipelineResourcePlanner(CompiledModel& model, const CompilerOption& opt);
-    [[nodiscard]] bool can_admit(uint32_t device, GpuResourceRequest request) const;
-    [[nodiscard]] bool allocation_fits(uint32_t device, GpuResourceRequest request) const;
-    void commit(uint32_t device, GpuResourceRequest request);
-
-private:
-    [[nodiscard]] const GpuResourcePlan* find(uint32_t device) const;
-    CompiledModel& model;
-    std::map<uint32_t, uint64_t> usage_baselines;
-};
 
 Result<void> prepare_model_pipeline(CompiledModel& compiled,
                                     const CompilerOption& opt);
@@ -84,8 +66,7 @@ void release_vulkan_dense_host_copies(CompiledModel& compiled);
 // workspace for this device. Shape estimates use the default prefill chunk;
 // larger chunks/contexts remain checked when their buffers are allocated.
 [[nodiscard]] uint64_t vulkan_pending_reserve(const CompiledModel& compiled,
-                                              uint32_t device_index,
-                                              uint64_t heap_budget) noexcept;
+                                              uint32_t device_index) noexcept;
 
 [[nodiscard]] bool support_vulkan_attention(const CompiledOperatorTable& operators,
                                             const AttentionBlockPlan& attention) noexcept;

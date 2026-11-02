@@ -273,7 +273,7 @@ static std::string gpu_resource_plan_json(const CompiledModel& model)
         device.add_uint("allocated_execution_bytes", plan.allocated_execution_size);
         const auto physical = query_vulkan_graph_compute(model.vulkan_runtime, plan.initial.device_index, model.opt.optimization_flags);
         device.add_uint("arena_preparation_physical_bytes", physical.preparation_physical_size);
-        device.add_uint("arena_compute_physical_bytes", physical.compute_physical_size);
+        device.add_uint("arena_compute_physical_bytes", physical.total_physical_size - physical.preparation_physical_size);
         device.add_uint("arena_total_physical_bytes", physical.total_physical_size);
         device.add_uint("planned_prefill_rows", graph_plan.prefill_rows);
         device.add_uint("planned_context_tokens", graph_plan.context_tokens);

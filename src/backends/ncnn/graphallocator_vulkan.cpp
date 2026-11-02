@@ -93,7 +93,7 @@ VulkanGraphArenaSize VulkanGraphAllocator::physical_size() const
     const std::lock_guard<std::mutex> lock(mutex);
     const uint64_t total = pool->physical_bytes();
     const uint64_t preparation = reserved ? preparation_physical_size : total;
-    return {preparation, total - preparation, total};
+    return {preparation, total};
 }
 
 } // namespace moe

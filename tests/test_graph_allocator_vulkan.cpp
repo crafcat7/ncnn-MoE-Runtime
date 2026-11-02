@@ -34,9 +34,8 @@ static void arena_check(bool condition, const char* message)
 #if NCNN_MOE_WITH_VULKAN
 static void check_physical_size(const VulkanGraphArenaSize& size)
 {
-    arena_check(size.preparation_physical_size <= size.total_physical_size
-                    && size.compute_physical_size == size.total_physical_size - size.preparation_physical_size,
-                "graph arena physical preparation and compute sizes must sum to the total");
+    arena_check(size.preparation_physical_size <= size.total_physical_size,
+                "graph arena preparation physical size must not exceed total size");
 }
 
 static ncnn::Option graph_option(VulkanGraphAllocator& arena, const VulkanContext& context)

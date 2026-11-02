@@ -12,11 +12,32 @@
 namespace ncnn {
 namespace moe {
 
-bool GraphMemoryLiveOrder::operator()(const GraphMemoryLiveRange& left, const GraphMemoryLiveRange& right) const noexcept
+namespace {
+
+struct LiveRange
 {
-    return left.last_node != right.last_node ? left.last_node > right.last_node
-                                             : left.offset > right.offset;
-}
+    uint32_t last_node = 0;
+    uint64_t offset = 0;
+    uint64_t size = 0;
+};
+
+struct LiveOrder
+{
+    bool operator()(const LiveRange& left, const LiveRange& right) const noexcept
+    {
+        return left.last_node != right.last_node ? left.last_node > right.last_node
+                                                 : left.offset > right.offset;
+    }
+};
+
+struct DeviceState
+{
+    uint64_t peak_size = 0;
+    std::map<uint64_t, uint64_t> free_ranges;
+    std::priority_queue<LiveRange, std::vector<LiveRange>, LiveOrder> live_ranges;
+};
+
+} // namespace
 
 static bool graph_memory_align(uint64_t offset, uint64_t alignment, uint64_t& aligned) noexcept
 {
@@ -27,7 +48,7 @@ static bool graph_memory_align(uint64_t offset, uint64_t alignment, uint64_t& al
     return true;
 }
 
-static void graph_memory_free(GraphMemoryDeviceState& state, uint64_t offset, uint64_t size)
+static void graph_memory_free(DeviceState& state, uint64_t offset, uint64_t size)
 {
     if (size == 0) return;
     auto next = state.free_ranges.lower_bound(offset);
@@ -49,7 +70,7 @@ static void graph_memory_free(GraphMemoryDeviceState& state, uint64_t offset, ui
     state.free_ranges.emplace(offset, size);
 }
 
-static Result<uint64_t> graph_memory_allocate(GraphMemoryDeviceState& state, const GraphMemoryBuffer& buffer)
+static Result<uint64_t> graph_memory_allocate(DeviceState& state, const GraphMemoryBuffer& buffer)
 {
     if (buffer.size == 0) return uint64_t{0};
     auto best = state.free_ranges.end();
@@ -164,14 +185,14 @@ Result<GraphMemoryPlan> plan_graph_memory(std::span<const GraphMemoryBuffer> buf
     });
     GraphMemoryPlan plan;
     plan.allocations.resize(buffers.size());
-    std::map<uint32_t, GraphMemoryDeviceState> devices;
+    std::map<uint32_t, DeviceState> devices;
     for (size_t index : order)
     {
         const GraphMemoryBuffer& buffer = buffers[index];
-        GraphMemoryDeviceState& state = devices[buffer.device_index];
+        DeviceState& state = devices[buffer.device_index];
         while (!state.live_ranges.empty() && state.live_ranges.top().last_node < buffer.first_node)
         {
-            const GraphMemoryLiveRange expired = state.live_ranges.top();
+            const LiveRange expired = state.live_ranges.top();
             state.live_ranges.pop();
             graph_memory_free(state, expired.offset, expired.size);
         }

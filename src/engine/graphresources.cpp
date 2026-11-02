@@ -64,7 +64,9 @@ static Result<void> allocate_graph_resources(const CompiledModel& model,
         resource->admitted.workspace_size = request.workspace_size;
         // A successful reservation covers the complete execution capacity,
         // including any free preparation backing reused by the arena.
-        resource->allocated_execution_size = std::max(size, allocated.value().compute_physical_size);
+        const VulkanGraphArenaSize& physical = allocated.value();
+        const uint64_t compute_physical_size = physical.total_physical_size - physical.preparation_physical_size;
+        resource->allocated_execution_size = std::max(size, compute_physical_size);
     }
     return {};
 }

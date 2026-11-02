@@ -4,8 +4,6 @@
 #include "ncnn/moe/result.h"
 
 #include <cstdint>
-#include <map>
-#include <queue>
 #include <span>
 #include <vector>
 
@@ -53,25 +51,6 @@ struct GraphMemorySubmission
     uint32_t device_index = 0;
     uint32_t first_node = 0;
     uint32_t last_node = 0;
-};
-
-struct GraphMemoryLiveRange
-{
-    uint32_t last_node = 0;
-    uint64_t offset = 0;
-    uint64_t size = 0;
-};
-
-struct GraphMemoryLiveOrder
-{
-    bool operator()(const GraphMemoryLiveRange& left, const GraphMemoryLiveRange& right) const noexcept;
-};
-
-struct GraphMemoryDeviceState
-{
-    uint64_t peak_size = 0;
-    std::map<uint64_t, uint64_t> free_ranges;
-    std::priority_queue<GraphMemoryLiveRange, std::vector<GraphMemoryLiveRange>, GraphMemoryLiveOrder> live_ranges;
 };
 
 // Lifetimes are closed intervals: inputs and outputs used at the same node

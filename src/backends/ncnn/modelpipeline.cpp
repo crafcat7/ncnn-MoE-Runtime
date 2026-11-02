@@ -18,6 +18,7 @@
 #include "graph/compiler.h"
 #include "engine/expert.h"
 #include "graph/compiledmodel.h"
+#include "graph/resourceplan.h"
 #include "ncnn/moe/session.h"
 #include "storage/weightstore.h"
 #include "vulkancontext.h"
@@ -1814,8 +1815,7 @@ static GpuResourceRequest qwen_execution_resources(const CompiledModel& compiled
 }
 
 uint64_t vulkan_pending_reserve(const CompiledModel& compiled,
-                                uint32_t device_index,
-                                uint64_t heap_budget) noexcept
+                                uint32_t device_index) noexcept
 {
     for (const GpuResourcePlan& plan : compiled.memory_plan.gpu_devices)
         if (plan.initial.device_index == device_index)
@@ -1836,7 +1836,6 @@ uint64_t vulkan_pending_reserve(const CompiledModel& compiled,
             break;
         }
     }
-    (void)heap_budget;
     return has_gpu_operator ? dense_vulkan_pending_state_size(compiled, device_index) : 0;
 }
 
@@ -2002,7 +2001,25 @@ static uint64_t expert_wave_workspace_size(const CompiledModel& model, uint32_t 
     return workspace;
 }
 
-PipelineResourcePlanner::PipelineResourcePlanner(CompiledModel& model, const CompilerOption& opt) : model(model)
+namespace {
+
+// One model-wide ledger shared by persistent preparation and Expert caching.
+// Shape-specific operators supply requests; policy is independent of family.
+class ResourcePlanner
+{
+public:
+    ResourcePlanner(CompiledModel& model, const CompilerOption& opt);
+    [[nodiscard]] bool can_admit(uint32_t device, GpuResourceRequest request) const;
+    [[nodiscard]] bool allocation_fits(uint32_t device, GpuResourceRequest request) const;
+    void commit(uint32_t device, GpuResourceRequest request);
+
+private:
+    [[nodiscard]] const GpuResourcePlan* find(uint32_t device) const;
+    CompiledModel& model;
+    std::map<uint32_t, uint64_t> usage_baselines;
+};
+
+ResourcePlanner::ResourcePlanner(CompiledModel& model, const CompilerOption& opt) : model(model)
 {
     std::vector<uint32_t> devices = opt.device_indices;
     if (devices.empty()) devices.push_back(model.opt.vulkan_device_index);
@@ -2040,7 +2057,7 @@ PipelineResourcePlanner::PipelineResourcePlanner(CompiledModel& model, const Com
     }
 }
 
-bool PipelineResourcePlanner::can_admit(uint32_t device, GpuResourceRequest request) const
+bool ResourcePlanner::can_admit(uint32_t device, GpuResourceRequest request) const
 {
     const GpuResourcePlan* plan = find(device);
     GpuResourceSnapshot live = live_gpu_resources(model, device);
@@ -2055,28 +2072,30 @@ bool PipelineResourcePlanner::can_admit(uint32_t device, GpuResourceRequest requ
 
 // Allocation has already happened. Only the additional unallocated state
 // and workspace belong in the live check; the preflight checked weights.
-bool PipelineResourcePlanner::allocation_fits(uint32_t device, GpuResourceRequest request) const
+bool ResourcePlanner::allocation_fits(uint32_t device, GpuResourceRequest request) const
 {
     request.persistent_size = 0;
     return can_admit(device, request);
 }
 
-void PipelineResourcePlanner::commit(uint32_t device, GpuResourceRequest request)
+void ResourcePlanner::commit(uint32_t device, GpuResourceRequest request)
 {
     for (GpuResourcePlan& plan : model.memory_plan.gpu_devices)
         if (plan.initial.device_index == device) commit_gpu_resources(plan, request);
 }
 
-const GpuResourcePlan* PipelineResourcePlanner::find(uint32_t device) const
+const GpuResourcePlan* ResourcePlanner::find(uint32_t device) const
 {
     for (const GpuResourcePlan& plan : model.memory_plan.gpu_devices)
         if (plan.initial.device_index == device) return &plan;
     return nullptr;
 }
 
+} // namespace
+
 // Backend products are published as a complete group. A failed creation or a
 // driver-budget change must preserve both the CPU weights and earlier groups.
-static Result<bool> prepare_resource_group(CompiledModel& model, PipelineResourcePlanner& resources,
+static Result<bool> prepare_resource_group(CompiledModel& model, ResourcePlanner& resources,
                                            uint32_t device, GpuResourceRequest request,
                                            CompiledLayerPlan* layer, const std::string& operation,
                                            const std::function<Result<void>()>& prepare,
@@ -2290,7 +2309,7 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
 {
     compiled.operators.bind_weight_count(compiled.weights.size());
     if (compiled.opt.hybrid_mode == HybridMode::CpuOnly) return {};
-    PipelineResourcePlanner resources(compiled, opt);
+    ResourcePlanner resources(compiled, opt);
     if (use_qwen_device_pipeline(compiled, opt))
     {
         const uint32_t device = compiled.opt.vulkan_device_index;

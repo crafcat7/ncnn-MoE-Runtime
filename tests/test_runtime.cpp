@@ -16884,7 +16884,7 @@ void test_gated_delta_vulkan_budget_admission()
                                          + (explicit_cache ? "explicit cache" : "automatic cache") + "): " + compiled.error().message);
             check(model.qwen_device_chain);
             check(static_cast<bool>(model.qwen_device_head));
-            const uint64_t execution_reserve = vulkan_pending_reserve(model, opt.device_index, opt.gpu_heap_budget);
+            const uint64_t execution_reserve = vulkan_pending_reserve(model, opt.device_index);
             check(execution_reserve > 0);
             const auto resource_plan = std::find_if(model.memory_plan.gpu_devices.begin(), model.memory_plan.gpu_devices.end(), [&](const GpuResourcePlan& plan) {
                 return plan.initial.device_index == opt.device_index;

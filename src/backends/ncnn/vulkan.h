@@ -20,7 +20,6 @@ using VulkanRuntimePtr = std::shared_ptr<VulkanRuntime>;
 struct VulkanGraphArenaSize
 {
     uint64_t preparation_physical_size = 0;
-    uint64_t compute_physical_size = 0;
     uint64_t total_physical_size = 0;
 };
 

@@ -114,7 +114,7 @@ static GpuResourcePlan cache_resource_plan(const CompiledModel& model, const Gpu
         return *found;
     auto plan = make_gpu_resource_plan({gpu.device_index, gpu.heap_budget, gpu.heap_usage},
                                        model.opt.num_concurrent_sessions);
-    const uint64_t pending = vulkan_pending_reserve(model, gpu.device_index, gpu.heap_budget);
+    const uint64_t pending = vulkan_pending_reserve(model, gpu.device_index);
     const uint64_t sessions = plan.num_concurrent_sessions;
     plan.admitted.workspace_size = pending / sessions + (pending % sessions != 0);
     return plan;
