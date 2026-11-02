@@ -1,4 +1,5 @@
 #include "gpu_segment_fixture.h"
+#include "backends/ncnn/attention_vulkan.h"
 #include "backends/ncnn/expertbank_vulkan.h"
 #include "backends/ncnn/modelpipeline.h"
 
@@ -762,6 +763,34 @@ static void bank_persistent_logits(const CompiledModel& cpu, const CompiledModel
     std::vector<ActivationBuffer> snapshots;
     uint64_t position = 0;
     std::string error;
+    const auto check_attention_ring = [&]() {
+        const LayerCache& cache = caches[0];
+        const AttentionBlockPlan& attention = gpu.graph.layer_plans[0].attention;
+        const auto operation = gpu.operators.at(attention.vulkan_attention_operator).attention;
+        segment_check(operation && cache.dtype == DType::BFloat16 && cache.vulkan_attention_cache,
+                      "resident full-bank Attention did not retain its BF16 Vulkan ring");
+        const auto context = operation->vulkan_context();
+        const auto& key = cache.vulkan_attention_cache->key;
+        const auto& value = cache.vulkan_attention_cache->value;
+        const size_t expected_element_size = context->device()->info.support_bf16_storage()
+                                                 ? sizeof(uint16_t)
+                                                 : sizeof(float);
+        const auto valid_ring = [&](const ncnn::VkMat& ring) {
+            return !ring.empty() && ring.dims == 3
+                   && ring.w == static_cast<int>(attention.head_dimension)
+                   && ring.h == static_cast<int>(cache.capacity_tokens * 2)
+                   && ring.c == static_cast<int>(attention.kv_head_count)
+                   && ring.elemsize == expected_element_size && ring.elempack == 1
+                   && ring.cstep >= static_cast<uint64_t>(ring.w) * ring.h;
+        };
+        segment_check(cache.capacity_tokens != 0 && cache.token_count <= cache.capacity_tokens
+                          && valid_ring(key) && valid_ring(value),
+                      "resident full-bank KV ring width, dimensions, or doubled capacity are invalid");
+        const uint64_t allocated_bytes = static_cast<uint64_t>(key.cstep) * key.c * key.elemsize
+                                         + static_cast<uint64_t>(value.cstep) * value.c * value.elemsize;
+        segment_check(cache.device_allocated_size == allocated_bytes,
+                      "resident full-bank KV ring cstep bytes disagree with its allocation ledger");
+    };
     for (size_t step = 0; step < 3; ++step)
     {
         const bool multiple_rows = explicit_reservation ? step == 0 : step == 1;
@@ -796,6 +825,7 @@ static void bank_persistent_logits(const CompiledModel& cpu, const CompiledModel
         position += ids.size();
         segment_check(caches[0].token_count == position && caches[1].gated_delta_token_count == position,
                       "persistent bank decode did not publish each cache exactly once");
+        if (step == 0) check_attention_ring();
         workspace.reset();
         segment_check(!workspace.active() && workspace.allocated_bytes() <= memory.value().host_output_workspace_size,
                       "transient workspace reset discarded output accounting or retained an unfinished segment");

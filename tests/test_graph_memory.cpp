@@ -268,6 +268,7 @@ static CompiledModel model_memory_fixture()
         layer.attention.head_count = 2;
         layer.attention.kv_head_count = 1;
         layer.attention.head_dimension = 4;
+        layer.attention.kv_cache_dtype = DType::Float32;
         layer.attention.value_head_dimension = 4;
         layer.attention.convolution_kernel_size = 2;
         layer.attention.sliding_window = 4096;
@@ -325,9 +326,20 @@ static void test_model_graph_lifetimes_and_shapes()
     memory_check(larger_rows && total_model_peak(larger_rows.value().prefill) > total_model_peak(planned.value().prefill)
                      && total_model_peak(larger_rows.value().decode) > total_model_peak(planned.value().decode),
                  "prefill and batched decode working sets must follow their actual row counts");
+    const auto standard_state = std::find_if(planned.value().session_state.begin(), planned.value().session_state.end(),
+                                             [](const GraphMemoryDevice& state) { return state.device_index == 7; });
+    memory_check(standard_state != planned.value().session_state.end() && standard_state->peak_size == 6144,
+                 "FP32 Attention state must include the 64-token doubled ring and its 32-token growth predecessor");
     const auto larger_context = plan_model_graph_memory(model, 8, 1, 1024);
-    memory_check(larger_context && larger_context.value().session_state.back().peak_size > planned.value().session_state.back().peak_size,
-                 "longer contexts must grow the selected Standard Attention Session state");
+    const GraphMemoryDevice* larger_standard_state = nullptr;
+    if (larger_context)
+    {
+        const auto found = std::find_if(larger_context.value().session_state.begin(), larger_context.value().session_state.end(),
+                                        [](const GraphMemoryDevice& state) { return state.device_index == 7; });
+        if (found != larger_context.value().session_state.end()) larger_standard_state = &*found;
+    }
+    memory_check(larger_standard_state && larger_standard_state->peak_size == 98304,
+                 "longer contexts must account for the 1024-token doubled ring and its 512-token growth predecessor");
 
     CompiledModel cross_device = model;
     cross_device.graph.nodes[3].inputs = {1};

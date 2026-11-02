@@ -1043,43 +1043,72 @@ static ncnn::VkMat attention_ring_view(const ncnn::VkMat& storage, uint64_t firs
 #endif
 }
 
-static bool record_attention_ring_append(const ncnn::Pipeline* pipeline, const ncnn::VkMat& source_key, const ncnn::VkMat& source_value,
+// Copy strided KV rows; append mode also writes the duplicate ring rows.
+static bool record_attention_copy(const ncnn::Pipeline* pipeline, const ncnn::VkMat& source_key, const ncnn::VkMat& source_value,
                                          ncnn::VkMat& destination_key, ncnn::VkMat& destination_value, uint64_t capacity, uint64_t destination_start,
-                                         bool round_kv,
+                                         bool round_kv, uint64_t source_start, bool copy_only,
                                          ncnn::VkCompute& command)
 {
-    if (!pipeline || source_key.empty() || source_value.empty() || destination_key.empty() || destination_value.empty() || source_key.dims != 3
-        || source_key.elempack != 1
+    const bool source_fp32 = source_key.elemsize == sizeof(float)
+                             && destination_key.elemsize == sizeof(uint16_t);
+    const bool fp32_to_bf16 = !copy_only && source_fp32 && round_kv;
+    const bool destination_fp32 = copy_only
+                                  && source_key.elemsize == sizeof(uint16_t)
+                                  && destination_key.elemsize == sizeof(float);
+    if (!pipeline || source_key.empty() || source_value.empty() || destination_key.empty() || destination_value.empty()
+        || source_key.dims != 3 || source_value.dims != 3 || destination_key.dims != 3 || destination_value.dims != 3
+        || source_key.h <= 0 || destination_key.h <= 0
+        || source_key.elempack != 1 || source_value.elempack != 1
+        || destination_key.elempack != 1 || destination_value.elempack != 1
         || (source_key.elemsize != sizeof(float)
             && source_key.elemsize != sizeof(uint16_t))
         || source_key.elemsize != source_value.elemsize
         || source_key.w != source_value.w || source_key.h != source_value.h
-        || source_key.c != source_value.c || destination_key.w != source_key.w || destination_key.c != source_key.c || destination_value.w != source_key.w
-        || destination_value.c != source_key.c
-        || destination_key.elemsize != source_key.elemsize
-        || destination_value.elemsize != source_key.elemsize
-        || capacity == 0 || destination_start >= capacity || source_key.cstep > std::numeric_limits<uint32_t>::max()
-        || destination_key.cstep > std::numeric_limits<uint32_t>::max())
+        || source_key.c != source_value.c || source_key.cstep != source_value.cstep
+        || destination_key.w != source_key.w || destination_key.c != source_key.c
+        || destination_value.w != source_key.w || destination_value.h != destination_key.h
+        || destination_value.c != source_key.c || destination_key.cstep != destination_value.cstep
+        || (destination_key.elemsize != sizeof(float)
+            && destination_key.elemsize != sizeof(uint16_t))
+        || destination_key.elemsize != destination_value.elemsize
+        || (copy_only && round_kv)
+        || (source_key.elemsize != destination_key.elemsize && !fp32_to_bf16 && !destination_fp32)
+        || capacity == 0 || destination_start >= capacity
+        || source_start > static_cast<uint64_t>(source_key.h)
+        || static_cast<uint64_t>(copy_only ? destination_key.h : source_key.h)
+               > static_cast<uint64_t>(source_key.h) - source_start
+        || source_key.cstep > std::numeric_limits<uint32_t>::max()
+        || destination_key.cstep > std::numeric_limits<uint32_t>::max()
+        || capacity > std::numeric_limits<uint32_t>::max()
+        || destination_start > std::numeric_limits<uint32_t>::max()
+        || source_start > std::numeric_limits<uint32_t>::max())
         return false;
 
     const std::vector<ncnn::VkMat> bindings = {
         source_key,
         source_value,
-        destination_key,
-        destination_value,
+        destination_fp32 ? source_key : destination_key,
+        destination_fp32 ? source_value : destination_value,
+        destination_fp32 ? destination_key : source_key,
+        destination_fp32 ? destination_value : source_value,
     };
-    std::vector<ncnn::vk_constant_type> constants(8);
+    const uint32_t rows = static_cast<uint32_t>(copy_only ? destination_key.h : source_key.h);
+    std::vector<ncnn::vk_constant_type> constants(12);
     constants[0].u32 = static_cast<uint32_t>(source_key.w);
-    constants[1].u32 = static_cast<uint32_t>(source_key.h);
+    constants[1].u32 = rows;
     constants[2].u32 = static_cast<uint32_t>(source_key.c);
     constants[3].u32 = static_cast<uint32_t>(source_key.cstep);
     constants[4].u32 = static_cast<uint32_t>(destination_key.cstep);
     constants[5].u32 = static_cast<uint32_t>(capacity);
     constants[6].u32 = static_cast<uint32_t>(destination_start);
     constants[7].u32 = round_kv ? 1 : 0;
+    constants[8].u32 = source_fp32 ? 1 : 0;
+    constants[9].u32 = static_cast<uint32_t>(source_start);
+    constants[10].u32 = copy_only ? 1 : 0;
+    constants[11].u32 = destination_fp32 ? 1 : 0;
     ncnn::VkMat dispatcher;
     dispatcher.w = source_key.w;
-    dispatcher.h = source_key.h;
+    dispatcher.h = static_cast<int>(rows);
     dispatcher.c = source_key.c;
     command.record_pipeline(pipeline, bindings, constants, dispatcher);
     return true;
@@ -1396,6 +1425,10 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
     implementation.option.use_packing_layout = false;
     ncnn::VulkanDevice* vkdev = implementation.vulkan_context->device();
     implementation.kv_option = implementation.option;
+    implementation.kv_option.use_fp16_storage = false;
+    const uint64_t kv_size = vulkan_kv_size(config.kv_cache_dtype, vkdev->info.device_index());
+    if (kv_size == UINT64_MAX) return {};
+    implementation.kv_option.use_bf16_storage = kv_size == sizeof(uint16_t);
     if (has_flag(config.optimization_flags, OptimizationVulkanDecodeSdpa)
         && has_flag(config.optimization_flags, OptimizationVulkanBfloat16CoopMatrix))
     {
@@ -2162,9 +2195,10 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
                                                    : attention_ring_view(cache.vulkan_attention_cache->value,
                                                                          cache.first_slot,
                                                                          cache.token_count);
-            if (!record_attention_ring_append(implementation.ring_append_pipeline.get(), previous_key, previous_value, next_cache->key, next_cache->value,
+            if (!record_attention_copy(implementation.ring_append_pipeline.get(), previous_key, previous_value, next_cache->key, next_cache->value,
                                               ring_capacity, 0,
                                               config.kv_cache_dtype == DType::BFloat16,
+                                              0, false,
                                               command))
             {
                 return false;
@@ -2271,22 +2305,26 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
         key_rope = key_rope_output[0];
     }
 
+    const size_t source_element_size = use_qkv_rope
+                                           ? activation_element_size
+                                           : vulkan_activation_element_size(implementation.option);
     if (query_rope.elempack != 1 || query_rope.dims != 3 || query_rope.w != static_cast<int>(config.head_dimension)
         || query_rope.h != static_cast<int>(token_count) || query_rope.c != static_cast<int>(config.head_count)
         || (!use_qkv_ring
             && (key_rope.elempack != 1 || value_heads.elempack != 1 || key_rope.dims != 3 || key_rope.w != static_cast<int>(config.head_dimension)
                 || key_rope.h != static_cast<int>(token_count) || key_rope.c != static_cast<int>(config.kv_head_count) || value_heads.dims != 3
                 || value_heads.w != static_cast<int>(config.head_dimension) || value_heads.h != static_cast<int>(token_count)
-                || value_heads.c != static_cast<int>(config.kv_head_count) || key_rope.elemsize != activation_element_size
-                || value_heads.elemsize != activation_element_size)))
+                || value_heads.c != static_cast<int>(config.kv_head_count) || key_rope.elemsize != source_element_size
+                || value_heads.elemsize != source_element_size)))
     {
         return false;
     }
 
     if (!use_qkv_ring
-        && !record_attention_ring_append(implementation.ring_append_pipeline.get(), key_rope, value_heads, next_cache->key, next_cache->value, ring_capacity,
+        && !record_attention_copy(implementation.ring_append_pipeline.get(), key_rope, value_heads, next_cache->key, next_cache->value, ring_capacity,
                                          append_slot,
                                          config.kv_cache_dtype == DType::BFloat16,
+                                         0, false,
                                          command))
     {
         return false;
@@ -2326,28 +2364,32 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
                 return false;
             }
         }
-        auto& sdpa_key = ticket.keep_buffer(combined_key);
-        auto& sdpa_value = ticket.keep_buffer(combined_value);
+        auto& sdpa_key = ticket.keep_buffer();
+        auto& sdpa_value = ticket.keep_buffer();
         if (low_precision_kv)
         {
-            vkdev->convert_packing(combined_key,
-                                   sdpa_key,
-                                   1,
-                                   1,
-                                   command,
-                                   implementation.kv_option);
-            vkdev->convert_packing(combined_value,
-                                   sdpa_value,
-                                   1,
-                                   1,
-                                   command,
-                                   implementation.kv_option);
+            sdpa_key.create(combined_key.w, combined_key.h, combined_key.c, sizeof(float), implementation.option.blob_vkallocator);
+            sdpa_value.create(combined_value.w, combined_value.h, combined_value.c, sizeof(float), implementation.option.blob_vkallocator);
             if (sdpa_key.empty() || sdpa_value.empty()
-                || sdpa_key.elemsize != sizeof(float)
-                || sdpa_value.elemsize != sizeof(float))
+                || !record_attention_copy(implementation.ring_append_pipeline.get(),
+                                                  next_cache->key,
+                                                  next_cache->value,
+                                                  sdpa_key,
+                                                  sdpa_value,
+                                                  ring_capacity,
+                                                  0,
+                                                  false,
+                                                  ring_first_slot,
+                                                  true,
+                                                  command))
             {
                 return false;
             }
+        }
+        else
+        {
+            sdpa_key = combined_key;
+            sdpa_value = combined_value;
         }
         auto& sdpa_input = ticket.keep_list(std::initializer_list<ncnn::VkMat>{
             query_rope,
@@ -2652,15 +2694,6 @@ bool Attention_vulkan::materialize_device_cache(LayerCache& cache) const
         return false;
     }
 
-    const ncnn::VkMat source_key = attention_ring_view(device_cache.key,
-                                                       cache.first_slot,
-                                                       cache.token_count);
-    const ncnn::VkMat source_value = attention_ring_view(device_cache.value,
-                                                         cache.first_slot,
-                                                         cache.token_count);
-    if (source_key.empty() || source_value.empty())
-        return false;
-
     VulkanRuntimeState& runtime_state = implementation.vulkan_context->runtime_state();
     VulkanTransferLease transfer_lease = implementation.vulkan_context->acquire_transfer_slot();
     VulkanTransferSlot& transfer_slot = transfer_lease.slot();
@@ -2689,15 +2722,21 @@ bool Attention_vulkan::materialize_device_cache(LayerCache& cache) const
     }
     transfer_slot.command_used = true;
 
-    ncnn::Option copy_option = implementation.option;
-    copy_option.blob_vkallocator = transfer_slot.staging_allocator;
-    copy_option.workspace_vkallocator = transfer_slot.staging_allocator;
-    copy_option.staging_vkallocator = transfer_slot.staging_allocator;
     ncnn::VkMat& key_staging = transfer_slot.attention_cache_key;
     ncnn::VkMat& value_staging = transfer_slot.attention_cache_value;
-    command.record_clone(source_key, key_staging, copy_option);
-    command.record_clone(source_value, value_staging, copy_option);
-    if (key_staging.empty() || value_staging.empty())
+    if (!record_attention_copy(implementation.ring_append_pipeline.get(),
+                                      device_cache.key,
+                                      device_cache.value,
+                                      key_staging,
+                                      value_staging,
+                                      cache.capacity_tokens,
+                                      0,
+                                      false,
+                                      cache.first_slot,
+                                      true,
+                                      command)
+        || key_staging.empty()
+        || value_staging.empty())
         return false;
 
     if (submit_compute_and_wait(command, implementation.vulkan_context->device()) != 0)
@@ -3335,6 +3374,9 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
             work.key_rope = work.key_rope_output[0];
         }
 
+        const size_t source_element_size = use_qkv_rope
+                                               ? activation_element_size
+                                               : vulkan_activation_element_size(implementation.option);
         if (work.query_rope.elempack != 1
             || work.query_rope.dims != 3
             || work.query_rope.w
@@ -3357,13 +3399,13 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
                     || work.value_heads.h != 1
                     || work.value_heads.c
                            != static_cast<int>(config.kv_head_count)
-                    || work.key_rope.elemsize != activation_element_size
-                    || work.value_heads.elemsize != activation_element_size)))
+                    || work.key_rope.elemsize != source_element_size
+                    || work.value_heads.elemsize != source_element_size)))
         {
             return AttentionBatchResult_vulkan::NotExecuted;
         }
         if (!use_qkv_ring
-            && !record_attention_ring_append(implementation.ring_append_pipeline.get(),
+            && !record_attention_copy(implementation.ring_append_pipeline.get(),
                                              work.key_rope,
                                              work.value_heads,
                                              work.next_cache->key,
@@ -3371,6 +3413,8 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
                                              ring_capacity,
                                              append_slot,
                                              config.kv_cache_dtype == DType::BFloat16,
+                                             0,
+                                             false,
                                              command))
         {
             return AttentionBatchResult_vulkan::NotExecuted;
@@ -3424,27 +3468,34 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
                     return AttentionBatchResult_vulkan::NotExecuted;
                 }
             }
-            ncnn::VkMat sdpa_key = work.combined_key;
-            ncnn::VkMat sdpa_value = work.combined_value;
+            ncnn::VkMat sdpa_key;
+            ncnn::VkMat sdpa_value;
             if (low_precision_kv)
             {
                 ncnn::VkMat converted_key;
                 ncnn::VkMat converted_value;
-                vkdev->convert_packing(work.combined_key,
-                                       converted_key,
-                                       1,
-                                       1,
-                                       command,
-                                       implementation.kv_option);
-                vkdev->convert_packing(work.combined_value,
-                                       converted_value,
-                                       1,
-                                       1,
-                                       command,
-                                       implementation.kv_option);
+                converted_key.create(work.combined_key.w,
+                                     work.combined_key.h,
+                                     work.combined_key.c,
+                                     sizeof(float),
+                                     implementation.option.blob_vkallocator);
+                converted_value.create(work.combined_value.w,
+                                       work.combined_value.h,
+                                       work.combined_value.c,
+                                       sizeof(float),
+                                       implementation.option.blob_vkallocator);
                 if (converted_key.empty() || converted_value.empty()
-                    || converted_key.elemsize != sizeof(float)
-                    || converted_value.elemsize != sizeof(float))
+                    || !record_attention_copy(implementation.ring_append_pipeline.get(),
+                                                     work.next_cache->key,
+                                                     work.next_cache->value,
+                                                     converted_key,
+                                                     converted_value,
+                                                     ring_capacity,
+                                                     0,
+                                                     false,
+                                                     ring_first_slot,
+                                                     true,
+                                                     command))
                 {
                     return AttentionBatchResult_vulkan::NotExecuted;
                 }
@@ -3452,6 +3503,11 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
                 work.retained_gpu.push_back(converted_value);
                 sdpa_key = converted_key;
                 sdpa_value = converted_value;
+            }
+            else
+            {
+                sdpa_key = work.combined_key;
+                sdpa_value = work.combined_value;
             }
             std::vector<ncnn::VkMat> sdpa_input = {
                 work.query_rope,

@@ -1454,6 +1454,7 @@ static uint64_t dense_qwen_gated_delta_state_size(const CompiledModel& compiled,
 
 static uint64_t dense_standard_attention_initial_state_size(const CompiledModel& compiled,
                                                             const AttentionBlockPlan& attention,
+                                                            uint32_t device_index,
                                                             uint32_t context_tokens = 0) noexcept
 {
     const uint64_t key_columns = saturating_multiply_u64(attention.kv_head_count,
@@ -1469,10 +1470,8 @@ static uint64_t dense_standard_attention_initial_state_size(const CompiledModel&
     }
     if (capacity < required_tokens)
         capacity = required_tokens;
-    // Attention_vulkan inherits the QnK projection option, which currently
-    // disables BF16 storage. Its device KV rings therefore use FP32 even when
-    // the model declares a BF16 cache; reserve the actual upper-bound size.
-    const uint64_t element_size = sizeof(float);
+    const uint64_t element_size = vulkan_kv_size(attention.kv_cache_dtype, device_index);
+    if (element_size == UINT64_MAX) return UINT64_MAX;
     // The Vulkan KV ring stores two copies of each key/value row so wrapped
     // cache views stay contiguous. Count every concurrent Session's initial
     // prefill capacity; later growth remains checked at allocation time.
@@ -1526,10 +1525,10 @@ uint64_t dense_vulkan_attention_storage_size(const CompiledModel& compiled,
                                                           static_cast<uint64_t>(attention.head_dimension / 2) * sizeof(float),
                                                           static_cast<uint64_t>(attention.head_count) * sizeof(float)},
                                                          alignment);
-            state = dense_standard_attention_initial_state_size(compiled, attention);
+            state = dense_standard_attention_initial_state_size(compiled, attention, device_index);
             return saturating_add_u64(saturating_add_u64(input, constants), state);
         }
-        state = dense_standard_attention_initial_state_size(compiled, attention);
+        state = dense_standard_attention_initial_state_size(compiled, attention, device_index);
         const bool bfloat16 = standard_attention_bfloat16_fusion_supported(compiled, attention, alignment, device_index);
         TensorData fused;
         fused.dtype = bfloat16 ? DType::BFloat16 : DType::Float32;
@@ -1613,6 +1612,7 @@ uint64_t dense_vulkan_attention_storage_size(const CompiledModel& compiled,
 
 static uint64_t attention_session_state_size(const CompiledModel& compiled,
                                              const AttentionBlockPlan& attention,
+                                             uint32_t device_index,
                                              uint32_t context_tokens = 0) noexcept
 {
     const uint64_t sessions = std::max(1u, compiled.opt.num_concurrent_sessions);
@@ -1632,7 +1632,9 @@ static uint64_t attention_session_state_size(const CompiledModel& compiled,
             const uint64_t index = saturating_multiply_u64(saturating_multiply_u64(capacity + blocks, attention.index_head_dimension), sizeof(float));
             return saturating_add_u64(kv, index);
         }
-        return dense_standard_attention_initial_state_size(compiled, attention, context_tokens) / sessions;
+        const uint64_t state = dense_standard_attention_initial_state_size(compiled, attention, device_index,
+                                                                           context_tokens);
+        return state == UINT64_MAX ? UINT64_MAX : state / sessions;
     }
     if (attention.kind != AttentionKind::MultiHeadLatent)
         return 0;
@@ -1666,7 +1668,7 @@ uint64_t dense_vulkan_pending_state_size(const CompiledModel& compiled,
         {
             if (layer.vulkan_device_index == device_index
                 && support_vulkan_attention(compiled.operators, layer.attention))
-                size = saturating_add_u64(size, attention_session_state_size(compiled, layer.attention));
+                size = saturating_add_u64(size, attention_session_state_size(compiled, layer.attention, device_index));
         }
     }
     return saturating_multiply_u64(size, std::max(1u, compiled.opt.num_concurrent_sessions));
@@ -2127,17 +2129,20 @@ static uint64_t constant_storage(const CompiledModel& model, std::initializer_li
     return bytes == 0 ? 0 : dense_qwen_constant_storage_size({bytes}, alignment);
 }
 
-static GpuResourceRequest attention_resource_request(const CompiledModel& model, const CompiledLayerPlan& layer)
+static Result<GpuResourceRequest> attention_resource_request(const CompiledModel& model, const CompiledLayerPlan& layer)
 {
     const AttentionBlockPlan& attention = layer.attention;
     const uint32_t device = layer.vulkan_device_index;
-    const uint64_t alignment = dense_qwen_gpu_alignment(model, device);
     GpuResourceRequest request;
+    const uint64_t session_state_size = attention_session_state_size(model, attention, device);
+    if (session_state_size == UINT64_MAX)
+        return Error{ErrorCode::InvalidArgument, "Vulkan Attention state size exceeds the allocation range"};
+    const uint64_t alignment = dense_qwen_gpu_alignment(model, device);
     if (alignment == 0) return request;
     if (attention.kind == AttentionKind::Standard
         && standard_attention_requires_native(model, attention, device)
         && !has_flag(model.opt.optimization_flags, OptimizationVulkanQnK)) return request;
-    request.session_state_size = attention_session_state_size(model, attention);
+    request.session_state_size = session_state_size;
     const uint64_t rows = std::max(1u, SessionOptions{}.prefill_chunk_size);
     const uint64_t query = saturating_multiply_u64(attention.head_count, attention.head_dimension);
     const uint64_t value = saturating_multiply_u64(attention.head_count, attention.value_head_dimension);
@@ -2159,7 +2164,11 @@ static GpuResourceRequest attention_resource_request(const CompiledModel& model,
     if (attention.kind == AttentionKind::Standard || attention.kind == AttentionKind::GatedDeltaNet)
     {
         const uint64_t total = dense_vulkan_attention_storage_size(model, layer, alignment, device);
+        if (total == UINT64_MAX)
+            return Error{ErrorCode::InvalidArgument, "Vulkan Attention storage size exceeds the allocation range"};
         const uint64_t state = saturating_multiply_u64(request.session_state_size, std::max(1u, model.opt.num_concurrent_sessions));
+        if (state == UINT64_MAX)
+            return Error{ErrorCode::InvalidArgument, "Vulkan Attention state size exceeds the allocation range"};
         if (total >= state && total != 0) request.persistent_size = total - state;
         if (attention.kind == AttentionKind::GatedDeltaNet && request.persistent_size == 0)
         {
@@ -2187,7 +2196,7 @@ static GpuResourceRequest attention_resource_request(const CompiledModel& model,
         }
         return request;
     }
-    if (attention.kind != AttentionKind::MultiHeadLatent) return {};
+    if (attention.kind != AttentionKind::MultiHeadLatent) return GpuResourceRequest{};
     for (TensorHandle handle : {attention.query_a_weight, attention.query_b_weight, attention.key_value_weight,
                                 attention.output_a_weight, attention.output_b_weight, attention.indexer_query_weight,
                                 attention.indexer_weights_weight, attention.compressor_key_value_weight,
@@ -2196,7 +2205,7 @@ static GpuResourceRequest attention_resource_request(const CompiledModel& model,
     {
         if (handle == invalid_tensor_handle) continue;
         const uint64_t size = projection_storage(model, handle, alignment, device);
-        if (size == 0) return {};
+        if (size == 0) return GpuResourceRequest{};
         request.persistent_size = saturating_add_u64(request.persistent_size, size);
     }
     request.persistent_size = saturating_add_u64(request.persistent_size,
@@ -2295,7 +2304,9 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
         request.workspace_size = execution.workspace_size;
         for (const CompiledLayerPlan& layer : compiled.graph.layer_plans)
         {
-            GpuResourceRequest attention = attention_resource_request(compiled, layer);
+            auto attention_result = attention_resource_request(compiled, layer);
+            if (!attention_result) return attention_result.error();
+            GpuResourceRequest attention = std::move(attention_result).value();
             if (attention.persistent_size == 0 && layer.attention.kind == AttentionKind::Standard)
             {
                 for (TensorHandle weight : {layer.attention.query_weight, layer.attention.key_weight,
@@ -2340,7 +2351,9 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
             if (kind == AttentionKind::None || !attention_enabled) continue;
             if (kind == AttentionKind::Standard
                 && (has_flag(layer.attention.flags, AttentionBlockQsa) || has_flag(layer.attention.flags, AttentionBlockExternalResidual))) continue;
-            const GpuResourceRequest request = attention_resource_request(compiled, layer);
+            auto request_result = attention_resource_request(compiled, layer);
+            if (!request_result) return request_result.error();
+            const GpuResourceRequest request = std::move(request_result).value();
             auto prepared = prepare_resource_group(compiled, resources, layer.vulkan_device_index, request, &layer, "attention at layer " + std::to_string(layer.layer_id), [&]() -> Result<void> {
                     if (kind == AttentionKind::Standard) return prepare_standard_attention_operators(compiled, layer);
                     if (kind == AttentionKind::GatedDeltaNet) { prepare_gated_delta_attention_operators(compiled, layer); return {}; }
@@ -2616,6 +2629,22 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
                 // per head. A sink adds a real destination column to both.
                 // KV ring views alias Session state.
                 const uint64_t destinations = saturating_add_u64(context_tokens, has_flag(attention.flags, AttentionBlockSink) ? 1 : 0);
+                const uint64_t kv_size = vulkan_kv_size(attention.kv_cache_dtype, device);
+                if (kv_size == UINT64_MAX)
+                    return Error{ErrorCode::InvalidArgument, "Vulkan Attention KV device is invalid"};
+                if (kv_size == sizeof(uint16_t))
+                {
+                    // General SDPA consumes two FP32 KV buffers per Session;
+                    // each head has VkMat's 16-byte channel alignment.
+                    const uint64_t head_elements = saturating_multiply_u64(attention.head_dimension, destinations);
+                    const uint64_t kv_elements = saturating_multiply_u64(saturating_add_u64(head_elements, 3) / 4 * 4,
+                                                                          attention.kv_head_count);
+                    for (uint64_t operand = 0; operand < static_cast<uint64_t>(std::min(rows, sequence_count)) * 2; ++operand)
+                    {
+                        auto ret = add(kv_elements, 1);
+                        if (!ret) return ret.error();
+                    }
+                }
                 const uint64_t attention_plane = saturating_multiply_u64(destinations, attention.head_count);
                 columns.insert(columns.end(), {attention_plane, attention_plane});
                 // SDPA's head-major output is permuted into token-major
@@ -3210,14 +3239,16 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
             if (node.type != ExecutionNodeType::Attention || node.backend != ExecutionBackend::Vulkan
                 || node.layer_plan_index >= graph->layer_plans.size()) continue;
             const CompiledLayerPlan& layer = graph->layer_plans[node.layer_plan_index];
-            uint64_t bytes = attention_session_state_size(compiled, layer.attention, result.context_tokens);
+            uint64_t bytes = attention_session_state_size(compiled, layer.attention, layer.vulkan_device_index,
+                                                          result.context_tokens);
             if (layer.attention.kind == AttentionKind::Standard)
             {
                 // Doubling a ring retains its previous half-capacity buffer
                 // until publication after the fence. This is allocation
                 // overlap, rather than spare heap headroom.
                 const uint64_t previous = result.context_tokens > 16
-                                              ? attention_session_state_size(compiled, layer.attention, std::max(1u, result.context_tokens / 2))
+                                              ? attention_session_state_size(compiled, layer.attention, layer.vulkan_device_index,
+                                                                             std::max(1u, result.context_tokens / 2))
                                               : 0;
                 if (bank_chain && graph == &compiled.graph)
                     bank_growth[node.layer_plan_index] = previous;
@@ -3234,7 +3265,8 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
             else if (layer.attention.kind == AttentionKind::MultiHeadLatent)
             {
                 bytes /= 2;
-                const uint64_t previous = attention_session_state_size(compiled, layer.attention, std::max(1u, result.context_tokens / 2)) / 2;
+                const uint64_t previous = attention_session_state_size(compiled, layer.attention, layer.vulkan_device_index,
+                                                                       std::max(1u, result.context_tokens / 2)) / 2;
                 growth[layer.vulkan_device_index] = std::max(growth[layer.vulkan_device_index], previous);
             }
             uint64_t& total = states[layer.vulkan_device_index];

@@ -5339,7 +5339,7 @@ std::shared_ptr<Mxfp4Linear_vulkan> Mxfp4Linear_vulkan::create_with_allocator(co
     if (upload_batch)
     {
         uploaded = direct_staging
-                       ? upload_batch->record_prepared_storage(implementation.storage, implementation.option, weight_allocator)
+                       ? upload_batch->record_prepared_storage(implementation.storage, weight_allocator)
                        : upload_batch->record(combined, implementation.storage, implementation.option, weight_allocator);
     }
     else
@@ -6045,18 +6045,18 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
     }
     if (output_columns > static_cast<uint32_t>(std::numeric_limits<int>::max()) / implementation.pipeline->local_size_x())
         return {};
-    ncnn::Option upload_option = implementation.option;
-    upload_option.blob_vkallocator = weight_allocator;
-    upload_option.workspace_vkallocator = weight_allocator;
-    upload_option.staging_vkallocator = staging_allocator;
     bool uploaded = false;
     if (upload_batch)
-        uploaded = upload_batch->record_prepared_storage(implementation.storage, upload_option, weight_allocator);
+        uploaded = upload_batch->record_prepared_storage(implementation.storage, weight_allocator);
     else if (transfer)
         uploaded = transfer->record_prepared_storage(implementation.storage, independent_allocator) && transfer->submit_and_wait();
     else
     {
         const std::lock_guard<std::mutex> lock(implementation.vulkan_context->command_mutex());
+        ncnn::Option upload_option = implementation.option;
+        upload_option.blob_vkallocator = weight_allocator;
+        upload_option.workspace_vkallocator = weight_allocator;
+        upload_option.staging_vkallocator = staging_allocator;
         ncnn::VkTransfer command(device);
         command.record_upload(combined, implementation.storage, upload_option);
         uploaded = !implementation.storage.empty() && command.submit_and_wait() == 0;

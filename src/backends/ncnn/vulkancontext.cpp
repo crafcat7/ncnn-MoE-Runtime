@@ -1194,10 +1194,8 @@ std::span<uint8_t> VulkanWeightUploadBatch::prepare_storage(size_t bytes, ncnn::
 }
 
 bool VulkanWeightUploadBatch::record_prepared_storage(ncnn::VkMat& destination,
-                                                      const ncnn::Option& option,
                                                       ncnn::VkAllocator* weight_allocator)
 {
-    (void)option; // Byte storage requires no ncnn cast or packing operation.
     auto* allocator = dynamic_cast<VulkanExpertWeightAllocator*>(weight_allocator);
     if (failed || submitted || !independent_command || !allocator
         || !independent_command->record_prepared_storage(destination, allocator))

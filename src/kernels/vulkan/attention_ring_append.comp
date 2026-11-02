@@ -16,6 +16,15 @@ layout(binding = 3) buffer destination_value_blob
 {
     sfp destination_value_data[];
 };
+// Bindings 4/5 read the source or write the FP32 destination during BF16 widening.
+layout(binding = 4) buffer key_float_alias_blob
+{
+    float key_float_data[];
+};
+layout(binding = 5) buffer value_float_alias_blob
+{
+    float value_float_data[];
+};
 
 layout(push_constant) uniform parameter
 {
@@ -27,6 +36,10 @@ layout(push_constant) uniform parameter
     uint capacity;
     uint destination_start;
     uint round_kv;
+    uint source_fp32;
+    uint source_start;
+    uint copy_only;
+    uint destination_fp32;
 }
 p;
 
@@ -44,14 +57,37 @@ void main()
     if (column >= p.width || row >= p.rows || channel >= p.channels)
         return;
 
-    const uint source_index = channel * p.source_cstep + row * p.width + column;
-    const uint slot = (p.destination_start + row) % p.capacity;
-    const uint destination_index = channel * p.destination_cstep + slot * p.width + column;
-    const uint duplicate_index = destination_index + p.capacity * p.width;
-    const float source_key = buffer_ld1(source_key_data, source_index);
-    const float source_value = buffer_ld1(source_value_data, source_index);
+    const uint source_index = channel * p.source_cstep + (p.source_start + row) * p.width + column;
+    const uint destination_row = p.copy_only != 0u ? row : (p.destination_start + row) % p.capacity;
+    const uint destination_index = channel * p.destination_cstep + destination_row * p.width + column;
+    if (p.copy_only != 0u && p.destination_fp32 == 0u)
+    {
+        buffer_cp1(destination_key_data, destination_index, source_key_data, source_index);
+        buffer_cp1(destination_value_data, destination_index, source_value_data, source_index);
+        return;
+    }
+
+    float source_key;
+    float source_value;
+    if (p.source_fp32 != 0u)
+    {
+        source_key = key_float_data[source_index];
+        source_value = value_float_data[source_index];
+    }
+    else
+    {
+        source_key = buffer_ld1(source_key_data, source_index);
+        source_value = buffer_ld1(source_value_data, source_index);
+    }
     const float key = p.round_kv != 0u ? round_bf16(source_key) : source_key;
     const float value = p.round_kv != 0u ? round_bf16(source_value) : source_value;
+    if (p.copy_only != 0u)
+    {
+        key_float_data[destination_index] = key;
+        value_float_data[destination_index] = value;
+        return;
+    }
+    const uint duplicate_index = destination_index + p.capacity * p.width;
     buffer_st1(destination_key_data, destination_index, key);
     buffer_st1(destination_key_data, duplicate_index, key);
     buffer_st1(destination_value_data, destination_index, value);

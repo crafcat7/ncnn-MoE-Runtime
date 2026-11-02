@@ -549,8 +549,8 @@ static void direct_upload_pool()
             a[index] = static_cast<uint8_t>(index * 13 + 1);
             b[index] = static_cast<uint8_t>(index * 13 + 5);
         }
-        upload_check(first_batch.record_prepared_storage(first, option, &weights)
-                         && second_batch.record_prepared_storage(second, option, &weights),
+        upload_check(first_batch.record_prepared_storage(first, &weights)
+                         && second_batch.record_prepared_storage(second, &weights),
                      "record both mapped reservations");
         upload_check(first_batch.submit() && second_batch.submit(), "submit both isolated lanes");
     }
@@ -573,7 +573,7 @@ static void direct_upload_pool()
             upload_check(mapped.size() == bytes, "reused mapped staging size");
             for (size_t index = 0; index < bytes; ++index)
                 mapped[index] = static_cast<uint8_t>(index * 13 + seed);
-            upload_check(batch.record_prepared_storage(destination, option, &weights) && batch.submit(), "reuse command pool, CB, fences and consumed semaphore");
+            upload_check(batch.record_prepared_storage(destination, &weights) && batch.submit(), "reuse command pool, CB, fences and consumed semaphore");
         }
         verify_payload(context, destination, bytes, seed);
     }
@@ -591,7 +591,7 @@ static void direct_upload_pool()
         auto mapped = cancelled.prepare_storage(bytes, &weights);
         std::fill(mapped.begin(), mapped.end(), uint8_t(77));
         ncnn::VkMat destination;
-        upload_check(cancelled.record_prepared_storage(destination, option, &weights), "cancel recorded unsubmitted batch");
+        upload_check(cancelled.record_prepared_storage(destination, &weights), "cancel recorded unsubmitted batch");
     }
     {
         VulkanExpertWeightAllocator exhausted(context->device(), bytes, 1);
@@ -599,7 +599,7 @@ static void direct_upload_pool()
         auto mapped = rejected.prepare_storage(bytes, &exhausted);
         upload_check(mapped.size() == bytes, "exhaustion fixture obtains staging before bounded device allocation");
         ncnn::VkMat destination;
-        upload_check(!rejected.record_prepared_storage(destination, option, &exhausted) && !rejected.submit()
+        upload_check(!rejected.record_prepared_storage(destination, &exhausted) && !rejected.submit()
                          && destination.empty() && exhausted.physical_bytes() == 0 && exhausted.physical_limit_rejections() != 0,
                      "physical exhaustion rejects the upload before any queue submission");
     }
@@ -615,7 +615,7 @@ static void direct_upload_pool()
         for (size_t index = 0; index < bytes; ++index)
             mapped[index] = static_cast<uint8_t>(index * 13 + 3);
         ncnn::VkMat destination;
-        upload_check(retry.record_prepared_storage(destination, option, &weights) && retry.submit(), "retry resets cancelled command recording");
+        upload_check(retry.record_prepared_storage(destination, &weights) && retry.submit(), "retry resets cancelled command recording");
         verify_payload(context, destination, bytes, 3);
     }
     {
@@ -628,7 +628,7 @@ static void direct_upload_pool()
         upload_check(mapped.size() == bytes, "poison fixture mapped reservation");
         std::fill(mapped.begin(), mapped.end(), uint8_t(33));
         ncnn::VkMat destination;
-        upload_check(poisoned.record_prepared_storage(destination, option, &weights), "poison fixture first records a valid copy");
+        upload_check(poisoned.record_prepared_storage(destination, &weights), "poison fixture first records a valid copy");
         upload_check(poisoned.prepare_storage(7, &weights).empty() && !poisoned.submit(), "illegal reservation poisons existing recorded lane");
     }
     {
@@ -638,7 +638,7 @@ static void direct_upload_pool()
         for (size_t index = 0; index < bytes; ++index)
             mapped[index] = static_cast<uint8_t>(index * 13 + 17);
         ncnn::VkMat destination;
-        upload_check(retry.record_prepared_storage(destination, option, &weights) && retry.submit(), "fresh command resources replace poisoned lane");
+        upload_check(retry.record_prepared_storage(destination, &weights) && retry.submit(), "fresh command resources replace poisoned lane");
         verify_payload(context, destination, bytes, 17);
     }
     {

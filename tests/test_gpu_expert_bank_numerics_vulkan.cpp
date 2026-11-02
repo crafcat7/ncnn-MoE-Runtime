@@ -198,6 +198,7 @@ static ActivationBuffer numeric_reference(const std::array<BankNumericExpert, 4>
 }
 
 static void numeric_fusion_case(const std::shared_ptr<VulkanContext>& context, const ExpertBank_vulkan& bank,
+                                const ncnn::Option& option,
                                 const ActivationBuffer& input, const ActivationBuffer& selected,
                                 const ActivationBuffer& expected)
 {
@@ -211,7 +212,6 @@ static void numeric_fusion_case(const std::shared_ptr<VulkanContext>& context, c
     ActivationBuffer residual_only(input.rows(), expected.columns()), fused(input.rows(), expected.columns()), flag(1, 1);
     {
         const std::lock_guard<std::mutex> lock(context->command_mutex());
-        const auto& option = bank.option();
         ncnn::VkCompute command(context->device());
         ncnn::VkMat input_staging, selected_staging, shared_staging, residual_staging, zero_staging;
         ncnn::VkMat device_input, device_selected, device_shared, device_residual, validation;
@@ -271,6 +271,15 @@ static void numeric_case(const std::shared_ptr<VulkanContext>& context, const Ba
     segment_check(static_cast<bool>(planned), planned ? "" : planned.error().message);
     const auto created = ExpertBank_vulkan::create(planned.value(), context, [&](uint32_t expert) -> Result<ExpertBankWeights_vulkan> { return weights[expert]; });
     segment_check(static_cast<bool>(created), created ? "" : created.error().message);
+    ncnn::Option option;
+    option.use_vulkan_compute = true;
+    option.use_fp16_packed = false;
+    option.use_fp16_storage = false;
+    option.use_bf16_packed = false;
+    option.use_bf16_storage = false;
+    option.blob_vkallocator = context->blob_allocator();
+    option.workspace_vkallocator = context->blob_allocator();
+    option.staging_vkallocator = context->staging_allocator();
     // Keep every numerical stress case; pair decode with small K and prefill with K=1.
     const std::array<std::pair<uint32_t, size_t>, 2> selections = {{{4, 1}, {1, 3}}};
     for (const auto& [top_k, rows] : selections)
@@ -297,7 +306,6 @@ static void numeric_case(const std::shared_ptr<VulkanContext>& context, const Ba
         ActivationBuffer actual(rows, test.output), flag(1, 1);
         {
             const std::lock_guard<std::mutex> lock(context->command_mutex());
-            const auto& option = created.value()->option();
             ncnn::VkCompute command(context->device());
             ncnn::VkMat input_staging, selected_staging, zero_staging, device_input, device_selected, validation, output, output_staging, flag_staging;
             std::vector<ncnn::VkMat> workspace;
@@ -339,7 +347,7 @@ static void numeric_case(const std::shared_ptr<VulkanContext>& context, const Ba
                 }
         }
         if (top_k == 1 && test.code_basis == BankCodeBasis::Down && test.output == 5)
-            numeric_fusion_case(context, *created.value(), input, selected, expected);
+            numeric_fusion_case(context, *created.value(), option, input, selected, expected);
     }
 }
 

@@ -27,6 +27,22 @@ namespace moe {
 
 inline constexpr uint64_t vulkan_weight_block_size = 64 * 1024;
 
+[[nodiscard]] inline uint64_t vulkan_kv_size(DType dtype, uint32_t device_index) noexcept
+{
+#if NCNN_MOE_WITH_VULKAN
+    if (dtype == DType::BFloat16)
+    {
+        const int count = ncnn::get_gpu_count();
+        if (count <= 0 || device_index >= static_cast<uint32_t>(count)) return UINT64_MAX;
+        if (ncnn::get_gpu_info(static_cast<int>(device_index)).support_bf16_storage()) return sizeof(uint16_t);
+    }
+#else
+    (void)dtype;
+    (void)device_index;
+#endif
+    return sizeof(float);
+}
+
 #if NCNN_MOE_WITH_VULKAN
 class ActivationBuffer;
 struct TensorData;
@@ -541,7 +557,6 @@ public:
     // cannot escape this batch; submission rejects an unrecorded reservation.
     [[nodiscard]] std::span<uint8_t> prepare_storage(size_t bytes, ncnn::VkAllocator* weight_allocator);
     [[nodiscard]] bool record_prepared_storage(ncnn::VkMat& destination,
-                                               const ncnn::Option& option,
                                                ncnn::VkAllocator* weight_allocator);
     [[nodiscard]] bool submit();
 

@@ -16,7 +16,6 @@
 #endif
 
 namespace ncnn {
-class Option;
 class VkCompute;
 namespace moe {
 class VulkanContext;
@@ -83,7 +82,6 @@ public:
     [[nodiscard]] const ExpertBankPlan_vulkan& description() const noexcept;
     [[nodiscard]] uint64_t physical_size() const noexcept;
 #if NCNN_MOE_WITH_VULKAN
-    [[nodiscard]] const ncnn::Option& option() const noexcept;
     // Caller owns the command lock and retains bank, operands, output, and
     // workspace until its fence or command reset. Never submits or locks.
     // selected is FP32 [rows, 2*K+1]: IDs, weights, router status. validation

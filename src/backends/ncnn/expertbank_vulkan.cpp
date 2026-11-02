@@ -26,7 +26,6 @@ public:
     std::shared_ptr<VulkanContext> context;
     ExpertBankPlan_vulkan plan;
 #if NCNN_MOE_WITH_VULKAN
-    ncnn::Option option;
     std::unique_ptr<VulkanExpertWeightAllocator> allocator;
     ncnn::VkMat weights;
     std::shared_ptr<ncnn::Pipeline> gate_up;
@@ -362,22 +361,23 @@ Result<std::shared_ptr<ExpertBank_vulkan>> ExpertBank_vulkan::create(const Exper
     auto& d = *result->d;
     d.context = context;
     d.plan = plan;
-    d.option.use_vulkan_compute = true;
-    d.option.use_fp16_packed = false;
-    d.option.use_fp16_storage = false;
-    d.option.use_fp16_arithmetic = false;
-    d.option.use_bf16_packed = false;
-    d.option.use_bf16_storage = false;
-    d.option.use_subgroup_ops = context->device()->info.support_subgroup_ops();
-    d.option.blob_vkallocator = context->blob_allocator();
-    d.option.workspace_vkallocator = context->blob_allocator();
-    d.option.staging_vkallocator = context->staging_allocator();
+    ncnn::Option option;
+    option.use_vulkan_compute = true;
+    option.use_fp16_packed = false;
+    option.use_fp16_storage = false;
+    option.use_fp16_arithmetic = false;
+    option.use_bf16_packed = false;
+    option.use_bf16_storage = false;
+    option.use_subgroup_ops = context->device()->info.support_subgroup_ops();
+    option.blob_vkallocator = context->blob_allocator();
+    option.workspace_vkallocator = context->blob_allocator();
+    option.staging_vkallocator = context->staging_allocator();
     d.allocator = std::make_unique<VulkanExpertWeightAllocator>(context->device(), static_cast<size_t>(plan.storage_size), plan.physical_size);
     const uint32_t weight_format = plan.dtype == DType::Float32 ? 0 : plan.dtype == DType::BFloat16 ? 1
                                                                                                     : 2;
-    if (!create_bank_pipeline(context, d.option, expertbank_gate_up_shader, sizeof(expertbank_gate_up_shader) - 1, 128, weight_format, true, d.gate_up)
-        || !create_bank_pipeline(context, d.option, expertbank_down_shader, sizeof(expertbank_down_shader) - 1, 128, weight_format, true, d.down)
-        || !create_bank_pipeline(context, d.option, expertbank_combine_shader, sizeof(expertbank_combine_shader) - 1, 128,
+    if (!create_bank_pipeline(context, option, expertbank_gate_up_shader, sizeof(expertbank_gate_up_shader) - 1, 128, weight_format, true, d.gate_up)
+        || !create_bank_pipeline(context, option, expertbank_down_shader, sizeof(expertbank_down_shader) - 1, 128, weight_format, true, d.down)
+        || !create_bank_pipeline(context, option, expertbank_combine_shader, sizeof(expertbank_combine_shader) - 1, 128,
                                  weight_format, false, d.combine))
         return Error{ErrorCode::InternalError, "selected full-resident Expert bank pipeline preparation failed"};
     VulkanWeightUploadBatch upload(context);
@@ -397,7 +397,7 @@ Result<std::shared_ptr<ExpertBank_vulkan>> ExpertBank_vulkan::create(const Exper
     }
     const uint64_t end = plan.down_weights + plan.down_stride * plan.expert_count;
     std::memset(storage.data() + end, 0, static_cast<size_t>(plan.storage_size - end));
-    if (!upload.record_prepared_storage(d.weights, d.option, d.allocator.get()) || !upload.submit()
+    if (!upload.record_prepared_storage(d.weights, d.allocator.get()) || !upload.submit()
         || d.weights.empty() || d.allocator->physical_bytes() != plan.physical_size)
         return Error{ErrorCode::InternalError, "selected full-resident Expert bank upload or physical allocation failed"};
     return result;
@@ -410,11 +410,6 @@ Result<std::shared_ptr<ExpertBank_vulkan>> ExpertBank_vulkan::create(const Exper
 }
 
 #if NCNN_MOE_WITH_VULKAN
-const ncnn::Option& ExpertBank_vulkan::option() const noexcept
-{
-    return d->option;
-}
-
 bool ExpertBank_vulkan::record(const ncnn::VkMat& normalized, const ncnn::VkMat& selected,
                                uint32_t top_k, ncnn::VkMat& combined, ncnn::VkMat& validation,
                                ncnn::VkCompute& command, std::vector<ncnn::VkMat>& workspace,
