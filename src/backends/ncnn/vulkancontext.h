@@ -102,8 +102,6 @@ struct VulkanRuntimeState
     AtomicCounter resident_graph_activation_upload_bytes;
     AtomicCounter resident_graph_activation_download_bytes;
     AtomicCounter resident_graph_route_download_bytes;
-    AtomicCounter command_graph_submissions;
-    AtomicCounter command_graph_operations;
     AtomicCounter attention_qkv_rope_fusions;
     AtomicCounter attention_device_rope_fusions;
     AtomicCounter attention_qkv_ring_fusions;
@@ -304,30 +302,6 @@ private:
 class VulkanContext
 {
 public:
-    struct ShaderCacheKey
-    {
-        const char* source = nullptr;
-        uint64_t variant = 0;
-
-        [[nodiscard]] bool operator==(const ShaderCacheKey& other) const noexcept
-        {
-            return source == other.source && variant == other.variant;
-        }
-    };
-
-    struct ShaderCacheKeyHash
-    {
-        [[nodiscard]] size_t operator()(const ShaderCacheKey& key) const noexcept
-        {
-            const size_t source_hash = std::hash<const void*>{}(static_cast<const void*>(key.source));
-            const size_t variant_hash = std::hash<uint64_t>{}(key.variant);
-            return source_hash
-                   ^ (variant_hash + static_cast<size_t>(0x9e3779b9u)
-                      + (source_hash << 6)
-                      + (source_hash >> 2));
-        }
-    };
-
     VulkanContext(const VulkanContext&) = delete;
     VulkanContext& operator=(const VulkanContext&) = delete;
 
@@ -406,6 +380,30 @@ public:
     { return *weight_transfer_pool; }
 
 private:
+    struct ShaderCacheKey
+    {
+        const char* source = nullptr;
+        uint64_t variant = 0;
+
+        [[nodiscard]] bool operator==(const ShaderCacheKey& other) const noexcept
+        {
+            return source == other.source && variant == other.variant;
+        }
+    };
+
+    struct ShaderCacheKeyHash
+    {
+        [[nodiscard]] size_t operator()(const ShaderCacheKey& key) const noexcept
+        {
+            const size_t source_hash = std::hash<const void*>{}(static_cast<const void*>(key.source));
+            const size_t variant_hash = std::hash<uint64_t>{}(key.variant);
+            return source_hash
+                   ^ (variant_hash + static_cast<size_t>(0x9e3779b9u)
+                      + (source_hash << 6)
+                      + (source_hash >> 2));
+        }
+    };
+
     friend class VulkanComputeBatch;
     // Reused under command_mutex; each batch drains before releasing the lock.
     std::vector<std::unique_ptr<ncnn::VkCompute>> ordered_commands;
@@ -485,7 +483,6 @@ public:
     [[nodiscard]] uint64_t allocated_bytes() const noexcept;
     [[nodiscard]] uint64_t planned_capacity() const noexcept
     { return slot_capacity; }
-    void clear() noexcept;
 
 private:
     struct Storage;

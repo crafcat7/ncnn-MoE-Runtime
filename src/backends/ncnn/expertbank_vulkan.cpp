@@ -81,26 +81,6 @@ static uint64_t bank_aligned(uint64_t bytes, uint64_t alignment) noexcept
     return ((bytes + alignment - 1) / alignment) * alignment;
 }
 
-uint64_t ExpertBank_vulkan::workspace_size(const ExpertBankPlan_vulkan& plan, uint32_t rows, uint32_t top_k) noexcept
-{
-    if (rows == 0 || top_k == 0 || top_k > 64 || top_k > plan.expert_count || plan.alignment == 0) return 0;
-    const uint64_t route_rows = static_cast<uint64_t>(rows) * top_k;
-    const uint64_t limit = std::numeric_limits<uint64_t>::max() / sizeof(float);
-    if (plan.intermediate_columns == 0 || plan.output_columns == 0
-        || route_rows > limit / std::max(plan.intermediate_columns, plan.output_columns)) return 0;
-    const uint64_t intermediate = bank_aligned(route_rows * plan.intermediate_columns * sizeof(float), plan.alignment);
-    const uint64_t outputs = bank_aligned(route_rows * plan.output_columns * sizeof(float), plan.alignment);
-    const uint64_t combined = bank_aligned(static_cast<uint64_t>(rows) * plan.output_columns * sizeof(float), plan.alignment);
-    if (!intermediate || !outputs || !combined || intermediate > std::numeric_limits<uint64_t>::max() - outputs
-        || intermediate + outputs > std::numeric_limits<uint64_t>::max() - combined) return 0;
-    return intermediate + outputs + combined;
-}
-
-uint64_t ExpertBank_vulkan::workspace_size(uint32_t rows, uint32_t top_k) const noexcept
-{
-    return workspace_size(d->plan, rows, top_k);
-}
-
 #if NCNN_MOE_WITH_VULKAN
 static bool bank_bias_metadata(const TensorData* bias, uint32_t columns)
 {

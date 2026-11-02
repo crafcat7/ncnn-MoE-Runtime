@@ -258,7 +258,8 @@ static void test_host_output_leases(uint32_t device_index)
     const auto small_plan = plan_host_output_slot_size(2, 17);
     const auto large_plan = plan_host_output_slot_size(3, 33);
     arena_check(small_plan && large_plan, "host output fixture planning failed");
-    VulkanHostOutput pool;
+    auto owner = std::make_unique<VulkanHostOutput>();
+    auto& pool = *owner;
     ActivationBuffer first, second;
     ncnn::VkMat first_device, second_device;
     const auto prepare = [&](VulkanHostOutput& target, size_t rows, uint32_t columns, uint64_t limit,
@@ -320,11 +321,10 @@ static void test_host_output_leases(uint32_t device_index)
     // mapped allocation and its dedicated allocator alive after publication.
     first_device.release();
     second_device.release();
-    pool.clear();
-    arena_check(pool.allocated_bytes() == 0
-                    && first.row(2)[32] == 43.0f + 98.0f * 0.125f
+    owner.reset();
+    arena_check(first.row(2)[32] == 43.0f + 98.0f * 0.125f
                     && std::equal(second.values().begin(), second.values().end(), second_snapshot.values().begin()),
-                "clearing a workspace invalidated its already published full logits");
+                "destroying a workspace invalidated its already published full logits");
 }
 
 static void test_model_shape_growth(uint32_t device_index)

@@ -473,7 +473,6 @@ public:
         if (d->attention_norm)
         {
             if (!d->attention_norm->record(input, normalized_attention, command)) return fail("cannot record pre-attention RMSNorm");
-            storage.push_back(normalized_attention);
             ++ffn_statistics.dispatches;
         }
         else
@@ -483,7 +482,6 @@ public:
         {
             branch.create(d->hidden, static_cast<int>(positions.size()), sizeof(float), d->context->blob_allocator());
             if (branch.empty()) return fail("cannot allocate Vulkan Attention branch");
-            storage.push_back(branch);
         }
         // Group adjacent rows from one cache. Prefill retains native multi-row
         // kernels; independent Session rows are all recorded into this command.
@@ -530,11 +528,11 @@ public:
                 qsa_work.push_back(std::make_unique<QsaAttentionWork_vulkan>());
                 if (!d->qsa->record_forward(source, *caches[first], positions[first], output, command, *qsa_work.back())) return fail("QSA device recording failed");
             }
-            storage.push_back(output);
             if (first == 0 && count == positions.size())
                 branch = output;
             else
             {
+                storage.push_back(output);
                 ncnn::VkMat destination = row_view(branch, first, count);
                 const auto buffer = destination.buffer();
                 const auto offset = destination.buffer_offset();
@@ -619,7 +617,6 @@ public:
                     error = "cannot record final Vulkan RMSNorm";
                     return false;
                 }
-                storage.push_back(normalized);
                 if (d->lm_head.qnk)
                     recorded = d->lm_head.qnk->record_forward(normalized, output, command, storage);
                 else if (d->lm_head.float8)
@@ -634,7 +631,6 @@ public:
                 error = "cannot record resident Vulkan LM projection";
                 return false;
             }
-            storage.push_back(output);
             if (output.elempack != 1)
             {
                 ncnn::VkMat unpacked;
@@ -644,7 +640,7 @@ public:
                     error = "cannot unpack Vulkan logits";
                     return false;
                 }
-                storage.push_back(unpacked);
+                storage.push_back(output);
                 output = unpacked;
             }
             if (!host_output) host_output = std::make_shared<VulkanHostOutput>();
@@ -1147,31 +1143,22 @@ bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const Activati
             // original chunk fence, including Router IDs consumed below.
             if (!flush_before(layer_work[layer].experts)) return false;
             auto& command = *recording;
-            ncnn::VkMat combined;
-            if (!model.gpu_expert_banks[layer]->record(current.normalized, current.router_work.selected,
-                                                       options[layer].top_k, combined, validation, command, bank_storage))
-                return fail("cannot record resident indexed Expert bank");
-            bank_storage.push_back(combined);
             auto& target = *current.target;
+            ncnn::VkMat shared;
+            const ncnn::VkMat* shared_input = nullptr;
             if (target.shared)
             {
-                ncnn::VkMat shared;
                 if (!target.shared->record(current.normalized, shared, command, current.storage, current.ffn_statistics))
                     return fail("cannot record resident shared Expert");
                 current.storage.push_back(shared);
-                std::vector<ncnn::VkMat> added(1);
-                if (target.add->forward({combined, shared}, added, command, target.option) != 0 || added[0].empty())
-                    return fail("cannot record resident routed/shared addition");
-                current.storage.push_back(added[0]);
-                combined = added[0];
-                ++current.ffn_statistics.dispatches;
+                shared_input = &shared;
             }
-            std::vector<ncnn::VkMat> added(1);
-            if (target.add->forward({current.residual, combined}, added, command, target.option) != 0 || added[0].empty())
-                return fail("cannot record resident Expert residual");
-            hidden = added[0];
-            current.storage.push_back(hidden);
-            ++current.ffn_statistics.dispatches;
+            ncnn::VkMat combined;
+            if (!model.gpu_expert_banks[layer]->record(current.normalized, current.router_work.selected,
+                                                       options[layer].top_k, combined, validation, command, bank_storage,
+                                                       shared_input, &current.residual))
+                return fail("cannot record resident indexed Expert bank");
+            hidden = combined;
             budget.record(layer_work[layer].experts);
         }
         if (end == layers)
@@ -1276,8 +1263,8 @@ bool GpuSegment_vulkan::forward(const ActivationBuffer& initial_hidden, std::spa
         error = "invalid Vulkan segment inputs";
         return false;
     }
-    auto pending = std::shared_ptr<GpuSegmentContinuation_vulkan>(new GpuSegmentContinuation_vulkan);
-    auto& work = *pending->d;
+    GpuSegmentContinuation_vulkan pending;
+    auto& work = *pending.d;
     work.target = d;
     work.previous = *workspace.d;
     work.positions.assign(positions.begin(), positions.end());
@@ -1301,17 +1288,17 @@ bool GpuSegment_vulkan::forward(const ActivationBuffer& initial_hidden, std::spa
             error = work.error;
             return false;
         }
-        pending->mark_submit_attempted();
+        pending.mark_submit_attempted();
         if (submit_compute_and_wait(command, d->context->device()) != 0)
         {
             (void)command.reset();
-            pending->abort();
+            pending.abort();
             error = "Vulkan segment submit or fence wait failed";
             return false;
         }
-        pending->mark_completed();
+        pending.mark_completed();
     }
-    return pending->publish(routes, workspace, error);
+    return pending.publish(routes, workspace, error);
 #else
     (void)initial_hidden;
     (void)positions;
@@ -1419,8 +1406,8 @@ bool GpuSegment_vulkan::finish(bool produce_logits, bool last_row_only, Activati
         error = "Vulkan head has no compatible resident segment";
         return false;
     }
-    auto pending = std::shared_ptr<GpuSegmentContinuation_vulkan>(new GpuSegmentContinuation_vulkan);
-    auto& work = *pending->d;
+    GpuSegmentContinuation_vulkan pending;
+    auto& work = *pending.d;
     work.target = d;
     if (!workspace.d->host_output) workspace.d->host_output = std::make_shared<VulkanHostOutput>();
     work.host_output = workspace.d->host_output;
@@ -1445,17 +1432,17 @@ bool GpuSegment_vulkan::finish(bool produce_logits, bool last_row_only, Activati
             error = work.error;
             return false;
         }
-        pending->mark_submit_attempted();
+        pending.mark_submit_attempted();
         if (submit_compute_and_wait(command, d->context->device()) != 0)
         {
             (void)command.reset();
-            pending->abort();
+            pending.abort();
             error = "Vulkan head submit or fence wait failed";
             return false;
         }
-        pending->mark_completed();
+        pending.mark_completed();
     }
-    return pending->publish_head(logits, workspace, error);
+    return pending.publish_head(logits, workspace, error);
 #else
     (void)produce_logits;
     (void)last_row_only;

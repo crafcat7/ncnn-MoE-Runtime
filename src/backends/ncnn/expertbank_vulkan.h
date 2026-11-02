@@ -82,10 +82,6 @@ public:
     [[nodiscard]] const std::shared_ptr<VulkanContext>& context() const noexcept;
     [[nodiscard]] const ExpertBankPlan_vulkan& description() const noexcept;
     [[nodiscard]] uint64_t physical_size() const noexcept;
-    [[nodiscard]] uint32_t record_dispatches() const noexcept
-    { return 3; }
-    [[nodiscard]] uint64_t workspace_size(uint32_t rows, uint32_t top_k) const noexcept;
-    [[nodiscard]] static uint64_t workspace_size(const ExpertBankPlan_vulkan& plan, uint32_t rows, uint32_t top_k) noexcept;
 #if NCNN_MOE_WITH_VULKAN
     [[nodiscard]] const ncnn::Option& option() const noexcept;
     // Caller owns the command lock and retains bank, operands, output, and

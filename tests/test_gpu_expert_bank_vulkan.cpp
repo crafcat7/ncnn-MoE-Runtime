@@ -294,9 +294,8 @@ static std::shared_ptr<ExpertBank_vulkan> bank_create(const std::vector<BankExpe
     segment_check(static_cast<bool>(created), created ? "" : created.error().message);
     segment_check(callbacks == fixtures.size() && previous.expired(), "bank did not release its final host expert lease");
     segment_check(created.value()->physical_size() == planned.value().physical_size
-                      && created.value()->description().expert_count == fixtures.size()
-                      && created.value()->workspace_size(3, 4) == ExpertBank_vulkan::workspace_size(planned.value(), 3, 4),
-                  "bank allocation or workspace charge differs from its metadata-only plan");
+                      && created.value()->description().expert_count == fixtures.size(),
+                  "bank allocation differs from its metadata-only plan");
     return created.value();
 }
 

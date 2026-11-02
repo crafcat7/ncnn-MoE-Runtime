@@ -31,7 +31,7 @@ ncnn::VkBufferMemory* VulkanGraphAllocator::fastMalloc(size_t size)
 
 void VulkanGraphAllocator::fastFree(ncnn::VkBufferMemory* buffer)
 {
-    const std::lock_guard<std::mutex> lock(mutex);
+    // The pool serializes frees; graph reservation state is untouched.
     pool->fastFree(buffer);
 }
 

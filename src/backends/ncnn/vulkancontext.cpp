@@ -426,12 +426,6 @@ uint64_t VulkanHostOutput::allocated_bytes() const noexcept
     return size;
 }
 
-void VulkanHostOutput::clear() noexcept
-{
-    for (auto& slot : slots) slot.reset();
-    slot_capacity = 0;
-}
-
 bool copy_staging_to_cpu_batches(ncnn::VkMat& staging,
                                  std::span<const ActivationBuffer*> inputs,
                                  std::span<ActivationBuffer*> outputs,
@@ -767,8 +761,6 @@ VulkanStatistics get_vulkan_statistics(const VulkanRuntimePtr& vulkan_runtime) n
     result.rms_norm_linear_fusions = state.rms_norm_linear_fusions.load();
     result.kv_ring_appends = state.kv_ring_appends.load();
     result.bfloat16_cooperative_matrix_dispatches = state.bfloat16_cooperative_matrix_dispatches.load();
-    result.command_graph_submissions = state.command_graph_submissions.load();
-    result.command_graph_operations = state.command_graph_operations.load();
     result.kv_ring_resizes = state.kv_ring_resizes.load();
     result.kv_ring_wrapped_views = state.kv_ring_wrapped_views.load();
     return result;
@@ -848,7 +840,13 @@ int VulkanComputeBatch::wait() noexcept
 {
     while (completed < submitted)
     {
-        const int result = wait_submitted_compute(*context.ordered_commands[completed], context.device(), queue);
+        auto& command = *context.ordered_commands[completed];
+        int result = wait_submitted_compute(command, context.device(), queue);
+        if (result == 0)
+        {
+            // Reset this command after its fence completes, while later queue work may still run.
+            result = command.reset();
+        }
         if (result != 0) completion_error = result;
         ++completed;
     }
@@ -858,7 +856,7 @@ int VulkanComputeBatch::wait() noexcept
 int VulkanComputeBatch::reset() noexcept
 {
     int result = wait();
-    for (size_t i = 0; i < recorded; ++i)
+    for (size_t i = submitted; i < recorded; ++i)
         if (context.ordered_commands[i]->reset() != 0) result = -1;
     recorded = submitted = completed = 0;
     completion_error = result;

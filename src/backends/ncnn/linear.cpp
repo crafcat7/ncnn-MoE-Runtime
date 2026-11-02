@@ -280,7 +280,7 @@ public:
     std::unique_ptr<VulkanTransferLease> transfer_lease;
     std::vector<ncnn::VkMat> upload_staging;
     std::vector<PendingDownload> pending_downloads;
-    uint64_t recorded_operations = 0;
+    bool recorded = false;
     bool submitted = false;
     bool completed = false;
 #endif
@@ -497,7 +497,7 @@ bool CommandGraph_vulkan::upload(const ActivationBuffer& input,
     tensor->columns = input.columns();
     output.d = std::move(tensor);
     d->upload_staging.push_back(std::move(staging));
-    ++d->recorded_operations;
+    d->recorded = true;
     return true;
 #else
     (void)input;
@@ -570,7 +570,7 @@ bool CommandGraph_vulkan::linear(const Linear& op,
     tensor->rows = input.rows();
     tensor->columns = op.output_columns();
     output.d = std::move(tensor);
-    ++d->recorded_operations;
+    d->recorded = true;
     return true;
 #else
     (void)op;
@@ -637,7 +637,7 @@ bool CommandGraph_vulkan::submit()
 {
 #if NCNN_MOE_USE_NCNN && NCNN_MOE_WITH_VULKAN
     if (!d || d->submitted || d->state->failed
-        || (d->recorded_operations == 0 && d->pending_downloads.empty())
+        || (!d->recorded && d->pending_downloads.empty())
         || !d->context || !d->transfer_lease)
     {
         return false;
@@ -657,8 +657,6 @@ bool CommandGraph_vulkan::submit()
     ++runtime_state.compute_submissions;
     runtime_state.batch_uploads += d->upload_staging.size();
     runtime_state.batch_downloads += d->pending_downloads.size();
-    ++runtime_state.command_graph_submissions;
-    runtime_state.command_graph_operations += d->recorded_operations;
     return true;
 #else
     return false;

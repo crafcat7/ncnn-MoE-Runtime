@@ -65,7 +65,6 @@ public:
     [[nodiscard]] bool complete() const noexcept;
     [[nodiscard]] size_t rows() const noexcept;
     [[nodiscard]] uint32_t columns() const noexcept;
-    [[nodiscard]] size_t expert_count() const noexcept;
     // Recording does not publish counters. Only a completed final wave exposes
     // its actual Combine dispatch count to the submission owner.
     [[nodiscard]] uint64_t pending_combine_dispatches() const noexcept;

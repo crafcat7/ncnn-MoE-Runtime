@@ -1297,12 +1297,6 @@ void test_linear_operator()
                                 == 1));
         check(static_cast<bool>(graph_after.batch_uploads - graph_before.batch_uploads == 1));
         check(static_cast<bool>(graph_after.batch_downloads - graph_before.batch_downloads == 2));
-        check(static_cast<bool>(graph_after.command_graph_submissions
-                                    - graph_before.command_graph_submissions
-                                == 1));
-        check(static_cast<bool>(graph_after.command_graph_operations
-                                    - graph_before.command_graph_operations
-                                == 4));
 
         ActivationBuffer typed_input(input.rows(), input.columns(), DType::BFloat16);
         for (size_t row = 0; row < input.rows(); ++row)

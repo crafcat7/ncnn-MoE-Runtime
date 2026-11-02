@@ -147,15 +147,6 @@ uint32_t ResidentFfnRegion_vulkan::columns() const noexcept
     return d->input_columns;
 }
 
-size_t ResidentFfnRegion_vulkan::expert_count() const noexcept
-{
-#if NCNN_MOE_WITH_VULKAN
-    return d->slots.size();
-#else
-    return 0;
-#endif
-}
-
 uint64_t ResidentFfnRegion_vulkan::pending_combine_dispatches() const noexcept
 {
     return d->pending_combine_dispatches;

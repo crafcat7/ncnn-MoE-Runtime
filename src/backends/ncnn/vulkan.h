@@ -59,8 +59,6 @@ struct VulkanStatistics
     uint64_t resident_graph_activation_upload_bytes = 0;
     uint64_t resident_graph_activation_download_bytes = 0;
     uint64_t resident_graph_route_download_bytes = 0;
-    uint64_t command_graph_submissions = 0;
-    uint64_t command_graph_operations = 0;
     uint64_t attention_qkv_rope_fusions = 0;
     uint64_t attention_device_rope_fusions = 0;
     uint64_t attention_qkv_ring_fusions = 0;
