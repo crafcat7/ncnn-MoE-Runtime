@@ -208,13 +208,6 @@ public:
     [[nodiscard]] bool record_rms_norm_chain(const ncnn::VkMat& input,
                                              ncnn::VkMat& output,
                                              ncnn::VkCompute& command) const;
-    [[nodiscard]] bool record_swiglu_chain(const ncnn::VkMat& input,
-                                           const Bfloat16Linear_vulkan& down,
-                                           uint32_t intermediate_columns, ExpertActivation activation,
-                                           float activation_limit, bool apply_router_gate,
-                                           ncnn::VkMat& output, ncnn::VkCompute& command,
-                                           std::vector<ncnn::VkMat>& workspace,
-                                           FfnRecordStatistics_vulkan& statistics) const;
     // Caller owns the command, holds the context lock and retains workspace until submission.
     [[nodiscard]] bool record_input_normalization(const ncnn::VkMat& input, ncnn::VkMat& output, ncnn::VkCompute& cmd) const;
     [[nodiscard]] bool record_rms_norm_chain_parallel(const ncnn::VkMat& input,
@@ -237,6 +230,18 @@ private:
     friend class SharedFfn_vulkan;
     friend class GpuSegment_vulkan;
     friend class GpuSegmentContinuation_vulkan;
+
+#if NCNN_MOE_WITH_VULKAN
+    // Internal record-only path: caller owns submission, operand/workspace
+    // lifetime, and publication of the collected statistics after completion.
+    [[nodiscard]] bool record_swiglu_chain(const ncnn::VkMat& input,
+                                           const Bfloat16Linear_vulkan& down,
+                                           uint32_t intermediate_columns, ExpertActivation activation,
+                                           float activation_limit, bool apply_router_gate,
+                                           ncnn::VkMat& output, ncnn::VkCompute& command,
+                                           std::vector<ncnn::VkMat>& workspace,
+                                           FfnRecordStatistics_vulkan& statistics) const;
+#endif
 
     // Caller provides allocated outputs and holds the context lock; scalar uses readonly bindings.
     void record_scalar_projection(const ncnn::VkMat& input,
@@ -368,12 +373,6 @@ public:
                                                    DeviceTensor_vulkan& output) const;
 
 #if NCNN_MOE_WITH_VULKAN
-    [[nodiscard]] bool record_swiglu_chain(const ncnn::VkMat& input,
-                                           const Float8Linear_vulkan& up, const Float8Linear_vulkan& down,
-                                           ExpertActivation activation, float activation_limit,
-                                           ncnn::VkMat& output, ncnn::VkCompute& command,
-                                           std::vector<ncnn::VkMat>& workspace,
-                                           FfnRecordStatistics_vulkan& statistics) const;
     // Internal recording bridge; caller owns the command and holds the context lock.
     [[nodiscard]] bool record_input_normalization(const ncnn::VkMat& input,
                                                   ncnn::VkMat& output,
@@ -397,6 +396,18 @@ private:
     friend class LatentAttention_vulkan;
     friend class LayerHead_vulkan;
     friend class SharedFfn_vulkan;
+
+#if NCNN_MOE_WITH_VULKAN
+    // Internal record-only path: caller owns submission, operand/workspace
+    // lifetime, and publication of the collected statistics after completion.
+    [[nodiscard]] bool record_swiglu_chain(const ncnn::VkMat& input,
+                                           const Float8Linear_vulkan& up, const Float8Linear_vulkan& down,
+                                           ExpertActivation activation, float activation_limit,
+                                           ncnn::VkMat& output, ncnn::VkCompute& command,
+                                           std::vector<ncnn::VkMat>& workspace,
+                                           FfnRecordStatistics_vulkan& statistics) const;
+#endif
+
     [[nodiscard]] const std::shared_ptr<VulkanContext>& vulkan_context() const noexcept;
     [[nodiscard]] const ncnn::Option& option() const noexcept;
     [[nodiscard]] uint32_t input_columns() const noexcept;

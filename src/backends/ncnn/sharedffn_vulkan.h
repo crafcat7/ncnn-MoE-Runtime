@@ -33,8 +33,6 @@ public:
     [[nodiscard]] static std::shared_ptr<SharedFfn_vulkan> create(const CompiledModel& model,
                                                                   const MoeBlockPlan& moe);
     [[nodiscard]] const std::shared_ptr<VulkanContext>& context() const noexcept;
-    [[nodiscard]] uint32_t input_columns() const noexcept;
-    [[nodiscard]] uint32_t output_columns() const noexcept;
 #if NCNN_MOE_WITH_VULKAN
     // Caller holds the context lock and retains input/output/workspace and
     // this adapter until completion or command reset. Never submits or waits.

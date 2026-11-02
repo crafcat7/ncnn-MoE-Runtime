@@ -678,12 +678,6 @@ Result<void> forward_model(const CompiledModel& model,
             {
                 if (node->backend != ExecutionBackend::Vulkan)
                     return Error{ErrorCode::InternalError, "resident graph segment has a non-Vulkan Attention node"};
-                auto& positions = state.attention_positions;
-                auto& caches = state.attention_caches;
-                positions.resize(input_ids.size());
-                caches.assign(input_ids.size(), &state.layers[layer.layer_id]);
-                for (size_t row = 0; row < positions.size(); ++row) positions[row] = position_offset + row;
-                auto options = latent_router_options(model, moe, input_ids, state.expert_scratch.explicit_expert_ids);
                 std::string error;
                 if (pending_continuation)
                 {
@@ -694,8 +688,17 @@ Result<void> forward_model(const CompiledModel& model,
                     continuation_region.reset();
                     continuation_target = invalid_execution_node_id;
                 }
-                else if (!segment->forward(hidden, positions, caches, options, layer_state.dispatch_plan, state.gpu_segment, error))
-                    return Error{ErrorCode::InternalError, "resident Vulkan segment at layer " + std::to_string(layer.layer_id) + " failed: " + error};
+                else
+                {
+                    auto& positions = state.attention_positions;
+                    auto& caches = state.attention_caches;
+                    positions.resize(input_ids.size());
+                    caches.assign(input_ids.size(), &state.layers[layer.layer_id]);
+                    for (size_t row = 0; row < positions.size(); ++row) positions[row] = position_offset + row;
+                    auto options = latent_router_options(model, moe, input_ids, state.expert_scratch.explicit_expert_ids);
+                    if (!segment->forward(hidden, positions, caches, options, layer_state.dispatch_plan, state.gpu_segment, error))
+                        return Error{ErrorCode::InternalError, "resident Vulkan segment at layer " + std::to_string(layer.layer_id) + " failed: " + error};
+                }
                 layer_state.normalized.reset(input_ids.size(), model.descriptor.hidden_size, false);
                 layer_state.normalized_device = state.gpu_segment.device_input();
                 layer_state.gpu_segment = true;
@@ -1848,19 +1851,9 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             {
                 if (node->backend != ExecutionBackend::Vulkan)
                     return Error{ErrorCode::InternalError, "resident staged segment has a non-Vulkan Attention node"};
-                auto& positions = workspace.staged_attention_positions;
-                auto& caches = workspace.staged_attention_caches;
-                positions.resize(session_count);
-                caches.resize(session_count);
-                for (size_t row = 0; row < session_count; ++row)
-                {
-                    positions[row] = entries[row].position_offset;
-                    caches[row] = &entries[row].state->layers[layer.layer_id];
-                }
                 auto& initial_hidden = batch_scratch.staged_merged;
                 if (!workspace.gpu_segment.active() && !merge_hidden_rows(initial_hidden))
                     return Error{ErrorCode::InternalError, "cannot merge resident staged segment input"};
-                auto options = latent_router_options(model, moe, workspace.staged_input_ids, batch_scratch.explicit_expert_ids);
                 std::string error;
                 if (pending_continuation)
                 {
@@ -1871,8 +1864,21 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                     continuation_region.reset();
                     continuation_target = invalid_execution_node_id;
                 }
-                else if (!segment->forward(initial_hidden, positions, caches, options, fused_routes, workspace.gpu_segment, error))
-                    return Error{ErrorCode::InternalError, "resident staged Vulkan segment at layer " + std::to_string(layer.layer_id) + " failed: " + error};
+                else
+                {
+                    auto& positions = workspace.staged_attention_positions;
+                    auto& caches = workspace.staged_attention_caches;
+                    positions.resize(session_count);
+                    caches.resize(session_count);
+                    for (size_t row = 0; row < session_count; ++row)
+                    {
+                        positions[row] = entries[row].position_offset;
+                        caches[row] = &entries[row].state->layers[layer.layer_id];
+                    }
+                    auto options = latent_router_options(model, moe, workspace.staged_input_ids, batch_scratch.explicit_expert_ids);
+                    if (!segment->forward(initial_hidden, positions, caches, options, fused_routes, workspace.gpu_segment, error))
+                        return Error{ErrorCode::InternalError, "resident staged Vulkan segment at layer " + std::to_string(layer.layer_id) + " failed: " + error};
+                }
                 workspace.staged_state.normalized.reset(session_count, model.descriptor.hidden_size, false);
                 for (size_t row = 0; row < session_count; ++row)
                 {

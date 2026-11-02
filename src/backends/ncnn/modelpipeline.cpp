@@ -29,7 +29,6 @@
 
 #include <algorithm>
 #include <array>
-#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -1879,7 +1878,7 @@ static uint64_t minimum_gpu_expert_reserve(const CompiledModel& compiled, uint32
     return saturating_multiply_u64(required, std::max(1u, compiled.opt.num_concurrent_sessions));
 }
 
-static Result<void> prepare_gated_residual_pipeline(CompiledModel& compiled, const CompilerOption& opt)
+static Result<void> prepare_gated_residual_pipeline(CompiledModel& compiled)
 {
     for (TensorHandle handle = 0; handle < compiled.weights.size(); ++handle)
         if (compiled.weights.at(handle).dtype == DType::Float8E4M3)
@@ -2095,11 +2094,12 @@ const GpuResourcePlan* ResourcePlanner::find(uint32_t device) const
 
 // Backend products are published as a complete group. A failed creation or a
 // driver-budget change must preserve both the CPU weights and earlier groups.
+template <typename Prepare, typename Supported>
 static Result<bool> prepare_resource_group(CompiledModel& model, ResourcePlanner& resources,
                                            uint32_t device, GpuResourceRequest request,
                                            CompiledLayerPlan* layer, const std::string& operation,
-                                           const std::function<Result<void>()>& prepare,
-                                           const std::function<bool()>& supported)
+                                           const Prepare& prepare,
+                                           const Supported& supported)
 {
     // Zero denotes a capability decision made before selecting a GPU product.
     // Once a supported product is selected, allocation failure is an error.
@@ -2344,7 +2344,7 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
             return Error{ErrorCode::InvalidArgument, "gated residual Vulkan persistent weights and minimum working set exceed the GPU heap budget on device " + std::to_string(device)};
         const auto previous_operators = compiled.operators;
         const auto previous_layers = compiled.graph.layer_plans;
-        auto prepared = prepare_gated_residual_pipeline(compiled, opt);
+        auto prepared = prepare_gated_residual_pipeline(compiled);
         if (!prepared || !resources.allocation_fits(device, request))
         {
             compiled.gated_residual_device_head.reset();
@@ -2486,8 +2486,7 @@ static uint32_t graph_node_device(const CompiledModel& model, const ExecutionGra
 static bool graph_has_expert_banks(const CompiledModel& model, const ExecutionGraph& graph)
 {
     return &graph == &model.graph && model.bank_submission_rows != 0
-           && !graph.layer_plans.empty() && model.gpu_expert_bank_plans.size() == graph.layer_plans.size()
-           && std::all_of(model.gpu_expert_bank_plans.begin(), model.gpu_expert_bank_plans.end(), [](const auto& plan) { return plan.has_value(); });
+           && !graph.layer_plans.empty() && model.gpu_expert_bank_plans.size() == graph.layer_plans.size();
 }
 
 static uint64_t graph_tensor_elements(const CompiledModel& model, const ExecutionGraph& graph,
@@ -2755,7 +2754,7 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
         const bool shared = node.type == ExecutionNodeType::SharedExpertGroup;
         if (routed && graph_has_expert_banks(model, graph))
         {
-            const ExpertBankPlan_vulkan& bank = *model.gpu_expert_bank_plans[node.layer_plan_index];
+            const ExpertBankPlan_vulkan& bank = model.gpu_expert_bank_plans[node.layer_plan_index];
             const uint64_t routes = saturating_multiply_u64(rows, layer.moe.top_k);
             // The token-major aggregate is folded into the final Combine
             // output; only route-major activated gate/up and down results

@@ -98,14 +98,6 @@ const std::shared_ptr<VulkanContext>& SharedFfn_vulkan::context() const noexcept
 {
     return d->context;
 }
-uint32_t SharedFfn_vulkan::input_columns() const noexcept
-{
-    return d->input_columns;
-}
-uint32_t SharedFfn_vulkan::output_columns() const noexcept
-{
-    return d->output_columns;
-}
 
 #if NCNN_MOE_WITH_VULKAN
 bool SharedFfn_vulkan::record(const ncnn::VkMat& normalized, ncnn::VkMat& output,

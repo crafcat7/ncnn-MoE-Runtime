@@ -16,7 +16,6 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
-#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -121,7 +120,7 @@ struct CompiledModel
     std::shared_ptr<GpuSegment_vulkan> gpu_head;
     // Full-resident selection is model-wide. Metadata is published before
     // arena planning; executable banks are published only after all uploads.
-    std::vector<std::optional<ExpertBankPlan_vulkan>> gpu_expert_bank_plans;
+    std::vector<ExpertBankPlan_vulkan> gpu_expert_bank_plans;
     std::vector<std::shared_ptr<ExpertBank_vulkan>> gpu_expert_banks;
     uint32_t bank_submission_rows = 0;
     uint64_t gpu_expert_bank_size = 0;

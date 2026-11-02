@@ -38,11 +38,11 @@ static std::map<uint32_t, GpuResourceRequest> graph_resource_requests(const Mode
 }
 
 static Result<void> allocate_graph_resources(const CompiledModel& model,
-                                             const ModelGraphMemoryPlan& graph,
+                                             const std::map<uint32_t, GpuResourceRequest>& requests,
+                                             uint32_t sessions,
                                              std::vector<GpuResourcePlan>* initial_resources)
 {
-    const uint32_t sessions = std::max({1u, model.opt.num_concurrent_sessions, graph.sequence_count});
-    for (const auto& [device, request] : graph_resource_requests(graph, sessions))
+    for (const auto& [device, request] : requests)
     {
         if (request.session_state_size > std::numeric_limits<uint64_t>::max() - request.workspace_size
             || request.session_state_size + request.workspace_size > std::numeric_limits<uint64_t>::max() / sessions)
@@ -78,7 +78,8 @@ Result<void> prepare_model_graph_resources(CompiledModel& model, uint32_t prefil
     if (!plan)
         return plan.error();
     auto resources = std::make_shared<GraphResources>();
-    for (const auto& [device, request] : graph_resource_requests(plan.value(), sessions))
+    const auto requests = graph_resource_requests(plan.value(), sessions);
+    for (const auto& [device, request] : requests)
     {
         if (request.workspace_size == 0 && request.session_state_size == 0)
             continue;
@@ -87,7 +88,7 @@ Result<void> prepare_model_graph_resources(CompiledModel& model, uint32_t prefil
             return Error{ErrorCode::InternalError, "cannot create the planned GPU graph resource domain"};
         resources->contexts.push_back(std::move(context));
     }
-    auto allocated = allocate_graph_resources(model, plan.value(), &model.memory_plan.gpu_devices);
+    auto allocated = allocate_graph_resources(model, requests, sessions, &model.memory_plan.gpu_devices);
     if (!allocated)
         return allocated.error();
     resources->plan = std::move(plan).value();
@@ -210,7 +211,7 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
         const auto context = model.gpu_head->context();
         const uint32_t device = model.graph.layer_plans.front().vulkan_device_index;
         uint64_t total = 0, lease_capacity = 1;
-        std::vector<std::optional<ExpertBankPlan_vulkan>> plans;
+        std::vector<ExpertBankPlan_vulkan> plans;
         bool supported = true;
         for (const CompiledLayerPlan& layer : model.graph.layer_plans)
         {
@@ -297,7 +298,7 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
                 for (size_t index = 0; index < model.graph.layer_plans.size(); ++index)
                 {
                     const auto& layer = model.graph.layer_plans[index];
-                    auto bank = ExpertBank_vulkan::create(*model.gpu_expert_bank_plans[index], context, [&](uint32_t expert) {
+                    auto bank = ExpertBank_vulkan::create(model.gpu_expert_bank_plans[index], context, [&](uint32_t expert) {
                         return load_bank_expert(model, layer.moe.experts.at(expert), cache);
                     });
                     if (!bank)
@@ -370,7 +371,9 @@ Result<uint64_t> ensure_model_graph_resources(const CompiledModel& model, uint64
     // each workspace's already-admitted slot capacity until model teardown.
     plan.value().host_output_slot_size = std::max(plan.value().host_output_slot_size, resources.plan.host_output_slot_size);
     plan.value().host_output_workspace_size = std::max(plan.value().host_output_workspace_size, resources.plan.host_output_workspace_size);
-    auto allocated = allocate_graph_resources(model, plan.value(), nullptr);
+    const uint32_t sessions = std::max({1u, model.opt.num_concurrent_sessions, plan.value().sequence_count});
+    const auto requests = graph_resource_requests(plan.value(), sessions);
+    auto allocated = allocate_graph_resources(model, requests, sessions, nullptr);
     if (!allocated)
         return allocated.error();
     resources.plan = std::move(plan).value();
