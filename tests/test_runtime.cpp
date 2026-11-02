@@ -19817,6 +19817,30 @@ void test_sampling_and_streaming_generation()
     check(static_cast<bool>(default_after_filter));
     check_near(default_after_filter.value().probability, 1.0f / 3.0f, 1e-6f);
 
+    std::vector<float> wide_logits(33, -infinity);
+    wide_logits[0] = 1.0f;
+    wide_logits[1] = nan;
+    wide_logits[16] = 2.0f;
+    wide_logits[17] = infinity;
+    wide_logits[32] = 3.0f;
+    const float wide_normalizer = std::exp(-2.0f) + std::exp(-1.0f) + 1.0f;
+    const auto check_wide_sample = [&wide_logits, &wide_normalizer](const Result<SampledToken>& sampled) {
+        check(static_cast<bool>(sampled));
+        if (!sampled)
+            return;
+        const int32_t token_id = sampled.value().token_id;
+        check(token_id == 0 || token_id == 16 || token_id == 32);
+        const float weight = std::exp(wide_logits[token_id] - 3.0f);
+        check_near(sampled.value().probability, weight / wide_normalizer, weight / wide_normalizer * 1e-3f + 1e-6f);
+    };
+    check_wide_sample(session.value()->sample(wide_logits));
+    SamplingOptions wide_top_k_options;
+    wide_top_k_options.top_k = 2;
+    const auto wide_filtered = session.value()->sample(wide_logits, wide_top_k_options);
+    check(static_cast<bool>(wide_filtered));
+    check(wide_filtered.value().token_id == 16 || wide_filtered.value().token_id == 32);
+    check_wide_sample(session.value()->sample(wide_logits));
+
     logits = {-10.0f, 10.0f, 9.0f, 8.0f, 7.0f, 6.0f};
     SamplingOptions bounded_options;
     bounded_options.top_k = 2;

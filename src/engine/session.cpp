@@ -28,10 +28,11 @@ namespace moe {
 
 [[nodiscard]] static Result<void> validate_sampling_options(const SamplingOptions& opt);
 
-[[nodiscard]] static Result<void> sampling_distribution_into(std::span<const float> logits,
-                                                             const SamplingOptions& opt,
-                                                             std::vector<SampledToken>& candidates,
-                                                             std::vector<int32_t>& token_ids);
+[[nodiscard]] static Result<float> sampling_distribution_into(std::span<const float> logits,
+                                                              const SamplingOptions& opt,
+                                                              std::vector<SampledToken>& candidates,
+                                                              std::vector<int32_t>& token_ids,
+                                                              std::vector<float>& exp_values);
 
 [[nodiscard]] static float candidate_probability(std::span<const SampledToken> candidates,
                                                  int32_t token_id) noexcept;
@@ -665,11 +666,13 @@ Result<GenerationResult> Session::generate_speculative(const GenerationOptions& 
                     auto target_distribution = sampling_distribution_into(target_row,
                                                                           opt.sampling,
                                                                           sampling_candidates[0],
-                                                                          sampling_token_ids);
+                                                                          sampling_token_ids,
+                                                                          sampling_residual);
                     auto draft_distribution = sampling_distribution_into(proposal.logits[accepted].values(),
                                                                          opt.sampling,
                                                                          sampling_candidates[1],
-                                                                         sampling_token_ids);
+                                                                         sampling_token_ids,
+                                                                         sampling_residual);
                     if (!target_distribution || !draft_distribution)
                     {
                         auto rolled_back = finish_cache(state->layers,
@@ -680,6 +683,12 @@ Result<GenerationResult> Session::generate_speculative(const GenerationOptions& 
                                    ? target_distribution.error()
                                    : draft_distribution.error();
                     }
+                    const float target_normalizer = target_distribution.value();
+                    for (SampledToken& candidate : sampling_candidates[0])
+                        candidate.probability /= target_normalizer;
+                    const float draft_normalizer = draft_distribution.value();
+                    for (SampledToken& candidate : sampling_candidates[1])
+                        candidate.probability /= draft_normalizer;
                     const int32_t token_id = proposal.token_ids[accepted];
                     const float target_probability = candidate_probability(sampling_candidates[0],
                                                                            token_id);
@@ -844,10 +853,12 @@ static Result<void> validate_sampling_options(const SamplingOptions& opt)
     return {};
 }
 
-static Result<void> sampling_distribution_into(std::span<const float> logits,
-                                               const SamplingOptions& opt,
-                                               std::vector<SampledToken>& candidates,
-                                               std::vector<int32_t>& token_ids)
+// Return the final sum so ordinary sampling can normalize only the scanned prefix.
+static Result<float> sampling_distribution_into(std::span<const float> logits,
+                                                const SamplingOptions& opt,
+                                                std::vector<SampledToken>& candidates,
+                                                std::vector<int32_t>& token_ids,
+                                                std::vector<float>& exp_values)
 {
     candidates.clear();
 
@@ -901,8 +912,29 @@ static Result<void> sampling_distribution_into(std::span<const float> logits,
     }
 
     const size_t token_count = direct_ids ? logits.size() : token_ids.size();
+    exp_values.resize(token_count);
     candidates.reserve(token_count);
     const float maximum = maximum_logit / opt.temperature;
+    for (size_t token_index = 0; token_index < token_count; ++token_index)
+    {
+        const int32_t token_id = direct_ids ? static_cast<int32_t>(token_index)
+                                            : token_ids[token_index];
+        const float logit = logits[token_id];
+        exp_values[token_index] = std::isfinite(logit)
+                                      ? logit / opt.temperature - maximum
+                                      : 0.0f;
+    }
+    const size_t max_exp_count = static_cast<size_t>(std::numeric_limits<uint32_t>::max() - 16u);
+    for (size_t offset = 0; offset < exp_values.size();)
+    {
+        const size_t count = std::min(exp_values.size() - offset,
+                                      max_exp_count);
+        // Leave room for the 16-wide kernel's index + width checks.
+        float_exp_inplace(exp_values.data() + offset,
+                          static_cast<uint32_t>(count));
+        offset += count;
+    }
+
     float normalizer = 0.0f;
     for (size_t token_index = 0; token_index < token_count; ++token_index)
     {
@@ -911,7 +943,7 @@ static Result<void> sampling_distribution_into(std::span<const float> logits,
         const float logit = logits[token_id];
         if (!std::isfinite(logit))
             continue;
-        const float probability = float_approximate_exp(logit / opt.temperature - maximum);
+        const float probability = exp_values[token_index];
         candidates.push_back(SampledToken{token_id, probability});
         normalizer += probability;
     }
@@ -954,9 +986,7 @@ static Result<void> sampling_distribution_into(std::span<const float> logits,
         normalizer += candidate.probability;
     if (!std::isfinite(normalizer) || normalizer <= 0.0f)
         return Error{ErrorCode::InvalidArgument, "sampling distribution is invalid"};
-    for (SampledToken& candidate : candidates)
-        candidate.probability /= normalizer;
-    return {};
+    return normalizer;
 }
 
 static float candidate_probability(std::span<const SampledToken> candidates,
@@ -1045,9 +1075,11 @@ Result<SampledToken> Session::sample_unlocked(std::span<const float> logits,
     auto distribution_result = sampling_distribution_into(logits,
                                                           opt,
                                                           sampling_candidates[0],
-                                                          sampling_token_ids);
+                                                          sampling_token_ids,
+                                                          sampling_residual);
     if (!distribution_result)
         return distribution_result.error();
+    const float normalizer = distribution_result.value();
     const std::vector<SampledToken>& candidates = sampling_candidates[0];
 
     if (candidates.size() == 1)
@@ -1058,12 +1090,14 @@ Result<SampledToken> Session::sample_unlocked(std::span<const float> logits,
     float cumulative_probability = 0.0f;
     for (const SampledToken& candidate : candidates)
     {
-        cumulative_probability += candidate.probability;
+        const float probability = candidate.probability / normalizer;
+        cumulative_probability += probability;
         if (sample_value < cumulative_probability)
-            return SampledToken{candidate.token_id, candidate.probability};
+            return SampledToken{candidate.token_id, probability};
     }
     const SampledToken& final_candidate = candidates.back();
-    return SampledToken{final_candidate.token_id, final_candidate.probability};
+    return SampledToken{final_candidate.token_id,
+                        final_candidate.probability / normalizer};
 }
 
 Result<SampledToken> Session::sample(std::span<const float> logits, const SamplingOptions& opt)
