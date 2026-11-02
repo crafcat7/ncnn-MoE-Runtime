@@ -9,6 +9,8 @@ namespace moe {
 
 float avx2_float_dot(const float* left, const float* right, uint32_t count) noexcept;
 float avx512_float_dot(const float* left, const float* right, uint32_t count) noexcept;
+size_t avx2_float_argmax(const float* values, size_t count) noexcept;
+size_t avx512_float_argmax(const float* values, size_t count) noexcept;
 void avx2_float_gemm_4x4(const float* weights,
                          size_t weight_stride,
                          const float* input,

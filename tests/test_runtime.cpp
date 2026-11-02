@@ -19745,10 +19745,68 @@ void test_sampling_and_streaming_generation()
     check(static_cast<bool>(greedy));
     check(static_cast<bool>(greedy.value().token_id == 0));
 
+    const float infinity = std::numeric_limits<float>::infinity();
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    std::vector<float> tie_across_8(18, -2.0f);
+    tie_across_8[7] = 9.0f;
+    tie_across_8[8] = 9.0f;
+    tie_across_8[17] = 9.0f;
+    std::vector<float> tie_across_16(33, -2.0f);
+    tie_across_16[15] = 11.0f;
+    tie_across_16[16] = 11.0f;
+    tie_across_16[32] = 11.0f;
+    std::vector<float> nonfinite_and_tail_tie(19, -infinity);
+    nonfinite_and_tail_tie[0] = nan;
+    nonfinite_and_tail_tie[7] = infinity;
+    nonfinite_and_tail_tie[8] = 5.0f;
+    nonfinite_and_tail_tie[17] = 5.0f;
+    std::vector<float> signed_zero_tie(17, 0.0f);
+    signed_zero_tie[0] = -0.0f;
+    signed_zero_tie[8] = -0.0f;
+    signed_zero_tie[16] = -0.0f;
+    const float denormal = std::numeric_limits<float>::denorm_min();
+    std::vector<float> subnormal_tie(17, -1.0f);
+    subnormal_tie[0] = -denormal;
+    subnormal_tie[7] = denormal;
+    subnormal_tie[8] = denormal;
+    subnormal_tie[16] = denormal;
+    struct GreedyCase
+    {
+        const std::vector<float>& logits;
+        int32_t token_id;
+    };
+    const std::array<GreedyCase, 5> greedy_cases = {{
+        {tie_across_8, 7},
+        {tie_across_16, 15},
+        {nonfinite_and_tail_tie, 8},
+        {signed_zero_tie, 0},
+        {subnormal_tie, 7},
+    }};
+    for (const GreedyCase& test_case : greedy_cases)
+    {
+        const auto sampled = session.value()->sample(test_case.logits, greedy_options);
+        check(static_cast<bool>(sampled));
+        check(static_cast<bool>(sampled.value().token_id == test_case.token_id));
+        check_near(sampled.value().probability, 1.0f, 1e-6f);
+    }
+
     logits = {std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity()};
     greedy = session.value()->sample(logits, greedy_options);
     check(static_cast<bool>(!greedy));
     check(static_cast<bool>(greedy.error().code == ErrorCode::InvalidArgument));
+    std::vector<float> all_nonfinite(33, -infinity);
+    for (size_t index = 0; index < all_nonfinite.size(); ++index)
+    {
+        if (index % 3 == 0)
+            all_nonfinite[index] = nan;
+        else if (index % 3 == 1)
+            all_nonfinite[index] = infinity;
+        else
+            all_nonfinite[index] = -infinity;
+    }
+    const auto vector_invalid = session.value()->sample(all_nonfinite, greedy_options);
+    check(static_cast<bool>(!vector_invalid));
+    check(static_cast<bool>(vector_invalid.error().code == ErrorCode::InvalidArgument));
 
     logits = {1.0f, 2.0f, 3.0f};
     SamplingOptions top_k_options;

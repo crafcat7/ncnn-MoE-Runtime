@@ -7,6 +7,7 @@
 #include "kernels/fastmath.h"
 #include "kernels/latentattention.h"
 #include "kernels/statecache.h"
+#include "kernels/vector.h"
 
 #include <algorithm>
 #include <array>
@@ -1032,24 +1033,14 @@ Result<SampledToken> Session::sample_unlocked(std::span<const float> logits,
         return valid_options.error();
     if (opt.temperature == 0.0f)
     {
-        int32_t selected_token = -1;
-        float selected_logit = -std::numeric_limits<float>::infinity();
-        for (size_t token_id = 0; token_id < logits.size(); ++token_id)
-        {
-            const float logit = logits[token_id];
-            if (!std::isfinite(logit))
-                continue;
-            if (selected_token < 0 || logit > selected_logit)
-            {
-                selected_token = static_cast<int32_t>(token_id);
-                selected_logit = logit;
-            }
-        }
-        if (selected_token < 0)
+        const size_t selected_token = float_argmax(logits.data(), logits.size());
+        if (selected_token == logits.size())
         {
             return Error{ErrorCode::InvalidArgument, "sampling requires at least one finite logit"};
         }
-        return SampledToken{selected_token, 1.0f};
+        if (selected_token > static_cast<size_t>(std::numeric_limits<int32_t>::max()))
+            return Error{ErrorCode::InvalidArgument, "sampling requires at least one finite logit"};
+        return SampledToken{static_cast<int32_t>(selected_token), 1.0f};
     }
     auto distribution_result = sampling_distribution_into(logits,
                                                           opt,

@@ -6,6 +6,7 @@
 #include <bit>
 #include <cmath>
 #include <immintrin.h>
+#include <limits>
 
 #if defined(__clang__)
 #pragma clang attribute push(__attribute__((target("avx512f,avx512bw,avx512vl"))), apply_to = function)
@@ -648,6 +649,51 @@ void avx512_bfloat16_weighted_scale(float* output, const float* input, const uin
         const float value = std::bit_cast<float>(static_cast<uint32_t>(weight[index]) << 16);
         output[index] = input[index] * scale * (value + weight_offset);
     }
+}
+
+size_t avx512_float_argmax(const float* values, size_t count) noexcept
+{
+    if (count == 0)
+        return 0;
+
+    const __m512 negative_infinity = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
+    __m512 maxima = negative_infinity;
+    size_t index = 0;
+    for (; count - index >= 16; index += 16)
+    {
+        const __m512 current = _mm512_loadu_ps(values + index);
+        const __m512i exponent = _mm512_and_si512(_mm512_castps_si512(current),
+                                                  _mm512_set1_epi32(0x7f800000));
+        const __mmask16 nonfinite = _mm512_cmpeq_epi32_mask(exponent,
+                                                            _mm512_set1_epi32(0x7f800000));
+        const __mmask16 finite = static_cast<__mmask16>(~nonfinite);
+        maxima = _mm512_max_ps(maxima,
+                               _mm512_mask_mov_ps(negative_infinity, finite, current));
+    }
+
+    float maximum = _mm512_reduce_max_ps(maxima);
+    for (; index < count; ++index)
+    {
+        const float current = values[index];
+        if (std::isfinite(current) && current > maximum)
+            maximum = current;
+    }
+    if (maximum == -std::numeric_limits<float>::infinity())
+        return count;
+
+    const __m512 target = _mm512_set1_ps(maximum);
+    index = 0;
+    for (; count - index >= 16; index += 16)
+    {
+        const __m512 current = _mm512_loadu_ps(values + index);
+        const unsigned lanes_equal = static_cast<unsigned>(_mm512_cmp_ps_mask(current, target, _CMP_EQ_OQ));
+        if (lanes_equal != 0)
+            return index + std::countr_zero(lanes_equal);
+    }
+    for (; index < count; ++index)
+        if (values[index] == maximum)
+            return index;
+    return count;
 }
 
 } // namespace moe
