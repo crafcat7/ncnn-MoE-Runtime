@@ -3,14 +3,24 @@
 #include "kernels/bfloat16.h"
 #include "kernels/ops.h"
 
+#if NCNN_MOE_WITH_VULKAN
+#include <layer.h>
+#include <layer_type.h>
+#include <paramdict.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace ncnn {
 namespace moe {
@@ -231,6 +241,125 @@ static void norm_case(const std::shared_ptr<VulkanContext>& context, const Vulka
                "RMSNorm did not release its externally allocated weight before allocator destruction");
 }
 
+static void norm_residual_add_case(const std::shared_ptr<VulkanContext>& context,
+                                   uint32_t columns, uint32_t rows, bool subgroup)
+{
+    TensorData weight;
+    weight.dtype = DType::Float32;
+    weight.shape = {columns};
+    for (uint32_t column = 0; column < columns; ++column)
+        weight.float32_data.push_back(0.8f + std::cos(static_cast<float>((column * 17) % 509) * 0.019f) * 0.6f);
+
+    constexpr float epsilon = 1e-5f;
+    constexpr float weight_offset = 0.25f;
+    const auto option = norm_option(context, subgroup);
+    auto reference_norm = RmsNorm_vulkan::create(weight, epsilon, weight_offset, context, option);
+    auto fused_norm = RmsNorm_vulkan::create(weight, epsilon, weight_offset, context, option, nullptr, true);
+    norm_check(reference_norm && fused_norm, "cannot create plain and fused RMSNorm pipelines");
+
+    auto* add_layer = ncnn::create_layer_vulkan(ncnn::LayerType::BinaryOp);
+    auto add = std::shared_ptr<ncnn::Layer>(add_layer, [context, option](ncnn::Layer* layer) {
+        if (!layer) return;
+        const std::lock_guard<std::mutex> lock(context->command_mutex());
+        layer->destroy_pipeline(option);
+        delete layer;
+    });
+    norm_check(static_cast<bool>(add), "cannot create Vulkan BinaryOp reference layer");
+    {
+        const std::lock_guard<std::mutex> lock(context->command_mutex());
+        add->vkdev = context->device();
+        ncnn::ParamDict parameters;
+        parameters.set(0, 0);
+        norm_check(add->load_param(parameters) == 0 && add->create_pipeline(option) == 0,
+                   "cannot prepare Vulkan BinaryOp reference layer");
+    }
+
+    ActivationBuffer input(rows, columns), branch(rows, columns);
+    for (uint32_t row = 0; row < rows; ++row)
+        for (uint32_t column = 0; column < columns; ++column)
+        {
+            input.row(row)[column] = std::sin(static_cast<float>((column * 29 + row * 31 + 5) % 1021) * 0.017f) * 0.7f;
+            branch.row(row)[column] = std::cos(static_cast<float>((column * 11 + row * 23 + 3) % 997) * 0.021f) * 0.4f;
+        }
+
+    ncnn::VkMat input_staging, branch_staging;
+    norm_check(fill_staging_upload(input, input_staging, context->staging_allocator())
+                   && fill_staging_upload(branch, branch_staging, context->staging_allocator()),
+               "RMSNorm residual test upload staging allocation failed");
+    ncnn::VkMat reference_residual_staging, reference_output_staging;
+    ncnn::VkMat fused_residual_staging, fused_output_staging;
+    norm_check(prepare_staging_batch(reference_residual_staging, rows, columns, context->staging_allocator())
+                   && prepare_staging_batch(reference_output_staging, rows, columns, context->staging_allocator())
+                   && prepare_staging_batch(fused_residual_staging, rows, columns, context->staging_allocator())
+                   && prepare_staging_batch(fused_output_staging, rows, columns, context->staging_allocator()),
+               "RMSNorm residual test download staging allocation failed");
+    ActivationBuffer reference_residual(rows, columns), reference_output(rows, columns);
+    ActivationBuffer fused_residual(rows, columns), fused_output(rows, columns);
+    {
+        const std::lock_guard<std::mutex> lock(context->command_mutex());
+        ncnn::VkCompute command(context->device());
+        ncnn::VkMat device_input, device_branch;
+        norm_check(record_prepared_staging_upload(input_staging, rows, device_input, command,
+                                                  context->device(), option)
+                       && record_prepared_staging_upload(branch_staging, rows, device_branch, command,
+                                                         context->device(), option),
+                   "RMSNorm residual test input upload recording failed");
+
+        std::vector<ncnn::VkMat> added(1);
+        norm_check(add->forward({device_input, device_branch}, added, command, option) == 0 && !added[0].empty(),
+                   "Vulkan BinaryOp reference recording failed");
+        ncnn::VkMat reference_normalized;
+        norm_check(reference_norm->record(added[0], reference_normalized, command),
+                   "plain RMSNorm reference recording failed");
+
+        ncnn::VkMat invalid_output;
+        norm_check(!fused_norm->record(device_input, invalid_output, command, &device_branch, &invalid_output)
+                       && invalid_output.empty(),
+                   "fused RMSNorm accepted aliased normalized and residual output variables");
+        ncnn::VkMat fused_normalized = device_branch;
+        ncnn::VkMat fused_sum = device_input;
+        norm_check(fused_norm->record(device_input, fused_normalized, command, &device_branch, &fused_sum),
+                   "fused RMSNorm residual recording failed");
+        const size_t activation_bytes = static_cast<size_t>(rows) * columns * sizeof(float);
+        const auto overlaps = [&](const ncnn::VkMat& first, const ncnn::VkMat& second) {
+            if (first.buffer() != second.buffer()) return false;
+            const size_t first_offset = first.buffer_offset();
+            const size_t second_offset = second.buffer_offset();
+            return first_offset <= second_offset ? second_offset - first_offset < activation_bytes
+                                                 : first_offset - second_offset < activation_bytes;
+        };
+        norm_check(!overlaps(fused_normalized, device_input)
+                       && !overlaps(fused_normalized, device_branch)
+                       && !overlaps(fused_sum, device_input)
+                       && !overlaps(fused_sum, device_branch)
+                       && !overlaps(fused_normalized, fused_sum),
+                   "fused RMSNorm outputs alias an input or each other");
+        norm_check(record_prepared_activation_staging_download(added[0], rows, columns,
+                                                               reference_residual_staging, command,
+                                                               context->device(), option)
+                       && record_prepared_activation_staging_download(reference_normalized, rows, columns,
+                                                                      reference_output_staging, command,
+                                                                      context->device(), option)
+                       && record_prepared_activation_staging_download(fused_sum, rows, columns,
+                                                                      fused_residual_staging, command,
+                                                                      context->device(), option)
+                       && record_prepared_activation_staging_download(fused_normalized, rows, columns,
+                                                                      fused_output_staging, command,
+                                                                      context->device(), option)
+                       && submit_compute_and_wait(command, context->device()) == 0
+                       && copy_staging_to_cpu_batch(reference_residual_staging, reference_residual)
+                       && copy_staging_to_cpu_batch(reference_output_staging, reference_output)
+                       && copy_staging_to_cpu_batch(fused_residual_staging, fused_residual)
+                       && copy_staging_to_cpu_batch(fused_output_staging, fused_output),
+                   "RMSNorm residual comparison submission or download failed");
+    }
+    const size_t bytes = input.values().size() * sizeof(float);
+    norm_check(std::memcmp(reference_residual.values().data(), fused_residual.values().data(), bytes) == 0,
+               "fused residual differs bitwise from Vulkan BinaryOp Add");
+    norm_check(std::memcmp(reference_output.values().data(), fused_output.values().data(), bytes) == 0,
+               "fused normalization differs bitwise from plain Vulkan RMSNorm");
+}
+
 static void norm_device(uint32_t device)
 {
     const auto runtime = create_vulkan_runtime();
@@ -254,6 +383,11 @@ static void norm_device(uint32_t device)
             norm_case(context, runtime, test.columns, test.rows, test.dtype, subgroup, epsilon, offset, index % 2 != 0);
         ++index;
     }
+    const auto& limits = context->device()->info.physicalDeviceProperties().limits;
+    if (limits.maxPerStageDescriptorStorageBuffers >= 5 && limits.maxDescriptorSetStorageBuffers >= 5)
+        for (const auto& test : {std::pair<uint32_t, uint32_t>{33, 3}, {2880, 3}})
+            for (const bool subgroup : {false, true})
+                norm_residual_add_case(context, test.first, test.second, subgroup);
 }
 #endif
 
@@ -275,7 +409,7 @@ int main(int argc, char** argv)
         else
             for (uint32_t device = 0; device < ncnn::moe::get_gpu_count(); ++device)
                 ncnn::moe::norm_device(device);
-        std::cout << "RMSNorm FP64, tails, offsets, aliases, descriptors and allocator lifetime passed\n";
+        std::cout << "RMSNorm FP64, tails, aliases, residual fusion, descriptors and allocator lifetime passed\n";
         return 0;
     }
     catch (const std::exception& error)

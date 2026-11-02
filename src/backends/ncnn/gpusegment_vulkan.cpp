@@ -104,6 +104,7 @@ public:
     std::shared_ptr<ncnn::Layer> add;
     CompiledOperator lm_head;
     uint32_t hidden = 0;
+    bool add_norm = false;
     bool head = false;
 #endif
 };
@@ -276,8 +277,12 @@ std::shared_ptr<GpuSegment_vulkan> GpuSegment_vulkan::create(const CompiledModel
         impl.option = impl.attention->option();
     }
     impl.hidden = model.descriptor.hidden_size;
+    const auto& limits = impl.context->device()->info.physicalDeviceProperties().limits;
+    impl.add_norm = limits.maxPerStageDescriptorStorageBuffers >= 5
+                    && limits.maxDescriptorSetStorageBuffers >= 5;
     impl.ffn_norm = RmsNorm_vulkan::create(model.weights.at(layer.moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon,
-                                           model.descriptor.norm_weight_offset, impl.context, impl.option);
+                                           model.descriptor.norm_weight_offset, impl.context, impl.option,
+                                           nullptr, impl.add_norm);
     impl.router = Router_vulkan::create(model.weights.at(layer.moe.router_weight),
                                         layer.moe.router_bias == invalid_tensor_handle ? nullptr : &model.weights.at(layer.moe.router_bias),
                                         layer.moe.router_selection_bias == invalid_tensor_handle ? nullptr : &model.weights.at(layer.moe.router_selection_bias),
@@ -539,13 +544,22 @@ public:
             }
             first += count;
         }
-        std::vector<ncnn::VkMat> added(1);
-        if (d->add->forward({input, branch}, added, command, d->option) != 0 || added[0].empty()) return fail("cannot record Attention residual");
-        residual = added[0];
-        storage.push_back(residual);
-        ++ffn_statistics.dispatches;
-        if (!d->ffn_norm->record(residual, normalized, command) || !d->router->record(normalized, options, router_work, command)) return fail("cannot record Vulkan FFN norm and router");
-        storage.push_back(normalized);
+        if (d->add_norm)
+        {
+            if (!d->ffn_norm->record(input, normalized, command, &branch, &residual))
+                return fail("cannot record fused Vulkan Attention residual and FFN norm");
+        }
+        else
+        {
+            std::vector<ncnn::VkMat> added(1);
+            if (d->add->forward({input, branch}, added, command, d->option) != 0 || added[0].empty()) return fail("cannot record Attention residual");
+            residual = added[0];
+            ++ffn_statistics.dispatches;
+            if (!d->ffn_norm->record(residual, normalized, command))
+                return fail("cannot record Vulkan FFN norm");
+        }
+        if (!d->router->record(normalized, options, router_work, command))
+            return fail("cannot record Vulkan router");
         selected_columns = Router_vulkan::selected_columns(options.top_k);
         if (!download_routes) return true;
         if (!prepare_staging_batch(selected_staging, positions.size(), selected_columns, d->context->staging_allocator())
