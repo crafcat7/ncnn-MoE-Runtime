@@ -20,32 +20,25 @@ static void memory_check(bool condition, const char* message)
     if (!condition) throw std::runtime_error(message);
 }
 
-static void test_submission_budget()
-{
-    for (double estimate : {0.0, 4000.0, std::numeric_limits<double>::infinity()})
-    {
-        GpuSubmissionBudget budget(estimate);
-        memory_check(budget.append(std::numeric_limits<double>::max()),
-                     "recorded work must make progress even with an empty or unbounded estimate");
-    }
-}
-
 static void test_submission_budget_lookahead()
 {
     const double large = std::numeric_limits<double>::max();
-    GpuSubmissionBudget budget(4000.0);
-    memory_check(!budget.would_flush_before(large), "an empty command must not be submitted");
-    budget.record(1);
-    memory_check(budget.would_flush_before(large) && budget.would_flush_before(large),
-                 "considering a boundary must preserve unacknowledged work");
-    budget.submitted();
-    memory_check(!budget.would_flush_before(large), "successful submission must clear pending work");
-    for (double work : {std::numeric_limits<double>::infinity(),
-                        std::numeric_limits<double>::quiet_NaN(), -1.0})
+    for (double estimate : {0.0, 4000.0, std::numeric_limits<double>::infinity()})
     {
-        budget.record(work);
-        memory_check(budget.would_flush_before(large), "nonfinite estimates must not prevent progress");
+        GpuSubmissionBudget budget(estimate);
+        memory_check(!budget.would_flush_before(large), "an empty command must not be submitted");
+        budget.record(1);
+        memory_check(budget.would_flush_before(large) && budget.would_flush_before(large),
+                     "considering a boundary must preserve unacknowledged work");
         budget.submitted();
+        memory_check(!budget.would_flush_before(large), "successful submission must clear pending work");
+        for (double work : {std::numeric_limits<double>::infinity(),
+                            std::numeric_limits<double>::quiet_NaN(), -1.0})
+        {
+            budget.record(work);
+            memory_check(budget.would_flush_before(large), "nonfinite estimates must not prevent progress");
+            budget.submitted();
+        }
     }
 }
 
@@ -416,7 +409,6 @@ int main()
     try
     {
         ncnn::moe::test_closed_lifetimes_and_branches();
-        ncnn::moe::test_submission_budget();
         ncnn::moe::test_submission_budget_lookahead();
         ncnn::moe::test_submission_fences();
         ncnn::moe::test_alignment_and_reuse();

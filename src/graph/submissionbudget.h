@@ -43,16 +43,6 @@ public:
         }
     }
 
-    // Compatibility for callers that decide boundaries after recording work.
-    // Such callers historically acknowledge the boundary immediately.
-    [[nodiscard]] bool append(double work) noexcept
-    {
-        record(work);
-        if (pending < target) return false;
-        submitted();
-        return true;
-    }
-
 private:
     static constexpr double max_work = 200e9;
 

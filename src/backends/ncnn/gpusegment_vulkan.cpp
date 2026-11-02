@@ -18,6 +18,7 @@
 #include <bit>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -1045,8 +1046,9 @@ bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const Activati
             return false;
         }
     const uint32_t chunk_layers = bank_chunk_layers(model, static_cast<uint32_t>(rows));
-    GpuSegmentWorkspace_vulkan local_workspace;
-    auto& output_workspace = workspace ? *workspace : local_workspace;
+    std::optional<GpuSegmentWorkspace_vulkan> local_workspace;
+    if (!workspace) local_workspace.emplace();
+    auto& output_workspace = workspace ? *workspace : *local_workspace;
     if (!output_workspace.d->host_output) output_workspace.d->host_output = std::make_shared<VulkanHostOutput>();
     const std::lock_guard<std::mutex> lock(context->command_mutex());
     auto& head_implementation = *model.gpu_head->d;
@@ -1182,8 +1184,10 @@ bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const Activati
         if (batches.submit() != 0)
             return fail("resident Expert bank submit or fence wait failed");
         budget.submitted();
-        if (batches.wait() != 0)
-            return fail("resident Expert bank submit or fence wait failed");
+        const size_t chunk_submissions = batches.submission_count();
+        // reset drains submitted commands and clears the batch counters.
+        // Do it before readback/publication so a reset error still aborts the chunk.
+        if (batches.reset() != 0) return fail("resident Expert bank submit or fence wait failed");
         ActivationBuffer checked(1, 1);
         if (!copy_staging_to_cpu_batch(validation_download, checked)
             || std::bit_cast<uint32_t>(checked.row(0)[0]) != 0)
@@ -1196,10 +1200,6 @@ bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const Activati
                 return fail("cannot read resident Expert bank logits");
             completed.swap(head.pending_logits);
         }
-        const size_t chunk_submissions = batches.submission_count();
-        // Retire command-owned operands before publishing caches or logits;
-        // even a reset failure must leave the transaction unpublished.
-        if (batches.reset() != 0) return fail("cannot retire resident Expert bank commands");
         for (auto& pending : work)
         {
             for (auto& attention : pending->active_attention_work())

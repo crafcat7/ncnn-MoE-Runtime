@@ -154,6 +154,9 @@ struct ExpertScratch
     ActivationBuffer staged_merged;
     ActivationBuffer staged_output;
     std::vector<uint32_t> explicit_expert_ids;
+    // Full-bank routing spans are borrowed only through forward_banks.
+    std::vector<std::vector<uint32_t>> bank_ids;
+    std::vector<ExpertDispatchOptions> bank_options;
 };
 
 // Storage owned by one scheduler worker for one in-flight staged batch.  Shared

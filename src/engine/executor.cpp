@@ -422,11 +422,16 @@ Result<void> forward_model(const CompiledModel& model,
             {
                 if (use_speculative_context)
                     return Error{ErrorCode::InternalError, "resident Expert bank plan cannot consume speculative hidden captures"};
-                std::vector<uint64_t> positions(input_ids.size());
+                auto& positions = state.attention_positions;
+                positions.resize(input_ids.size());
                 for (size_t row = 0; row < positions.size(); ++row) positions[row] = position_offset + row;
-                std::vector<LayerCache*> caches;
-                std::vector<ExpertDispatchOptions> options;
-                std::vector<std::vector<uint32_t>> explicit_ids(model.graph.layer_plans.size());
+                auto& caches = state.attention_caches;
+                caches.clear();
+                auto& options = state.expert_scratch.bank_options;
+                auto& bank_ids = state.expert_scratch.bank_ids;
+                options.clear();
+                bank_ids.resize(model.graph.layer_plans.size());
+                options.resize(model.graph.layer_plans.size());
                 uint64_t assignments = 0;
                 for (size_t index = 0; index < model.graph.layer_plans.size(); ++index)
                 {
@@ -434,7 +439,7 @@ Result<void> forward_model(const CompiledModel& model,
                     if (layer.layer_id >= state.layers.size())
                         return Error{ErrorCode::InternalError, "resident Expert bank layer cache is out of range"};
                     caches.insert(caches.end(), input_ids.size(), &state.layers[layer.layer_id]);
-                    options.push_back(latent_router_options(model, layer.moe, input_ids, explicit_ids[index]));
+                    options[index] = latent_router_options(model, layer.moe, input_ids, bank_ids[index]);
                     assignments += input_ids.size() * layer.moe.top_k;
                 }
                 std::string error;
@@ -1546,11 +1551,16 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             {
                 if (model.speculative.enabled() && use_speculative_context)
                     return Error{ErrorCode::InternalError, "resident staged Expert bank plan cannot consume speculative hidden captures"};
-                std::vector<uint64_t> positions(session_count);
+                auto& positions = workspace.staged_attention_positions;
+                positions.resize(session_count);
                 for (size_t row = 0; row < session_count; ++row) positions[row] = entries[row].position_offset;
-                std::vector<LayerCache*> caches;
-                std::vector<ExpertDispatchOptions> options;
-                std::vector<std::vector<uint32_t>> explicit_ids(model.graph.layer_plans.size());
+                auto& caches = workspace.staged_attention_caches;
+                caches.clear();
+                auto& options = batch_scratch.bank_options;
+                auto& bank_ids = batch_scratch.bank_ids;
+                options.clear();
+                bank_ids.resize(model.graph.layer_plans.size());
+                options.resize(model.graph.layer_plans.size());
                 uint64_t assignments = 0;
                 for (size_t index = 0; index < model.graph.layer_plans.size(); ++index)
                 {
@@ -1561,7 +1571,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                             return Error{ErrorCode::InternalError, "resident staged Expert bank cache is out of range"};
                         caches.push_back(&entry.state->layers[layer.layer_id]);
                     }
-                    options.push_back(latent_router_options(model, layer.moe, input_ids, explicit_ids[index]));
+                    options[index] = latent_router_options(model, layer.moe, input_ids, bank_ids[index]);
                     assignments += layer.moe.top_k;
                 }
                 ActivationBuffer completed;

@@ -440,7 +440,7 @@ private:
 
 // Ordered asynchronous submissions within one planned resource lifetime.
 // Caller holds context.command_mutex() and all operand/pipeline owners until
-// wait/reset completes. Each boundary preserves the VkMat producer access state.
+// reset completes. Each boundary preserves the VkMat producer access state.
 class VulkanComputeBatch
 {
 public:
@@ -450,17 +450,14 @@ public:
     VulkanComputeBatch& operator=(const VulkanComputeBatch&) = delete;
     [[nodiscard]] ncnn::VkCompute* next();
     [[nodiscard]] int submit();
-    [[nodiscard]] int wait() noexcept;
     [[nodiscard]] int reset() noexcept;
     [[nodiscard]] size_t submission_count() const noexcept
     { return submitted; }
-    [[nodiscard]] size_t pending_count() const noexcept
-    { return submitted - completed; }
 
 private:
     VulkanContext& context;
     VkQueue queue = VK_NULL_HANDLE;
-    size_t recorded = 0, submitted = 0, completed = 0;
+    size_t recorded = 0, submitted = 0;
     int completion_error = 0;
 };
 

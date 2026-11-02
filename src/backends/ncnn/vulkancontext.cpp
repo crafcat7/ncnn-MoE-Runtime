@@ -836,29 +836,21 @@ int VulkanComputeBatch::submit()
     return result;
 }
 
-int VulkanComputeBatch::wait() noexcept
-{
-    while (completed < submitted)
-    {
-        auto& command = *context.ordered_commands[completed];
-        int result = wait_submitted_compute(command, context.device(), queue);
-        if (result == 0)
-        {
-            // Reset this command after its fence completes, while later queue work may still run.
-            result = command.reset();
-        }
-        if (result != 0) completion_error = result;
-        ++completed;
-    }
-    return completion_error;
-}
-
 int VulkanComputeBatch::reset() noexcept
 {
-    int result = wait();
+    for (size_t i = 0; i < submitted; ++i)
+    {
+        auto& command = *context.ordered_commands[i];
+        int result = wait_submitted_compute(command, context.device(), queue);
+        if (result == 0)
+            // Reset this command after its fence completes, while later queue work may still run.
+            result = command.reset();
+        if (result != 0) completion_error = result;
+    }
+    int result = completion_error;
     for (size_t i = submitted; i < recorded; ++i)
         if (context.ordered_commands[i]->reset() != 0) result = -1;
-    recorded = submitted = completed = 0;
+    recorded = submitted = 0;
     completion_error = result;
     return result;
 }

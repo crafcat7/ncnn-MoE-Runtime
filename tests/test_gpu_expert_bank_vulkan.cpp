@@ -472,7 +472,8 @@ static void bank_preparation_failures(const std::shared_ptr<VulkanContext>& cont
 }
 
 static CompiledModel bank_model(bool gpu, DType dtype, bool native_delta, bool resident,
-                                ExpertLayout layout = ExpertLayout::InterleavedGateUpDown)
+                                ExpertLayout layout = ExpertLayout::InterleavedGateUpDown,
+                                bool with_token_experts = false)
 {
     auto descriptor = segment_descriptor(native_delta);
     descriptor.expert_count = descriptor.experts_per_token = 4;
@@ -488,6 +489,18 @@ static CompiledModel bank_model(bool gpu, DType dtype, bool native_delta, bool r
         moe.flags |= MoeDescriptorProjectionBias;
         const auto prefix = "layers." + std::to_string(layer) + ".";
         mapping[prefix + "router.weight"] = bank_weight(DType::BFloat16, 4, bank_width, layer + 19);
+        if (with_token_experts)
+        {
+            TensorData routes;
+            routes.dtype = DType::Int64;
+            routes.shape = {descriptor.vocabulary_size, moe.top_k};
+            routes.int64_data.resize(static_cast<size_t>(descriptor.vocabulary_size) * moe.top_k);
+            for (uint32_t token = 0; token < descriptor.vocabulary_size; ++token)
+                for (uint32_t rank = 0; rank < moe.top_k; ++rank)
+                    routes.int64_data[static_cast<size_t>(token) * moe.top_k + rank]
+                        = static_cast<int64_t>((token + rank) % moe.expert_count);
+            mapping[prefix + "router.token_experts"] = std::move(routes);
+        }
         auto experts = bank_fixture(dtype, ExpertLayout::InterleavedGateUpDown, 4);
         for (uint32_t expert = 0; expert < experts.size(); ++expert)
         {
@@ -600,33 +613,59 @@ static void bank_engine(const CompiledModel& cpu, const CompiledModel& gpu, bool
                           "the insufficient-budget model did not retain its original GPU streaming route boundary");
         for (const auto& state : actual.layers)
             segment_check(!state.vulkan_attention_state_unknown, "successful bank/streaming execution poisoned Session state");
+        if (output == LogitsOutput::All)
+        {
+            const std::array<int32_t, 1> next_token = {4};
+            const auto next_reference = forward_model(cpu, next_token, expected_stats, expected, ids.size(), LogitsOutput::All);
+            segment_check(static_cast<bool>(next_reference), next_reference ? "" : next_reference.error().message);
+            const auto next_result = forward_model(gpu, next_token, actual_stats, actual, ids.size(), LogitsOutput::All);
+            segment_check(static_cast<bool>(next_result), next_result ? "" : next_result.error().message);
+            segment_compare(actual.logits.values(), expected.logits.values(), "reused single-session bank scratch " + label);
+            segment_gpu_routes(actual_stats);
+            segment_check(actual.layers[0].token_count == rows + 1
+                              && actual.layers[1].gated_delta_token_count == rows + 1,
+                          "single-session bank scratch reuse advanced cache state at the wrong position");
+        }
     }
     std::array<SessionState, 2> expected, actual;
     std::array<SessionStatistics, 2> expected_stats, actual_stats;
     std::array<std::vector<float>, 2> logits;
     std::array<DecodeBatchEntry, 2> entries;
-    for (size_t row = 0; row < entries.size(); ++row)
-    {
-        const std::array<int32_t, 1> token = {static_cast<int32_t>(row + 2)};
-        const auto reference = forward_model(cpu, token, expected_stats[row], expected[row], 0, LogitsOutput::All);
-        segment_check(static_cast<bool>(reference), reference ? "" : reference.error().message);
-        entries[row] = {token[0], &actual_stats[row], &actual[row], 0, &logits[row]};
-    }
+    std::array<uint64_t, 2> positions{};
     BatchWorkspace workspace;
-    const auto before = get_vulkan_statistics(gpu.vulkan_runtime);
-    const auto result = forward_decode_batch(gpu, entries, workspace);
-    segment_check(static_cast<bool>(result), result ? "" : result.error().message);
-    const auto after = get_vulkan_statistics(gpu.vulkan_runtime);
-    if (resident)
-        segment_check(after.resident_graph_route_download_bytes == before.resident_graph_route_download_bytes
-                          && after.resident_graph_activation_download_bytes == before.resident_graph_activation_download_bytes,
-                      "staged resident banks downloaded routes or intermediate activations");
-    for (size_t row = 0; row < entries.size(); ++row)
+    constexpr std::array<size_t, 3> active_rows_by_step = {2, 1, 2};
+    for (size_t step = 0; step < active_rows_by_step.size(); ++step)
     {
-        segment_compare(logits[row], expected[row].logits.values(), "staged independent Session " + label + " row=" + std::to_string(row));
-        segment_gpu_routes(actual_stats[row]);
-        segment_check(actual[row].layers[0].token_count == 1 && actual[row].layers[1].gated_delta_token_count == 1,
-                      "staged bank execution committed another Session's state");
+        const size_t active_rows = active_rows_by_step[step];
+        for (size_t row = 0; row < active_rows; ++row)
+        {
+            const int32_t token = static_cast<int32_t>(2 + step + row);
+            const std::array<int32_t, 1> token_ids = {token};
+            const auto reference = forward_model(cpu, token_ids, expected_stats[row], expected[row], positions[row], LogitsOutput::All);
+            segment_check(static_cast<bool>(reference), reference ? "" : reference.error().message);
+            entries[row] = {token, &actual_stats[row], &actual[row], positions[row], &logits[row]};
+        }
+        const auto before = get_vulkan_statistics(gpu.vulkan_runtime);
+        const auto result = forward_decode_batch(gpu, std::span<const DecodeBatchEntry>(entries.data(), active_rows), workspace);
+        segment_check(static_cast<bool>(result), result ? "" : result.error().message);
+        const auto after = get_vulkan_statistics(gpu.vulkan_runtime);
+        if (resident)
+            segment_check(after.resident_graph_route_download_bytes == before.resident_graph_route_download_bytes
+                              && after.resident_graph_activation_download_bytes == before.resident_graph_activation_download_bytes,
+                          "staged resident banks downloaded routes or intermediate activations");
+        for (size_t row = 0; row < entries.size(); ++row)
+        {
+            const uint64_t committed_position = positions[row] + (row < active_rows ? 1 : 0);
+            segment_check(actual[row].layers[0].token_count == committed_position
+                              && actual[row].layers[1].gated_delta_token_count == committed_position,
+                          "staged bank execution advanced a Session cache at the wrong position");
+            if (row >= active_rows) continue;
+            segment_compare(logits[row], expected[row].logits.values(),
+                            "staged independent Session " + label + " step=" + std::to_string(step)
+                                + " row=" + std::to_string(row));
+            segment_gpu_routes(actual_stats[row]);
+            ++positions[row];
+        }
     }
 }
 
@@ -741,8 +780,11 @@ static void bank_persistent_logits(const CompiledModel& cpu, const CompiledModel
         }
         if (step == 1) held_prefill = std::move(logits);
         if (step == 2) held_prefill.clear();
+        // The final successful call exercises local workspace teardown while
+        // its externally leased logits and committed caches remain observable.
+        GpuSegmentWorkspace_vulkan* call_workspace = !explicit_reservation && step == 2 ? nullptr : &workspace;
         segment_check(GpuSegment_vulkan::forward_banks(gpu, input, positions, pointers, options, true, false,
-                                                       logits, error, &workspace),
+                                                       logits, error, call_workspace),
                       "persistent bank output execution failed: " + error);
         segment_compare(logits.values(), expected.logits.values(), "persistent bank complete logits step " + std::to_string(step));
         if (step == 1)
@@ -808,6 +850,11 @@ static void bank_models()
     const auto interleaved_bank = bank_model(true, DType::BFloat16, false, true);
     bank_engine(interleaved_cpu, interleaved_bank, true);
     bank_persistent_logits(interleaved_cpu, interleaved_bank, false);
+    const auto explicit_cpu = bank_model(false, DType::BFloat16, false, true,
+                                         ExpertLayout::InterleavedGateUpDown, true);
+    const auto explicit_bank = bank_model(true, DType::BFloat16, false, true,
+                                          ExpertLayout::InterleavedGateUpDown, true);
+    bank_engine(explicit_cpu, explicit_bank, true);
     const auto cpu = bank_model(false, DType::BFloat16, true, true, ExpertLayout::PackedGateUpDown);
     const auto native_delta = bank_model(true, DType::BFloat16, true, true, ExpertLayout::PackedGateUpDown);
     bank_engine(cpu, native_delta, true);
@@ -820,7 +867,7 @@ static void ordered_batch_cases(const std::shared_ptr<VulkanContext>& context)
     ncnn::Mat source(4096), result;
     for (int i = 0; i < source.w; ++i) source[i] = static_cast<float>(i) / 16;
     // Repeat to exercise command/fence reuse. Leaving the last run without an
-    // explicit wait exercises exception/early-return ownership retirement.
+    // explicit reset exercises exception/early-return ownership retirement.
     for (int iteration = 0; iteration < 3; ++iteration)
     {
         std::array<ncnn::VkMat, 2> values;
@@ -837,12 +884,16 @@ static void ordered_batch_cases(const std::shared_ptr<VulkanContext>& context)
                     command->record_clone(values[i - 1], values[i], option);
                 segment_check(!values[i].empty(), "cannot allocate ordered dependency operand");
                 if (i + 1 == values.size()) command->record_clone(values[i], result, option);
-                segment_check(batches.submit() == 0 && batches.pending_count() == i + 1,
-                              "ordered submissions waited before their retirement boundary");
+                segment_check(batches.submit() == 0 && batches.submission_count() == i + 1,
+                              "ordered submission count differs before reset");
             }
             if (iteration != 2)
-                segment_check(batches.wait() == 0 && batches.pending_count() == 0 && batches.submission_count() == values.size(),
-                              "ordered command fences did not retire exactly once");
+            {
+                const size_t submission_count = batches.submission_count();
+                segment_check(submission_count == values.size() && batches.reset() == 0
+                                  && batches.submission_count() == 0,
+                              "ordered reset did not drain commands and clear the submission count");
+            }
         }
         segment_check(result.w == source.w, "ordered output was not published after drain");
         for (int i = 0; i < source.w; ++i)
