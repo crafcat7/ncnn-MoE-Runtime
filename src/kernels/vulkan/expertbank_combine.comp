@@ -9,6 +9,10 @@ layout(binding = 2) writeonly buffer output_blob
 { float output_data[]; };
 layout(binding = 3) buffer validation_blob
 { uint validation[]; };
+layout(binding = 4) readonly buffer shared_blob
+{ float shared_data[]; };
+layout(binding = 5) readonly buffer residual_blob
+{ float residual_data[]; };
 
 layout(push_constant) uniform parameter
 {
@@ -16,6 +20,8 @@ layout(push_constant) uniform parameter
     uint rows;
     uint top_k;
     uint expert_count;
+    uint has_shared;
+    uint has_residual;
 }
 p;
 
@@ -50,16 +56,21 @@ void main()
     barrier();
     if (row_invalid != 0u && lane == 0u) atomicOr(validation[0], 1u);
     const uint column = gl_GlobalInvocationID.x;
+    const uint index = row * p.columns + column;
     if (row < p.rows && column < p.columns)
     {
         precise float sum = 0.0;
         if (row_invalid == 0u)
+        {
             for (uint rank = 0u; rank < p.top_k; ++rank)
             {
                 const uint route = route_order[rank];
                 precise float product = selected[base + p.top_k + route] * input_data[(row * p.top_k + route) * p.columns + column];
                 sum = sum + product;
             }
-        output_data[row * p.columns + column] = sum;
+            if (p.has_shared != 0u) sum = sum + shared_data[index];
+            if (p.has_residual != 0u) sum = residual_data[index] + sum;
+        }
+        output_data[index] = sum;
     }
 }

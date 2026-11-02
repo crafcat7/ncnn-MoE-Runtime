@@ -95,7 +95,8 @@ public:
     // caller must read it after the final fence and reject a nonzero value.
     [[nodiscard]] bool record(const ncnn::VkMat& normalized, const ncnn::VkMat& selected,
                               uint32_t top_k, ncnn::VkMat& combined, ncnn::VkMat& validation,
-                              ncnn::VkCompute& command, std::vector<ncnn::VkMat>& workspace) const;
+                              ncnn::VkCompute& command, std::vector<ncnn::VkMat>& workspace,
+                              const ncnn::VkMat* shared = nullptr, const ncnn::VkMat* residual = nullptr) const;
 #endif
 
 private:

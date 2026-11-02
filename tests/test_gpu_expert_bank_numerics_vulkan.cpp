@@ -197,6 +197,71 @@ static ActivationBuffer numeric_reference(const std::array<BankNumericExpert, 4>
     return output;
 }
 
+static void numeric_fusion_case(const std::shared_ptr<VulkanContext>& context, const ExpertBank_vulkan& bank,
+                                const ActivationBuffer& input, const ActivationBuffer& selected,
+                                const ActivationBuffer& expected)
+{
+    ActivationBuffer shared(input.rows(), expected.columns()), residual(input.rows(), expected.columns());
+    for (size_t row = 0; row < input.rows(); ++row)
+        for (uint32_t column = 0; column < expected.columns(); ++column)
+        {
+            shared.row(row)[column] = 33554432.0f;
+            residual.row(row)[column] = -33554432.0f;
+        }
+    ActivationBuffer residual_only(input.rows(), expected.columns()), fused(input.rows(), expected.columns()), flag(1, 1);
+    {
+        const std::lock_guard<std::mutex> lock(context->command_mutex());
+        const auto& option = bank.option();
+        ncnn::VkCompute command(context->device());
+        ncnn::VkMat input_staging, selected_staging, shared_staging, residual_staging, zero_staging;
+        ncnn::VkMat device_input, device_selected, device_shared, device_residual, validation;
+        ncnn::VkMat residual_output, fused_output, residual_output_staging, fused_output_staging, flag_staging;
+        std::vector<ncnn::VkMat> workspace;
+        const uint32_t zero = 0;
+        segment_check(fill_staging_upload(input, input_staging, option.staging_vkallocator)
+                          && record_mapped_upload(input_staging, device_input, command, option)
+                          && fill_staging_upload(selected, selected_staging, option.staging_vkallocator)
+                          && record_mapped_upload(selected_staging, device_selected, command, option)
+                          && fill_staging_upload(shared, shared_staging, option.staging_vkallocator)
+                          && record_mapped_upload(shared_staging, device_shared, command, option)
+                          && fill_staging_upload(residual, residual_staging, option.staging_vkallocator)
+                          && record_mapped_upload(residual_staging, device_residual, command, option)
+                          && fill_staging_values(&zero, 1, sizeof(zero), zero_staging, option.staging_vkallocator)
+                          && record_mapped_upload(zero_staging, validation, command, option)
+                          && bank.record(device_input, device_selected, 1, residual_output, validation, command, workspace,
+                                         nullptr, &device_residual)
+                          && bank.record(device_input, device_selected, 1, fused_output, validation, command, workspace,
+                                         &device_shared, &device_residual)
+                          && prepare_staging_batch(residual_output_staging, input.rows(), expected.columns(), option.staging_vkallocator)
+                          && record_prepared_activation_staging_download(residual_output, input.rows(), expected.columns(),
+                                                                         residual_output_staging, command, context->device(), option)
+                          && prepare_staging_batch(fused_output_staging, input.rows(), expected.columns(), option.staging_vkallocator)
+                          && record_prepared_activation_staging_download(fused_output, input.rows(), expected.columns(),
+                                                                         fused_output_staging, command, context->device(), option)
+                          && prepare_staging_batch(flag_staging, 1, 1, option.staging_vkallocator)
+                          && record_prepared_activation_staging_download(validation, 1, 1, flag_staging,
+                                                                         command, context->device(), option)
+                          && submit_compute_and_wait(command, context->device()) == 0
+                          && copy_staging_to_cpu_batch(residual_output_staging, residual_only)
+                          && copy_staging_to_cpu_batch(fused_output_staging, fused)
+                          && copy_staging_to_cpu_batch(flag_staging, flag),
+                      "cannot execute fused Expert bank numerical fixture");
+    }
+    segment_check(std::bit_cast<uint32_t>(flag.row(0)[0]) == 0, "valid fused routes set validation failure");
+    for (size_t row = 0; row < input.rows(); ++row)
+        for (size_t column = 0; column < expected.columns(); ++column)
+        {
+            volatile float residual_expected = residual.row(row)[column] + expected.row(row)[column];
+            volatile float after_shared = expected.row(row)[column] + shared.row(row)[column];
+            volatile float fused_expected = residual.row(row)[column] + after_shared;
+            segment_check(std::bit_cast<uint32_t>(residual_only.row(row)[column])
+                              == std::bit_cast<uint32_t>(residual_expected),
+                          "residual-only Expert bank combine changed FP32 order");
+            segment_check(std::bit_cast<uint32_t>(fused.row(row)[column]) == std::bit_cast<uint32_t>(fused_expected),
+                          "shared/residual Expert bank combine changed FP32 order");
+        }
+}
+
 static void numeric_case(const std::shared_ptr<VulkanContext>& context, const BankNumericCase& test)
 {
     const auto experts = numeric_experts(test);
@@ -273,13 +338,15 @@ static void numeric_case(const std::shared_ptr<VulkanContext>& context, const Ba
                                   label + " exact FP4 code mismatch at " + std::to_string(column));
                 }
         }
+        if (top_k == 1 && test.code_basis == BankCodeBasis::Down && test.output == 5)
+            numeric_fusion_case(context, *created.value(), input, selected, expected);
     }
 }
 
 static int numeric_run()
 {
     if (get_gpu_count() == 0) return 77;
-    const std::array<BankNumericCase, 17> cases = {{{32, 5, 7, 123, false, false, 32},
+    const std::array<BankNumericCase, 18> cases = {{{32, 5, 7, 123, false, false, 32},
                                                     {32, 1, 1, 120, false, true},
                                                     {128, 3, 0, 120, false, false},
                                                     {128, 129, 254, -120, false, false},
@@ -295,7 +362,8 @@ static int numeric_run()
                                                     {32, 16, 254, -118, false, false, 32, true, false, BankCodeBasis::GateUp},
                                                     {32, 16, 127, 0, false, false, 32, false, false, BankCodeBasis::Down},
                                                     {32, 16, 0, 123, false, false, 32, false, false, BankCodeBasis::Down},
-                                                    {32, 16, 254, -118, false, false, 32, false, false, BankCodeBasis::Down}}};
+                                                    {32, 16, 254, -118, false, false, 32, false, false, BankCodeBasis::Down},
+                                                    {32, 5, 127, 0, false, false, 32, false, false, BankCodeBasis::Down}}};
     for (uint32_t device = 0; device < get_gpu_count(); ++device)
     {
         const auto context = VulkanContext::acquire(device, create_vulkan_runtime(), segment_flags);

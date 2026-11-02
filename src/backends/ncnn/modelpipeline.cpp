@@ -2451,11 +2451,21 @@ static uint32_t graph_node_device(const CompiledModel& model, const ExecutionGra
                : model.opt.vulkan_device_index;
 }
 
+static bool graph_has_expert_banks(const CompiledModel& model, const ExecutionGraph& graph)
+{
+    return &graph == &model.graph && model.bank_submission_rows != 0
+           && !graph.layer_plans.empty() && model.gpu_expert_bank_plans.size() == graph.layer_plans.size()
+           && std::all_of(model.gpu_expert_bank_plans.begin(), model.gpu_expert_bank_plans.end(), [](const auto& plan) { return plan.has_value(); });
+}
+
 static uint64_t graph_tensor_elements(const CompiledModel& model, const ExecutionGraph& graph,
                                       const ExecutionTensor& tensor, uint32_t rows, uint32_t logits_rows)
 {
     if (tensor.producer >= graph.nodes.size()) return UINT64_MAX;
     const ExecutionNode& producer = graph.nodes[tensor.producer];
+    // Full-bank recording folds routed aggregation and the following Combine
+    // into one output. The ExpertGroup tensor is not materialized there.
+    if (producer.type == ExecutionNodeType::ExpertGroup && graph_has_expert_banks(model, graph)) return 0;
     // The cache output documents the state dependency; the cache has a
     // Session lifetime and is not an activation in the reusable graph arena.
     if (producer.type == ExecutionNodeType::Attention && producer.outputs.size() > 1
@@ -2468,9 +2478,7 @@ static uint64_t graph_tensor_elements(const CompiledModel& model, const Executio
                                     : tensor.shape[dimension];
         elements = saturating_multiply_u64(elements, extent);
     }
-    if (producer.type == ExecutionNodeType::ExpertGroup && producer.layer_plan_index < graph.layer_plans.size()
-        && !(&graph == &model.graph && model.bank_submission_rows != 0
-             && model.gpu_expert_bank_plans.size() == graph.layer_plans.size()))
+    if (producer.type == ExecutionNodeType::ExpertGroup && producer.layer_plan_index < graph.layer_plans.size())
         elements = saturating_multiply_u64(elements, graph.layer_plans[producer.layer_plan_index].moe.top_k);
     if (model.descriptor.hyper_connection_kind != HyperConnectionKind::None
         && (producer.type == ExecutionNodeType::TokenEmbedding || producer.type == ExecutionNodeType::Attention
@@ -2508,13 +2516,6 @@ uint32_t bank_chunk_layers(const CompiledModel& model, uint32_t rows) noexcept
     if (model.bank_submission_rows == 0 || model.graph.layer_plans.empty()) return 0;
     return static_cast<uint32_t>(std::min<size_t>(model.graph.layer_plans.size(),
                                                   std::max(1u, model.bank_submission_rows / std::max(1u, rows))));
-}
-
-static bool graph_has_expert_banks(const CompiledModel& model, const ExecutionGraph& graph)
-{
-    return &graph == &model.graph && model.bank_submission_rows != 0
-           && !graph.layer_plans.empty() && model.gpu_expert_bank_plans.size() == graph.layer_plans.size()
-           && std::all_of(model.gpu_expert_bank_plans.begin(), model.gpu_expert_bank_plans.end(), [](const auto& plan) { return plan.has_value(); });
 }
 
 // Opaque recorders retain their VkMat operands through the submission fence.
@@ -2708,8 +2709,9 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
         {
             const ExpertBankPlan_vulkan& bank = *model.gpu_expert_bank_plans[node.layer_plan_index];
             const uint64_t routes = saturating_multiply_u64(rows, layer.moe.top_k);
-            // The token-major aggregate is the graph Expert output. Only
-            // route-major activated gate/up and down results are private.
+            // The token-major aggregate is folded into the final Combine
+            // output; only route-major activated gate/up and down results
+            // remain private.
             for (uint64_t columns : {static_cast<uint64_t>(bank.intermediate_columns), static_cast<uint64_t>(bank.output_columns)})
             {
                 auto ret = add(columns, routes);
@@ -2794,10 +2796,11 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
                 if (!ret) return ret.error();
             }
         }
-        if (shared && segment_input)
+        if (shared && segment_input && !graph_has_expert_banks(model, graph))
         {
-            // The recorded tail retains aggregate + shared before adding
-            // the residual. Shared output and final hidden are graph tensors.
+            // Non-bank recorded tails retain aggregate + shared before
+            // adding the residual. Bank recording folds both additions into
+            // the final hidden output.
             auto sum = add(hidden);
             if (!sum) return sum.error();
         }

@@ -330,7 +330,7 @@ Result<ExpertBankPlan_vulkan> ExpertBank_vulkan::plan(std::span<const ExpertBank
     plan.expert_count = static_cast<uint32_t>(experts.size());
     plan.alignment = std::max<size_t>(4, context->device()->info.buffer_offset_alignment());
     const auto& limits = context->device()->info.physicalDeviceProperties().limits;
-    if (limits.maxPerStageDescriptorStorageBuffers < 4 || limits.maxDescriptorSetStorageBuffers < 4
+    if (limits.maxPerStageDescriptorStorageBuffers < 6 || limits.maxDescriptorSetStorageBuffers < 6
         || limits.maxPushConstantsSize < 64 || limits.maxComputeWorkGroupInvocations < 128
         || limits.maxComputeWorkGroupSize[0] < 128 || limits.maxComputeWorkGroupCount[0] < (static_cast<uint64_t>(std::max(plan.intermediate_columns, plan.output_columns)) + 3) / 4
         || std::max(plan.intermediate_columns, plan.output_columns) > static_cast<uint32_t>((std::numeric_limits<int>::max() / 128) * 4)
@@ -437,7 +437,8 @@ const ncnn::Option& ExpertBank_vulkan::option() const noexcept
 
 bool ExpertBank_vulkan::record(const ncnn::VkMat& normalized, const ncnn::VkMat& selected,
                                uint32_t top_k, ncnn::VkMat& combined, ncnn::VkMat& validation,
-                               ncnn::VkCompute& command, std::vector<ncnn::VkMat>& workspace) const
+                               ncnn::VkCompute& command, std::vector<ncnn::VkMat>& workspace,
+                               const ncnn::VkMat* shared, const ncnn::VkMat* residual) const
 {
     const auto& plan = d->plan;
     const auto valid_tensor = [&](const ncnn::VkMat& tensor) {
@@ -450,7 +451,9 @@ bool ExpertBank_vulkan::record(const ncnn::VkMat& normalized, const ncnn::VkMat&
         || !valid_tensor(selected) || selected.dims != 2 || selected.w != static_cast<int>(2 * top_k + 1) || selected.h != normalized.h
         || !valid_tensor(validation) || validation.w != 1
         || (validation.dims != 1 && !(validation.dims == 2 && validation.h == 1))
-        || validation.data == normalized.data || validation.data == selected.data) return false;
+        || validation.data == normalized.data || validation.data == selected.data
+        || (shared && (shared == &combined || shared == &validation || !valid_tensor(*shared) || shared->dims != 2 || shared->w != static_cast<int>(plan.output_columns) || shared->h != normalized.h || shared->data == validation.data))
+        || (residual && (residual == &combined || residual == &validation || !valid_tensor(*residual) || residual->dims != 2 || residual->w != static_cast<int>(plan.output_columns) || residual->h != normalized.h || residual->data == validation.data))) return false;
     const uint32_t rows = static_cast<uint32_t>(normalized.h);
     const auto& limits = d->context->device()->info.physicalDeviceProperties().limits;
     const uint64_t route_rows = static_cast<uint64_t>(rows) * top_k;
@@ -495,15 +498,18 @@ bool ExpertBank_vulkan::record(const ncnn::VkMat& normalized, const ncnn::VkMat&
         command.record_pipeline_readonly(d->gate_up.get(), {normalized, d->weights, selected, intermediate}, {1, 1, 1, 0}, constants, dispatch);
         dispatch.w = static_cast<int>(((static_cast<uint64_t>(plan.output_columns) + 3) / 4) * 128);
         command.record_pipeline_readonly(d->down.get(), {intermediate, d->weights, selected, outputs}, {1, 1, 1, 0}, constants, dispatch);
-        constants.resize(4);
+        constants.resize(6);
         constants[0].u32 = plan.output_columns;
         constants[1].u32 = rows;
         constants[2].u32 = top_k;
         constants[3].u32 = plan.expert_count;
+        constants[4].u32 = shared != nullptr;
+        constants[5].u32 = residual != nullptr;
         dispatch.w = static_cast<int>(plan.output_columns);
         dispatch.h = normalized.h;
         dispatch.c = 1;
-        command.record_pipeline_readonly(d->combine.get(), {outputs, selected, destination, validation}, {1, 1, 0, 0}, constants, dispatch);
+        command.record_pipeline_readonly(d->combine.get(), {outputs, selected, destination, validation, shared ? *shared : outputs, residual ? *residual : outputs},
+                                         {1, 1, 0, 0, 1, 1}, constants, dispatch);
         combined = destination;
         return true;
     }

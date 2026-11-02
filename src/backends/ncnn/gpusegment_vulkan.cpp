@@ -1093,19 +1093,17 @@ bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const Activati
             // Session position, including layers committed by an earlier chunk.
             if (submitted)
                 for (auto* cache : caches) cache->vulkan_attention_state_unknown = true;
+            // Also run on exceptions: never leave target/cache references in
+            // the head-owned pool, and never move GPU operand cleanup to a later token.
+            pooled.retire();
         }
-        // Also run on exceptions: never leave target/cache references in the
-        // head-owned pool, and never move GPU operand cleanup to a later token.
-        pooled.retire();
     };
     std::unique_ptr<void, decltype(cleanup)> guard(reinterpret_cast<void*>(1), cleanup);
     auto fail = [&](const std::string& reason) { error = reason; return false; };
     for (size_t first = 0; first < layers; first += chunk_layers)
     {
-        if (batches.reset() != 0) return fail("cannot reset resident Expert bank commands");
         auto* recording = batches.next();
         if (!recording) return fail("cannot acquire ordered resident Expert bank command");
-        pooled.retire();
         validation_upload.release();
         validation.release();
         validation_download.release();
