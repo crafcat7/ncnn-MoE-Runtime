@@ -341,8 +341,10 @@ std::shared_ptr<GpuSegment_vulkan> GpuSegment_vulkan::create_head(const Compiled
 #endif
 }
 
-uint32_t GpuSegment_vulkan::continuation_target(const CompiledModel& model, uint32_t expert_node_id)
+Result<uint32_t> GpuSegment_vulkan::continuation_target(const CompiledModel& model, uint32_t expert_node_id,
+                                                       uint32_t& fence_id)
 {
+    fence_id = invalid_execution_node_id;
     if (expert_node_id >= model.graph.nodes.size()) return invalid_execution_node_id;
     const auto& source = model.graph.nodes[expert_node_id];
     if (source.type != ExecutionNodeType::ExpertGroup || source.backend != ExecutionBackend::Vulkan
@@ -355,6 +357,8 @@ uint32_t GpuSegment_vulkan::continuation_target(const CompiledModel& model, uint
     auto next = std::find(model.schedule.node_order.begin(), model.schedule.node_order.end(), expert_node_id);
     if (next == model.schedule.node_order.end()) return invalid_execution_node_id;
     bool combined = false;
+    uint32_t target_id = invalid_execution_node_id;
+    bool head = false;
     while (++next != model.schedule.node_order.end())
     {
         const ExecutionNodeId candidate_id = *next;
@@ -377,14 +381,57 @@ uint32_t GpuSegment_vulkan::continuation_target(const CompiledModel& model, uint
             && model.graph.layer_plans[candidate.layer_plan_index].vulkan_device_index == source_layer.vulkan_device_index
             && model.gpu_segments[candidate.layer_plan_index]
             && model.gpu_segments[candidate.layer_plan_index]->context() == context)
-            return candidate_id;
+        {
+            target_id = candidate_id;
+            break;
+        }
         if (candidate.type == ExecutionNodeType::FinalNorm && model.gpu_head && model.gpu_head->context() == context)
-            return candidate_id;
+        {
+            target_id = candidate_id;
+            head = true;
+            break;
+        }
         // All other nodes are explicit boundaries. Follow actual schedule
         // order rather than assuming that layer ids are consecutive.
         return invalid_execution_node_id;
     }
-    return invalid_execution_node_id;
+    if (target_id == invalid_execution_node_id) return invalid_execution_node_id;
+
+    uint32_t resolved_fence = invalid_execution_node_id;
+    auto fence = next;
+    while (++fence != model.schedule.node_order.end())
+    {
+        const ExecutionNodeId candidate_id = *fence;
+        if (candidate_id >= model.graph.nodes.size())
+            return Error{ErrorCode::InvalidModel, "GPU continuation memory target has an invalid scheduled fence"};
+        const auto& candidate = model.graph.nodes[candidate_id];
+        if ((head && candidate.type == ExecutionNodeType::LmHead)
+            || (!head && candidate.type == ExecutionNodeType::Router
+                && candidate.layer_plan_index == model.graph.nodes[target_id].layer_plan_index))
+        {
+            resolved_fence = candidate_id;
+            break;
+        }
+        // Match the memory planner's existing stop points. In particular, do
+        // not search beyond another layer's Expert/Attention/FFN boundary.
+        if (candidate.type == ExecutionNodeType::ExpertGroup || candidate.type == ExecutionNodeType::Attention
+            || candidate.type == ExecutionNodeType::DenseFfn || candidate.type == ExecutionNodeType::TokenEmbedding)
+            break;
+    }
+    if (resolved_fence == invalid_execution_node_id || model.graph.nodes[resolved_fence].backend != ExecutionBackend::Vulkan)
+        return Error{ErrorCode::InvalidModel, "GPU continuation memory target has no selected Router or LM head fence"};
+
+    const auto device_index = [&](const ExecutionNode& node) {
+        return node.layer_plan_index < model.graph.layer_plans.size()
+                   ? model.graph.layer_plans[node.layer_plan_index].vulkan_device_index
+                   : model.opt.vulkan_device_index;
+    };
+    const uint32_t device = device_index(source);
+    if (device_index(model.graph.nodes[target_id]) != device || device_index(model.graph.nodes[resolved_fence]) != device)
+        return Error{ErrorCode::InvalidModel, "GPU continuation memory submission crosses a device boundary"};
+
+    fence_id = resolved_fence;
+    return target_id;
 }
 
 class GpuSegmentContinuation_vulkan::Implementation

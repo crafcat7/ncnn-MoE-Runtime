@@ -71,14 +71,15 @@ static Result<void> allocate_graph_resources(const CompiledModel& model,
     return {};
 }
 
-Result<void> prepare_model_graph_resources(CompiledModel& model, uint32_t prefill_rows)
+static Result<void> prepare_model_graph_resources(CompiledModel& model,
+                                                  uint32_t prefill_rows,
+                                                  ModelGraphMemoryPlan&& plan)
 {
     const uint32_t sessions = std::max(1u, model.opt.num_concurrent_sessions);
-    auto plan = plan_model_graph_memory(model, std::max(1u, prefill_rows), sessions);
-    if (!plan)
-        return plan.error();
+    if (prefill_rows == 0 || plan.prefill_rows != prefill_rows || plan.sequence_count != sessions)
+        return Error{ErrorCode::InvalidArgument, "GPU graph memory plan does not match the requested shape"};
     auto resources = std::make_shared<GraphResources>();
-    const auto requests = graph_resource_requests(plan.value(), sessions);
+    const auto requests = graph_resource_requests(plan, sessions);
     for (const auto& [device, request] : requests)
     {
         if (request.workspace_size == 0 && request.session_state_size == 0)
@@ -91,9 +92,19 @@ Result<void> prepare_model_graph_resources(CompiledModel& model, uint32_t prefil
     auto allocated = allocate_graph_resources(model, requests, sessions, &model.memory_plan.gpu_devices);
     if (!allocated)
         return allocated.error();
-    resources->plan = std::move(plan).value();
+    resources->plan = std::move(plan);
     model.graph_resources = std::move(resources);
     return {};
+}
+
+Result<void> prepare_model_graph_resources(CompiledModel& model, uint32_t prefill_rows)
+{
+    const uint32_t rows = std::max(1u, prefill_rows);
+    const uint32_t sessions = std::max(1u, model.opt.num_concurrent_sessions);
+    auto plan = plan_model_graph_memory(model, rows, sessions);
+    if (!plan)
+        return plan.error();
+    return prepare_model_graph_resources(model, rows, std::move(plan).value());
 }
 
 #if NCNN_MOE_WITH_VULKAN
@@ -287,7 +298,7 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
                 // Selection ends here. All subsequent failures are terminal;
                 // no partially prepared bank is changed to streaming/CPU.
                 model.memory_plan.gpu_devices = std::move(candidate);
-                auto prepared = prepare_model_graph_resources(model, model.bank_submission_rows);
+                auto prepared = prepare_model_graph_resources(model, model.bank_submission_rows, std::move(graph).value());
                 if (!prepared) return prepared.error();
                 const auto live = bank_live_resources(model, device);
                 if (live.heap_usage > live.heap_budget || total > live.heap_budget - live.heap_usage)

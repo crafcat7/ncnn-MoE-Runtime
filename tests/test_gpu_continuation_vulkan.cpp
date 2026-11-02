@@ -1,5 +1,7 @@
 #include "gpu_segment_fixture.h"
 
+#include <algorithm>
+
 namespace ncnn {
 namespace moe {
 
@@ -345,6 +347,84 @@ static int continuation_run()
         for (const bool native_delta : {false, true})
         {
             auto gpu = segment_compile(true, native_delta);
+            if (!native_delta)
+            {
+                const auto scheduled_node = [](const CompiledModel& model, ExecutionNodeType type, uint32_t layer) {
+                    const auto found = std::find_if(model.schedule.node_order.begin(), model.schedule.node_order.end(),
+                                                    [&](ExecutionNodeId id) {
+                                                        const auto& node = model.graph.nodes[id];
+                                                        return node.type == type && node.layer_plan_index == layer;
+                                                    });
+                    return found == model.schedule.node_order.end() ? invalid_execution_node_id : *found;
+                };
+                const uint32_t first_expert = scheduled_node(gpu, ExecutionNodeType::ExpertGroup, 0);
+                const uint32_t next_attention = scheduled_node(gpu, ExecutionNodeType::Attention, 1);
+                const uint32_t next_router = scheduled_node(gpu, ExecutionNodeType::Router, 1);
+                const uint32_t last_expert = scheduled_node(gpu, ExecutionNodeType::ExpertGroup, 1);
+                const uint32_t final_norm = scheduled_node(gpu, ExecutionNodeType::FinalNorm, invalid_execution_layer_id);
+                const uint32_t lm_head = scheduled_node(gpu, ExecutionNodeType::LmHead, invalid_execution_layer_id);
+                const auto rejects = [](const CompiledModel& model, uint32_t source) {
+                    uint32_t resolved_fence = invalid_execution_node_id;
+                    const auto resolved = GpuSegment_vulkan::continuation_target(model, source, resolved_fence);
+                    return !resolved && resolved.error().code == ErrorCode::InvalidModel
+                           && resolved_fence == invalid_execution_node_id;
+                };
+                segment_check(first_expert != invalid_execution_node_id && next_attention != invalid_execution_node_id
+                                  && next_router != invalid_execution_node_id && last_expert != invalid_execution_node_id
+                                  && final_norm != invalid_execution_node_id && lm_head != invalid_execution_node_id,
+                              "continuation boundary fixture is incomplete");
+
+                uint32_t fence = invalid_execution_node_id;
+                const auto layer_target = GpuSegment_vulkan::continuation_target(gpu, first_expert, fence);
+                segment_check(layer_target && layer_target.value() == next_attention && fence == next_router,
+                              "layer continuation target and Router fence were not resolved together");
+                const auto head_target = GpuSegment_vulkan::continuation_target(gpu, last_expert, fence);
+                segment_check(head_target && head_target.value() == final_norm && fence == lm_head,
+                              "head continuation target and LM-head fence were not resolved together");
+
+                CompiledModel no_target = gpu;
+                no_target.gpu_segments[1].reset();
+                fence = invalid_execution_node_id;
+                const auto unmatched = GpuSegment_vulkan::continuation_target(no_target, first_expert, fence);
+                segment_check(unmatched && unmatched.value() == invalid_execution_node_id
+                                  && fence == invalid_execution_node_id,
+                              "a legal boundary without a selected target segment must remain not applicable");
+
+                CompiledModel cpu_router = gpu;
+                cpu_router.graph.nodes[next_router].backend = ExecutionBackend::Cpu;
+                segment_check(rejects(cpu_router, first_expert),
+                              "a selected continuation with a CPU Router fence must be rejected");
+
+                CompiledModel missing_router = gpu;
+                auto& no_router_order = missing_router.schedule.node_order;
+                const auto router_position = std::find(no_router_order.begin(), no_router_order.end(), next_router);
+                segment_check(router_position != no_router_order.end(), "Router fence is missing from the fixture schedule");
+                no_router_order.erase(router_position);
+                segment_check(rejects(missing_router, first_expert),
+                              "a selected layer continuation without its Router fence must be rejected");
+
+                CompiledModel missing_head = gpu;
+                auto& no_head_order = missing_head.schedule.node_order;
+                const auto head_position = std::find(no_head_order.begin(), no_head_order.end(), lm_head);
+                segment_check(head_position != no_head_order.end(), "LM-head fence is missing from the fixture schedule");
+                no_head_order.erase(head_position);
+                segment_check(rejects(missing_head, last_expert),
+                              "a selected head continuation without its LM-head fence must be rejected");
+
+                CompiledModel blocked = gpu;
+                auto& blocked_order = blocked.schedule.node_order;
+                const auto target_position = std::find(blocked_order.begin(), blocked_order.end(), next_attention);
+                segment_check(target_position != blocked_order.end(), "Attention target is missing from the fixture schedule");
+                blocked_order.insert(target_position + 1, first_expert);
+                segment_check(rejects(blocked, first_expert),
+                              "a continuation fence must not be searched past another layer boundary");
+
+                CompiledModel cross_device = gpu;
+                const uint32_t layer_device = cross_device.graph.layer_plans[1].vulkan_device_index;
+                cross_device.opt.vulkan_device_index = layer_device == 0 ? 1 : layer_device - 1;
+                segment_check(rejects(cross_device, last_expert),
+                              "a continuation whose head fence crosses device ownership must be rejected");
+            }
             const std::array<int32_t, 2> ids = {2, 6};
             ActivationBuffer input;
             forward_embedding(gpu.weights.at(gpu.token_embedding), ids, input);

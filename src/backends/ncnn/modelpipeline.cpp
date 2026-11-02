@@ -2911,36 +2911,15 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
         {
             const ExecutionNode& source = graph.nodes[node_id];
             if (source.type != ExecutionNodeType::ExpertGroup) continue;
-            const ExecutionNodeId target_id = GpuSegment_vulkan::continuation_target(model, node_id);
+            uint32_t fence_id = invalid_execution_node_id;
+            const auto resolved = GpuSegment_vulkan::continuation_target(model, node_id, fence_id);
+            if (!resolved) return resolved.error();
+            const uint32_t target_id = resolved.value();
             if (target_id == invalid_execution_node_id) continue;
-            if (target_id >= graph.nodes.size() || positions[target_id] <= positions[node_id])
-                return Error{ErrorCode::InvalidModel, "GPU continuation memory target does not follow its Expert group"};
-            const ExecutionNode& target = graph.nodes[target_id];
-            const bool head = target.type == ExecutionNodeType::FinalNorm;
-            if (!head && target.type != ExecutionNodeType::Attention)
-                return Error{ErrorCode::InvalidModel, "GPU continuation memory target is not an Attention or final head"};
-            auto next = std::find(schedule.node_order.begin(), schedule.node_order.end(), target_id);
-            ExecutionNodeId fence_id = invalid_execution_node_id;
-            while (++next != schedule.node_order.end())
-            {
-                const ExecutionNode& candidate = graph.nodes[*next];
-                if ((head && candidate.type == ExecutionNodeType::LmHead)
-                    || (!head && candidate.type == ExecutionNodeType::Router && candidate.layer_plan_index == target.layer_plan_index))
-                {
-                    fence_id = candidate.id;
-                    break;
-                }
-                // Never retain an unrelated layer's Expert group by scanning
-                // past a missing Router/head boundary in a malformed schedule.
-                if (candidate.type == ExecutionNodeType::ExpertGroup || candidate.type == ExecutionNodeType::Attention
-                    || candidate.type == ExecutionNodeType::DenseFfn || candidate.type == ExecutionNodeType::TokenEmbedding)
-                    break;
-            }
-            if (fence_id == invalid_execution_node_id || graph.nodes[fence_id].backend != ExecutionBackend::Vulkan)
-                return Error{ErrorCode::InvalidModel, "GPU continuation memory target has no selected Router or LM head fence"};
+            if (target_id >= graph.nodes.size() || fence_id >= graph.nodes.size()
+                || positions[target_id] <= positions[node_id] || positions[fence_id] <= positions[target_id])
+                return Error{ErrorCode::InvalidModel, "GPU continuation memory target or fence does not follow its Expert group"};
             const uint32_t device = graph_node_device(model, graph, source);
-            if (graph_node_device(model, graph, target) != device || graph_node_device(model, graph, graph.nodes[fence_id]) != device)
-                return Error{ErrorCode::InvalidModel, "GPU continuation memory submission crosses a device boundary"};
             submissions.push_back({device, positions[node_id], positions[fence_id]});
         }
     std::vector<uint32_t> starts = positions;

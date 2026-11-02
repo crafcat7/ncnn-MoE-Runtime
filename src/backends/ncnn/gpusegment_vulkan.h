@@ -51,9 +51,12 @@ public:
     [[nodiscard]] static std::shared_ptr<GpuSegment_vulkan> create(const CompiledModel& model, const CompiledLayerPlan& layer);
     [[nodiscard]] static std::shared_ptr<GpuSegment_vulkan> create_head(const CompiledModel& model);
     [[nodiscard]] const std::shared_ptr<VulkanContext>& context() const noexcept;
-    // Shared by execution and lifetime planning. Returns an Attention or
-    // FinalNorm node, or invalid_execution_node_id at an explicit boundary.
-    [[nodiscard]] static uint32_t continuation_target(const CompiledModel& model, uint32_t expert_node_id);
+    // Shared by execution and lifetime planning. Returns a target and writes
+    // its Router/LM-head fence. A legal non-applicable boundary returns
+    // invalid_execution_node_id; a matched target without a valid fence or
+    // device range is an error.
+    [[nodiscard]] static Result<uint32_t> continuation_target(const CompiledModel& model, uint32_t expert_node_id,
+                                                              uint32_t& fence_id);
 
     // Execute an admitted full-bank chain. Cache pointers are layer-major,
     // with one entry per input row; Router IDs never cross the host boundary.

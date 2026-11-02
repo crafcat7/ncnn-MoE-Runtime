@@ -1014,8 +1014,14 @@ Result<void> forward_model(const CompiledModel& model,
                 const bool capture_boundary = use_speculative_context
                                               && std::find(model.speculative.target_layer_ids.begin(), model.speculative.target_layer_ids.end(), layer.layer_id)
                                                      != model.speculative.target_layer_ids.end();
-                ExecutionNodeId target_id = capture_boundary ? invalid_execution_node_id
-                                                             : GpuSegment_vulkan::continuation_target(model, node_id);
+                ExecutionNodeId target_id = invalid_execution_node_id;
+                if (!capture_boundary)
+                {
+                    uint32_t fence_id = invalid_execution_node_id;
+                    const auto resolved = GpuSegment_vulkan::continuation_target(model, node_id, fence_id);
+                    if (!resolved) return resolved.error();
+                    target_id = resolved.value();
+                }
                 if (target_id != invalid_execution_node_id && needs_mtp_final_hidden
                     && model.graph.nodes[target_id].type == ExecutionNodeType::FinalNorm)
                     target_id = invalid_execution_node_id;
@@ -2315,8 +2321,14 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                 const bool capture_boundary = use_speculative_context
                                               && std::find(model.speculative.target_layer_ids.begin(), model.speculative.target_layer_ids.end(), layer.layer_id)
                                                      != model.speculative.target_layer_ids.end();
-                ExecutionNodeId target_id = capture_boundary ? invalid_execution_node_id
-                                                             : GpuSegment_vulkan::continuation_target(model, node_id);
+                ExecutionNodeId target_id = invalid_execution_node_id;
+                if (!capture_boundary)
+                {
+                    uint32_t fence_id = invalid_execution_node_id;
+                    const auto resolved = GpuSegment_vulkan::continuation_target(model, node_id, fence_id);
+                    if (!resolved) return resolved.error();
+                    target_id = resolved.value();
+                }
                 if (target_id != invalid_execution_node_id && use_speculative_context
                     && model.speculative.kind == SpeculativeModelKind::Mtp
                     && model.graph.nodes[target_id].type == ExecutionNodeType::FinalNorm)
