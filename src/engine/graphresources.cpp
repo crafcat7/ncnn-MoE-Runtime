@@ -386,7 +386,12 @@ Result<uint64_t> ensure_model_graph_resources(const CompiledModel& model, uint64
     const auto requests = graph_resource_requests(plan.value(), sessions);
     auto allocated = allocate_graph_resources(model, requests, sessions, nullptr);
     if (!allocated)
+    {
+        // Replanning may have released obsolete free arena backing. Keep the
+        // host-output capacity, but force the next request to reserve again.
+        resources.plan.prefill_rows = 0;
         return allocated.error();
+    }
     resources.plan = std::move(plan).value();
     return resources.plan.host_output_slot_size;
 }

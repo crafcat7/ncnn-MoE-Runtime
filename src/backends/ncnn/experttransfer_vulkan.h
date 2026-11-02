@@ -40,6 +40,9 @@ public:
     // The graph arena retains reusable blocks and permits physical growth only
     // during explicit preparation/reservation. Expert-cache pools never call it.
     void configure_graph_pool(bool allow_growth);
+    // Explicit graph replanning may discard free backing. Keep the smallest
+    // wholly free block that can cover the new reservation, and all live blocks.
+    void trim_graph_pool(uint64_t reservation_bytes);
 
 private:
     struct Allocation;

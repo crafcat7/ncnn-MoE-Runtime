@@ -314,6 +314,30 @@ void VulkanExpertWeightAllocator::configure_graph_pool(bool allow_growth)
     allow_physical_growth = allow_growth;
 }
 
+void VulkanExpertWeightAllocator::trim_graph_pool(uint64_t reservation_bytes)
+{
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (!retain_free_blocks)
+        return;
+    const Block* retained = nullptr;
+    for (const auto& block : blocks)
+        if (block->used.empty() && block->capacity >= reservation_bytes
+            && (!retained || block->capacity < retained->capacity))
+            retained = block.get();
+    for (auto block = blocks.begin(); block != blocks.end();)
+    {
+        if (!(*block)->used.empty() || block->get() == retained)
+        {
+            ++block;
+            continue;
+        }
+        vkDestroyBuffer(vkdev->vkdevice(), (*block)->buffer, nullptr);
+        vkFreeMemory(vkdev->vkdevice(), (*block)->memory, nullptr);
+        allocated_bytes -= (*block)->memory_size;
+        block = blocks.erase(block);
+    }
+}
+
 struct VulkanExpertTransferPool::Lane
 {
     const ncnn::VulkanDevice* device;

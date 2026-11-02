@@ -3,6 +3,7 @@
 #if NCNN_MOE_WITH_VULKAN
 #include "experttransfer_vulkan.h"
 
+#include <algorithm>
 #include <limits>
 
 namespace ncnn {
@@ -65,6 +66,13 @@ bool VulkanGraphAllocator::reserve_graph_compute(uint64_t bytes)
     if (!reserved)
         preparation_physical_size = pool->physical_bytes();
 
+    // A larger shape replaces obsolete free arenas instead of accumulating
+    // one full peak per replan. Live tensors retain their backing unchanged.
+    // Once trimmed, a failed allocation must not advertise the old capacity.
+    reserved_compute_size = 0;
+    pool->trim_graph_pool(bytes);
+    // Preparation cannot remain charged to backing that was reclaimed.
+    preparation_physical_size = std::min(preparation_physical_size, pool->physical_bytes());
     pool->configure_graph_pool(true);
     ncnn::VkBufferMemory* warm = nullptr;
     try

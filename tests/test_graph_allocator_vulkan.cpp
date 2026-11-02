@@ -135,6 +135,28 @@ static void test_reservation_reuse_and_growth(uint32_t device_index)
     std::unique_ptr<ncnn::VkBufferMemory, decltype(release)> larger(arena.fastMalloc(larger_compute), release);
     arena_check(larger != nullptr && arena.physical_size().total_physical_size == grown.total_physical_size,
                 "larger graph reservation did not back the required contiguous allocation");
+    larger.reset();
+    for (uint64_t capacity : {larger_compute * 2, larger_compute * 4, larger_compute * 8})
+    {
+        arena_check(arena.reserve_graph_compute(capacity), "successive graph shape growth failed");
+        arena_check(arena.physical_size().total_physical_size <= preparation_size + capacity + alignment,
+                    "graph replanning accumulated obsolete fully free working sets");
+        arena_check(live.buffer() == live_buffer && live.buffer_offset() == live_offset,
+                    "reclaiming obsolete graph arenas relocated a live tensor");
+        verify_content(context, arena, live, expected);
+    }
+    if (std::numeric_limits<size_t>::max() == std::numeric_limits<uint64_t>::max())
+    {
+        // Alignment overflow rejects this request after trimming, without
+        // depending on the driver or exhausting the device's physical heap.
+        arena_check(!arena.reserve_graph_compute(std::numeric_limits<uint64_t>::max()),
+                    "an unrepresentable graph reservation unexpectedly succeeded");
+        verify_content(context, arena, live, expected);
+        arena_check(arena.reserve_graph_compute(initial_compute),
+                    "a failed replan prevented a later smaller reservation");
+        larger.reset(arena.fastMalloc(initial_compute));
+        arena_check(larger != nullptr, "a failed replan left a stale advertised capacity");
+    }
     live.release();
 }
 
