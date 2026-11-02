@@ -2,6 +2,7 @@
 #include "internal/gputelemetry.h"
 #include "ncnn/moe/runtime.h"
 #include "engine/cpu.h"
+#include "engine/graphresources.h"
 #include "graph/compiledmodel.h"
 #include "kernels/bfloat16.h"
 
@@ -250,6 +251,11 @@ static std::string stats_json(const SessionMetrics& metrics)
 static std::string gpu_resource_plan_json(const CompiledModel& model)
 {
     const ModelMemoryPlan& memory_plan = model.memory_plan;
+    if (memory_plan.gpu_devices.empty())
+        return "[]";
+    GraphResources& graph_resources = *model.graph_resources;
+    const std::lock_guard<std::mutex> graph_lock(graph_resources.mutex);
+    const ModelGraphMemoryPlan& graph_plan = graph_resources.plan;
     std::string result = "[";
     for (const GpuResourcePlan& plan : memory_plan.gpu_devices)
     {
@@ -269,12 +275,12 @@ static std::string gpu_resource_plan_json(const CompiledModel& model)
         device.add_uint("arena_preparation_physical_bytes", physical.preparation_physical_size);
         device.add_uint("arena_compute_physical_bytes", physical.compute_physical_size);
         device.add_uint("arena_total_physical_bytes", physical.total_physical_size);
-        device.add_uint("planned_prefill_rows", memory_plan.graph.prefill_rows);
-        device.add_uint("planned_context_tokens", memory_plan.graph.context_tokens);
-        for (const auto& arena : memory_plan.graph.prefill.devices)
+        device.add_uint("planned_prefill_rows", graph_plan.prefill_rows);
+        device.add_uint("planned_context_tokens", graph_plan.context_tokens);
+        for (const auto& arena : graph_plan.prefill.devices)
             if (arena.device_index == plan.initial.device_index)
                 device.add_uint("prefill_graph_peak_bytes", arena.peak_size);
-        for (const auto& arena : memory_plan.graph.decode.devices)
+        for (const auto& arena : graph_plan.decode.devices)
             if (arena.device_index == plan.initial.device_index)
                 device.add_uint("decode_graph_peak_bytes", arena.peak_size);
         device.add_uint("expert_cache_reserve_bytes", plan.expert_cache_reserve);

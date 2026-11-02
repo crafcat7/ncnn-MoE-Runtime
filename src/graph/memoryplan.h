@@ -44,7 +44,6 @@ struct ModelMemoryPlan
     uint64_t expert_cache_size = 0;
     uint64_t available_memory_size = 0;
     std::vector<GpuResourcePlan> gpu_devices;
-    ModelGraphMemoryPlan graph;
 };
 
 struct Option;

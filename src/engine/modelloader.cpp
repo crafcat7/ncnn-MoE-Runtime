@@ -1080,8 +1080,7 @@ Result<void> ModelLoader::load(const std::filesystem::path& model_path)
     if (!ret)
         return ret.error();
 
-    ret = prepare_model_expert_banks(model, SessionOptions{}.prefill_chunk_size,
-                                     opt.expert_gpu_cache_size, opt.expert_gpu_victim_cache_size);
+    ret = prepare_model_expert_banks(model, SessionOptions{}.prefill_chunk_size, opt.expert_gpu_cache_size);
     if (!ret)
         return ret.error();
 

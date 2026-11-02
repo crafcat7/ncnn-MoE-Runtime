@@ -89,10 +89,6 @@ Result<void> prepare_model_graph_resources(CompiledModel& model, uint32_t prefil
     if (!allocated)
         return allocated.error();
     resources->plan = std::move(plan).value();
-    resources->prefill_rows = resources->plan.prefill_rows;
-    resources->context_tokens = resources->plan.context_tokens;
-    resources->sequence_count = resources->plan.sequence_count;
-    model.memory_plan.graph = resources->plan;
     model.graph_resources = std::move(resources);
     return {};
 }
@@ -200,9 +196,8 @@ static GpuResourceSnapshot bank_live_resources(const CompiledModel& model, uint3
 }
 #endif
 
-Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_rows, uint64_t expert_budget, uint64_t victim_budget)
+Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_rows, uint64_t expert_budget)
 {
-    (void)victim_budget; // Full residency needs no eviction/victim reserve.
     if (!model.gpu_expert_banks.empty())
         return Error{ErrorCode::InvalidArgument, "resident Expert banks have already been prepared"};
 #if NCNN_MOE_WITH_VULKAN
@@ -332,25 +327,31 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
     return prepare_model_graph_resources(model, prefill_rows);
 }
 
-Result<void> ensure_model_graph_resources(const CompiledModel& model, uint64_t rows, uint64_t context_tokens, uint32_t sequence_count)
+Result<uint64_t> ensure_model_graph_resources(const CompiledModel& model, uint64_t rows, uint64_t context_tokens, uint32_t sequence_count)
 {
     // Direct compiler clients may manage allocation themselves. Runtime loads
     // always initialize the shared graph resource domain before publishing.
-    if (!model.graph_resources || model.memory_plan.gpu_devices.empty())
-        return {};
+    if (!model.graph_resources)
+        return uint64_t{0};
+    GraphResources& resources = *model.graph_resources;
+    if (model.memory_plan.gpu_devices.empty())
+    {
+        const std::lock_guard<std::mutex> lock(resources.mutex);
+        return resources.plan.host_output_slot_size;
+    }
     if (rows > std::numeric_limits<uint32_t>::max() || context_tokens > std::numeric_limits<uint32_t>::max())
         return Error{ErrorCode::InvalidArgument, "GPU graph shape exceeds uint32 range"};
-    GraphResources& resources = *model.graph_resources;
     // The row count may decrease when context grows. Read the shape under one
     // lock so concurrent Sessions cannot combine dimensions from two plans.
     const std::lock_guard<std::mutex> lock(resources.mutex);
-    if (rows <= resources.prefill_rows.load() && context_tokens <= resources.context_tokens.load() && sequence_count <= resources.sequence_count.load())
-        return {};
+    if (rows <= resources.plan.prefill_rows && context_tokens <= resources.plan.context_tokens
+        && sequence_count <= resources.plan.sequence_count)
+        return resources.plan.host_output_slot_size;
     // Replan the requested shape, not the Cartesian product of all historic
     // maxima. A long-context decode can reuse a larger short-context prefill
     // arena without reserving a fictitious long-context 512-row prefill.
     const uint32_t next_rows = std::max(1u, static_cast<uint32_t>(rows));
-    uint32_t next_context = std::max(1u, resources.context_tokens.load());
+    uint32_t next_context = std::max(1u, resources.plan.context_tokens);
     while (next_context < context_tokens)
     {
         if (next_context > std::numeric_limits<uint32_t>::max() / 2)
@@ -371,10 +372,7 @@ Result<void> ensure_model_graph_resources(const CompiledModel& model, uint64_t r
     if (!allocated)
         return allocated.error();
     resources.plan = std::move(plan).value();
-    resources.prefill_rows = resources.plan.prefill_rows;
-    resources.context_tokens = resources.plan.context_tokens;
-    resources.sequence_count = resources.plan.sequence_count;
-    return {};
+    return resources.plan.host_output_slot_size;
 }
 
 } // namespace moe

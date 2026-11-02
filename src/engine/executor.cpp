@@ -338,15 +338,11 @@ Result<void> forward_model(const CompiledModel& model,
 
     if (input_ids.size() > std::numeric_limits<uint64_t>::max() - position_offset)
         return Error{ErrorCode::InvalidArgument, "execution position overflows"};
-    auto graph_resources = ensure_model_graph_resources(model, input_ids.size(), position_offset + input_ids.size());
-    if (!graph_resources)
-        return graph_resources.error();
+    auto output_size = ensure_model_graph_resources(model, input_ids.size(), position_offset + input_ids.size());
+    if (!output_size)
+        return output_size.error();
     prepare_execution_state(model, state);
-    if (model.graph_resources)
-    {
-        const std::lock_guard<std::mutex> lock(model.graph_resources->mutex);
-        state.gpu_segment.reserve_host_output(model.graph_resources->plan.host_output_slot_size);
-    }
+    state.gpu_segment.reserve_host_output(output_size.value());
 
     ExpertCacheStatistics execution_cache_before;
     if (model.expert_cache)
@@ -1357,14 +1353,10 @@ Result<void> forward_decode_batch(const CompiledModel& model,
     }
     if (entries.size() > std::numeric_limits<uint32_t>::max())
         return Error{ErrorCode::InvalidArgument, "decode batch exceeds uint32 range"};
-    auto graph_resources = ensure_model_graph_resources(model, 1, context_tokens, static_cast<uint32_t>(entries.size()));
-    if (!graph_resources)
-        return graph_resources.error();
-    if (model.graph_resources)
-    {
-        const std::lock_guard<std::mutex> lock(model.graph_resources->mutex);
-        workspace.gpu_segment.reserve_host_output(model.graph_resources->plan.host_output_slot_size);
-    }
+    auto output_size = ensure_model_graph_resources(model, 1, context_tokens, static_cast<uint32_t>(entries.size()));
+    if (!output_size)
+        return output_size.error();
+    workspace.gpu_segment.reserve_host_output(output_size.value());
     const CpuOpenMpThreadLimitScope openmp_scope;
 
     if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
