@@ -147,13 +147,14 @@ void mxfp4_down()
             if (column + 3u < p.output_columns) sum.w += mxfp4_dot8(base, column + 3u, blocks, k, x0, x1, safe_input);
         }
     }
-    vec4 reduced = vec4(0.0);
+    float reduced = 0.0;
 #if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
     const vec4 subgroup_sum = subgroupAdd(sum);
     if (gl_SubgroupInvocationID == 0u) mxfp4_partial[gl_SubgroupID] = subgroup_sum;
     barrier();
-    if (tid == 0u)
-        for (uint group = 0u; group < gl_NumSubgroups; ++group) reduced += mxfp4_partial[group];
+    // First four lanes reduce one output each in ascending subgroup order.
+    if (tid < 4u)
+        for (uint group = 0u; group < gl_NumSubgroups; ++group) reduced += mxfp4_partial[group][tid];
 #else
     mxfp4_partial[tid] = sum;
     barrier();
@@ -162,15 +163,15 @@ void mxfp4_down()
         if (tid < stride) mxfp4_partial[tid] += mxfp4_partial[tid + stride];
         barrier();
     }
-    reduced = mxfp4_partial[0];
+    if (tid < 4u) reduced = mxfp4_partial[0][tid];
 #endif
-    if (tid == 0u)
-        for (uint offset = 0u; offset < 4u && column + offset < p.output_columns; ++offset)
-        {
-            if (valid)
-                reduced[offset] += uintBitsToFloat(weights[p.down_weights + uint(id_value) * p.down_stride + p.down_bias + column + offset]);
-            output_data[(row * p.top_k + route) * p.output_columns + column + offset] = valid ? reduced[offset] : 0.0;
-        }
+    if (tid < 4u && column + tid < p.output_columns)
+    {
+        const uint output_column = column + tid;
+        if (valid)
+            reduced += uintBitsToFloat(weights[p.down_weights + uint(id_value) * p.down_stride + p.down_bias + output_column]);
+        output_data[(row * p.top_k + route) * p.output_columns + output_column] = valid ? reduced : 0.0;
+    }
 }
 
 void main()

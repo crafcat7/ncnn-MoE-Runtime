@@ -161,8 +161,8 @@ void mxfp4_gate_up()
             }
         }
     }
-    vec4 gate_reduced = vec4(0.0);
-    vec4 up_reduced = vec4(0.0);
+    float gate_reduced = 0.0;
+    float up_reduced = 0.0;
 #if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
     const vec4 gate_subgroup = subgroupAdd(gate_sum);
     const vec4 up_subgroup = subgroupAdd(up_sum);
@@ -172,11 +172,12 @@ void mxfp4_gate_up()
         up_mxfp4_partial[gl_SubgroupID] = up_subgroup;
     }
     barrier();
-    if (tid == 0u)
+    // First four lanes reduce one output each in ascending subgroup order.
+    if (tid < 4u)
         for (uint group = 0u; group < gl_NumSubgroups; ++group)
         {
-            gate_reduced += gate_mxfp4_partial[group];
-            up_reduced += up_mxfp4_partial[group];
+            gate_reduced += gate_mxfp4_partial[group][tid];
+            up_reduced += up_mxfp4_partial[group][tid];
         }
 #else
     gate_mxfp4_partial[tid] = gate_sum;
@@ -191,28 +192,31 @@ void mxfp4_gate_up()
         }
         barrier();
     }
-    gate_reduced = gate_mxfp4_partial[0];
-    up_reduced = up_mxfp4_partial[0];
+    if (tid < 4u)
+    {
+        gate_reduced = gate_mxfp4_partial[0][tid];
+        up_reduced = up_mxfp4_partial[0][tid];
+    }
 #endif
-    if (tid == 0u)
-        for (uint offset = 0u; offset < 4u && column + offset < p.intermediate_columns; ++offset)
+    if (tid < 4u && column + tid < p.intermediate_columns)
+    {
+        const uint output_column = column + tid;
+        float result = 0.0;
+        if (valid)
         {
-            float result = 0.0;
-            if (valid)
+            const uint bias = uint(id_value) * p.gate_stride + p.gate_bias + output_column * 2u;
+            float gate = gate_reduced + uintBitsToFloat(weights[bias]);
+            float up = up_reduced + uintBitsToFloat(weights[bias + 1u]);
+            if (p.activation_limit > 0.0)
             {
-                const uint bias = uint(id_value) * p.gate_stride + p.gate_bias + (column + offset) * 2u;
-                float gate = gate_reduced[offset] + uintBitsToFloat(weights[bias]);
-                float up = up_reduced[offset] + uintBitsToFloat(weights[bias + 1u]);
-                if (p.activation_limit > 0.0)
-                {
-                    gate = min(gate, p.activation_limit);
-                    up = clamp(up, -p.activation_limit, p.activation_limit);
-                }
-                result = p.activation == 0u ? (gate / (1.0 + exp(-1.702 * gate))) * (up + 1.0)
-                                            : (gate / (1.0 + exp(-gate))) * up;
+                gate = min(gate, p.activation_limit);
+                up = clamp(up, -p.activation_limit, p.activation_limit);
             }
-            output_data[(row * p.top_k + route) * p.intermediate_columns + column + offset] = result;
+            result = p.activation == 0u ? (gate / (1.0 + exp(-1.702 * gate))) * (up + 1.0)
+                                        : (gate / (1.0 + exp(-gate))) * up;
         }
+        output_data[(row * p.top_k + route) * p.intermediate_columns + output_column] = result;
+    }
 }
 
 void main()

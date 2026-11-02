@@ -65,8 +65,7 @@ vec4 matrix_values(uint output_column, uint input_column)
     return result;
 }
 
-shared float partial0[128];
-shared float partial1[128];
+shared vec2 partial[128];
 
 void main()
 {
@@ -88,43 +87,28 @@ void main()
         if (second_output)
             sum1 += dot(matrix_values(output_column + 1u, column), input_values);
     }
-    float result0 = 0.0;
-    float result1 = 0.0;
+    float result = 0.0;
 #if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
-    const float reduced0 = subgroupAdd(sum0);
-    const float reduced1 = subgroupAdd(sum1);
+    const vec2 reduced = subgroupAdd(vec2(sum0, sum1));
     if (gl_SubgroupInvocationID == 0u)
-    {
-        partial0[gl_SubgroupID] = reduced0;
-        partial1[gl_SubgroupID] = reduced1;
-    }
+        partial[gl_SubgroupID] = reduced;
     barrier();
-    if (lane == 0u)
+    if (lane < outputs_per_group)
         for (uint subgroup = 0u; subgroup < gl_NumSubgroups; ++subgroup)
-        {
-            result0 += partial0[subgroup];
-            result1 += partial1[subgroup];
-        }
+            result += partial[subgroup][lane];
 #else
-    partial0[lane] = sum0;
-    partial1[lane] = sum1;
+    partial[lane] = vec2(sum0, sum1);
     barrier();
     for (uint stride = 64u; stride > 0u; stride >>= 1u)
     {
         if (lane < stride)
-        {
-            partial0[lane] += partial0[lane + stride];
-            partial1[lane] += partial1[lane + stride];
-        }
+            partial[lane] += partial[lane + stride];
         barrier();
     }
-    result0 = partial0[0];
-    result1 = partial1[0];
+    if (lane < outputs_per_group)
+        result = partial[0][lane];
 #endif
-    if (lane == 0u && output_column < p.output_columns)
-    {
-        output_data[output_column] = result0 + (p.bias_term != 0u ? bias_data[output_column] : 0.0);
-        if (second_output)
-            output_data[output_column + 1u] = result1 + (p.bias_term != 0u ? bias_data[output_column + 1u] : 0.0);
-    }
+    const uint column = output_column + lane;
+    if (lane < outputs_per_group && column < p.output_columns)
+        output_data[column] = result + (p.bias_term != 0u ? bias_data[column] : 0.0);
 }
