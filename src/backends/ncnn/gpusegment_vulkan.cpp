@@ -342,7 +342,7 @@ std::shared_ptr<GpuSegment_vulkan> GpuSegment_vulkan::create_head(const Compiled
 }
 
 Result<uint32_t> GpuSegment_vulkan::continuation_target(const CompiledModel& model, uint32_t expert_node_id,
-                                                       uint32_t& fence_id)
+                                                        uint32_t& fence_id)
 {
     fence_id = invalid_execution_node_id;
     if (expert_node_id >= model.graph.nodes.size()) return invalid_execution_node_id;

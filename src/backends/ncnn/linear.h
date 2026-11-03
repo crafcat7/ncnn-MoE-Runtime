@@ -289,7 +289,7 @@ public:
                                                                        const VulkanRuntimePtr& vulkan_runtime,
                                                                        uint64_t optimization_flags);
     [[nodiscard]] static std::vector<uint64_t> scratch_elements(uint32_t gate_output_columns,
-                                                                 uint64_t rows);
+                                                                uint64_t rows);
     [[nodiscard]] bool forward(const ActivationBuffer& input,
                                ActivationBuffer& output) const;
 
@@ -334,7 +334,7 @@ public:
                                                                      const VulkanRuntimePtr& vulkan_runtime,
                                                                      uint64_t optimization_flags);
     [[nodiscard]] static std::vector<uint64_t> scratch_elements(uint32_t input_columns,
-                                                                 uint64_t rows);
+                                                                uint64_t rows);
     // Device input includes its FP32 clone; host input quantizes and uploads before recording.
     [[nodiscard]] static std::vector<uint64_t> swiglu_scratch_elements(uint32_t input_columns,
                                                                        uint32_t intermediate_columns,
@@ -574,10 +574,10 @@ public:
                                                                            const VulkanRuntimePtr& vulkan_runtime,
                                                                            uint64_t optimization_flags);
     [[nodiscard]] static std::vector<uint64_t> scratch_elements(uint32_t intermediate_columns,
-                                                                 uint32_t output_columns,
-                                                                 bool separate_up,
-                                                                 bool router_gate,
-                                                                 uint64_t rows);
+                                                                uint32_t output_columns,
+                                                                bool separate_up,
+                                                                bool router_gate,
+                                                                uint64_t rows);
     [[nodiscard]] bool forward(const ActivationBuffer& input, ActivationBuffer& output) const;
     [[nodiscard]] bool forward_device(const DeviceTensor_vulkan& input, DeviceTensor_vulkan& output) const;
     [[nodiscard]] bool prepare_router_gate(const TensorData& weight);

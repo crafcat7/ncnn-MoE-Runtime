@@ -268,8 +268,8 @@ std::shared_ptr<GatedResidualLayer_vulkan> GatedResidualLayer_vulkan::create_hea
 
 #if NCNN_MOE_WITH_VULKAN
 static bool ple_rows(const WeightStore& weights, const PleBlockPlan& plan,
-                          std::span<const int32_t> tokens, const LayerCache& cache, ActivationBuffer& packed,
-                          uint32_t& encoding, uint32_t& stride, std::vector<int32_t>& next_history)
+                     std::span<const int32_t> tokens, const LayerCache& cache, ActivationBuffer& packed,
+                     uint32_t& encoding, uint32_t& stride, std::vector<int32_t>& next_history)
 {
     if (plan.ngram_size < 2 || plan.heads_per_ngram == 0 || plan.embedding_shards.empty()
         || cache.ple_token_history.size() > plan.ngram_size - 1) return false;
@@ -392,8 +392,8 @@ static bool ple_rows(const WeightStore& weights, const PleBlockPlan& plan,
 #endif
 
 bool GatedResidualLayer_vulkan::forward(const ActivationBuffer& initial_hidden, std::span<const int32_t> tokens,
-                               uint64_t position, LayerCache& cache, const ExpertDispatchOptions& options,
-                               ExpertDispatchPlan& routes, GatedResidualWorkspace_vulkan& workspace, std::string& error) const
+                                        uint64_t position, LayerCache& cache, const ExpertDispatchOptions& options,
+                                        ExpertDispatchPlan& routes, GatedResidualWorkspace_vulkan& workspace, std::string& error) const
 {
 #if NCNN_MOE_WITH_VULKAN
     error.clear();
@@ -464,8 +464,8 @@ bool GatedResidualLayer_vulkan::forward(const ActivationBuffer& initial_hidden, 
             || !residual_allocate(ple_norm, impl.ple.embedding_dimension, input.h, impl.context)) return fail("PLE selected-row upload or workspace allocation");
         ++uploads;
         residual_record(impl.pipeline.get(), 7, impl.ple.embedding_dimension, heads, input.h, impl.ple.embedding_dimension,
-                    0, 0, {packed_gpu, packed_gpu, packed_gpu, packed_gpu, packed_gpu, ple_norm}, cmd,
-                    encoding, impl.ple.embedding_dimension / heads, stride);
+                        0, 0, {packed_gpu, packed_gpu, packed_gpu, packed_gpu, packed_gpu, ple_norm}, cmd,
+                        encoding, impl.ple.embedding_dimension / heads, stride);
         if (!impl.ple_key->record_forward(ple_norm, ple_key, cmd, buffers)
             || !impl.ple_value->record_forward(ple_norm, ple_value, cmd, buffers)) return fail("PLE key/value projection");
         ncnn::VkMat key_normalized, query_normalized;
@@ -480,16 +480,16 @@ bool GatedResidualLayer_vulkan::forward(const ActivationBuffer& initial_hidden, 
         residual_prepare_read(impl.convolution_weight);
         residual_prepare_read(ple_state->d->convolution);
         residual_record(impl.pipeline.get(), 0, impl.hidden, impl.copies, input.h, expanded, impl.epsilon, impl.offset,
-                    {ple_key, impl.key_norm, ple_key, ple_key, ple_key, key_normalized}, cmd);
+                        {ple_key, impl.key_norm, ple_key, ple_key, ple_key, key_normalized}, cmd);
         residual_record(impl.pipeline.get(), 0, impl.hidden, impl.copies, input.h, expanded, impl.epsilon, impl.offset,
-                    {input, impl.query_norm, input, input, input, query_normalized}, cmd);
+                        {input, impl.query_norm, input, input, input, query_normalized}, cmd);
         residual_record(impl.pipeline.get(), 5, impl.hidden, impl.copies, input.h, expanded, 0, 0,
-                    {key_normalized, query_normalized, ple_value, ple_value, ple_value, gated}, cmd);
+                        {key_normalized, query_normalized, ple_value, ple_value, ple_value, gated}, cmd);
         residual_record(impl.pipeline.get(), 0, impl.hidden, impl.copies, input.h, expanded, impl.epsilon, impl.offset,
-                    {gated, impl.conv_norm, gated, gated, gated, conv_input}, cmd);
+                        {gated, impl.conv_norm, gated, gated, gated, conv_input}, cmd);
         residual_record(impl.pipeline.get(), 6, impl.hidden, impl.copies, input.h, expanded, 0, 0,
-                    {conv_input, gated, impl.convolution_weight, input, ple_state->d->convolution, ple_query}, cmd,
-                    impl.ple.convolution_kernel_size, impl.ple.ngram_size, length, ple_state->d->slot);
+                        {conv_input, gated, impl.convolution_weight, input, ple_state->d->convolution, ple_query}, cmd,
+                        impl.ple.convolution_kernel_size, impl.ple.ngram_size, length, ple_state->d->slot);
         next_slot = length == 0 ? 0 : static_cast<uint32_t>((ple_state->d->slot + tokens.size()) % length);
         buffers.insert(buffers.end(), {input, key_normalized, query_normalized});
         input = ple_query;
@@ -588,7 +588,7 @@ bool GatedResidualLayer_vulkan::forward(const ActivationBuffer& initial_hidden, 
 }
 
 bool GatedResidualLayer_vulkan::defer_combine(std::span<const MoeCombineInput_vulkan> inputs,
-                                     size_t rows, uint32_t columns, std::shared_ptr<const DeviceTensor_vulkan> shared, GatedResidualWorkspace_vulkan& workspace)
+                                              size_t rows, uint32_t columns, std::shared_ptr<const DeviceTensor_vulkan> shared, GatedResidualWorkspace_vulkan& workspace)
 {
 #if NCNN_MOE_WITH_VULKAN
     if (!workspace.active()) return false;
@@ -612,7 +612,7 @@ bool GatedResidualLayer_vulkan::defer_combine(std::span<const MoeCombineInput_vu
 }
 
 bool GatedResidualLayer_vulkan::finish(const CompiledModel& model, bool produce_logits, bool last_only,
-                              ActivationBuffer& logits, GatedResidualWorkspace_vulkan& workspace)
+                                       ActivationBuffer& logits, GatedResidualWorkspace_vulkan& workspace)
 {
 #if NCNN_MOE_WITH_VULKAN
     if (!workspace.active() || !model.gated_residual_device_head) return false;

@@ -487,7 +487,7 @@ Result<void> forward_model(const CompiledModel& model,
             if (model.gated_residual_chain)
             {
                 if (!GatedResidualLayer_vulkan::finish(model, logits_output != LogitsOutput::None,
-                                              logits_output == LogitsOutput::Last, state.logits, state.gated_residual_layer))
+                                                       logits_output == LogitsOutput::Last, state.logits, state.gated_residual_layer))
                     return Error{ErrorCode::InternalError, "continuous gated residual Vulkan LM head execution failed"};
                 produced_logits = logits_output != LogitsOutput::None;
                 statistics.vulkan_gated_residual_blocks += logits_output != LogitsOutput::None ? 1 : 0;
@@ -1127,7 +1127,7 @@ Result<void> forward_model(const CompiledModel& model,
                 }
                 if ((moe.has_shared_expert && !layer_state.shared_expert_device_output)
                     || !GatedResidualLayer_vulkan::defer_combine(inputs, input_ids.size(), model.descriptor.hidden_size,
-                                                        layer_state.shared_expert_device_output, state.gated_residual_layer))
+                                                                 layer_state.shared_expert_device_output, state.gated_residual_layer))
                     return Error{ErrorCode::InternalError, "continuous gated residual Vulkan Expert combine failed"};
                 inputs.clear();
                 fused_router_ready = false;

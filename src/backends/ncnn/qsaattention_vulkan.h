@@ -74,9 +74,9 @@ public:
     // order. Rows are included; context_tokens is a capacity upper bound.
     // Persistent cache storage and the logical output are excluded.
     [[nodiscard]] static std::vector<uint64_t> scratch_elements(const AttentionBlockPlan& plan,
-                                                                 uint32_t hidden_size,
-                                                                 uint32_t rows,
-                                                                 uint32_t context_tokens);
+                                                                uint32_t hidden_size,
+                                                                uint32_t rows,
+                                                                uint32_t context_tokens);
     [[nodiscard]] uint64_t initial_state_bytes() const noexcept;
 #if NCNN_MOE_WITH_VULKAN
     [[nodiscard]] const std::shared_ptr<VulkanContext>& vulkan_context() const noexcept;

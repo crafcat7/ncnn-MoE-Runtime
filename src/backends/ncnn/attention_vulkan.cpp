@@ -47,8 +47,8 @@ namespace ncnn {
 namespace moe {
 
 std::vector<uint64_t> Attention_vulkan::scratch_elements(const AttentionConfig_vulkan& config, uint32_t rows,
-                                                        uint32_t context_tokens, uint32_t sequence_count,
-                                                        uint64_t kv_element_size, bool direct_ring)
+                                                         uint32_t context_tokens, uint32_t sequence_count,
+                                                         uint64_t kv_element_size, bool direct_ring)
 {
     const uint64_t query = saturating_multiply_u64(config.head_count, config.head_dimension);
     const uint64_t key = saturating_multiply_u64(config.kv_head_count, config.head_dimension);
@@ -56,14 +56,14 @@ std::vector<uint64_t> Attention_vulkan::scratch_elements(const AttentionConfig_v
     // Normalization, fused QKV[/gate], rotated query, attended values and the
     // projection before residual Add. Add's result belongs to the graph.
     std::vector<uint64_t> columns = {config.hidden_size,
-        saturating_add_u64(query, saturating_add_u64(saturating_multiply_u64(key, 2), gate ? query : 0)),
-        query, query, config.hidden_size, 1, 1}; // RMSNorm mean and coefficient.
+                                     saturating_add_u64(query, saturating_add_u64(saturating_multiply_u64(key, 2), gate ? query : 0)),
+                                     query, query, config.hidden_size, 1, 1}; // RMSNorm mean and coefficient.
     if (!direct_ring) columns.insert(columns.end(), {key, key});
     if (gate) columns.push_back(query);
     const bool decode_sdpa = rows == 1 && config.head_dimension <= 128
-        && static_cast<uint64_t>(context_tokens) + (has_flag(config.flags, AttentionSink) ? 1 : 0) <= 4096
-        && (config.sliding_window == 0 || context_tokens <= config.sliding_window)
-        && has_flag(config.optimization_flags, OptimizationVulkanDecodeSdpa);
+                             && static_cast<uint64_t>(context_tokens) + (has_flag(config.flags, AttentionSink) ? 1 : 0) <= 4096
+                             && (config.sliding_window == 0 || context_tokens <= config.sliding_window)
+                             && has_flag(config.optimization_flags, OptimizationVulkanDecodeSdpa);
     std::vector<uint64_t> elements;
     if (!decode_sdpa)
     {
@@ -80,9 +80,10 @@ std::vector<uint64_t> Attention_vulkan::scratch_elements(const AttentionConfig_v
         }
         const uint64_t plane = saturating_multiply_u64(destinations, config.head_count);
         columns.insert(columns.end(), {plane, plane, query}); // qk, mask, head-to-token permute.
-        if (rows % 4 == 0) columns.push_back(query); // packed permute needs pack1 reshape.
+        if (rows % 4 == 0) columns.push_back(query);          // packed permute needs pack1 reshape.
 #if NCNN_MOE_USE_NCNN && !NCNN_BATCH
-        else columns.push_back(query);
+        else
+            columns.push_back(query);
 #endif
     }
     if (!has_flag(config.optimization_flags, OptimizationVulkanDeviceRope))
@@ -1097,9 +1098,9 @@ static ncnn::VkMat attention_ring_view(const ncnn::VkMat& storage, uint64_t firs
 
 // Copy strided KV rows; append mode also writes the duplicate ring rows.
 static bool record_attention_copy(const ncnn::Pipeline* pipeline, const ncnn::VkMat& source_key, const ncnn::VkMat& source_value,
-                                         ncnn::VkMat& destination_key, ncnn::VkMat& destination_value, uint64_t capacity, uint64_t destination_start,
-                                         bool round_kv, uint64_t source_start, bool copy_only,
-                                         ncnn::VkCompute& command)
+                                  ncnn::VkMat& destination_key, ncnn::VkMat& destination_value, uint64_t capacity, uint64_t destination_start,
+                                  bool round_kv, uint64_t source_start, bool copy_only,
+                                  ncnn::VkCompute& command)
 {
     const bool source_fp32 = source_key.elemsize == sizeof(float)
                              && destination_key.elemsize == sizeof(uint16_t);
@@ -2259,10 +2260,10 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
                                                                          cache.first_slot,
                                                                          cache.token_count);
             if (!record_attention_copy(implementation.ring_append_pipeline.get(), previous_key, previous_value, next_cache->key, next_cache->value,
-                                              ring_capacity, 0,
-                                              config.kv_cache_dtype == DType::BFloat16,
-                                              0, false,
-                                              command))
+                                       ring_capacity, 0,
+                                       config.kv_cache_dtype == DType::BFloat16,
+                                       0, false,
+                                       command))
             {
                 return false;
             }
@@ -2385,10 +2386,10 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
 
     if (!use_qkv_ring
         && !record_attention_copy(implementation.ring_append_pipeline.get(), key_rope, value_heads, next_cache->key, next_cache->value, ring_capacity,
-                                         append_slot,
-                                         config.kv_cache_dtype == DType::BFloat16,
-                                         0, false,
-                                         command))
+                                  append_slot,
+                                  config.kv_cache_dtype == DType::BFloat16,
+                                  0, false,
+                                  command))
     {
         return false;
     }
@@ -2435,16 +2436,16 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
             sdpa_value.create(combined_value.w, combined_value.h, combined_value.c, sizeof(float), implementation.option.blob_vkallocator);
             if (sdpa_key.empty() || sdpa_value.empty()
                 || !record_attention_copy(implementation.ring_append_pipeline.get(),
-                                                  next_cache->key,
-                                                  next_cache->value,
-                                                  sdpa_key,
-                                                  sdpa_value,
-                                                  ring_capacity,
-                                                  0,
-                                                  false,
-                                                  ring_first_slot,
-                                                  true,
-                                                  command))
+                                          next_cache->key,
+                                          next_cache->value,
+                                          sdpa_key,
+                                          sdpa_value,
+                                          ring_capacity,
+                                          0,
+                                          false,
+                                          ring_first_slot,
+                                          true,
+                                          command))
             {
                 return false;
             }
@@ -2788,16 +2789,16 @@ bool Attention_vulkan::materialize_device_cache(LayerCache& cache) const
     ncnn::VkMat& key_staging = transfer_slot.attention_cache_key;
     ncnn::VkMat& value_staging = transfer_slot.attention_cache_value;
     if (!record_attention_copy(implementation.ring_append_pipeline.get(),
-                                      device_cache.key,
-                                      device_cache.value,
-                                      key_staging,
-                                      value_staging,
-                                      cache.capacity_tokens,
-                                      0,
-                                      false,
-                                      cache.first_slot,
-                                      true,
-                                      command)
+                               device_cache.key,
+                               device_cache.value,
+                               key_staging,
+                               value_staging,
+                               cache.capacity_tokens,
+                               0,
+                               false,
+                               cache.first_slot,
+                               true,
+                               command)
         || key_staging.empty()
         || value_staging.empty())
         return false;
@@ -3469,16 +3470,16 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
         }
         if (!use_qkv_ring
             && !record_attention_copy(implementation.ring_append_pipeline.get(),
-                                             work.key_rope,
-                                             work.value_heads,
-                                             work.next_cache->key,
-                                             work.next_cache->value,
-                                             ring_capacity,
-                                             append_slot,
-                                             config.kv_cache_dtype == DType::BFloat16,
-                                             0,
-                                             false,
-                                             command))
+                                      work.key_rope,
+                                      work.value_heads,
+                                      work.next_cache->key,
+                                      work.next_cache->value,
+                                      ring_capacity,
+                                      append_slot,
+                                      config.kv_cache_dtype == DType::BFloat16,
+                                      0,
+                                      false,
+                                      command))
         {
             return AttentionBatchResult_vulkan::NotExecuted;
         }
@@ -3549,16 +3550,16 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
                                        implementation.option.blob_vkallocator);
                 if (converted_key.empty() || converted_value.empty()
                     || !record_attention_copy(implementation.ring_append_pipeline.get(),
-                                                     work.next_cache->key,
-                                                     work.next_cache->value,
-                                                     converted_key,
-                                                     converted_value,
-                                                     ring_capacity,
-                                                     0,
-                                                     false,
-                                                     ring_first_slot,
-                                                     true,
-                                                     command))
+                                              work.next_cache->key,
+                                              work.next_cache->value,
+                                              converted_key,
+                                              converted_value,
+                                              ring_capacity,
+                                              0,
+                                              false,
+                                              ring_first_slot,
+                                              true,
+                                              command))
                 {
                     return AttentionBatchResult_vulkan::NotExecuted;
                 }

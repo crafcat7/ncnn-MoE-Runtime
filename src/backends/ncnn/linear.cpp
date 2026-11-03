@@ -2667,12 +2667,12 @@ static bool bfloat16_swiglu_scratch_shape(uint32_t intermediate_columns, bool ro
 }
 
 std::vector<uint64_t> Bfloat16Linear_vulkan::swiglu_scratch_elements(uint32_t intermediate_columns,
-                                                                    bool router_gate, uint64_t rows)
+                                                                     bool router_gate, uint64_t rows)
 {
     uint64_t fused_columns = 0;
     if (!bfloat16_swiglu_scratch_shape(intermediate_columns, router_gate, rows, fused_columns))
         return intermediate_columns == 0 || rows == 0 ? std::vector<uint64_t>{}
-                                                       : std::vector<uint64_t>{UINT64_MAX};
+                                                      : std::vector<uint64_t>{UINT64_MAX};
     return {saturating_multiply_u64(fused_columns, rows)};
 }
 
@@ -2994,7 +2994,7 @@ bool Bfloat16Expert_vulkan::forward(const ActivationBuffer& input,
 }
 
 static bool bfloat16_expert_scratch_shape(uint32_t gate_output_columns, uint64_t rows,
-                                         uint32_t& fused_columns) noexcept
+                                          uint32_t& fused_columns) noexcept
 {
     fused_columns = gate_output_columns;
     return gate_output_columns != 0 && rows != 0
@@ -3002,12 +3002,12 @@ static bool bfloat16_expert_scratch_shape(uint32_t gate_output_columns, uint64_t
 }
 
 std::vector<uint64_t> Bfloat16Expert_vulkan::scratch_elements(uint32_t gate_output_columns,
-                                                             uint64_t rows)
+                                                              uint64_t rows)
 {
     uint32_t fused_columns = 0;
     if (!bfloat16_expert_scratch_shape(gate_output_columns, rows, fused_columns))
         return gate_output_columns == 0 || rows == 0 ? std::vector<uint64_t>{}
-                                                      : std::vector<uint64_t>{UINT64_MAX};
+                                                     : std::vector<uint64_t>{UINT64_MAX};
     return {saturating_multiply_u64(fused_columns, rows)};
 }
 
@@ -3906,12 +3906,12 @@ static bool float8_linear_scratch_shape(uint32_t input_columns, uint64_t rows,
 }
 
 std::vector<uint64_t> Float8Linear_vulkan::scratch_elements(uint32_t input_columns,
-                                                           uint64_t rows)
+                                                            uint64_t rows)
 {
     uint32_t scratch_columns = 0;
     if (!float8_linear_scratch_shape(input_columns, rows, scratch_columns))
         return input_columns == 0 || rows == 0 ? std::vector<uint64_t>{}
-                                                : std::vector<uint64_t>{UINT64_MAX};
+                                               : std::vector<uint64_t>{UINT64_MAX};
     return {saturating_multiply_u64(scratch_columns, rows)};
 }
 
@@ -6937,8 +6937,7 @@ bool QnkExpert_vulkan::record(const ncnn::VkMat& input, ncnn::VkMat& output,
                                                            static_cast<bool>(implementation.up),
                                                            static_cast<bool>(implementation.router_gate),
                                                            scratch_columns);
-    if (scratch_count != (implementation.up ? (implementation.router_gate ? 5u : 3u)
-                                            : (implementation.router_gate ? 4u : 2u))
+    if (scratch_count != (implementation.up ? (implementation.router_gate ? 5u : 3u) : (implementation.router_gate ? 4u : 2u))
         || gate.output_columns != scratch_columns[0])
         return false;
     size_t scratch_index = 0;

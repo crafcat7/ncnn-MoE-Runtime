@@ -936,7 +936,7 @@ static bool mapped_ple_embedding_shard(const std::string& name, const TensorData
 }
 
 static Result<uint64_t> gated_residual_vulkan_releasable_dense_size(const MoeModelDescriptor& descriptor,
-                                                          const Option& opt, const WeightMapping& weights)
+                                                                    const Option& opt, const WeightMapping& weights)
 {
     const uint64_t required_flags = OptimizationVulkanAttention | OptimizationVulkanQnK
                                     | OptimizationVulkanExpertGpuPriority | OptimizationVulkanCommandGraph;

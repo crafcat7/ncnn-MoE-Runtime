@@ -42,7 +42,7 @@ static bool gated_delta_record_columns(uint32_t head_count, uint32_t kv_head_cou
         return false;
     const uint64_t convolution = saturating_add_u64(saturating_multiply_u64(key_size, 2), values);
     const uint64_t fused = saturating_add_u64(convolution,
-                                               saturating_add_u64(values, saturating_multiply_u64(head_count, 2)));
+                                              saturating_add_u64(values, saturating_multiply_u64(head_count, 2)));
     if (convolution == UINT64_MAX || fused == UINT64_MAX || fused > int_max)
         return false;
     convolution_columns = static_cast<uint32_t>(convolution);
@@ -52,10 +52,10 @@ static bool gated_delta_record_columns(uint32_t head_count, uint32_t kv_head_cou
 }
 
 std::vector<uint64_t> GatedDeltaNet_vulkan::scratch_elements(uint32_t head_count,
-                                                              uint32_t kv_head_count,
-                                                              uint32_t head_dimension,
-                                                              uint32_t value_head_dimension,
-                                                              uint32_t rows)
+                                                             uint32_t kv_head_count,
+                                                             uint32_t head_dimension,
+                                                             uint32_t value_head_dimension,
+                                                             uint32_t rows)
 {
     uint32_t convolution_columns = 0;
     uint32_t value_columns = 0;

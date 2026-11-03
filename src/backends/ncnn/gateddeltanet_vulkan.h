@@ -135,10 +135,10 @@ public:
     // Shape-only query for the two FP32 record-local buffers, in recorder
     // order. Rows are included; UINT64_MAX signals an unrepresentable shape.
     [[nodiscard]] static std::vector<uint64_t> scratch_elements(uint32_t head_count,
-                                                                 uint32_t kv_head_count,
-                                                                 uint32_t head_dimension,
-                                                                 uint32_t value_head_dimension,
-                                                                 uint32_t rows);
+                                                                uint32_t kv_head_count,
+                                                                uint32_t head_dimension,
+                                                                uint32_t value_head_dimension,
+                                                                uint32_t rows);
 #if NCNN_MOE_WITH_VULKAN
     // The caller holds the context command lock and retains work through submit/wait.
     // Discarding an unsubmitted recording leaves logical cache metadata unchanged.
