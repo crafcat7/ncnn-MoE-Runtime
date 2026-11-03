@@ -142,7 +142,8 @@ public:
                                                                          const TensorData* sinks,
                                                                          // Q, K, V, output projection, and optional output gate.
                                                                          const std::array<CompiledOperator, 5>& projections,
-                                                                         const AttentionConfig_vulkan& config);
+                                                                         const AttentionConfig_vulkan& config,
+                                                                         std::shared_ptr<QnkLinear_vulkan> fused_native_qkv = {});
     // One upload, one submission, and one download per Attention block.
     [[nodiscard]] bool forward(uint64_t position_offset, LayerCache& cache, const ActivationBuffer& input, ActivationBuffer& output) const;
     // Materializes an otherwise valid device KV ring into the CPU cache.  This
@@ -220,7 +221,8 @@ private:
                                                                        std::shared_ptr<Bfloat16Linear_vulkan> fused_qkv_gate,
                                                                        std::shared_ptr<Bfloat16Linear_vulkan> output_projection_bfloat16,
                                                                        std::array<CompiledOperator, 5> native_projections,
-                                                                       const AttentionConfig_vulkan& config);
+                                                                       const AttentionConfig_vulkan& config,
+                                                                       std::shared_ptr<QnkLinear_vulkan> fused_native_qkv = {});
     std::unique_ptr<Implementation> d;
 };
 

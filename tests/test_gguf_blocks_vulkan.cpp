@@ -391,13 +391,17 @@ static void block_projections(uint32_t device, DType dtype)
             const uint64_t native_bytes = dtype == DType::MxFp4
                                               ? matrix.mxfp4_blocks.size() + matrix.mxfp4_scales.size()
                                               : matrix.qnk_values().size();
-            const uint64_t expected_storage = align(native_bytes) + align(matrix.shape[0] * sizeof(float))
-                                              + (fp4 ? align(matrix.input_column_indices.size() * sizeof(uint32_t)) : 0);
+            const bool unpacked_codes = dtype == DType::Q4_0 || dtype == DType::Q5_0 || dtype == DType::IQ4NL;
+            const uint64_t projection_bytes = unpacked_codes ? matrix.element_count() / 32 * 34 : native_bytes;
+            const uint64_t auxiliary = align(matrix.shape[0] * sizeof(float))
+                                       + (fp4 ? align(matrix.input_column_indices.size() * sizeof(uint32_t)) : 0);
+            const uint64_t expected_storage = align(projection_bytes) + auxiliary;
             auto operation = QnkLinear_vulkan::create(matrix, bias_ptr, device, runtime, OptimizationDefaultFlags, groups);
             block_check(operation && operation->dtype() == dtype
                             && operation->device_bytes() == expected_storage
-                            && QnkLinear_vulkan::storage_bytes(matrix, alignment) == expected_storage,
-                        "native block projection stores compact weights, optional bias and map");
+                            && QnkLinear_vulkan::projection_storage_bytes(matrix, alignment) == expected_storage
+                            && QnkLinear_vulkan::storage_bytes(matrix, alignment) == align(native_bytes) + auxiliary,
+                        "prepared projection and native expert storage must match their respective reservations");
             for (size_t tokens : {size_t(1), size_t(4), size_t(5)})
             {
                 if (fp4 && tokens == 5)

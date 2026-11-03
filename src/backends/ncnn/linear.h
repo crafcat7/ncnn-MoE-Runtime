@@ -483,6 +483,16 @@ public:
     ~QnkLinear_vulkan();
 
     [[nodiscard]] static uint64_t storage_bytes(const TensorData& matrix, uint64_t alignment) noexcept;
+    // Standalone projections may losslessly unpack low-bit codes at load time.
+    // Expert storage retains its native block layout and uses storage_bytes().
+    [[nodiscard]] static uint64_t projection_storage_bytes(const TensorData& matrix, uint64_t alignment) noexcept;
+    [[nodiscard]] static bool can_fuse(std::span<const TensorData* const> matrices,
+                                       uint64_t alignment = 256, uint64_t storage_limit = UINT64_C(0x7fffffff)) noexcept;
+    [[nodiscard]] static std::shared_ptr<QnkLinear_vulkan> create_fused(std::span<const TensorData* const> matrices,
+                                                                        std::span<const TensorData* const> biases,
+                                                                        uint32_t vulkan_device_index,
+                                                                        const VulkanRuntimePtr& vulkan_runtime,
+                                                                        uint64_t optimization_flags);
 
     [[nodiscard]] static std::shared_ptr<QnkLinear_vulkan> create(const TensorData& matrix,
                                                                   const TensorData* bias,

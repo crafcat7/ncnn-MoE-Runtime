@@ -164,6 +164,7 @@ public:
     ncnn::VkMat rope_inverse_frequencies_gpu;
 #endif
     std::shared_ptr<Linear> fused_qkv;
+    std::shared_ptr<QnkLinear_vulkan> fused_native_qkv;
     std::shared_ptr<Bfloat16Linear_vulkan> fused_qkv_gate;
     std::shared_ptr<Linear> output_projection;
     std::shared_ptr<Bfloat16Linear_vulkan> output_projection_bfloat16;
@@ -554,9 +555,10 @@ bool Attention_vulkan::record_native_qkv(const ncnn::VkMat& input,
     const uint64_t key_value_columns = static_cast<uint64_t>(config.kv_head_count) * config.head_dimension;
     const uint64_t total_columns = query_columns + key_value_columns * 2
                                    + (implementation.output_gate ? query_columns : 0);
-    if ((!implementation.native_projections[0].qnk && !implementation.native_projections[0].float8)
-        || (!implementation.native_projections[1].qnk && !implementation.native_projections[1].float8)
-        || (!implementation.native_projections[2].qnk && !implementation.native_projections[2].float8)
+    if ((!implementation.fused_native_qkv
+         && ((!implementation.native_projections[0].qnk && !implementation.native_projections[0].float8)
+             || (!implementation.native_projections[1].qnk && !implementation.native_projections[1].float8)
+             || (!implementation.native_projections[2].qnk && !implementation.native_projections[2].float8)))
         || input.empty()
         || input.dims != 2
         || input.elempack != 1
@@ -592,9 +594,11 @@ bool Attention_vulkan::record_native_qkv(const ncnn::VkMat& input,
                                                     offset,
                                                     static_cast<uint32_t>(total_columns));
     };
-    if (!record_projection(implementation.native_projections[0], 0)
-        || !record_projection(implementation.native_projections[1], query_offset)
-        || !record_projection(implementation.native_projections[2], value_offset))
+    if (implementation.fused_native_qkv)
+        implementation.fused_native_qkv->record(input, output, command);
+    else if (!record_projection(implementation.native_projections[0], 0)
+             || !record_projection(implementation.native_projections[1], query_offset)
+             || !record_projection(implementation.native_projections[2], value_offset))
         return false;
     if (implementation.output_gate)
     {
@@ -1273,7 +1277,8 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_native(const TensorDa
                                                                   const TensorData* key_norm_weight,
                                                                   const TensorData* sinks,
                                                                   const std::array<CompiledOperator, 5>& projections,
-                                                                  const AttentionConfig_vulkan& config)
+                                                                  const AttentionConfig_vulkan& config,
+                                                                  std::shared_ptr<QnkLinear_vulkan> fused_native_qkv)
 {
     return create_impl(norm_weight,
                        query_norm_weight,
@@ -1284,7 +1289,7 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_native(const TensorDa
                        {},
                        {},
                        projections,
-                       config);
+                       config, std::move(fused_native_qkv));
 }
 
 std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData& norm_weight,
@@ -1296,16 +1301,15 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
                                                                 std::shared_ptr<Bfloat16Linear_vulkan> fused_qkv_gate,
                                                                 std::shared_ptr<Bfloat16Linear_vulkan> output_projection_bfloat16,
                                                                 std::array<CompiledOperator, 5> native_projections,
-                                                                const AttentionConfig_vulkan& config)
+                                                                const AttentionConfig_vulkan& config,
+                                                                std::shared_ptr<QnkLinear_vulkan> fused_native_qkv)
 {
 #if NCNN_MOE_WITH_VULKAN
 #if !NCNN_BATCH
     // Wrapped KV rings require VkMat offset views.
     return {};
 #endif
-    const bool use_native = std::any_of(native_projections.begin(),
-                                        native_projections.end(),
-                                        [](const auto& projection) { return projection.qnk || projection.float8; });
+    const bool use_native = fused_native_qkv || std::any_of(native_projections.begin(), native_projections.end(), [](const auto& projection) { return projection.qnk || projection.float8; });
     const bool use_bfloat16 = fused_qkv_gate || output_projection_bfloat16;
     const bool use_linear = fused_qkv || output_projection;
     if (config.hidden_size == 0
@@ -1378,16 +1382,20 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
             const CompiledOperator& projection = projection_for(index);
             return static_cast<bool>(projection.qnk) != static_cast<bool>(projection.float8);
         };
-        if (!has_projection(0) || !has_projection(1) || !has_projection(2) || !has_projection(3)
+        if ((!fused_native_qkv && (!has_projection(0) || !has_projection(1) || !has_projection(2)))
+            || (fused_native_qkv && std::any_of(native_projections.begin(), native_projections.begin() + 3, [](const auto& projection) { return projection.qnk || projection.float8; }))
+            || !has_projection(3)
             || (output_gate ? !has_projection(4)
                             : (native_projections[4].qnk || native_projections[4].float8)))
             return {};
         const auto& first_projection = native_projections[0];
-        context = first_projection.qnk ? first_projection.qnk->vulkan_context()
-                                       : first_projection.float8->vulkan_context();
-        projection_option = first_projection.qnk ? first_projection.qnk->option()
-                                                 : first_projection.float8->option();
-        if (!context)
+        context = fused_native_qkv       ? fused_native_qkv->vulkan_context()
+                  : first_projection.qnk ? first_projection.qnk->vulkan_context()
+                                         : first_projection.float8->vulkan_context();
+        projection_option = fused_native_qkv       ? fused_native_qkv->option()
+                            : first_projection.qnk ? first_projection.qnk->option()
+                                                   : first_projection.float8->option();
+        if (!context || (fused_native_qkv && (fused_native_qkv->input_columns() != config.hidden_size || fused_native_qkv->output_columns() != query_columns + 2 * key_value_columns)))
             return {};
         for (size_t index = 0; index < native_projections.size(); ++index)
         {
@@ -1460,6 +1468,7 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
     implementation.fused_qkv_gate = std::move(fused_qkv_gate);
     implementation.output_projection_bfloat16 = std::move(output_projection_bfloat16);
     implementation.native_projections = std::move(native_projections);
+    implementation.fused_native_qkv = std::move(fused_native_qkv);
     implementation.config = config;
     implementation.query_key_norm = query_key_norm;
     implementation.output_gate = output_gate;
@@ -1773,6 +1782,7 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
     (void)fused_qkv_gate;
     (void)output_projection_bfloat16;
     (void)native_projections;
+    (void)fused_native_qkv;
     (void)config;
     return {};
 #endif
@@ -2043,7 +2053,8 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
     const bool use_norm_rope = implementation.query_key_norm || implementation.output_gate
                                || (config.rope_head_dimension != 0
                                    && config.rope_head_dimension < config.head_dimension);
-    const bool use_native = static_cast<bool>(implementation.native_projections[0].qnk
+    const bool use_native = static_cast<bool>(implementation.fused_native_qkv
+                                              || implementation.native_projections[0].qnk
                                               || implementation.native_projections[0].float8);
     const bool use_qkv_rope = support_qkv_rope(token_count);
     const bool use_qkv_ring = uses_qkv_ring(token_count);
@@ -2980,7 +2991,8 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
     const bool use_norm_rope = implementation.query_key_norm || implementation.output_gate
                                || (config.rope_head_dimension != 0
                                    && config.rope_head_dimension < config.head_dimension);
-    const bool use_native = static_cast<bool>(implementation.native_projections[0].qnk
+    const bool use_native = static_cast<bool>(implementation.fused_native_qkv
+                                              || implementation.native_projections[0].qnk
                                               || implementation.native_projections[0].float8);
     const Linear* fused = implementation.fused_qkv.get();
     const Bfloat16Linear_vulkan* fused_gate = implementation.fused_qkv_gate.get();

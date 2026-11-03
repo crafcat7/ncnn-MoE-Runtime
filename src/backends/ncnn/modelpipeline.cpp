@@ -1085,12 +1085,38 @@ static Result<void> prepare_native_attention(CompiledModel& compiled,
         plan.output_bias,
         invalid_tensor_handle,
     };
+    const std::array<const TensorData*, 3> qkv = {
+        &compiled.weights.at(plan.query_weight), &compiled.weights.at(plan.key_weight), &compiled.weights.at(plan.value_weight)};
+    const std::array<const TensorData*, 3> qkv_biases = {
+        plan.query_bias == invalid_tensor_handle ? nullptr : &compiled.weights.at(plan.query_bias),
+        plan.key_bias == invalid_tensor_handle ? nullptr : &compiled.weights.at(plan.key_bias),
+        plan.value_bias == invalid_tensor_handle ? nullptr : &compiled.weights.at(plan.value_bias)};
+    std::shared_ptr<QnkLinear_vulkan> fused_qkv;
+#if NCNN_MOE_WITH_VULKAN
+    const auto context = VulkanContext::acquire(layer_plan.vulkan_device_index, compiled.vulkan_runtime,
+                                                compiled.opt.optimization_flags);
+    if (context && QnkLinear_vulkan::can_fuse(qkv, context->device()->info.buffer_offset_alignment(), context->device()->info.physicalDeviceProperties().limits.maxStorageBufferRange))
+    {
+        fused_qkv = QnkLinear_vulkan::create_fused(qkv, qkv_biases, layer_plan.vulkan_device_index,
+                                                   compiled.vulkan_runtime, compiled.opt.optimization_flags);
+        if (!fused_qkv)
+            return Error{ErrorCode::InternalError, "failed to create fused native Vulkan projections"};
+        const CompiledOperatorHandle fused_handle = compiled.operators.allocate();
+        compiled.operators.at_mutable(fused_handle).qnk = fused_qkv;
+        plan.fused_qkv_operator = fused_handle;
+    }
+#endif
     std::array<CompiledOperator, 5> projections;
     for (size_t index = 0; index < projections.size(); ++index)
     {
         const TensorHandle handle = weights[index];
         if (handle == invalid_tensor_handle)
             continue;
+        if (fused_qkv && index < 3)
+        {
+            compiled.operators.at_weight_mutable(handle) = {};
+            continue;
+        }
 
         CompiledOperator& projection_operator = compiled.operators.at_weight_mutable(handle);
         if (projection_operator.qnk || projection_operator.float8)
@@ -1141,7 +1167,7 @@ static Result<void> prepare_native_attention(CompiledModel& compiled,
                                                               key_norm,
                                                               sinks,
                                                               projections,
-                                                              standard_attention_vulkan_config(compiled, plan));
+                                                              standard_attention_vulkan_config(compiled, plan), fused_qkv);
     if (!attention_operator)
         return Error{ErrorCode::InternalError,
                      "failed to create native Vulkan Standard Attention at layer "
@@ -1328,7 +1354,7 @@ uint64_t dense_vulkan_weight_storage_size(const CompiledModel& compiled,
     {
         if (is_qnk_dtype(matrix.dtype) && !has_flag(compiled.opt.optimization_flags, OptimizationVulkanQnK))
             return 0;
-        return QnkLinear_vulkan::storage_bytes(matrix, alignment);
+        return QnkLinear_vulkan::projection_storage_bytes(matrix, alignment);
     }
 #if NCNN_MOE_WITH_VULKAN
     if (matrix.dtype == DType::Float8E4M3)
@@ -1497,10 +1523,10 @@ uint64_t dense_vulkan_attention_storage_size(const CompiledModel& compiled,
                 const TensorData& matrix = compiled.weights.at(handle);
                 const uint64_t projection = matrix.dtype == DType::Float8E4M3
                                                 ? constant_buffer_storage_size({matrix.element_count(),
-                                                                                    matrix.quantization_scales.size() * sizeof(float),
-                                                                                    static_cast<uint64_t>(matrix.shape[0]) * sizeof(float)},
-                                                                                   alignment)
-                                                : QnkLinear_vulkan::storage_bytes(matrix, alignment);
+                                                                                matrix.quantization_scales.size() * sizeof(float),
+                                                                                static_cast<uint64_t>(matrix.shape[0]) * sizeof(float)},
+                                                                               alignment)
+                                                : QnkLinear_vulkan::projection_storage_bytes(matrix, alignment);
                 if (projection == 0)
                     return 0;
                 input = saturating_add_u64(input, projection);
