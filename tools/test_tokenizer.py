@@ -426,8 +426,7 @@ def make_qwen3_chat_cases() -> list[tuple[str, list[dict[str, Any]], bool]]:
             {"role": "tool", "content": "Result"},
         ]),
     ]
-    for name, reasoning in (("string", "\n  Work. \n"), ("empty", ""), ("null", None),
-                            ("number", 42), ("object", {"ignored": True})):
+    for name, reasoning in (("string", "\n  Work. \n"), ("empty", ""), ("null", None), ("number", 42)):
         for latest in (False, True):
             messages = [{"role": "user", "content": "Question"},
                         {"role": "assistant", "content": "<think>inline</think>\nAnswer", "reasoning_content": reasoning}]

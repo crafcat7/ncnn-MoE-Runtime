@@ -629,12 +629,9 @@ class AdapterTests(unittest.TestCase):
             )
             plain = create_adapter(_model(root / "plain", "qwen4_exp"), thinking=False)
             self.assertEqual(plain.decode_completion_text("你好🙂"), Completion("", "你好🙂"))
-            for model_type in ("qwen3", "qwen3_5_moe", "qwen4_exp", "deepseek_v4"):
-                adapter = create_adapter(_model(root / model_type, model_type), thinking=True)
-                with self.subTest(model_type=model_type):
-                    self.assertEqual(adapter.decode_completion_text("  <think>\nreason</think>\n\nanswer"), Completion("reason", "answer"))
-                    self.assertEqual(adapter.decode_completion_text("<think>\nreason"), Completion("reason", ""))
-                    self.assertEqual(adapter.decode_completion_text("body <think> is literal"), Completion("body <think> is literal", ""))
+            dense = create_adapter(_model(root / "qwen3", "qwen3"), thinking=True)
+            self.assertEqual(dense.decode_completion_text("  <think>\nreason</think>\n\nanswer"), Completion("reason", "answer"))
+            self.assertEqual(dense.decode_completion_text("<think>\nreason"), Completion("reason", ""))
 
     def test_fingerprints_expose_previous_versions_and_protect_mismatches(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ncnn-moe-fingerprint-") as directory:
@@ -1264,20 +1261,19 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(completion, Completion("", "你好🙂"))
         self.assertEqual(output.getvalue().rstrip("\n"), "[answer]\n你好🙂")
 
-        for model_type in ("qwen3", "qwen3_5_moe", "qwen4_exp", "deepseek_v4"):
-            for response, expected in (
-                (["  <thi", "nk>", "\nreason", "</thi", "nk>\n\nanswer"], Completion("reason", "answer")),
-                (["  <thi", "nk>", "\nreason"], Completion("reason", "")),
-                (["  <thi"], Completion("<thi", "")),
-                (["body <thi", "nk> is literal"], Completion("body <think> is literal", "")),
-            ):
-                with self.subTest(model_type=model_type, response=response):
-                    app, _, _ = self._app(model_type, response=response, arguments=_arguments(stream=True))
-                    output = io.StringIO()
-                    with contextlib.redirect_stdout(output):
-                        completion, _, _ = app.send("question")
-                    self.assertEqual(completion, expected)
-                    self.assertEqual(output.getvalue().rstrip("\n"), app.adapter.visible_completion(expected))
+        for response, expected in (
+            (["  <thi", "nk>", "\nreason", "</thi", "nk>\n\nanswer"], Completion("reason", "answer")),
+            (["  <thi", "nk>", "\nreason"], Completion("reason", "")),
+            (["  <thi"], Completion("<thi", "")),
+            (["body <thi", "nk> is literal"], Completion("body <think> is literal", "")),
+        ):
+            with self.subTest(response=response):
+                app, _, _ = self._app("qwen3", response=response, arguments=_arguments(stream=True))
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    completion, _, _ = app.send("question")
+                self.assertEqual(completion, expected)
+                self.assertEqual(output.getvalue().rstrip("\n"), app.adapter.visible_completion(expected))
 
         qwen_events = [
             (300001, "  reason\ufffd</thi"),

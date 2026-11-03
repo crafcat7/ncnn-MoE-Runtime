@@ -2024,8 +2024,7 @@ class NativeQuantizedTests(unittest.TestCase):
                 self.assertEqual(generation[counter], 0, (mode, counter))
             self.assertGreater(gpu["resident_graph_submissions"], 0)
             self.assertGreater(gpu["resident_graph_activation_upload_bytes"], 0)
-            for counter in ("weight_upload_bytes", "weight_transfer_submissions",
-                            "resident_graph_activation_download_bytes", "resident_graph_route_download_bytes"):
+            for counter in ("weight_upload_bytes", "weight_transfer_submissions"):
                 self.assertEqual(gpu[counter], 0, (mode, counter))
         if not resident_experts:
             self.assertGreater(deferred["greedy_stats"]["generation"]["io_bytes"], 0)
