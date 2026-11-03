@@ -40,8 +40,8 @@ private:
     std::unique_ptr<Implementation> d;
 };
 
-// A model-neutral device segment ends at the host ExpertStore route boundary.
-// Only completed device tensors and validated compact routes are published.
+// A model-neutral device segment can continue through resident dense or routed
+// FFNs, or end at a host ExpertStore boundary with validated compact routes.
 class GpuSegment_vulkan
 {
 public:
@@ -58,16 +58,17 @@ public:
     [[nodiscard]] static Result<uint32_t> continuation_target(const CompiledModel& model, uint32_t expert_node_id,
                                                               uint32_t& fence_id);
 
-    // Execute an admitted full-bank chain. Cache pointers are layer-major,
-    // with one entry per input row; Router IDs never cross the host boundary.
+    // Execute an admitted resident chain. Cache pointers are layer-major,
+    // with one entry per input row. Routed layers require layer-major options;
+    // an all-dense chain also accepts an empty options span.
     // The owner submits bounded recording chunks and validates each fence
     // before publishing cache state. Hidden remains on the device between chunks.
-    [[nodiscard]] static bool forward_banks(const CompiledModel& model, const ActivationBuffer& initial_hidden,
-                                            std::span<const uint64_t> positions, std::span<LayerCache* const> caches,
-                                            std::span<const ExpertDispatchOptions> options,
-                                            bool produce_logits, bool last_row_only,
-                                            ActivationBuffer& logits, std::string& error,
-                                            GpuSegmentWorkspace_vulkan* workspace = nullptr);
+    [[nodiscard]] static bool forward_resident(const CompiledModel& model, const ActivationBuffer& initial_hidden,
+                                               std::span<const uint64_t> positions, std::span<LayerCache* const> caches,
+                                               std::span<const ExpertDispatchOptions> options,
+                                               bool produce_logits, bool last_row_only,
+                                               ActivationBuffer& logits, std::string& error,
+                                               GpuSegmentWorkspace_vulkan* workspace = nullptr);
 
     // Prepare a private transaction before entering the Expert command lock.
     // The Region records it only in the wave that completes its aggregate.

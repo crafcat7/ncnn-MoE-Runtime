@@ -403,13 +403,13 @@ Result<void> forward_model(const CompiledModel& model,
     std::shared_ptr<ResidentFfnRegion_vulkan> continuation_region;
     const ScopedResidentContinuation continuation_scope{pending_continuation, continuation_region};
     ExecutionNodeId continuation_target = invalid_execution_node_id;
-    bool bank_chain_finished = false;
+    bool resident_chain_finished = false;
     for (const ExecutionNodeId node_id : model.schedule.node_order)
     {
         if (node_id >= model.graph.nodes.size())
             return Error{ErrorCode::InternalError, "execution schedule references an invalid node"};
         const ExecutionNode* node = &model.graph.nodes[node_id];
-        if (bank_chain_finished) continue;
+        if (resident_chain_finished) continue;
         if (node->type == ExecutionNodeType::TokenEmbedding)
         {
             if (node->weight_inputs.size() != 1)
@@ -418,10 +418,10 @@ Result<void> forward_model(const CompiledModel& model,
                               input_ids,
                               hidden);
             hyper_connection_expand(hidden, model.descriptor.hyper_connection_multiplier, state.expert_scratch.staged_output);
-            if (!model.gpu_expert_banks.empty())
+            if (model.resident_submission_rows != 0)
             {
                 if (use_speculative_context)
-                    return Error{ErrorCode::InternalError, "resident Expert bank plan cannot consume speculative hidden captures"};
+                    return Error{ErrorCode::InternalError, "resident graph plan cannot consume speculative hidden captures"};
                 auto& positions = state.attention_positions;
                 positions.resize(input_ids.size());
                 for (size_t row = 0; row < positions.size(); ++row) positions[row] = position_offset + row;
@@ -437,20 +437,24 @@ Result<void> forward_model(const CompiledModel& model,
                 {
                     const auto& layer = model.graph.layer_plans[index];
                     if (layer.layer_id >= state.layers.size())
-                        return Error{ErrorCode::InternalError, "resident Expert bank layer cache is out of range"};
+                        return Error{ErrorCode::InternalError, "resident graph layer cache is out of range"};
                     caches.insert(caches.end(), input_ids.size(), &state.layers[layer.layer_id]);
-                    options[index] = latent_router_options(model, layer.moe, input_ids, bank_ids[index]);
-                    assignments += input_ids.size() * layer.moe.top_k;
+                    if (!layer.moe.experts.empty())
+                    {
+                        options[index] = latent_router_options(model, layer.moe, input_ids, bank_ids[index]);
+                        assignments += input_ids.size() * layer.moe.top_k;
+                    }
                 }
                 std::string error;
-                if (!GpuSegment_vulkan::forward_banks(model, hidden, positions, caches, options,
-                                                      logits_output != LogitsOutput::None, logits_output == LogitsOutput::Last,
-                                                      state.logits, error, &state.gpu_segment))
-                    return Error{ErrorCode::InternalError, "resident Expert bank chain failed: " + error};
+                const bool completed = GpuSegment_vulkan::forward_resident(model, hidden, positions, caches, options,
+                                                                           logits_output != LogitsOutput::None, logits_output == LogitsOutput::Last,
+                                                                           state.logits, error, &state.gpu_segment);
+                if (!completed)
+                    return Error{ErrorCode::InternalError, "resident graph chain failed: " + error};
                 statistics.expert_assignments += assignments;
                 statistics.expert_gpu_routes += assignments;
                 produced_logits = logits_output != LogitsOutput::None;
-                bank_chain_finished = true;
+                resident_chain_finished = true;
             }
             continue;
         }
@@ -1527,7 +1531,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
     std::shared_ptr<ResidentFfnRegion_vulkan> continuation_region;
     const ScopedResidentContinuation continuation_scope{pending_continuation, continuation_region};
     ExecutionNodeId continuation_target = invalid_execution_node_id;
-    bool bank_chain_finished = false;
+    bool resident_chain_finished = false;
     for (const ExecutionNodeId node_id : model.schedule.node_order)
     {
         if (node_id >= model.graph.nodes.size())
@@ -1535,7 +1539,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             return Error{ErrorCode::InternalError, "execution schedule references an invalid node"};
         }
         const ExecutionNode* node = &model.graph.nodes[node_id];
-        if (bank_chain_finished) continue;
+        if (resident_chain_finished) continue;
         if (node->type == ExecutionNodeType::TokenEmbedding)
         {
             if (node->weight_inputs.size() != 1)
@@ -1556,10 +1560,10 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             }
             if (!split_hidden_rows(scratch.staged_output))
                 return Error{ErrorCode::InternalError, "cannot split staged embedding rows"};
-            if (!model.gpu_expert_banks.empty())
+            if (model.resident_submission_rows != 0)
             {
                 if (model.speculative.enabled() && use_speculative_context)
-                    return Error{ErrorCode::InternalError, "resident staged Expert bank plan cannot consume speculative hidden captures"};
+                    return Error{ErrorCode::InternalError, "resident staged graph plan cannot consume speculative hidden captures"};
                 auto& positions = workspace.staged_attention_positions;
                 positions.resize(session_count);
                 for (size_t row = 0; row < session_count; ++row) positions[row] = entries[row].position_offset;
@@ -1577,17 +1581,21 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                     for (const auto& entry : entries)
                     {
                         if (layer.layer_id >= entry.state->layers.size())
-                            return Error{ErrorCode::InternalError, "resident staged Expert bank cache is out of range"};
+                            return Error{ErrorCode::InternalError, "resident staged graph cache is out of range"};
                         caches.push_back(&entry.state->layers[layer.layer_id]);
                     }
-                    options[index] = latent_router_options(model, layer.moe, input_ids, bank_ids[index]);
-                    assignments += layer.moe.top_k;
+                    if (!layer.moe.experts.empty())
+                    {
+                        options[index] = latent_router_options(model, layer.moe, input_ids, bank_ids[index]);
+                        assignments += layer.moe.top_k;
+                    }
                 }
                 ActivationBuffer completed;
                 std::string error;
-                if (!GpuSegment_vulkan::forward_banks(model, scratch.staged_output, positions, caches, options,
-                                                      requested_count != 0, false, completed, error, &workspace.gpu_segment))
-                    return Error{ErrorCode::InternalError, "resident staged Expert bank chain failed: " + error};
+                const bool executed = GpuSegment_vulkan::forward_resident(model, scratch.staged_output, positions, caches, options,
+                                                                          requested_count != 0, false, completed, error, &workspace.gpu_segment);
+                if (!executed)
+                    return Error{ErrorCode::InternalError, "resident staged graph chain failed: " + error};
                 for (size_t row = 0; row < session_count; ++row)
                 {
                     if (entries[row].logits)
@@ -1595,7 +1603,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                     entries[row].statistics->expert_assignments += assignments;
                     entries[row].statistics->expert_gpu_routes += assignments;
                 }
-                bank_chain_finished = true;
+                resident_chain_finished = true;
             }
             continue;
         }

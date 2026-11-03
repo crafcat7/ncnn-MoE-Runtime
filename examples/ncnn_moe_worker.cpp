@@ -787,7 +787,7 @@ private:
         resources.add_uint("expert_gpu_cache_bytes", effective.expert_gpu_cache_size);
         resources.add_uint("expert_gpu_bank_bytes", model_compiled(*model).gpu_expert_bank_size);
         resources.add_uint("expert_gpu_bank_layers", model_compiled(*model).gpu_expert_banks.size());
-        resources.add_uint("expert_gpu_bank_submission_rows", model_compiled(*model).bank_submission_rows);
+        resources.add_uint("expert_gpu_bank_submission_rows", model_compiled(*model).gpu_expert_banks.empty() ? 0 : model_compiled(*model).resident_submission_rows);
         resources.add_uint("expert_gpu_victim_cache_bytes", effective.expert_gpu_victim_cache_size);
         resources.add_uint("expert_io_workers", effective.num_expert_io_threads);
         resources.add_uint("expected_concurrency", effective.num_concurrent_sessions);

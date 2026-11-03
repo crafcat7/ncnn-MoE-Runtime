@@ -94,6 +94,26 @@ std::shared_ptr<SharedFfn_vulkan> SharedFfn_vulkan::create(const CompiledModel& 
 #endif
 }
 
+std::shared_ptr<SharedFfn_vulkan> SharedFfn_vulkan::create_dense(const CompiledModel& model, const ExpertPlan& ffn)
+{
+#if NCNN_MOE_WITH_VULKAN
+    if (model.opt.hybrid_mode != HybridMode::HybridExperts || ffn.use_gpu_cache) return {};
+    const auto& native = model.operators.at(ffn.vulkan_operator).qnk_expert;
+    if (!native || !native->vulkan_context()) return {};
+    auto result = std::shared_ptr<SharedFfn_vulkan>(new SharedFfn_vulkan);
+    auto& prepared = *result->d;
+    prepared.qnk = native;
+    prepared.context = native->vulkan_context();
+    prepared.input_columns = native->input_columns();
+    prepared.output_columns = native->output_columns();
+    return result;
+#else
+    (void)model;
+    (void)ffn;
+    return {};
+#endif
+}
+
 const std::shared_ptr<VulkanContext>& SharedFfn_vulkan::context() const noexcept
 {
     return d->context;

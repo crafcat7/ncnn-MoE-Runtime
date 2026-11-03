@@ -154,7 +154,7 @@ struct ExpertScratch
     ActivationBuffer staged_merged;
     ActivationBuffer staged_output;
     std::vector<uint32_t> explicit_expert_ids;
-    // Full-bank routing spans are borrowed only through forward_banks.
+    // Full-bank routing spans are borrowed only through forward_resident.
     std::vector<std::vector<uint32_t>> bank_ids;
     std::vector<ExpertDispatchOptions> bank_options;
 };

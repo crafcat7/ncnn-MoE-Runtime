@@ -492,6 +492,14 @@ void release_vulkan_dense_host_copies(CompiledModel& compiled)
             release_vulkan_dense_handle(compiled, shared.up_weight);
             release_vulkan_dense_handle(compiled, shared.down_weight);
         }
+        const ExpertPlan& dense = layer.dense_ffn;
+        if (dense.down_weight != invalid_tensor_handle && !dense.use_gpu_cache
+            && support_vulkan_dense_ffn(compiled.operators, dense))
+        {
+            release_vulkan_dense_handle(compiled, dense.gate_weight);
+            release_vulkan_dense_handle(compiled, dense.up_weight);
+            release_vulkan_dense_handle(compiled, dense.down_weight);
+        }
     };
 
     for (CompiledLayerPlan& layer : compiled.graph.layer_plans)
@@ -2021,12 +2029,15 @@ public:
     ResourcePlanner(CompiledModel& model, const CompilerOption& opt);
     [[nodiscard]] bool can_admit(uint32_t device, GpuResourceRequest request) const;
     [[nodiscard]] bool allocation_fits(uint32_t device, GpuResourceRequest request) const;
+    [[nodiscard]] bool explicit_cache_reserve(uint32_t device) const;
+    void refresh_expert_reserve(uint32_t device);
     void commit(uint32_t device, GpuResourceRequest request);
 
 private:
     [[nodiscard]] const GpuResourcePlan* find(uint32_t device) const;
     CompiledModel& model;
     std::map<uint32_t, uint64_t> usage_baselines;
+    std::map<uint32_t, uint64_t> explicit_cache_reserves;
 };
 
 ResourcePlanner::ResourcePlanner(CompiledModel& model, const CompilerOption& opt) : model(model)
@@ -2057,6 +2068,7 @@ ResourcePlanner::ResourcePlanner(CompiledModel& model, const CompilerOption& opt
             reserve = i < opt.gpu_expert_cache_reserves.size() ? opt.gpu_expert_cache_reserves[i] : reserve;
             break;
         }
+        explicit_cache_reserves[device] = reserve;
         if (has_flag(opt.flags, BackendVulkanExperts)
             && !has_flag(model.opt.flags, OptionDisableGpuExpertExecution))
             reserve = std::max(reserve, minimum_gpu_expert_reserve(model, device));
@@ -2088,6 +2100,19 @@ bool ResourcePlanner::allocation_fits(uint32_t device, GpuResourceRequest reques
     return can_admit(device, request);
 }
 
+bool ResourcePlanner::explicit_cache_reserve(uint32_t device) const
+{
+    const auto reserve = explicit_cache_reserves.find(device);
+    return reserve != explicit_cache_reserves.end() && reserve->second != 0;
+}
+
+void ResourcePlanner::refresh_expert_reserve(uint32_t device)
+{
+    for (GpuResourcePlan& plan : model.memory_plan.gpu_devices)
+        if (plan.initial.device_index == device)
+            plan.expert_cache_reserve = std::max(explicit_cache_reserves.at(device), minimum_gpu_expert_reserve(model, device));
+}
+
 void ResourcePlanner::commit(uint32_t device, GpuResourceRequest request)
 {
     for (GpuResourcePlan& plan : model.memory_plan.gpu_devices)
@@ -2107,17 +2132,22 @@ static Result<bool> prepare_resource_group(CompiledModel& model, ResourcePlanner
                                            uint32_t device, GpuResourceRequest request,
                                            CompiledLayerPlan* layer, const std::string& operation,
                                            const std::function<Result<void>()>& prepare,
-                                           const std::function<bool()>& supported)
+                                           const std::function<bool()>& supported,
+                                           bool allow_budget_fallback = false)
 {
     // Zero denotes a capability decision made before selecting a GPU product.
-    // Once a supported product is selected, allocation failure is an error.
+    // Creation failures are errors; optional residency can retain its cache
+    // execution path when the budget cannot hold persistent allocations.
     if (request.persistent_size == 0) return false;
     const std::string location = operation + " on device " + std::to_string(device);
     if (!resources.can_admit(device, request))
+    {
+        if (allow_budget_fallback) return false;
         return Error{ErrorCode::InvalidArgument, "Vulkan resource plan cannot allocate " + location
                                                      + " (persistent=" + std::to_string(request.persistent_size)
                                                      + ", session_state=" + std::to_string(request.session_state_size)
                                                      + ", workspace=" + std::to_string(request.workspace_size) + ")"};
+    }
     CompiledOperatorTable previous = model.operators;
     CompiledLayerPlan previous_layer;
     if (layer) previous_layer = *layer;
@@ -2132,6 +2162,7 @@ static Result<bool> prepare_resource_group(CompiledModel& model, ResourcePlanner
             return Error{prepared.error().code, "Vulkan preparation failed for " + location + ": " + prepared.error().message};
         if (!executable)
             return Error{ErrorCode::InternalError, "Vulkan preparation produced no executable product for " + location};
+        if (allow_budget_fallback) return false;
         return Error{ErrorCode::InvalidArgument, "Vulkan resource allocation exceeded the live budget for " + location};
     }
     resources.commit(device, request);
@@ -2277,13 +2308,26 @@ static GpuResourceRequest ffn_resource_request(const CompiledModel& model, const
         // An unsupported chain is a CPU placement decision before allocation.
         if (!projection_chain && !float8_chain && !bfloat16_chain) return {};
     }
-    const uint64_t gate = projection_storage(model, ffn.gate_weight, alignment, device);
-    const uint64_t up = projection_storage(model, ffn.up_weight, alignment, device);
-    const uint64_t down = projection_storage(model, ffn.down_weight, alignment, device);
-    if (gate == 0 || up == 0 || down == 0) return {};
-    uint64_t input = bf16_fused_storage_size(model, {ffn.gate_weight, ffn.up_weight, shared ? layer.moe.shared_expert_gate_weight : invalid_tensor_handle}, alignment, device);
-    if (input == 0) input = saturating_add_u64(gate, up);
-    uint64_t size = saturating_add_u64(input, down);
+    uint64_t size = 0;
+    if (!shared)
+    {
+        // Native FFNs own their complete projection chain; its physical
+        // allocations can differ from three independently prepared linears.
+        size = native_quantized_expert_storage_bytes(model.weights.at(ffn.gate_weight),
+                                                     &model.weights.at(ffn.up_weight), model.weights.at(ffn.down_weight),
+                                                     device, model.vulkan_runtime, model.opt.optimization_flags,
+                                                     nullptr, nullptr, nullptr, ffn.activation, ffn.activation_limit);
+    }
+    if (size == 0)
+    {
+        const uint64_t gate = projection_storage(model, ffn.gate_weight, alignment, device);
+        const uint64_t up = projection_storage(model, ffn.up_weight, alignment, device);
+        const uint64_t down = projection_storage(model, ffn.down_weight, alignment, device);
+        if (gate == 0 || up == 0 || down == 0) return {};
+        uint64_t input = bf16_fused_storage_size(model, {ffn.gate_weight, ffn.up_weight, shared ? layer.moe.shared_expert_gate_weight : invalid_tensor_handle}, alignment, device);
+        if (input == 0) input = saturating_add_u64(gate, up);
+        size = saturating_add_u64(input, down);
+    }
     if (shared && layer.moe.shared_expert_gate_weight != invalid_tensor_handle)
         size = saturating_add_u64(size, projection_storage(model, layer.moe.shared_expert_gate_weight, alignment, device));
     const uint64_t rows = SessionOptions{}.prefill_chunk_size;
@@ -2400,13 +2444,6 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
                                                                                                                                                                                                                                                                      layer.vulkan_device_index, compiled.vulkan_runtime, compiled.opt.optimization_flags); }, [&] { return support_vulkan_shared_experts(compiled.operators, layer.moe); });
                 if (!prepared) return prepared.error();
             }
-            if (layer.dense_ffn.down_weight == invalid_tensor_handle || layer.dense_ffn.use_gpu_cache) continue;
-            if (complete_ffn_kernel_supported(compiled, layer))
-            {
-                auto prepared = prepare_resource_group(compiled, resources, layer.vulkan_device_index, ffn_resource_request(compiled, layer, false), &layer, "dense FFN at layer " + std::to_string(layer.layer_id), [&] { return prepare_ffn_operators(compiled.weights, compiled.operators, layer.dense_ffn, layer.vulkan_device_index,
-                                                                                                                                                                                                                                                        compiled.vulkan_runtime, compiled.opt.optimization_flags, false); }, [&] { return support_vulkan_ffn(compiled.operators, layer.dense_ffn); });
-                if (!prepared) return prepared.error();
-            }
         }
     }
 
@@ -2435,13 +2472,70 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
             return {}; }, [&] { return uses_vulkan_dense_operator(compiled.operators.at_weight(compiled.lm_head_weight)); });
     if (!head_prepared) return head_prepared.error();
 
+    // Automatic dense placement keeps frequently reused FFNs resident after
+    // attention and the output head. Explicit cache capacity selects the
+    // existing demand-cache policy, including its bounded-memory behavior.
+    for (ExecutionGraph* graph : {&compiled.graph, &compiled.speculative.graph})
+    {
+        for (CompiledLayerPlan& layer : graph->layer_plans)
+        {
+            ExpertPlan& ffn = layer.dense_ffn;
+            if (ffn.down_weight == invalid_tensor_handle
+                || (ffn.use_gpu_cache && resources.explicit_cache_reserve(layer.vulkan_device_index))
+                || !complete_ffn_kernel_supported(compiled, layer)) continue;
+            const bool cached = ffn.use_gpu_cache;
+            const GpuResourceRequest request = ffn_resource_request(compiled, layer, false);
+            auto prepared = prepare_resource_group(compiled, resources, layer.vulkan_device_index, request, &layer, "dense FFN at layer " + std::to_string(layer.layer_id), [&] { return prepare_ffn_operators(compiled.weights, compiled.operators, layer.dense_ffn,
+                                                                                                                                                                                                               layer.vulkan_device_index, compiled.vulkan_runtime,
+                                                                                                                                                                                                               compiled.opt.optimization_flags, false); }, [&] { return support_vulkan_ffn(compiled.operators, layer.dense_ffn); }, cached);
+            if (!prepared) return prepared.error();
+            if (prepared.value() && cached)
+            {
+                layer.dense_ffn.use_gpu_cache = false;
+                resources.refresh_expert_reserve(layer.vulkan_device_index);
+            }
+        }
+    }
+
     compiled.gpu_segments.resize(compiled.graph.layer_plans.size());
     if (has_flag(opt.flags, BackendVulkanExperts)
         && !has_flag(compiled.opt.flags, OptionDisableGpuExpertExecution))
     {
+        const bool dense_chain = !compiled.graph.layer_plans.empty() && GpuSegment_vulkan::supports_head(compiled)
+                                 && std::all_of(compiled.graph.layer_plans.begin(), compiled.graph.layer_plans.end(), [&](const auto& layer) {
+                                        return layer.dense_ffn.down_weight != invalid_tensor_handle
+                                               && layer.vulkan_device_index == device && GpuSegment_vulkan::supports(compiled, layer);
+                                    });
+        if (dense_chain)
+        {
+            GpuResourceRequest request;
+            request.persistent_size = constant_storage(compiled, {compiled.final_norm_weight}, alignment);
+            for (const auto& layer : compiled.graph.layer_plans)
+                request.persistent_size = saturating_add_u64(request.persistent_size,
+                                                             saturating_add_u64(constant_storage(compiled, {layer.dense_pre_ffn_norm_weight}, alignment), alignment * 8));
+            request.workspace_size = saturating_multiply_u64(SessionOptions{}.prefill_chunk_size,
+                                                             saturating_multiply_u64(compiled.descriptor.hidden_size, 4 * sizeof(float)));
+            if (resources.can_admit(device, request))
+            {
+                for (size_t index = 0; index < compiled.graph.layer_plans.size(); ++index)
+                {
+                    compiled.gpu_segments[index] = GpuSegment_vulkan::create(compiled, compiled.graph.layer_plans[index]);
+                    if (!compiled.gpu_segments[index])
+                        return Error{ErrorCode::InternalError, "cannot prepare selected resident dense segment at layer " + std::to_string(index)};
+                }
+                compiled.gpu_head = GpuSegment_vulkan::create_head(compiled);
+                if (!compiled.gpu_head)
+                    return Error{ErrorCode::InternalError, "cannot prepare selected resident dense head"};
+                if (!resources.allocation_fits(device, request))
+                    return Error{ErrorCode::InvalidArgument, "resident dense graph exceeds the live device budget"};
+                resources.commit(device, request);
+                compiled.resident_submission_rows = SessionOptions{}.prefill_chunk_size;
+            }
+        }
         for (size_t index = 0; index < compiled.graph.layer_plans.size(); ++index)
         {
             const auto& layer = compiled.graph.layer_plans[index];
+            if (layer.dense_ffn.down_weight != invalid_tensor_handle) continue;
             if (!GpuSegment_vulkan::supports(compiled, layer)
                 || !support_vulkan_experts(compiled.weights, layer.moe, compiled.opt.optimization_flags)) continue;
             const uint32_t segment_device = layer.vulkan_device_index;
@@ -2466,7 +2560,7 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
             compiled.gpu_segments[index] = std::move(segment);
             resources.commit(segment_device, request);
         }
-        if (!compiled.gpu_segments.empty() && compiled.gpu_segments.back()
+        if (!compiled.gpu_head && !compiled.gpu_segments.empty() && compiled.gpu_segments.back()
             && GpuSegment_vulkan::supports_head(compiled))
         {
             GpuResourceRequest request{constant_storage(compiled, {compiled.final_norm_weight}, alignment), 0, 0};
@@ -2491,10 +2585,14 @@ static uint32_t graph_node_device(const CompiledModel& model, const ExecutionGra
                : model.opt.vulkan_device_index;
 }
 
+static bool graph_has_resident_chain(const CompiledModel& model, const ExecutionGraph& graph)
+{
+    return &graph == &model.graph && model.resident_submission_rows != 0 && !graph.layer_plans.empty();
+}
+
 static bool graph_has_expert_banks(const CompiledModel& model, const ExecutionGraph& graph)
 {
-    return &graph == &model.graph && model.bank_submission_rows != 0
-           && !graph.layer_plans.empty() && model.gpu_expert_bank_plans.size() == graph.layer_plans.size();
+    return graph_has_resident_chain(model, graph) && model.gpu_expert_bank_plans.size() == graph.layer_plans.size();
 }
 
 static uint64_t graph_tensor_elements(const CompiledModel& model, const ExecutionGraph& graph,
@@ -2550,11 +2648,11 @@ static bool graph_has_gpu_segment(const CompiledModel& model, const ExecutionGra
     return &graph == &model.graph && index < model.gpu_segments.size() && model.gpu_segments[index];
 }
 
-uint32_t bank_chunk_layers(const CompiledModel& model, uint32_t rows) noexcept
+uint32_t resident_chunk_layers(const CompiledModel& model, uint32_t rows) noexcept
 {
-    if (model.bank_submission_rows == 0 || model.graph.layer_plans.empty()) return 0;
+    if (model.resident_submission_rows == 0 || model.graph.layer_plans.empty()) return 0;
     return static_cast<uint32_t>(std::min<size_t>(model.graph.layer_plans.size(),
-                                                  std::max(1u, model.bank_submission_rows / std::max(1u, rows))));
+                                                  std::max(1u, model.resident_submission_rows / std::max(1u, rows))));
 }
 
 // Opaque recorders retain their VkMat operands through the submission fence.
@@ -2683,6 +2781,11 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
             return {};
         }
         const bool segment_input = graph_has_gpu_segment(model, graph, node.layer_plan_index);
+        if (node.type == ExecutionNodeType::DenseFfn && graph_has_resident_chain(model, graph))
+        {
+            auto branch = add(hidden);
+            if (!branch) return branch.error();
+        }
         const bool resident_input = segment_input || model.gated_residual_chain
                                     || (&graph == &model.graph && !has_flag(model.opt.flags, OptionRouterPrediction)
                                         && model.operators.at_weight(layer.attention.query_a_weight).latent_layer);
@@ -2806,10 +2909,10 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
     std::vector<uint32_t> positions(graph.nodes.size());
     for (uint32_t position = 0; position < schedule.node_order.size(); ++position)
         positions[schedule.node_order[position]] = node_offset + position;
-    const bool bank_chain = graph_has_expert_banks(model, graph);
-    if (bank_chain)
+    const bool resident_chain = graph_has_resident_chain(model, graph);
+    if (resident_chain)
     {
-        const uint32_t chunk = bank_chunk_layers(model, rows);
+        const uint32_t chunk = resident_chunk_layers(model, rows);
         std::vector<ExecutionNodeId> attention(graph.layer_plans.size(), invalid_execution_node_id);
         std::vector<ExecutionNodeId> combine(graph.layer_plans.size(), invalid_execution_node_id);
         ExecutionNodeId head = invalid_execution_node_id;
@@ -2818,23 +2921,26 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
             if (node.type == ExecutionNodeType::LmHead) head = node.id;
             if (node.layer_plan_index >= graph.layer_plans.size()) continue;
             if (node.type == ExecutionNodeType::Attention) attention[node.layer_plan_index] = node.id;
-            if (node.type == ExecutionNodeType::Combine) combine[node.layer_plan_index] = node.id;
+            if (node.type == ExecutionNodeType::Combine || node.type == ExecutionNodeType::DenseFfn) combine[node.layer_plan_index] = node.id;
         }
         for (uint32_t first = 0; first < graph.layer_plans.size(); first += chunk)
         {
             const uint32_t last = std::min<uint32_t>(static_cast<uint32_t>(graph.layer_plans.size()), first + chunk) - 1;
             const ExecutionNodeId finish = last + 1 == graph.layer_plans.size() ? head : combine[last];
             if (attention[first] == invalid_execution_node_id || finish == invalid_execution_node_id)
-                return Error{ErrorCode::InvalidModel, "resident Expert bank graph has no recording boundary"};
+                return Error{ErrorCode::InvalidModel, "resident graph has no recording boundary"};
             const uint32_t device = graph_node_device(model, graph, graph.nodes[attention[first]]);
             submissions.push_back({device, positions[attention[first]], positions[finish]});
             // One zeroed validation word is shared by the entire chunk. Its
             // blob allocation is rounded to the real device alignment; host
             // upload/download slots use the separate staging allocator.
-            const uint64_t alignment = std::max<uint64_t>(4, gpu_buffer_alignment(model, device));
-            auto flag = append_graph_buffer(buffers, device, alignment, alignment,
-                                            positions[attention[first]], positions[finish], 1);
-            if (!flag) return flag.error();
+            if (graph_has_expert_banks(model, graph))
+            {
+                const uint64_t alignment = std::max<uint64_t>(4, gpu_buffer_alignment(model, device));
+                auto flag = append_graph_buffer(buffers, device, alignment, alignment,
+                                                positions[attention[first]], positions[finish], 1);
+                if (!flag) return flag.error();
+            }
         }
     }
     else if (&graph == &model.graph)
@@ -2876,12 +2982,12 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
     for (size_t index = 0; index < schedule.node_order.size(); ++index)
     {
         const ExecutionNode& node = graph.nodes[schedule.node_order[index]];
-        if (node.type != ExecutionNodeType::Combine || node.layer_plan_index >= fused_layers.size()
+        if ((node.type != ExecutionNodeType::Combine && !(resident_chain && node.type == ExecutionNodeType::DenseFfn)) || node.layer_plan_index >= fused_layers.size()
             || !fused_layers[node.layer_plan_index]) continue;
         // Fused layers defer the combine and FFN post until the next device
         // Attention, materialization, or final head submission actually runs.
         uint32_t finish = positions[node.id];
-        if (!bank_chain && index + 1 < schedule.node_order.size())
+        if (!resident_chain && index + 1 < schedule.node_order.size())
         {
             finish = positions[schedule.node_order[index + 1]];
             if ((model.gpu_head || model.gated_residual_device_head || model.operators.at_weight(model.hyper_head_function).layer_head)
@@ -2896,7 +3002,7 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
     for (const ExecutionNode& node : graph.nodes)
     {
         if (!graph_has_gpu_segment(model, graph, node.layer_plan_index)) continue;
-        if (!bank_chain && (node.type == ExecutionNodeType::SharedExpertGroup || node.type == ExecutionNodeType::Combine))
+        if (!resident_chain && (node.type == ExecutionNodeType::SharedExpertGroup || node.type == ExecutionNodeType::Combine))
             starts[node.id] = ends[node.id] = layer_finish[node.layer_plan_index];
         if (node.type == ExecutionNodeType::Router)
             for (const ExecutionNode& attention : graph.nodes)
@@ -2977,7 +3083,7 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
         const uint32_t device = graph_node_device(model, graph, node);
         const uint32_t position = positions[node_id];
         const uint64_t alignment = std::max<uint64_t>(4, gpu_buffer_alignment(model, device));
-        if (!bank_chain && node.type == ExecutionNodeType::ExpertGroup && graph_has_gpu_segment(model, graph, node.layer_plan_index))
+        if (!resident_chain && node.type == ExecutionNodeType::ExpertGroup && graph_has_gpu_segment(model, graph, node.layer_plan_index))
         {
             // One token-major aggregate survives to the next segment. The
             // submission ranges also retain final-wave route-major operands
@@ -3000,11 +3106,13 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
                 // Compact router selection and the residual/Norm temporaries
                 // recorded together with Attention. Hidden itself is a graph
                 // output; normalized is retained separately below.
-                private_columns = {hidden, Router_vulkan::selected_columns(layer.moe.top_k)};
+                const bool dense = layer.dense_ffn.down_weight != invalid_tensor_handle;
+                private_columns = dense ? std::vector<uint64_t>{hidden}
+                                        : std::vector<uint64_t>{hidden, Router_vulkan::selected_columns(layer.moe.top_k)};
                 if (layer.attention.kind == AttentionKind::GatedDeltaNet) private_columns.push_back(hidden);
                 // InnerProduct can pack groups of four rows. The Router's
                 // pack1 logits then coexist with the projection allocation.
-                if (rows % 4 == 0) private_columns.push_back(layer.moe.experts.size());
+                if (!dense && rows % 4 == 0) private_columns.push_back(layer.moe.experts.size());
             }
             else if (model.gated_residual_chain)
             {
@@ -3124,14 +3232,15 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
         if (!plan) return plan.error();
         (decode ? result.decode : result.prefill) = std::move(plan).value();
     }
-    if (graph_has_expert_banks(compiled, compiled.graph))
+    if (graph_has_resident_chain(compiled, compiled.graph))
     {
         // Smaller row counts record more layers before a fence. A reservation
         // for P rows therefore needs the peak envelope of every 1..P shape,
         // not just the largest matrix. Above the recording row budget the
         // chunk is one layer; cover its largest packed and unpacked shapes.
         std::vector<uint32_t> shapes;
-        const uint32_t enumerated = std::min(prefill_rows, compiled.bank_submission_rows);
+        const uint32_t submission_rows = compiled.resident_submission_rows;
+        const uint32_t enumerated = std::min(prefill_rows, submission_rows);
         for (uint32_t rows = 1; rows <= enumerated; ++rows) shapes.push_back(rows);
         if (prefill_rows > enumerated)
         {
@@ -3159,8 +3268,8 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
     }
     std::map<uint32_t, uint64_t> states;
     std::map<uint32_t, uint64_t> growth;
-    const bool bank_chain = graph_has_expert_banks(compiled, compiled.graph);
-    std::vector<uint64_t> bank_growth(compiled.graph.layer_plans.size(), 0);
+    const bool resident_chain = graph_has_resident_chain(compiled, compiled.graph);
+    std::vector<uint64_t> resident_growth(compiled.graph.layer_plans.size(), 0);
     for (const ExecutionGraph* graph : {&compiled.graph, &compiled.speculative.graph})
         for (const ExecutionNode& node : graph->nodes)
         {
@@ -3178,8 +3287,8 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
                                               ? attention_session_state_size(compiled, layer.attention, layer.vulkan_device_index,
                                                                              std::max(1u, result.context_tokens / 2))
                                               : 0;
-                if (bank_chain && graph == &compiled.graph)
-                    bank_growth[node.layer_plan_index] = previous;
+                if (resident_chain && graph == &compiled.graph)
+                    resident_growth[node.layer_plan_index] = previous;
                 else
                     growth[layer.vulkan_device_index] = std::max(growth[layer.vulkan_device_index], previous);
             }
@@ -3203,23 +3312,24 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
             if (total == UINT64_MAX)
                 return Error{ErrorCode::InvalidArgument, "Vulkan graph Session state exceeds the allocation range"};
         }
-    if (bank_chain)
+    if (resident_chain)
     {
         // Every growing KV ring in a recorded chunk retains its old backing
         // until the common fence. Cover each row-dependent chunk partition;
         // one-layer-at-a-time growth is insufficient for a resident decode.
         std::vector<uint32_t> chunks{1};
-        for (uint32_t rows = 1; rows <= compiled.bank_submission_rows; ++rows)
+        const uint32_t submission_rows = compiled.resident_submission_rows;
+        for (uint32_t rows = 1; rows <= submission_rows; ++rows)
         {
-            const uint32_t chunk = bank_chunk_layers(compiled, rows);
+            const uint32_t chunk = resident_chunk_layers(compiled, rows);
             if (std::find(chunks.begin(), chunks.end(), chunk) == chunks.end()) chunks.push_back(chunk);
         }
         for (uint32_t chunk : chunks)
-            for (size_t first = 0; first < bank_growth.size(); first += chunk)
+            for (size_t first = 0; first < resident_growth.size(); first += chunk)
             {
                 uint64_t previous = 0;
-                for (size_t index = first; index < std::min(bank_growth.size(), first + chunk); ++index)
-                    previous = saturating_add_u64(previous, bank_growth[index]);
+                for (size_t index = first; index < std::min(resident_growth.size(), first + chunk); ++index)
+                    previous = saturating_add_u64(previous, resident_growth[index]);
                 const uint32_t device = compiled.graph.layer_plans[first].vulkan_device_index;
                 growth[device] = std::max(growth[device], previous);
             }

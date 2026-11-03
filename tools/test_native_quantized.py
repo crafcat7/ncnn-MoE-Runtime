@@ -567,9 +567,10 @@ def hybrid_dense_host_release(tensors: dict, packed_sizes: dict[str, int], *,
     and releases query/key norms.
     Native Standard GQA Attention owns its pre-attention norm, sinks, and
     (for Qwen) query/key norms for each complete Vulkan layer, as well as its
-    unquantized projection copies. Q8_0 dense Linear operators release their
-    raw GGML payloads; embeddings, Expert banks, and Qwen dense-FFN Expert
-    chains retain theirs.
+    unquantized projection copies. Q8_0 dense Linear operators and persistent
+    dense FFN chains release their raw GGML payloads; embeddings and routed
+    Expert banks retain theirs. These small fixtures use automatic residency
+    with enough device memory for every supported dense FFN.
     Its HC/PLE/indexer weights also retain their host storage despite GPU
     execution. FP8
     reclaims codes and scales of the output head, standard/latent Attention,
@@ -615,8 +616,6 @@ def hybrid_dense_host_release(tensors: dict, packed_sizes: dict[str, int], *,
         if name.endswith("embed_tokens.weight") or name in ("model.embed_tokens.weight", "embed.weight"):
             continue
         if ".experts." in name:
-            continue
-        if qwen_family and re.search(r"\.mlp\.(?:gate|up|down)_proj\.weight$", name):
             continue
         released += raw_bytes
 
@@ -1731,6 +1730,34 @@ class NativeQuantizedTests(unittest.TestCase):
                 self.assertEqual(hybrid_dense_host_release(tensors, packed_gate, family="qwen4_exp"),
                                  query_norm.nbytes + key_norm.nbytes + second_gate.nbytes)
 
+    def test_q8_0_dense_ffn_release_expected_accounting(self):
+        # Q8_0 stores 32 values plus a two-byte scale in each 34-byte block.
+        # Vary both projection dimensions and layer count, independently of
+        # the worker's reported byte totals or the main 256-column fixture.
+        for hidden, intermediate, layers in ((64, 96, 1), (128, 160, 3)):
+            with self.subTest(hidden=hidden, intermediate=intermediate, layers=layers):
+                tensors, packed, q8_bytes = {}, {}, {}
+                expected = 0
+                for layer in range(layers):
+                    for role, shape in (("gate", (intermediate, hidden)),
+                                        ("up", (intermediate, hidden)),
+                                        ("down", (hidden, intermediate))):
+                        name = PREFIX + f"layers.{layer}.mlp.{role}_proj.weight"
+                        tensors[name] = ("BF16", np.zeros(shape, np.uint16))
+                        packed[name] = q8_bytes[name] = shape[0] * (shape[1] // 32) * 34
+                        expected += shape[0] * (shape[1] // 32) * 34
+                for name in (PREFIX + "embed_tokens.weight", PREFIX + "layers.0.mlp.experts.0.up_proj.weight"):
+                    tensors[name] = ("BF16", np.zeros((intermediate, hidden), np.uint16))
+                    packed[name] = q8_bytes[name] = intermediate * (hidden // 32) * 34
+                # Other packed GGML formats still keep their host payloads.
+                other = PREFIX + f"layers.{layers}.mlp.down_proj.weight"
+                tensors[other] = ("BF16", np.zeros((hidden, intermediate), np.uint16))
+                packed[other] = hidden * intermediate // 2
+                norm = PREFIX + "layers.0.post_attention_layernorm.weight"
+                tensors[norm] = ("BF16", np.zeros(hidden, np.uint16))
+                self.assertEqual(hybrid_dense_host_release(tensors, packed, q8_0_dense_bytes=q8_bytes), expected)
+                self.assertEqual(hybrid_dense_host_release(tensors, packed), 0)
+
     def test_mapped_ple_expected_accounting(self):
         model_config = config(True)
         model_config["model_type"] = "qwen4_exp"
@@ -2435,6 +2462,7 @@ def main() -> int:
             # The CPU job already runs these offline checks.
             cpu_only_tests = {
                 "test_hybrid_dense_release_expected_accounting",
+                "test_q8_0_dense_ffn_release_expected_accounting",
                 "test_mapped_ple_expected_accounting",
                 "test_native_gguf_block_fixture_oracles",
             }
