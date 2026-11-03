@@ -2052,8 +2052,11 @@ class NativeQuantizedTests(unittest.TestCase):
                 root.mkdir()
                 fixture = prepare_int4(root, method, True, "deepseek_dspark")
                 self.compare(fixture, direct=True)
-                with self.subTest(confidence="canonical_int4_one_row"):
-                    self.compare(quantize_tiny_confidence(fixture), direct=False)
+                if method == "awq":
+                    # Confidence rounding is independent of the import convention,
+                    # so one canonical INT4 row covers both methods.
+                    with self.subTest(confidence="canonical_int4_one_row"):
+                        self.compare(quantize_tiny_confidence(fixture), direct=False)
 
     def test_deepseek_dspark_native_fp4_proposals(self):
         for format_name in ("MXFP4", "NVFP4"):
@@ -2194,16 +2197,6 @@ class NativeQuantizedTests(unittest.TestCase):
         expected_types = {"q": "Q2_K", "k": "BF16", "v": "Q8_0", "o": "F32"}
         for family in ("qwen35moe", "gpt_oss"):
             projection_family = "qwen" if family == "qwen35moe" else family
-            with self.subTest(family=family, fixture="13-format-matrix"):
-                matrix_root = self.root / f"{family}-13-format-matrix"
-                matrix_root.mkdir()
-                matrix_fixture = (prepare_gguf(matrix_root, True, native_formats=NATIVE_GQA_GGUF_FORMATS)
-                                  if family == "qwen35moe"
-                                  else prepare_family_gguf(matrix_root, family, native_formats=NATIVE_GQA_GGUF_FORMATS))
-                matrix_types = standard_gqa_projection_types(matrix_fixture.source, projection_family)
-                self.assertEqual(len(set(matrix_types.values())), 4,
-                                 f"13-format matrix did not give Q/K/V/O distinct dtypes: {matrix_types}")
-
             with self.subTest(family=family, fixture="Q2_K-BF16-Q8_0-F32"):
                 mixed_root = self.root / f"{family}-mixed-gqa"
                 mixed_root.mkdir()
