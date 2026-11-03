@@ -369,6 +369,9 @@ int main(int argc, char** argv)
         {
             option.expert_memory_mode = ncnn::moe::ExpertMemoryMode::OnDemand;
             option.expert_cache_size = UINT64_C(2) * 1024 * 1024;
+            // Exercise lazy host reads even when the entire fixture fits a
+            // GPU bank; eager comparisons retain full-bank admission.
+            option.optimization_flags &= ~ncnn::moe::OptimizationVulkanIndexedExperts;
         }
         auto actual = runtime.load_model(argv[2], option);
         ncnn::moe::check(static_cast<bool>(actual), actual ? "" : actual.error().message);

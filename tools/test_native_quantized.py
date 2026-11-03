@@ -1044,7 +1044,7 @@ def assert_imported_gguf_native(loaded: dict, name: str, raw: np.ndarray, tag: i
                                 rows: int, columns: int,
                                 input_columns: np.ndarray | None = None,
                                 family: str = "qwen") -> None:
-    """Check the importer's lossless native representation for one GGUF matrix."""
+    """Check the importer's gpu native representation for one GGUF matrix."""
     if tag == 39:
         source = np.asarray(raw, dtype=np.uint8).reshape(rows, columns // 32, 17)
         codes = np.empty((rows, columns // 32, 32), dtype=np.uint8)
@@ -1970,20 +1970,39 @@ class NativeQuantizedTests(unittest.TestCase):
         self.assertEqual(resources["expert_cache_bytes"], 1024 * 1024)
         resident_experts = resources["expert_gpu_bank_layers"] > 0
         if resident_experts:
+            # A full bank loads deferred weights during model preparation,
+            # then executes without the host or dynamic GPU Expert caches.
+            model_config = json.loads((fixture.imported / "config.json").read_text())
+            text_config = model_config.get("text_config", model_config)
             self.assertEqual(resources["backend"], "hybrid")
             self.assertGreater(resources["expert_gpu_bank_bytes"], 0)
-        for mode in ("greedy", "sampled"):
-            self.assertEqual(deferred[mode][0], eager[mode][0])
-            np.testing.assert_allclose(deferred[mode][1], eager[mode][1], rtol=0, atol=3e-5)
+            self.assertEqual(resources["expert_gpu_bank_layers"], text_config["num_hidden_layers"])
+            self.assertGreater(resources["expert_gpu_bank_submission_rows"], 0)
+            self.assertEqual(resources["expert_gpu_cache_bytes"], 0)
+            self.assertEqual(resources["expert_gpu_victim_cache_bytes"], 0)
+        else:
+            self.assertEqual(resources["expert_gpu_bank_layers"], 0)
+        modes = [mode for mode in ("greedy", "sampled", "reused") if f"{mode}_stats" in deferred]
+        for mode in modes:
+            if mode != "reused":
+                self.assertEqual(deferred[mode][0], eager[mode][0])
+                np.testing.assert_allclose(deferred[mode][1], eager[mode][1], rtol=0, atol=3e-5)
             generation = deferred[mode + "_stats"]["generation"]
             self.assertLessEqual(generation["cache_resident_bytes"], resources["expert_cache_bytes"])
-            if resident_experts:
-                self.assertGreater(generation["assignments"], 0)
-                self.assertEqual(generation["gpu_routes"], generation["assignments"])
-                self.assertEqual(generation["cpu_routes"], 0)
-                self.assertEqual(generation["cpu_fallbacks"], 0)
-                self.assertEqual(generation["io_bytes"], 0)
-                self.assertEqual(generation["cache_resident_bytes"], 0)
+            if not resident_experts:
+                continue
+            gpu = deferred[mode + "_stats"]["generation_gpu"]
+            self.assertGreater(generation["assignments"], 0)
+            self.assertEqual(generation["gpu_routes"], generation["assignments"])
+            for counter in ("cpu_routes", "cpu_fallbacks", "gpu_execution_failures",
+                            "cache_hit", "cache_miss", "io_bytes", "cache_resident_bytes",
+                            "gpu_cache_stores", "gpu_cache_evictions"):
+                self.assertEqual(generation[counter], 0, (mode, counter))
+            self.assertGreater(gpu["resident_graph_submissions"], 0)
+            self.assertGreater(gpu["resident_graph_activation_upload_bytes"], 0)
+            for counter in ("weight_upload_bytes", "weight_transfer_submissions",
+                            "resident_graph_activation_download_bytes", "resident_graph_route_download_bytes"):
+                self.assertEqual(gpu[counter], 0, (mode, counter))
         if not resident_experts:
             self.assertGreater(deferred["greedy_stats"]["generation"]["io_bytes"], 0)
 

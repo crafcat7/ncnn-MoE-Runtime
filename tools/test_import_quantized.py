@@ -1177,7 +1177,8 @@ class ImportTests(unittest.TestCase):
         for family, arch in (("qwen3_5", "qwen35"), ("deepseek_v4", "dflash")):
             source, _ = self.family_assets(family)
             path = self.root / (arch + "-unsupported.gguf")
-            raw = np.zeros((4, 320), dtype=np.uint8)  # Q8_1 has 40 bytes per 32-value block.
+            block_size, block_bytes = gguf.GGML_QUANT_SIZES[gguf.GGMLQuantizationType.Q8_1]
+            raw = np.zeros((4, 256 // block_size * block_bytes), dtype=np.uint8)
             self.write_gguf(path, arch, [("token_embd.weight", raw, gguf.GGMLQuantizationType.Q8_1),
                                          ("output.weight", np.ones((4, 256), dtype=np.float32), None)])
             output = self.root / (arch + "-unsupported-output")
