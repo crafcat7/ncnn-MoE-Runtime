@@ -299,7 +299,7 @@ std::shared_ptr<GpuSegment_vulkan> GpuSegment_vulkan::create(const CompiledModel
                                            model.descriptor.norm_weight_offset, impl.context, impl.option,
                                            nullptr, impl.add_norm);
     if (dense)
-        impl.dense = SharedFfn_vulkan::create_dense(model, layer.dense_ffn);
+        impl.dense = SharedFfn_vulkan::create(model, layer.dense_ffn);
     else
     {
         impl.router = Router_vulkan::create(model.weights.at(layer.moe.router_weight),

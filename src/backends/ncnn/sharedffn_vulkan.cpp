@@ -94,7 +94,7 @@ std::shared_ptr<SharedFfn_vulkan> SharedFfn_vulkan::create(const CompiledModel& 
 #endif
 }
 
-std::shared_ptr<SharedFfn_vulkan> SharedFfn_vulkan::create_dense(const CompiledModel& model, const ExpertPlan& ffn)
+std::shared_ptr<SharedFfn_vulkan> SharedFfn_vulkan::create(const CompiledModel& model, const ExpertPlan& ffn)
 {
 #if NCNN_MOE_WITH_VULKAN
     if (model.opt.hybrid_mode != HybridMode::HybridExperts || ffn.use_gpu_cache) return {};
