@@ -509,8 +509,7 @@ static CompiledModel bank_model(bool gpu, DType dtype, bool native_delta, bool r
             routes.int64_data.resize(static_cast<size_t>(descriptor.vocabulary_size) * moe.top_k);
             for (uint32_t token = 0; token < descriptor.vocabulary_size; ++token)
                 for (uint32_t rank = 0; rank < moe.top_k; ++rank)
-                    routes.int64_data[static_cast<size_t>(token) * moe.top_k + rank]
-                        = static_cast<int64_t>((token + rank) % moe.expert_count);
+                    routes.int64_data[static_cast<size_t>(token) * moe.top_k + rank] = static_cast<int64_t>((token + rank) % moe.expert_count);
             mapping[prefix + "router.token_experts"] = std::move(routes);
         }
         auto experts = bank_fixture(dtype, ExpertLayout::InterleavedGateUpDown, 4);

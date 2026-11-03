@@ -12,8 +12,6 @@
 namespace ncnn {
 namespace moe {
 
-namespace {
-
 struct LiveRange
 {
     uint32_t last_node = 0;
@@ -36,8 +34,6 @@ struct DeviceState
     std::map<uint64_t, uint64_t> free_ranges;
     std::priority_queue<LiveRange, std::vector<LiveRange>, LiveOrder> live_ranges;
 };
-
-} // namespace
 
 static bool graph_memory_align(uint64_t offset, uint64_t alignment, uint64_t& aligned) noexcept
 {

@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -2012,8 +2013,6 @@ static uint64_t expert_wave_workspace_size(const CompiledModel& model, uint32_t 
     return workspace;
 }
 
-namespace {
-
 // One model-wide ledger shared by persistent preparation and Expert caching.
 // Shape-specific operators supply requests; policy is independent of family.
 class ResourcePlanner
@@ -2102,16 +2101,13 @@ const GpuResourcePlan* ResourcePlanner::find(uint32_t device) const
     return nullptr;
 }
 
-} // namespace
-
 // Backend products are published as a complete group. A failed creation or a
 // driver-budget change must preserve both the CPU weights and earlier groups.
-template<typename Prepare, typename Supported>
 static Result<bool> prepare_resource_group(CompiledModel& model, ResourcePlanner& resources,
                                            uint32_t device, GpuResourceRequest request,
                                            CompiledLayerPlan* layer, const std::string& operation,
-                                           const Prepare& prepare,
-                                           const Supported& supported)
+                                           const std::function<Result<void>()>& prepare,
+                                           const std::function<bool()>& supported)
 {
     // Zero denotes a capability decision made before selecting a GPU product.
     // Once a supported product is selected, allocation failure is an error.
