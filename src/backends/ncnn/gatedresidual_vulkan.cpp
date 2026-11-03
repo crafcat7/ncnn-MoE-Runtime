@@ -42,8 +42,8 @@ std::shared_ptr<ncnn::Pipeline> residual_pipeline(const std::shared_ptr<VulkanCo
 }
 
 void residual_record(const ncnn::Pipeline* pipeline, uint32_t mode, uint32_t hidden, uint32_t copies,
-                 uint32_t rows, uint32_t columns, float epsilon, float offset, std::initializer_list<ncnn::VkMat> values,
-                 ncnn::VkCompute& cmd, uint32_t kernel, uint32_t ngram, uint32_t length, uint32_t slot)
+                     uint32_t rows, uint32_t columns, float epsilon, float offset, std::initializer_list<ncnn::VkMat> values,
+                     ncnn::VkCompute& cmd, uint32_t kernel, uint32_t ngram, uint32_t length, uint32_t slot)
 {
     static thread_local std::vector<ncnn::VkMat> bindings(6);
     static thread_local std::vector<ncnn::vk_constant_type> constants(11);
@@ -84,7 +84,7 @@ bool residual_allocate(ncnn::VkMat& value, uint32_t columns, int rows, const std
 }
 
 bool residual_float_weight(const TensorData& tensor, ncnn::VkMat& value,
-                       ncnn::VkCompute& command, const ncnn::Option& opt)
+                           ncnn::VkCompute& command, const ncnn::Option& opt)
 {
     if (tensor.element_count() == 0 || tensor.element_count() > static_cast<uint64_t>(std::numeric_limits<int>::max())) return false;
     ncnn::Mat host(static_cast<int>(tensor.element_count()), sizeof(float));
@@ -202,20 +202,20 @@ bool GatedResidual_vulkan::record_pre(const ncnn::VkMat& input, ncnn::VkMat& red
         || !residual_allocate(reduced, impl.hidden, input.h, impl.context)) return false;
     residual_prepare_read(impl.norm);
     residual_record(impl.pipeline.get(), 0, impl.hidden, impl.copies, input.h, input.w,
-                impl.epsilon, impl.offset, {input, impl.norm, input, input, input, normalized}, cmd);
+                    impl.epsilon, impl.offset, {input, impl.norm, input, input, input, normalized}, cmd);
     if (!impl.down->record_forward(normalized, projected, cmd, storage)
         || !residual_allocate(activated, projected.w, input.h, impl.context)) return false;
     residual_record(impl.pipeline.get(), 1, impl.hidden, impl.copies, input.h, projected.w,
-                0, 0, {projected, projected, projected, projected, projected, activated}, cmd);
+                    0, 0, {projected, projected, projected, projected, projected, activated}, cmd);
     if (!impl.up->record_forward(activated, mixed, cmd, storage)) return false;
     residual_record(impl.pipeline.get(), 3, impl.hidden, impl.copies, input.h, impl.hidden,
-                0, 0, {normalized, mixed, mixed, mixed, mixed, reduced}, cmd);
+                    0, 0, {normalized, mixed, mixed, mixed, mixed, reduced}, cmd);
     if (impl.inject)
     {
         if (!impl.inject->record_forward(normalized, raw_inject, cmd, storage)
             || !residual_allocate(injection, impl.copies, input.h, impl.context)) return false;
         residual_record(impl.pipeline.get(), 2, impl.hidden, impl.copies, input.h, impl.copies,
-                    0, 0, {raw_inject, raw_inject, raw_inject, raw_inject, raw_inject, injection}, cmd);
+                        0, 0, {raw_inject, raw_inject, raw_inject, raw_inject, raw_inject, injection}, cmd);
     }
     for (const auto& value : {normalized, projected, activated, mixed, raw_inject})
         if (!value.empty()) storage.push_back(value);
@@ -228,7 +228,7 @@ bool GatedResidual_vulkan::record_post(const ncnn::VkMat& branch, const ncnn::Vk
     if (branch.w != static_cast<int>(impl.hidden) || branch.h != residual.h || residual.w != static_cast<int>(impl.hidden * impl.copies)
         || injection.w != static_cast<int>(impl.copies) || injection.h != residual.h || !residual_allocate(output, residual.w, residual.h, impl.context)) return false;
     residual_record(impl.pipeline.get(), 4, impl.hidden, impl.copies, residual.h, residual.w,
-                0, 0, {residual, branch, injection, residual, residual, output}, cmd);
+                    0, 0, {residual, branch, injection, residual, residual, output}, cmd);
     return true;
 }
 #endif

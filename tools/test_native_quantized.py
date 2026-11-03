@@ -1968,12 +1968,24 @@ class NativeQuantizedTests(unittest.TestCase):
         self.assertEqual(resources["selected_expert_memory"], "on-demand")
         self.assertTrue(resources["file_backed_experts"])
         self.assertEqual(resources["expert_cache_bytes"], 1024 * 1024)
+        resident_experts = resources["expert_gpu_bank_layers"] > 0
+        if resident_experts:
+            self.assertEqual(resources["backend"], "hybrid")
+            self.assertGreater(resources["expert_gpu_bank_bytes"], 0)
         for mode in ("greedy", "sampled"):
             self.assertEqual(deferred[mode][0], eager[mode][0])
             np.testing.assert_allclose(deferred[mode][1], eager[mode][1], rtol=0, atol=3e-5)
             generation = deferred[mode + "_stats"]["generation"]
             self.assertLessEqual(generation["cache_resident_bytes"], resources["expert_cache_bytes"])
-        self.assertGreater(deferred["greedy_stats"]["generation"]["io_bytes"], 0)
+            if resident_experts:
+                self.assertGreater(generation["assignments"], 0)
+                self.assertEqual(generation["gpu_routes"], generation["assignments"])
+                self.assertEqual(generation["cpu_routes"], 0)
+                self.assertEqual(generation["cpu_fallbacks"], 0)
+                self.assertEqual(generation["io_bytes"], 0)
+                self.assertEqual(generation["cache_resident_bytes"], 0)
+        if not resident_experts:
+            self.assertGreater(deferred["greedy_stats"]["generation"]["io_bytes"], 0)
 
     def test_hf_int4_paths(self):
         for method in ("awq", "gptq"):
@@ -2276,7 +2288,7 @@ class NativeQuantizedTests(unittest.TestCase):
                 for label, path in (("direct", fixture.source), ("imported", fixture.imported)):
                     with self.subTest(path=label):
                         if family == "qwen4_exp" and self.backend == "hybrid":
-                            with self.assertRaisesRegex(WorkerError, "continuous Qwen Vulkan execution does not support FP8"):
+                            with self.assertRaisesRegex(WorkerError, "continuous gated residual Vulkan execution does not support FP8 model weights"):
                                 self.run_worker(path, fixture.moe)
                             continue
                         is_cpu_reference = self.backend == "cpu" and label == "direct"

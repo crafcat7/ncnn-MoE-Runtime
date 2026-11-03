@@ -2,16 +2,19 @@
 #include "backends/ncnn/vulkancontext.h"
 #include "kernels/bfloat16.h"
 #include "kernels/ops.h"
+#include "kernels/qnk.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace ncnn {
 namespace moe {
@@ -230,6 +233,176 @@ static void projection_case(uint32_t device, const VulkanRuntimePtr& runtime,
                      "projection modified its host input");
 }
 
+static void projection_quantized(uint32_t device, const VulkanRuntimePtr& runtime,
+                                 DType dtype, uint32_t columns, uint32_t outputs,
+                                 uint32_t groups = 1, bool permuted = false)
+{
+    TensorData matrix;
+    matrix.dtype = dtype;
+    matrix.shape = {outputs, columns};
+    matrix.quantized_data.resize(static_cast<size_t>(qnk_storage_bytes(dtype, outputs, columns)));
+    for (size_t i = 0; i < matrix.quantized_data.size(); ++i)
+        matrix.quantized_data[i] = static_cast<uint8_t>((i * 37u + i / 11u + 53u) & 255u);
+    const auto half = [](uint8_t* data) { data[0] = 0x00; data[1] = 0x24; };
+    const uint32_t block_size = qnk_block_size(dtype);
+    const size_t block_bytes = qnk_block_bytes(dtype);
+    for (size_t offset = 0; offset < matrix.quantized_data.size(); offset += block_bytes)
+    {
+        uint8_t* block = matrix.quantized_data.data() + offset;
+        if (dtype == DType::Q2K)
+        {
+            half(block + 80);
+            half(block + 82);
+        }
+        else if (dtype == DType::Q3K)
+            half(block + 108);
+        else if (dtype == DType::Q6K)
+            half(block + 208);
+        else if (dtype == DType::Q8K)
+        {
+            const float scale = 0.015625f;
+            std::memcpy(block, &scale, sizeof(scale));
+        }
+        else
+        {
+            half(block);
+            if (dtype == DType::Q4K || dtype == DType::Q5K || dtype == DType::Q4_1 || dtype == DType::Q5_1)
+                half(block + 2);
+        }
+    }
+    if (permuted)
+        for (uint32_t k = 0; k < columns; ++k)
+            matrix.input_column_indices.push_back(columns - k - 1);
+
+    // Decode with the independent CPU block decoder, then compare against an
+    // FP64 dot product. Grouping and input permutations are explicit here.
+    TensorData reference;
+    reference.dtype = DType::Float32;
+    reference.shape = {outputs, columns * groups};
+    reference.float32_data.resize(static_cast<size_t>(outputs) * columns * groups, 0.0f);
+    std::array<float, qnk_block_elements> decoded;
+    for (uint32_t output = 0; output < outputs; ++output)
+        for (uint32_t k = 0; k < columns; k += block_size)
+        {
+            qnk_dequantize_block(dtype, matrix.quantized_data.data() + (static_cast<size_t>(output) * columns + k) / block_size * block_bytes, decoded.data());
+            const uint32_t group = output / (outputs / groups);
+            for (uint32_t i = 0; i < block_size; ++i)
+            {
+                const uint32_t input_column = permuted ? columns - (k + i) - 1 : k + i;
+                reference.float32_data[(static_cast<size_t>(output) * groups + group) * columns + input_column] = decoded[i];
+            }
+        }
+    const auto bias = projection_bias(DType::Float32, outputs);
+    const bool has_bias = outputs % 2 != 0;
+    const auto operation = QnkLinear_vulkan::create(matrix, has_bias ? &bias : nullptr, device, runtime, OptimizationDefaultFlags, groups);
+    projection_check(static_cast<bool>(operation), "native quantized projection factory failed");
+    const auto before = get_vulkan_statistics(runtime);
+    std::vector<float> single_row;
+    for (const size_t rows : {size_t(1), size_t(2), size_t(3), size_t(4), size_t(5), size_t(9)})
+    {
+        ActivationBuffer input(rows, columns * groups), actual;
+        for (size_t row = 0; row < rows; ++row)
+            for (uint32_t k = 0; k < input.columns(); ++k)
+                input.row(row)[k] = std::cos(static_cast<float>((k * 29 + row * 7) % 1021) * 0.023f) * 0.21f;
+        projection_check(operation->forward(input, actual), "native quantized projection execution failed");
+        projection_check(actual.rows() == rows && actual.columns() == outputs, "native quantized projection shape mismatch");
+        projection_compare(reference, has_bias ? &bias : nullptr, input, actual,
+                           "native dtype=" + std::to_string(static_cast<int>(dtype)) + " rows=" + std::to_string(rows));
+        if (rows == 1)
+            single_row.assign(actual.row(0), actual.row(0) + outputs);
+        else
+            projection_check(std::equal(single_row.begin(), single_row.end(), actual.row(0)),
+                             "native quantized prefill changed the single-row accumulation order");
+        if (outputs > 65535) break;
+    }
+    const auto after = get_vulkan_statistics(runtime);
+    projection_check(after.weight_upload_bytes == before.weight_upload_bytes
+                         && after.weight_transfer_submissions == before.weight_transfer_submissions,
+                     "native quantized projection reuploaded weights during execution");
+}
+
+static void projection_quantized_fusion(uint32_t device, const VulkanRuntimePtr& runtime, bool permuted)
+{
+    const std::array<DType, 4> types = {DType::IQ4NL, DType::Q5_0, DType::Q4_0, DType::Q8_0};
+    std::array<TensorData, 4> matrices, biases;
+    std::array<const TensorData*, 4> weights, bias_ptrs;
+    TensorData reference, reference_bias;
+    reference.dtype = reference_bias.dtype = DType::Float32;
+    reference.shape = {0, 256};
+    uint64_t planned = 0;
+    const auto context = VulkanContext::acquire(device, runtime, OptimizationDefaultFlags);
+    const uint64_t alignment = std::max<uint64_t>(4, context->device()->info.buffer_offset_alignment());
+    for (size_t m = 0; m < matrices.size(); ++m)
+    {
+        auto& matrix = matrices[m];
+        matrix.dtype = types[m];
+        matrix.shape = {static_cast<uint32_t>(m * 2 + 1), 256};
+        matrix.quantized_data.resize(static_cast<size_t>(qnk_storage_bytes(matrix.dtype, matrix.shape[0], 256)));
+        for (size_t i = 0; i < matrix.quantized_data.size(); ++i)
+            matrix.quantized_data[i] = static_cast<uint8_t>(i * 43 + i / 7 + m * 11);
+        const size_t bytes = qnk_block_bytes(matrix.dtype);
+        for (size_t i = 0; i < matrix.quantized_data.size(); i += bytes)
+        {
+            // Include zero, negative and non-power-of-two scales.
+            const uint16_t scale = i / bytes % 3 == 0 ? 0 : i / bytes % 3 == 1 ? 0xa521
+                                                                               : 0x26ab;
+            std::memcpy(matrix.quantized_data.data() + i, &scale, sizeof(scale));
+        }
+        if (permuted)
+            for (uint32_t k = 0; k < 256; ++k) matrix.input_column_indices.push_back(255 - k);
+        weights[m] = &matrix;
+        biases[m] = projection_bias(m % 2 == 0 ? DType::Float32 : DType::BFloat16, matrix.shape[0]);
+        bias_ptrs[m] = m == 2 ? nullptr : &biases[m];
+        const size_t first = reference.float32_data.size();
+        reference.shape[0] += matrix.shape[0];
+        reference.float32_data.resize(static_cast<size_t>(reference.shape[0]) * 256);
+        std::array<float, qnk_block_elements> block;
+        for (size_t offset = 0; offset < matrix.quantized_data.size(); offset += bytes)
+        {
+            qnk_dequantize_block(matrix.dtype, matrix.quantized_data.data() + offset, block.data());
+            for (size_t k = 0; k < 32; ++k)
+            {
+                const size_t column = offset / bytes * 32 + k;
+                reference.float32_data[first + column / 256 * 256 + (permuted ? 255 - column % 256 : column % 256)] = block[k];
+            }
+        }
+        for (uint32_t row = 0; row < matrix.shape[0]; ++row)
+            reference_bias.float32_data.push_back(bias_ptrs[m] ? projection_value(biases[m], row) : 0.0f);
+        const auto single = QnkLinear_vulkan::create(matrix, bias_ptrs[m], device, runtime, OptimizationDefaultFlags);
+        const uint64_t size = QnkLinear_vulkan::projection_storage_bytes(matrix, alignment);
+        projection_check(single && single->device_bytes() == size, "prepared projection exceeds its storage estimate");
+        planned += size;
+    }
+    reference_bias.shape = {reference.shape[0]};
+    projection_check(QnkLinear_vulkan::can_fuse(weights), "compatible mixed formats cannot fuse");
+    projection_check(!QnkLinear_vulkan::can_fuse(weights, alignment, planned - 1), "fused projections exceeded the storage binding limit");
+    projection_check(!QnkLinear_vulkan::can_fuse(weights, UINT64_MAX), "fused projections accepted overflowing alignment");
+    const auto fused = QnkLinear_vulkan::create_fused(weights, bias_ptrs, device, runtime, OptimizationDefaultFlags);
+    projection_check(fused && fused->device_bytes() <= planned, "fused projections exceed their resource reservation");
+    const auto before = get_vulkan_statistics(runtime);
+    for (const size_t rows : {size_t(1), size_t(3), size_t(4), size_t(5), size_t(9)})
+    {
+        ActivationBuffer input(rows, 256), output;
+        for (size_t i = 0; i < input.values().size(); ++i)
+            input.row(i / 256)[i % 256] = std::sin(static_cast<float>(i % 971) * 0.013f);
+        projection_check(fused->forward(input, output), "fused quantized projection failed");
+        projection_compare(reference, &reference_bias, input, output, "mixed quantized fusion");
+    }
+    const auto after = get_vulkan_statistics(runtime);
+    projection_check(after.weight_upload_bytes == before.weight_upload_bytes, "fused projection uploaded weights during forward");
+    matrices[1].shape[1] = 512;
+    projection_check(!QnkLinear_vulkan::can_fuse(weights), "fused incompatible input widths");
+    matrices[1].shape[1] = 256;
+    matrices[1].input_column_indices = permuted ? std::vector<uint32_t>{} : matrices[0].input_column_indices;
+    if (!permuted) matrices[1].input_column_indices = {0};
+    projection_check(!QnkLinear_vulkan::can_fuse(weights), "fused incompatible input permutations");
+    matrices[1].input_column_indices = matrices[0].input_column_indices;
+    biases[0].shape[0] += 1;
+    projection_check(!QnkLinear_vulkan::create_fused(weights, bias_ptrs, device, runtime, OptimizationDefaultFlags), "accepted invalid fused bias");
+    matrices[1].dtype = DType::Q3K;
+    projection_check(!QnkLinear_vulkan::can_fuse(weights), "fused incompatible native block layouts");
+}
+
 static void projection_nonfinite(uint32_t device, const VulkanRuntimePtr& runtime,
                                  const std::shared_ptr<VulkanContext>& context, bool native_bfloat16)
 {
@@ -298,6 +471,23 @@ int main(int argc, char** argv)
                                     ? static_cast<uint32_t>(std::stoul(argv[2]))
                                     : ncnn::moe::get_default_gpu_index();
         ncnn::moe::test_projection_matvec(device);
+        const auto runtime = ncnn::moe::create_vulkan_runtime();
+        using ncnn::moe::DType;
+        for (const auto dtype : {DType::Q2K, DType::Q3K, DType::Q4K, DType::Q5K, DType::Q6K, DType::Q8K,
+                                 DType::Q8_0, DType::IQ4NL, DType::IQ4XS, DType::Q4_0, DType::Q4_1, DType::Q5_0, DType::Q5_1})
+        {
+            ncnn::moe::projection_quantized(device, runtime, dtype, 512, 7);
+            ncnn::moe::projection_quantized(device, runtime, dtype, 256, 15, 3, true);
+        }
+        for (const auto dtype : {DType::Q8_0, DType::IQ4NL, DType::Q5_0})
+        {
+            ncnn::moe::projection_quantized(device, runtime, dtype, 32, 3);
+            ncnn::moe::projection_quantized(device, runtime, dtype, 2880, 32);
+        }
+        ncnn::moe::projection_quantized_fusion(device, runtime, false);
+        ncnn::moe::projection_quantized_fusion(device, runtime, true);
+        ncnn::moe::projection_quantized(device, runtime, DType::Q3K, 4096, 33);
+        ncnn::moe::projection_quantized(device, runtime, DType::Q8_0, 32, 262145);
         std::cout << "Projection matvec FP64/CPU, descriptor, tails and multirow comparisons passed\n";
         return 0;
     }

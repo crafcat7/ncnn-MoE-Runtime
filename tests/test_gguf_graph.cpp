@@ -3,6 +3,7 @@
 #include "engine/executor.h"
 #include "engine/sessionstate.h"
 #include "backends/ncnn/vulkan.h"
+#include "backends/ncnn/linear.h"
 #include "kernels/qnk.h"
 
 #include <algorithm>
@@ -176,6 +177,13 @@ static void compare_graphs(const CompiledModel& reference, const CompiledModel& 
     for (const auto& statistics : actual_statistics)
         check(statistics.expert_cpu_routes + statistics.expert_gpu_routes == statistics.expert_assignments,
               family + ": per-session CPU/GPU routes do not cover all Expert assignments after batched decode");
+    if (!candidate.gpu_expert_banks.empty())
+    {
+        for (const auto& statistics : actual_statistics)
+            check(statistics.expert_assignments > 0 && statistics.expert_gpu_routes == statistics.expert_assignments
+                      && statistics.expert_cpu_routes == 0 && statistics.expert_cpu_fallbacks == 0,
+                  family + ": resident Expert banks did not execute every assignment on GPU");
+    }
     if (candidate.gated_residual_chain)
     {
         for (const auto& statistics : actual_statistics)
@@ -229,6 +237,20 @@ static void compare_graphs(const CompiledModel& reference, const CompiledModel& 
                     }
                     check(has_native_projection,
                           family + ": GQA layer has no native quantized projection");
+                    const std::array<const TensorData*, 3> qkv = {
+                        &candidate.weights.at(attention.query_weight),
+                        &candidate.weights.at(attention.key_weight),
+                        &candidate.weights.at(attention.value_weight)};
+                    if (QnkLinear_vulkan::can_fuse(qkv))
+                    {
+                        const auto& fused = candidate.operators.at(attention.fused_qkv_operator).qnk;
+                        check(fused && fused->input_columns() == qkv[0]->shape[1]
+                                  && fused->output_columns() == qkv[0]->shape[0] + qkv[1]->shape[0] + qkv[2]->shape[0],
+                              family + ": compatible native QKV was not fused");
+                        for (TensorHandle handle : {attention.query_weight, attention.key_weight, attention.value_weight})
+                            check(!candidate.operators.at_weight(handle).qnk,
+                                  family + ": fused QKV retained duplicate projection weights");
+                    }
                 }
                 for (const auto& statistics : actual_statistics)
                 {
@@ -352,11 +374,21 @@ int main(int argc, char** argv)
         ncnn::moe::check(static_cast<bool>(actual), actual ? "" : actual.error().message);
         const auto& reference = ncnn::moe::model_compiled(*expected.value());
         const auto& candidate = ncnn::moe::model_compiled(*actual.value());
+        const bool resident_experts = !candidate.gpu_expert_banks.empty();
+        if (resident_experts)
+            ncnn::moe::check(hybrid && candidate.gpu_expert_banks.size() == candidate.graph.layer_plans.size()
+                                 && candidate.gpu_expert_bank_size > 0 && !candidate.expert_cache
+                                 && std::all_of(candidate.gpu_expert_banks.begin(), candidate.gpu_expert_banks.end(), [](const auto& bank) { return static_cast<bool>(bank); }),
+                             "resident graph did not prepare every Expert bank or retained an unused host cache");
         bool qnk_experts = false;
         if (on_demand)
+            ncnn::moe::check(candidate.memory_plan.selected_mode == ncnn::moe::ExpertMemoryMode::OnDemand,
+                             "on-demand graph comparison changed the selected memory mode");
+        // Full GPU banks consume the deferred payload during model preparation.
+        // Streaming paths exercise the host cache and its deferred reads below.
+        if (on_demand && !resident_experts)
         {
-            ncnn::moe::check(candidate.memory_plan.selected_mode == ncnn::moe::ExpertMemoryMode::OnDemand
-                                 && candidate.expert_cache,
+            ncnn::moe::check(static_cast<bool>(candidate.expert_cache),
                              "on-demand graph comparison did not construct the host Expert cache");
             ncnn::moe::check(candidate.expert_cache->statistics().bytes_read == 0,
                              "on-demand model read Expert payload before execution");
@@ -384,7 +416,7 @@ int main(int argc, char** argv)
                              && reference.descriptor.layers.size() == candidate.descriptor.layers.size(),
                          "HF/GGUF graph descriptor mismatch");
         ncnn::moe::compare_graphs(reference, candidate, hybrid);
-        if (on_demand)
+        if (on_demand && !resident_experts)
         {
             const auto cache = candidate.expert_cache->statistics();
             ncnn::moe::check(cache.resident_size <= candidate.expert_cache->capacity(),

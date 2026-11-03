@@ -37,13 +37,6 @@
 #include "kernels/vulkan/qnk_swiglu.comp.hex.h"
 #endif
 
-#if NCNN_MOE_USE_NCNN
-#include <layer.h>
-#include <layer_type.h>
-#include <mat.h>
-#include <modelbin.h>
-#include <paramdict.h>
-
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -54,6 +47,13 @@
 #include <optional>
 #include <utility>
 #include <vector>
+
+#if NCNN_MOE_USE_NCNN
+#include <layer.h>
+#include <layer_type.h>
+#include <mat.h>
+#include <modelbin.h>
+#include <paramdict.h>
 
 #if NCNN_MOE_WITH_VULKAN
 #include <allocator.h>
@@ -2667,12 +2667,12 @@ static bool bfloat16_swiglu_scratch_shape(uint32_t intermediate_columns, bool ro
 }
 
 std::vector<uint64_t> Bfloat16Linear_vulkan::swiglu_scratch_elements(uint32_t intermediate_columns,
-                                                                    bool router_gate, uint64_t rows)
+                                                                     bool router_gate, uint64_t rows)
 {
     uint64_t fused_columns = 0;
     if (!bfloat16_swiglu_scratch_shape(intermediate_columns, router_gate, rows, fused_columns))
         return intermediate_columns == 0 || rows == 0 ? std::vector<uint64_t>{}
-                                                       : std::vector<uint64_t>{UINT64_MAX};
+                                                      : std::vector<uint64_t>{UINT64_MAX};
     return {saturating_multiply_u64(fused_columns, rows)};
 }
 
@@ -2994,7 +2994,7 @@ bool Bfloat16Expert_vulkan::forward(const ActivationBuffer& input,
 }
 
 static bool bfloat16_expert_scratch_shape(uint32_t gate_output_columns, uint64_t rows,
-                                         uint32_t& fused_columns) noexcept
+                                          uint32_t& fused_columns) noexcept
 {
     fused_columns = gate_output_columns;
     return gate_output_columns != 0 && rows != 0
@@ -3002,12 +3002,12 @@ static bool bfloat16_expert_scratch_shape(uint32_t gate_output_columns, uint64_t
 }
 
 std::vector<uint64_t> Bfloat16Expert_vulkan::scratch_elements(uint32_t gate_output_columns,
-                                                             uint64_t rows)
+                                                              uint64_t rows)
 {
     uint32_t fused_columns = 0;
     if (!bfloat16_expert_scratch_shape(gate_output_columns, rows, fused_columns))
         return gate_output_columns == 0 || rows == 0 ? std::vector<uint64_t>{}
-                                                      : std::vector<uint64_t>{UINT64_MAX};
+                                                     : std::vector<uint64_t>{UINT64_MAX};
     return {saturating_multiply_u64(fused_columns, rows)};
 }
 
@@ -3906,12 +3906,12 @@ static bool float8_linear_scratch_shape(uint32_t input_columns, uint64_t rows,
 }
 
 std::vector<uint64_t> Float8Linear_vulkan::scratch_elements(uint32_t input_columns,
-                                                           uint64_t rows)
+                                                            uint64_t rows)
 {
     uint32_t scratch_columns = 0;
     if (!float8_linear_scratch_shape(input_columns, rows, scratch_columns))
         return input_columns == 0 || rows == 0 ? std::vector<uint64_t>{}
-                                                : std::vector<uint64_t>{UINT64_MAX};
+                                               : std::vector<uint64_t>{UINT64_MAX};
     return {saturating_multiply_u64(scratch_columns, rows)};
 }
 
@@ -5625,6 +5625,7 @@ public:
     std::unique_ptr<ncnn::VkWeightAllocator> weight_allocator;
     std::unique_ptr<ncnn::VkWeightStagingAllocator> weight_staging_allocator;
     std::shared_ptr<ncnn::Pipeline> pipeline;
+    std::shared_ptr<ncnn::Pipeline> prefill_pipeline;
     ncnn::VkMat storage;
     ncnn::VkMat quantized;
     ncnn::VkMat bias;
@@ -5648,8 +5649,12 @@ public:
 
 #if NCNN_MOE_WITH_VULKAN
 
+static size_t qnk_shader_type(DType dtype) noexcept;
+
 static bool create_qnk_projection_pipeline(const std::shared_ptr<VulkanContext>& context,
                                            const ncnn::Option& option,
+                                           DType dtype, bool permuted_input,
+                                           uint32_t tile_rows,
                                            std::shared_ptr<ncnn::Pipeline>& destination)
 {
     const std::shared_ptr<const std::vector<uint32_t>> spirv = context->shader_binary(qnk_projection_shader,
@@ -5660,13 +5665,18 @@ static bool create_qnk_projection_pipeline(const std::shared_ptr<VulkanContext>&
         return false;
 
     ncnn::VulkanDevice* device = context->device();
-    const size_t pipeline_key = option.use_subgroup_ops ? 1u : 0u;
+    const size_t pipeline_key = (qnk_shader_type(dtype) << 3u) | (permuted_input ? 4u : 0u)
+                                | (tile_rows == 4 ? 2u : 0u)
+                                | (option.use_subgroup_ops ? 1u : 0u);
     destination = context->find_pipeline(qnk_projection_shader, pipeline_key);
     if (destination)
         return true;
     std::unique_ptr<ncnn::Pipeline> pipeline(new ncnn::Pipeline(device));
-    pipeline->set_optimal_local_size_xyz(32, 1, 1);
-    const std::vector<ncnn::vk_specialization_type> specializations;
+    pipeline->set_local_size_xyz(128, 1, 1);
+    std::vector<ncnn::vk_specialization_type> specializations(3);
+    specializations[0].u32 = static_cast<uint32_t>(qnk_shader_type(dtype));
+    specializations[1].u32 = permuted_input ? 1u : 0u;
+    specializations[2].u32 = tile_rows;
     if (pipeline->create(spirv->data(),
                          spirv->size() * sizeof(uint32_t),
                          specializations)
@@ -5886,6 +5896,149 @@ uint64_t QnkLinear_vulkan::storage_bytes(const TensorData& matrix, uint64_t alig
     return total;
 }
 
+// Unpack codes once without rounding weights or retaining a second GPU copy.
+static DType qnk_projection_storage_type(DType dtype) noexcept
+{
+    return dtype == DType::Q4_0 || dtype == DType::Q5_0 || dtype == DType::IQ4NL
+               ? DType::Q8_0
+               : dtype;
+}
+
+uint64_t QnkLinear_vulkan::projection_storage_bytes(const TensorData& matrix, uint64_t alignment) noexcept
+{
+    const uint64_t native = storage_bytes(matrix, alignment);
+    const DType dtype = qnk_projection_storage_type(matrix.dtype);
+    if (native == 0 || dtype == matrix.dtype) return native;
+    alignment = std::max<uint64_t>(4, alignment);
+    const uint64_t raw = qnk_storage_bytes(matrix.dtype, matrix.shape[0], matrix.shape[1]);
+    const uint64_t packed = qnk_storage_bytes(dtype, matrix.shape[0], matrix.shape[1]);
+    const uint64_t raw_aligned = raw + (alignment - raw % alignment) % alignment;
+    const uint64_t packed_padding = (alignment - packed % alignment) % alignment;
+    if (packed == 0 || packed > UINT64_MAX - packed_padding
+        || native - raw_aligned > UINT64_MAX - packed - packed_padding) return 0;
+    return native - raw_aligned + packed + packed_padding;
+}
+
+#if NCNN_MOE_WITH_VULKAN
+static bool qnk_prepare_projection(const TensorData& matrix, TensorData& prepared)
+{
+    const DType dtype = qnk_projection_storage_type(matrix.dtype);
+    if (dtype == matrix.dtype || matrix.shape.size() != 2
+        || !matrix.quantization_scales.empty() || matrix.quantization_group_size != 0
+        || !matrix.quantization_zero_points.empty() || !matrix.quantization_group_indices.empty()) return false;
+    const auto raw = matrix.qnk_values();
+    const uint64_t packed_size = qnk_storage_bytes(dtype, matrix.shape[0], matrix.shape[1]);
+    if (packed_size == 0 || packed_size > static_cast<uint64_t>(std::numeric_limits<int>::max())
+        || raw.size() != qnk_storage_bytes(matrix.dtype, matrix.shape[0], matrix.shape[1])) return false;
+    prepared.dtype = dtype;
+    prepared.shape = matrix.shape;
+    prepared.input_column_indices = matrix.input_column_indices;
+    prepared.quantized_data.resize(static_cast<size_t>(packed_size));
+    const size_t block_bytes = qnk_block_bytes(matrix.dtype);
+    std::array<uint8_t, 22> unit_block{};
+    std::array<float, qnk_block_elements> codes;
+    for (size_t source = 0, destination = 0; source < raw.size(); source += block_bytes, destination += 34)
+    {
+        std::copy_n(raw.data() + source, block_bytes, unit_block.data());
+        unit_block[0] = 0;
+        unit_block[1] = 0x3c; // FP16 1.0: reuse the decoder for exact integer codes.
+        qnk_dequantize_block(matrix.dtype, unit_block.data(), codes.data());
+        uint8_t* output = prepared.quantized_data.data() + destination;
+        std::copy_n(raw.data() + source, 2, output);
+        for (size_t index = 0; index < 32; ++index)
+            output[2 + index] = static_cast<uint8_t>(static_cast<int8_t>(codes[index]));
+    }
+    return true;
+}
+#endif
+
+bool QnkLinear_vulkan::can_fuse(std::span<const TensorData* const> matrices,
+                                uint64_t alignment, uint64_t storage_limit) noexcept
+{
+    if (matrices.empty() || !matrices.front()) return false;
+    const TensorData& first = *matrices.front();
+    if (first.shape.size() != 2 || !is_qnk_dtype(first.dtype)
+        || !validate_input_column_indices(first)) return false;
+    uint64_t rows = 0;
+    uint64_t bytes = 0;
+    for (const TensorData* matrix : matrices)
+    {
+        if (!matrix || matrix->shape.size() != 2 || matrix->shape[1] != first.shape[1]
+            || qnk_projection_storage_type(matrix->dtype) != qnk_projection_storage_type(first.dtype)
+            || !matrix->quantization_scales.empty() || matrix->quantization_group_size != 0
+            || !matrix->quantization_zero_points.empty() || !matrix->quantization_group_indices.empty()
+            || matrix->input_column_indices != first.input_column_indices
+            || !qnk_shape_supported(matrix->dtype, matrix->shape[0], matrix->shape[1])) return false;
+        rows += matrix->shape[0];
+        const uint64_t size = projection_storage_bytes(*matrix, alignment);
+        if (size == 0) return false;
+        bytes += size;
+        if (rows > static_cast<uint64_t>(std::numeric_limits<int>::max() / 32)
+            || bytes > std::min<uint64_t>(storage_limit, std::numeric_limits<int>::max())) return false;
+    }
+    return rows != 0;
+}
+
+std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_fused(std::span<const TensorData* const> matrices,
+                                                                 std::span<const TensorData* const> biases,
+                                                                 uint32_t vulkan_device_index,
+                                                                 const VulkanRuntimePtr& vulkan_runtime,
+                                                                 uint64_t optimization_flags)
+{
+#if NCNN_MOE_WITH_VULKAN
+    if (!can_fuse(matrices) || matrices.size() != biases.size()) return {};
+    const auto context = VulkanContext::acquire(vulkan_device_index, vulkan_runtime, optimization_flags);
+    if (!context || !can_fuse(matrices, context->device()->info.buffer_offset_alignment(), context->device()->info.physicalDeviceProperties().limits.maxStorageBufferRange)) return {};
+    TensorData combined, combined_bias;
+    combined.dtype = qnk_projection_storage_type(matrices.front()->dtype);
+    combined.shape = {0, matrices.front()->shape[1]};
+    combined.input_column_indices = matrices.front()->input_column_indices;
+    size_t rows = 0;
+    for (const TensorData* matrix : matrices) rows += matrix->shape[0];
+    combined.quantized_data.reserve(static_cast<size_t>(qnk_storage_bytes(combined.dtype, rows, combined.shape[1])));
+    combined_bias.float32_data.reserve(rows);
+    for (size_t index = 0; index < matrices.size(); ++index)
+    {
+        const TensorData& matrix = *matrices[index];
+        TensorData prepared;
+        const TensorData* storage = &matrix;
+        if (qnk_projection_storage_type(matrix.dtype) != matrix.dtype)
+        {
+            if (!qnk_prepare_projection(matrix, prepared)) return {};
+            storage = &prepared;
+        }
+        const auto raw = storage->qnk_values();
+        if (raw.size() != qnk_storage_bytes(storage->dtype, storage->shape[0], storage->shape[1])) return {};
+        combined.quantized_data.insert(combined.quantized_data.end(), raw.begin(), raw.end());
+        const size_t offset = combined.shape[0];
+        combined.shape[0] += matrix.shape[0];
+        combined_bias.float32_data.resize(combined.shape[0], 0.0f);
+        if (const TensorData* bias = biases[index])
+        {
+            if (bias->shape != std::vector<uint32_t>{matrix.shape[0]}) return {};
+            if (bias->dtype == DType::Float32 && bias->float32_values().size() == matrix.shape[0])
+                std::copy(bias->float32_values().begin(), bias->float32_values().end(), combined_bias.float32_data.begin() + offset);
+            else if (bias->dtype == DType::BFloat16 && bias->bfloat16_values().size() == matrix.shape[0])
+                for (size_t row = 0; row < matrix.shape[0]; ++row)
+                    combined_bias.float32_data[offset + row] = bfloat16_to_float(bias->bfloat16_values()[row]);
+            else
+                return {};
+        }
+    }
+    combined_bias.dtype = DType::Float32;
+    combined_bias.shape = {combined.shape[0]};
+    return create_with_allocator(combined, &combined_bias, vulkan_device_index, nullptr, nullptr,
+                                 vulkan_runtime, optimization_flags, 1);
+#else
+    (void)matrices;
+    (void)biases;
+    (void)vulkan_device_index;
+    (void)vulkan_runtime;
+    (void)optimization_flags;
+    return {};
+#endif
+}
+
 std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create(const TensorData& matrix,
                                                            const TensorData* bias,
                                                            uint32_t vulkan_device_index,
@@ -5893,6 +6046,17 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create(const TensorData& mat
                                                            uint64_t optimization_flags,
                                                            uint32_t input_group_count)
 {
+#if NCNN_MOE_WITH_VULKAN
+    if (qnk_projection_storage_type(matrix.dtype) != matrix.dtype)
+    {
+        TensorData prepared;
+        if (!qnk_prepare_projection(matrix, prepared)) return {};
+        auto result = create_with_allocator(prepared, bias, vulkan_device_index, nullptr, nullptr,
+                                            vulkan_runtime, optimization_flags, input_group_count);
+        if (result) result->d->dtype = matrix.dtype;
+        return result;
+    }
+#endif
     return create_with_allocator(matrix,
                                  bias,
                                  vulkan_device_index,
@@ -6154,10 +6318,13 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
 
     {
         const std::lock_guard<std::mutex> lock(implementation.vulkan_context->command_mutex());
-        if (!create_qnk_projection_pipeline(implementation.vulkan_context, implementation.option, implementation.pipeline))
+        if (!create_qnk_projection_pipeline(implementation.vulkan_context, implementation.option, matrix.dtype,
+                                            implementation.columns_offset != 0, 1, implementation.pipeline)
+            || !create_qnk_projection_pipeline(implementation.vulkan_context, implementation.option, matrix.dtype,
+                                               implementation.columns_offset != 0, 4, implementation.prefill_pipeline))
             return {};
     }
-    if (output_columns > static_cast<uint32_t>(std::numeric_limits<int>::max()) / implementation.pipeline->local_size_x())
+    if ((output_columns + 3u) / 4u > static_cast<uint32_t>(std::numeric_limits<int>::max()) / implementation.pipeline->local_size_x())
         return {};
     bool uploaded = false;
     if (upload_batch)
@@ -6266,33 +6433,33 @@ void QnkLinear_vulkan::record(const ncnn::VkMat& input,
     bindings[1] = implementation.quantized;
     bindings[2] = implementation.bias;
     bindings[3] = output;
-    constants.resize(15);
+    constants.resize(14);
     constants[0].u32 = implementation.input_columns;
     constants[1].u32 = implementation.output_columns;
     constants[2].u32 = implementation.block_count;
     constants[3].u32 = input.dims == 1 ? 1u : static_cast<uint32_t>(input.h);
     constants[4].u32 = implementation.block_size;
-    constants[5].u32 = static_cast<uint32_t>(qnk_shader_type(implementation.dtype));
-    constants[6].u32 = implementation.group_size;
-    constants[7].u32 = implementation.group_count;
-    constants[8].u32 = implementation.scales_offset;
-    constants[9].u32 = implementation.zeros_offset;
-    constants[10].u32 = implementation.groups_offset;
-    constants[11].u32 = implementation.columns_offset;
-    constants[12].u32 = static_cast<uint32_t>(output.w);
-    constants[13].u32 = output_column_offset;
-    constants[14].u32 = implementation.input_group_count;
+    constants[5].u32 = implementation.group_size;
+    constants[6].u32 = implementation.group_count;
+    constants[7].u32 = implementation.scales_offset;
+    constants[8].u32 = implementation.zeros_offset;
+    constants[9].u32 = implementation.groups_offset;
+    constants[10].u32 = implementation.columns_offset;
+    constants[11].u32 = static_cast<uint32_t>(output.w);
+    constants[12].u32 = output_column_offset;
+    constants[13].u32 = implementation.input_group_count;
+    const uint32_t tile_rows = constants[3].u32 > 1 ? 4u : 1u;
+    const auto& pipeline = tile_rows == 1 ? implementation.pipeline : implementation.prefill_pipeline;
     ncnn::VkMat dispatcher;
-    // ncnn may round the requested 32 lanes up to the device subgroup size.
-    // One complete workgroup computes one output column on every device.
     // Vocabulary-sized projections can exceed the guaranteed 65535 workgroups
-    // along X. Retain one row per workgroup and tile over Z for every encoding.
-    const uint32_t column_groups = std::min(implementation.output_columns,
+    // along X. Tile over Z independently of the native block encoding.
+    const uint32_t output_groups = (implementation.output_columns + 3u) / 4u;
+    const uint32_t column_groups = std::min(output_groups,
                                             std::min(65535u, implementation.vulkan_context->device()->info.max_workgroup_count_x()));
-    dispatcher.w = static_cast<int>(column_groups * implementation.pipeline->local_size_x());
-    dispatcher.h = static_cast<int>(constants[3].u32);
-    dispatcher.c = static_cast<int>(implementation.output_columns / column_groups + (implementation.output_columns % column_groups != 0));
-    command.record_pipeline(implementation.pipeline.get(), bindings, constants, dispatcher);
+    dispatcher.w = static_cast<int>(column_groups * pipeline->local_size_x());
+    dispatcher.h = static_cast<int>((constants[3].u32 + tile_rows - 1) / tile_rows);
+    dispatcher.c = static_cast<int>((output_groups + column_groups - 1) / column_groups);
+    command.record_pipeline_readonly(pipeline.get(), bindings, {1, 1, 1, 0}, constants, dispatcher);
 #else
     (void)input;
     (void)output;
@@ -6770,8 +6937,7 @@ bool QnkExpert_vulkan::record(const ncnn::VkMat& input, ncnn::VkMat& output,
                                                            static_cast<bool>(implementation.up),
                                                            static_cast<bool>(implementation.router_gate),
                                                            scratch_columns);
-    if (scratch_count != (implementation.up ? (implementation.router_gate ? 5u : 3u)
-                                            : (implementation.router_gate ? 4u : 2u))
+    if (scratch_count != (implementation.up ? (implementation.router_gate ? 5u : 3u) : (implementation.router_gate ? 4u : 2u))
         || gate.output_columns != scratch_columns[0])
         return false;
     size_t scratch_index = 0;

@@ -390,10 +390,436 @@ static float dot_q6_block(const uint8_t* block, const float* input) noexcept
     return sum;
 }
 
+static __m128i lo4(__m128i packed) noexcept
+{
+    return _mm_and_si128(packed, _mm_set1_epi8(0x0f));
+}
+
+static __m128i hi4(__m128i packed) noexcept
+{
+    return _mm_and_si128(_mm_srli_epi16(packed, 4), _mm_set1_epi8(0x0f));
+}
+
+static __m256 u8_to_ps(__m128i values) noexcept
+{
+    return _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(values));
+}
+
+static __m256 i8_to_ps(__m128i values) noexcept
+{
+    return _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(values));
+}
+
+static float dot_q4_32(const uint8_t* block, bool affine, const float* input) noexcept
+{
+    const float scale = load_f16(block);
+    // Q4_1 stores y = scale * value + minimum; Q4_0 stores y = scale * (value - 8).
+    // Both fold into one FMA chain with the block constant held in `offset`.
+    const float minimum = affine ? load_f16(block + 2) : 0.0f;
+    const uint8_t* values = block + (affine ? 4 : 2);
+    const __m256 scale_vector = _mm256_set1_ps(scale);
+    const __m256 offset = _mm256_set1_ps(affine ? minimum : minimum - 8.0f * scale);
+    __m256 low_accumulator = _mm256_setzero_ps();
+    __m256 high_accumulator = _mm256_setzero_ps();
+    for (uint32_t index = 0; index < 16; index += 8)
+    {
+        const __m128i packed = load_u8x8(values + index);
+        low_accumulator = _mm256_fmadd_ps(_mm256_fmadd_ps(u8_to_ps(lo4(packed)), scale_vector, offset),
+                                          _mm256_loadu_ps(input + index),
+                                          low_accumulator);
+        high_accumulator = _mm256_fmadd_ps(_mm256_fmadd_ps(u8_to_ps(hi4(packed)), scale_vector, offset),
+                                           _mm256_loadu_ps(input + index + 16),
+                                           high_accumulator);
+    }
+    return horizontal_sum(_mm256_add_ps(low_accumulator, high_accumulator));
+}
+
+// Q5_0 stores scale*(code-16); Q5_1 stores scale*code+minimum. Both use four
+// high-bit bytes followed by sixteen nibble bytes, so one body serves them.
+static float dot_q5_32(const uint8_t* block, bool affine, const float* input) noexcept
+{
+    const float scale = load_f16(block);
+    const float minimum = affine ? load_f16(block + 2) : 0.0f;
+    const uint8_t* high_bits = block + (affine ? 4 : 2);
+    const uint8_t* values = block + (affine ? 8 : 6);
+    const __m256i lanes = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    const __m256i one = _mm256_set1_epi32(1);
+    const __m256 scale_vector = _mm256_set1_ps(scale);
+    const __m256 offset = _mm256_set1_ps(affine ? minimum : minimum - 16.0f * scale);
+    __m256 low_accumulator = _mm256_setzero_ps();
+    __m256 high_accumulator = _mm256_setzero_ps();
+    for (uint32_t index = 0; index < 16; index += 8)
+    {
+        const uint32_t group = index / 8;
+        const __m128i packed = load_u8x8(values + index);
+        const __m256i low_high = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(high_bits[group]), lanes), one);
+        const __m256i high_high = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(high_bits[group + 2]), lanes), one);
+        const __m256i low_values = _mm256_or_si256(_mm256_cvtepu8_epi32(lo4(packed)), _mm256_slli_epi32(low_high, 4));
+        const __m256i high_values = _mm256_or_si256(_mm256_cvtepu8_epi32(hi4(packed)), _mm256_slli_epi32(high_high, 4));
+        low_accumulator = _mm256_fmadd_ps(_mm256_fmadd_ps(_mm256_cvtepi32_ps(low_values), scale_vector, offset),
+                                          _mm256_loadu_ps(input + index),
+                                          low_accumulator);
+        high_accumulator = _mm256_fmadd_ps(_mm256_fmadd_ps(_mm256_cvtepi32_ps(high_values), scale_vector, offset),
+                                           _mm256_loadu_ps(input + index + 16),
+                                           high_accumulator);
+    }
+    return horizontal_sum(_mm256_add_ps(low_accumulator, high_accumulator));
+}
+
+static constexpr int8_t iq4_codes[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+// Q8_0 stores signed bytes directly; IQ4_NL indexes a codebook with the same
+// nibble layout. A null table selects the direct byte path, and the caller's
+// constant argument folds the branch away once this is inlined. Four
+// independent accumulators keep the multiply chain short.
+static float dot_q8_32(const uint8_t* block, const int8_t* table, const float* input) noexcept
+{
+    const float scale = load_f16(block);
+    __m256 low_accumulator;
+    __m256 low_high_accumulator;
+    __m256 high_accumulator;
+    __m256 high_high_accumulator;
+    if (table)
+    {
+        const __m128i codes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(table));
+        const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block + 2));
+        const __m128i low = _mm_shuffle_epi8(codes, lo4(packed));
+        const __m128i high = _mm_shuffle_epi8(codes, hi4(packed));
+        low_accumulator = _mm256_mul_ps(i8_to_ps(low), _mm256_loadu_ps(input));
+        low_high_accumulator = _mm256_mul_ps(i8_to_ps(_mm_srli_si128(low, 8)), _mm256_loadu_ps(input + 8));
+        high_accumulator = _mm256_mul_ps(i8_to_ps(high), _mm256_loadu_ps(input + 16));
+        high_high_accumulator = _mm256_mul_ps(i8_to_ps(_mm_srli_si128(high, 8)), _mm256_loadu_ps(input + 24));
+    }
+    else
+    {
+        low_accumulator = _mm256_mul_ps(i8_to_ps(load_u8x8(block + 2)), _mm256_loadu_ps(input));
+        low_high_accumulator = _mm256_mul_ps(i8_to_ps(load_u8x8(block + 10)), _mm256_loadu_ps(input + 8));
+        high_accumulator = _mm256_mul_ps(i8_to_ps(load_u8x8(block + 18)), _mm256_loadu_ps(input + 16));
+        high_high_accumulator = _mm256_mul_ps(i8_to_ps(load_u8x8(block + 26)), _mm256_loadu_ps(input + 24));
+    }
+    const __m256 low_pair = _mm256_add_ps(low_accumulator, low_high_accumulator);
+    const __m256 high_pair = _mm256_add_ps(high_accumulator, high_high_accumulator);
+    return scale * horizontal_sum(_mm256_add_ps(low_pair, high_pair));
+}
+
+static float dot32(DType dtype, const uint8_t* block, const float* input) noexcept
+{
+    switch (dtype)
+    {
+    case DType::Q4_0: return dot_q4_32(block, false, input);
+    case DType::Q4_1: return dot_q4_32(block, true, input);
+    case DType::Q5_0: return dot_q5_32(block, false, input);
+    case DType::Q5_1: return dot_q5_32(block, true, input);
+    case DType::Q8_0: return dot_q8_32(block, nullptr, input);
+    case DType::IQ4NL: return dot_q8_32(block, iq4_codes, input);
+    default: return 0.0f;
+    }
+}
+
+// Decode one 32-value block into 32 consecutive float32 weights. The
+// same 32-value decoding feeds a stored block instead of a fused dot product.
+void msvc_avx2_qnk_deq32(DType dtype, const uint8_t* block, float* output) noexcept
+{
+    if (!block || !output)
+        return;
+    switch (dtype)
+    {
+    case DType::Q4_0:
+    case DType::Q4_1:
+    {
+        const bool affine = dtype == DType::Q4_1;
+        const float scale = load_f16(block);
+        const float minimum = affine ? load_f16(block + 2) : 0.0f;
+        const uint8_t* values = block + (affine ? 4 : 2);
+        const __m256 scale_vector = _mm256_set1_ps(scale);
+        const __m256 offset = _mm256_set1_ps(affine ? minimum : minimum - 8.0f * scale);
+        for (uint32_t index = 0; index < 16; index += 8)
+        {
+            const __m128i packed = load_u8x8(values + index);
+            _mm256_storeu_ps(output + index,
+                             _mm256_fmadd_ps(u8_to_ps(lo4(packed)), scale_vector, offset));
+            _mm256_storeu_ps(output + index + 16,
+                             _mm256_fmadd_ps(u8_to_ps(hi4(packed)), scale_vector, offset));
+        }
+        return;
+    }
+    case DType::Q5_0:
+    {
+        const float scale = load_f16(block);
+        const uint8_t* high_bits = block + 2;
+        const uint8_t* values = block + 6;
+        const __m256i lanes = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+        const __m256i one = _mm256_set1_epi32(1);
+        const __m256 scale_vector = _mm256_set1_ps(scale);
+        const __m256 offset = _mm256_set1_ps(-16.0f * scale);
+        for (uint32_t index = 0; index < 16; index += 8)
+        {
+            const uint32_t group = index / 8;
+            const __m128i packed = load_u8x8(values + index);
+            const __m256i low_high = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(high_bits[group]), lanes), one);
+            const __m256i high_high = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(high_bits[group + 2]), lanes), one);
+            const __m256i low_values = _mm256_or_si256(_mm256_cvtepu8_epi32(lo4(packed)), _mm256_slli_epi32(low_high, 4));
+            const __m256i high_values = _mm256_or_si256(_mm256_cvtepu8_epi32(hi4(packed)), _mm256_slli_epi32(high_high, 4));
+            _mm256_storeu_ps(output + index,
+                             _mm256_fmadd_ps(_mm256_cvtepi32_ps(low_values), scale_vector, offset));
+            _mm256_storeu_ps(output + index + 16,
+                             _mm256_fmadd_ps(_mm256_cvtepi32_ps(high_values), scale_vector, offset));
+        }
+        return;
+    }
+    case DType::Q5_1:
+    {
+        const float scale = load_f16(block);
+        const float minimum = load_f16(block + 2);
+        const uint8_t* high_bits = block + 4;
+        const uint8_t* values = block + 8;
+        const __m256i lanes = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+        const __m256i one = _mm256_set1_epi32(1);
+        const __m256 scale_vector = _mm256_set1_ps(scale);
+        const __m256 minimum_vector = _mm256_set1_ps(minimum);
+        for (uint32_t group = 0; group < 4; ++group)
+        {
+            const __m128i packed = load_u8x8(values + (group % 2) * 8);
+            const __m128i nibbles = _mm_and_si128(group < 2 ? packed : _mm_srli_epi16(packed, 4),
+                                                  _mm_set1_epi8(0x0f));
+            const __m256i upper = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(high_bits[group]), lanes), one);
+            const __m256i decoded = _mm256_or_si256(_mm256_cvtepu8_epi32(nibbles), _mm256_slli_epi32(upper, 4));
+            _mm256_storeu_ps(output + group * 8,
+                             _mm256_fmadd_ps(_mm256_cvtepi32_ps(decoded), scale_vector, minimum_vector));
+        }
+        return;
+    }
+    case DType::Q8_0:
+    {
+        const float scale = load_f16(block);
+        const uint8_t* values = block + 2;
+        const __m256 scale_vector = _mm256_set1_ps(scale);
+        for (uint32_t index = 0; index < 32; index += 8)
+            _mm256_storeu_ps(output + index,
+                             _mm256_mul_ps(i8_to_ps(load_u8x8(values + index)), scale_vector));
+        return;
+    }
+    case DType::IQ4NL:
+    {
+        const float scale = load_f16(block);
+        const __m128i table = _mm_loadu_si128(reinterpret_cast<const __m128i*>(iq4_codes));
+        const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block + 2));
+        const __m128i low = _mm_shuffle_epi8(table, lo4(packed));
+        const __m128i high = _mm_shuffle_epi8(table, hi4(packed));
+        const __m256 scale_vector = _mm256_set1_ps(scale);
+        _mm256_storeu_ps(output, _mm256_mul_ps(i8_to_ps(low), scale_vector));
+        _mm256_storeu_ps(output + 8, _mm256_mul_ps(i8_to_ps(_mm_srli_si128(low, 8)), scale_vector));
+        _mm256_storeu_ps(output + 16, _mm256_mul_ps(i8_to_ps(high), scale_vector));
+        _mm256_storeu_ps(output + 24, _mm256_mul_ps(i8_to_ps(_mm_srli_si128(high, 8)), scale_vector));
+        return;
+    }
+    default:
+        return;
+    }
+}
+
+float msvc_avx2_qnk_dot_row(DType dtype,
+                            const uint8_t* weights,
+                            size_t block_stride,
+                            uint32_t block_count,
+                            const float* input) noexcept
+{
+    if (!weights || !input || block_count == 0)
+        return 0.0f;
+    float sum = 0.0f;
+    for (uint32_t block = 0; block < block_count; ++block)
+    {
+        sum += dot32(dtype,
+                     weights + static_cast<size_t>(block) * block_stride,
+                     input + static_cast<size_t>(block) * 32);
+    }
+    return sum;
+}
+
+// Defined with the MXFP4 helpers below; the int8 activation quantizer needs it
+// before that definition.
+static float horizontal_max(__m256 value) noexcept;
+
+// ---------------------------------------------------------------------------
+// Int8 activation path for 32-value GGML blocks
+// ---------------------------------------------------------------------------
+// The weight codes stay packed. Unsigned codes pair with signed activations in
+// a single _mm256_maddubs_epi16, so each instruction covers 32 byte products
+// instead of eight float32 lanes, and a row reads a quarter of the activation
+// bytes. Per block the weight term is
+//     (scale * code + additive) * (input_scale * q)
+//     = scale * input_scale * sum(code * q)
+//       + (additive - scale * code_bias) * input_scale * sum(q)
+// so the code bias and the additive minimum collapse into one scalar correction
+// per block while the integer sum stays a vector accumulator.
+void msvc_avx2_qnk_q8_quant(const float* source,
+                            int8_t* values,
+                            float* scales,
+                            int32_t* sums,
+                            uint32_t columns) noexcept
+{
+    if (!source || !values || !scales || !sums || columns == 0 || columns % 32 != 0)
+        return;
+    const __m256 sign_mask = _mm256_set1_ps(-0.0f);
+    const __m256 lower = _mm256_set1_ps(-127.0f);
+    const __m256 upper = _mm256_set1_ps(127.0f);
+    const uint32_t block_count = columns / 32;
+    for (uint32_t block = 0; block < block_count; ++block)
+    {
+        const float* block_source = source + static_cast<size_t>(block) * 32;
+        __m256 maximum_values = _mm256_setzero_ps();
+        for (uint32_t index = 0; index < 32; index += 8)
+        {
+            const __m256 current = _mm256_loadu_ps(block_source + index);
+            maximum_values = _mm256_max_ps(maximum_values, _mm256_andnot_ps(sign_mask, current));
+        }
+        const float maximum = horizontal_max(maximum_values);
+        // A zero block keeps scale 1 so the codes stay zero and the dot returns
+        // zero without a division by zero.
+        const float scale = maximum > 0.0f ? maximum / 127.0f : 1.0f;
+        scales[block] = scale;
+        const __m256 inverse_scale = _mm256_set1_ps(1.0f / scale);
+        int8_t* block_values = values + static_cast<size_t>(block) * 32;
+        int32_t block_sum = 0;
+        for (uint32_t index = 0; index < 32; index += 8)
+        {
+            // _mm256_cvtps_epi32 rounds to nearest-even, matching the scalar
+            // lrintf path, after the same clamp.
+            __m256 normalized = _mm256_mul_ps(_mm256_loadu_ps(block_source + index), inverse_scale);
+            normalized = _mm256_max_ps(lower, _mm256_min_ps(upper, normalized));
+            alignas(32) int32_t rounded[8];
+            _mm256_store_si256(reinterpret_cast<__m256i*>(rounded), _mm256_cvtps_epi32(normalized));
+            for (uint32_t lane = 0; lane < 8; ++lane)
+            {
+                block_values[index + lane] = static_cast<int8_t>(rounded[lane]);
+                block_sum += rounded[lane];
+            }
+        }
+        sums[block] = block_sum;
+    }
+}
+
+// One high bit per lane is packed into a byte. Replicate bit `n` of the byte
+// into lane `n` as 0x10 so it can be or-ed onto a 0..15 nibble code.
+static __m128i expand_q5_high_bits(uint8_t group) noexcept
+{
+    const __m128i lanes = _mm_setr_epi8(1, 2, 4, 8, 16, 32, 64, static_cast<char>(0x80),
+                                        1, 2, 4, 8, 16, 32, 64, static_cast<char>(0x80));
+    const __m128i bits = _mm_set1_epi8(static_cast<char>(group));
+    const __m128i hit = _mm_cmpeq_epi8(_mm_and_si128(bits, lanes), lanes);
+    return _mm_and_si128(hit, _mm_set1_epi8(16));
+}
+
+float msvc_avx2_qnk_q8_row(DType dtype,
+                           const uint8_t* weights,
+                           size_t block_stride,
+                           uint32_t block_count,
+                           const int8_t* input,
+                           const float* input_scales,
+                           const int32_t* input_sums) noexcept
+{
+    if (!weights || !input || !input_scales || !input_sums || block_count == 0)
+        return 0.0f;
+    static constexpr int8_t iq4_table_values[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+    const __m128i table = _mm_loadu_si128(reinterpret_cast<const __m128i*>(iq4_table_values));
+    const __m128i nibble_mask = _mm_set1_epi8(0x0f);
+    const __m128i unit = _mm_set1_epi16(1);
+    __m256 accumulator = _mm256_setzero_ps();
+    float correction = 0.0f;
+    for (uint32_t block = 0; block < block_count; ++block)
+    {
+        const uint8_t* encoded = weights + static_cast<size_t>(block) * block_stride;
+        const int8_t* block_input = input + static_cast<size_t>(block) * 32;
+        __m128i first_input = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block_input));
+        __m128i second_input = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block_input + 16));
+        __m128i first_codes = _mm_setzero_si128();
+        __m128i second_codes = _mm_setzero_si128();
+        float weight_scale = 0.0f;
+        float weight_additive = 0.0f;
+        float code_bias = 0.0f;
+        switch (dtype)
+        {
+        case DType::Q4_0:
+        case DType::Q4_1:
+        {
+            const bool affine = dtype == DType::Q4_1;
+            const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(encoded + (affine ? 4 : 2)));
+            first_codes = _mm_and_si128(packed, nibble_mask);
+            second_codes = _mm_and_si128(_mm_srli_epi16(packed, 4), nibble_mask);
+            weight_scale = load_f16(encoded);
+            weight_additive = affine ? load_f16(encoded + 2) : 0.0f;
+            code_bias = affine ? 0.0f : 8.0f;
+            break;
+        }
+        case DType::Q5_0:
+        case DType::Q5_1:
+        {
+            const bool affine = dtype == DType::Q5_1;
+            const uint8_t* high_bytes = encoded + (affine ? 4 : 2);
+            const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(encoded + (affine ? 8 : 6)));
+            first_codes = _mm_or_si128(_mm_and_si128(packed, nibble_mask),
+                                       _mm_unpacklo_epi64(expand_q5_high_bits(high_bytes[0]),
+                                                          expand_q5_high_bits(high_bytes[1])));
+            second_codes = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(packed, 4), nibble_mask),
+                                        _mm_unpacklo_epi64(expand_q5_high_bits(high_bytes[2]),
+                                                           expand_q5_high_bits(high_bytes[3])));
+            weight_scale = load_f16(encoded);
+            weight_additive = affine ? load_f16(encoded + 2) : 0.0f;
+            code_bias = affine ? 0.0f : 16.0f;
+            break;
+        }
+        case DType::Q8_0:
+        {
+            // |w| becomes the unsigned operand and its sign moves onto the
+            // activations, keeping signed codes out of the unsigned slot.
+            const __m128i first_weight = _mm_loadu_si128(reinterpret_cast<const __m128i*>(encoded + 2));
+            const __m128i second_weight = _mm_loadu_si128(reinterpret_cast<const __m128i*>(encoded + 18));
+            first_codes = _mm_sign_epi8(first_weight, first_weight);
+            second_codes = _mm_sign_epi8(second_weight, second_weight);
+            first_input = _mm_sign_epi8(first_input, first_weight);
+            second_input = _mm_sign_epi8(second_input, second_weight);
+            weight_scale = load_f16(encoded);
+            break;
+        }
+        case DType::IQ4NL:
+        {
+            const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(encoded + 2));
+            const __m128i first_value = _mm_shuffle_epi8(table, _mm_and_si128(packed, nibble_mask));
+            const __m128i second_value = _mm_shuffle_epi8(table, _mm_and_si128(_mm_srli_epi16(packed, 4), nibble_mask));
+            first_codes = _mm_sign_epi8(first_value, first_value);
+            second_codes = _mm_sign_epi8(second_value, second_value);
+            first_input = _mm_sign_epi8(first_input, first_value);
+            second_input = _mm_sign_epi8(second_input, second_value);
+            weight_scale = load_f16(encoded);
+            break;
+        }
+        default:
+            return 0.0f;
+        }
+        // Pairs of byte products stay below the signed 16-bit range: codes are
+        // at most 128 and activations at most 127, so 2 * 128 * 127 < 32767.
+        const __m128i first_pairs = _mm_maddubs_epi16(first_codes, first_input);
+        const __m128i second_pairs = _mm_maddubs_epi16(second_codes, second_input);
+        const __m256i integer_sum = _mm256_set_m128i(_mm_madd_epi16(second_pairs, unit),
+                                                     _mm_madd_epi16(first_pairs, unit));
+        const float input_scale = input_scales[block];
+        accumulator = _mm256_fmadd_ps(_mm256_cvtepi32_ps(integer_sum),
+                                      _mm256_set1_ps(weight_scale * input_scale),
+                                      accumulator);
+        correction += (weight_additive - weight_scale * code_bias)
+                      * input_scale * static_cast<float>(input_sums[block]);
+    }
+    return horizontal_sum(accumulator) + correction;
+}
+
 float msvc_avx2_qnk_dot_block(DType dtype, const uint8_t* block, const float* input) noexcept
 {
     if (!block || !input)
         return 0.0f;
+    if (qnk_block_size(dtype) == 32)
+        return dot32(dtype, block, input);
     if (dtype == DType::Q2K)
         return dot_q2_block(block, input);
     if (dtype == DType::Q3K)

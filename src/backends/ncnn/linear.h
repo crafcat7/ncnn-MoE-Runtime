@@ -289,7 +289,7 @@ public:
                                                                        const VulkanRuntimePtr& vulkan_runtime,
                                                                        uint64_t optimization_flags);
     [[nodiscard]] static std::vector<uint64_t> scratch_elements(uint32_t gate_output_columns,
-                                                                 uint64_t rows);
+                                                                uint64_t rows);
     [[nodiscard]] bool forward(const ActivationBuffer& input,
                                ActivationBuffer& output) const;
 
@@ -334,7 +334,7 @@ public:
                                                                      const VulkanRuntimePtr& vulkan_runtime,
                                                                      uint64_t optimization_flags);
     [[nodiscard]] static std::vector<uint64_t> scratch_elements(uint32_t input_columns,
-                                                                 uint64_t rows);
+                                                                uint64_t rows);
     // Device input includes its FP32 clone; host input quantizes and uploads before recording.
     [[nodiscard]] static std::vector<uint64_t> swiglu_scratch_elements(uint32_t input_columns,
                                                                        uint32_t intermediate_columns,
@@ -483,6 +483,16 @@ public:
     ~QnkLinear_vulkan();
 
     [[nodiscard]] static uint64_t storage_bytes(const TensorData& matrix, uint64_t alignment) noexcept;
+    // Standalone projections may losslessly unpack low-bit codes at load time.
+    // Expert storage retains its native block layout and uses storage_bytes().
+    [[nodiscard]] static uint64_t projection_storage_bytes(const TensorData& matrix, uint64_t alignment) noexcept;
+    [[nodiscard]] static bool can_fuse(std::span<const TensorData* const> matrices,
+                                       uint64_t alignment = 256, uint64_t storage_limit = UINT64_C(0x7fffffff)) noexcept;
+    [[nodiscard]] static std::shared_ptr<QnkLinear_vulkan> create_fused(std::span<const TensorData* const> matrices,
+                                                                        std::span<const TensorData* const> biases,
+                                                                        uint32_t vulkan_device_index,
+                                                                        const VulkanRuntimePtr& vulkan_runtime,
+                                                                        uint64_t optimization_flags);
 
     [[nodiscard]] static std::shared_ptr<QnkLinear_vulkan> create(const TensorData& matrix,
                                                                   const TensorData* bias,
@@ -564,10 +574,10 @@ public:
                                                                            const VulkanRuntimePtr& vulkan_runtime,
                                                                            uint64_t optimization_flags);
     [[nodiscard]] static std::vector<uint64_t> scratch_elements(uint32_t intermediate_columns,
-                                                                 uint32_t output_columns,
-                                                                 bool separate_up,
-                                                                 bool router_gate,
-                                                                 uint64_t rows);
+                                                                uint32_t output_columns,
+                                                                bool separate_up,
+                                                                bool router_gate,
+                                                                uint64_t rows);
     [[nodiscard]] bool forward(const ActivationBuffer& input, ActivationBuffer& output) const;
     [[nodiscard]] bool forward_device(const DeviceTensor_vulkan& input, DeviceTensor_vulkan& output) const;
     [[nodiscard]] bool prepare_router_gate(const TensorData& weight);

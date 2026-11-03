@@ -81,7 +81,7 @@ static uint64_t bank_aligned(uint64_t bytes, uint64_t alignment) noexcept
 }
 
 static uint64_t bank_scratch_shapes(const ExpertBankPlan_vulkan& plan, uint64_t rows, uint32_t top_k,
-                                   uint32_t columns[3], uint64_t heights[3]) noexcept
+                                    uint32_t columns[3], uint64_t heights[3]) noexcept
 {
     const uint64_t route_rows = saturating_multiply_u64(rows, top_k);
     columns[0] = plan.intermediate_columns;

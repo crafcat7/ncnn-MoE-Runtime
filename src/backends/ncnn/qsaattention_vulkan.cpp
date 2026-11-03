@@ -334,9 +334,9 @@ std::shared_ptr<QsaAttention_vulkan> QsaAttention_vulkan::create(const WeightSto
 }
 
 std::vector<uint64_t> QsaAttention_vulkan::scratch_elements(const AttentionBlockPlan& plan,
-                                                             uint32_t hidden_size,
-                                                             uint32_t rows,
-                                                             uint32_t context_tokens)
+                                                            uint32_t hidden_size,
+                                                            uint32_t rows,
+                                                            uint32_t context_tokens)
 {
     const uint64_t query = saturating_multiply_u64(plan.head_count, plan.head_dimension);
     const uint64_t key = saturating_multiply_u64(plan.kv_head_count, plan.head_dimension);

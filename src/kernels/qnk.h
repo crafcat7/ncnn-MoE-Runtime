@@ -77,11 +77,16 @@ void qnk_q8k_quantize(const float* source,
                                     uint32_t columns,
                                     QnKPack& output) noexcept;
 
+// use_q8_activations selects the int8 activation kernels for 32-value block
+// weights. It trades activation precision for a quarter of the activation
+// bytes and stays opt-in, because the exact-float parity contracts assume the
+// float32 dot path.
 [[nodiscard]] bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
                                       const ActivationBuffer& input,
                                       std::initializer_list<ActivationBuffer*> outputs,
                                       bool use_packed_weights,
-                                      std::span<std::shared_ptr<const QnKPack>* const> sidecars = {}) noexcept;
+                                      std::span<std::shared_ptr<const QnKPack>* const> sidecars = {},
+                                      bool use_q8_activations = false) noexcept;
 
 } // namespace moe
 } // namespace ncnn

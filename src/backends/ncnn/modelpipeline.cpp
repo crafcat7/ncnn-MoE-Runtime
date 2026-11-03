@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -1085,12 +1086,38 @@ static Result<void> prepare_native_attention(CompiledModel& compiled,
         plan.output_bias,
         invalid_tensor_handle,
     };
+    const std::array<const TensorData*, 3> qkv = {
+        &compiled.weights.at(plan.query_weight), &compiled.weights.at(plan.key_weight), &compiled.weights.at(plan.value_weight)};
+    const std::array<const TensorData*, 3> qkv_biases = {
+        plan.query_bias == invalid_tensor_handle ? nullptr : &compiled.weights.at(plan.query_bias),
+        plan.key_bias == invalid_tensor_handle ? nullptr : &compiled.weights.at(plan.key_bias),
+        plan.value_bias == invalid_tensor_handle ? nullptr : &compiled.weights.at(plan.value_bias)};
+    std::shared_ptr<QnkLinear_vulkan> fused_qkv;
+#if NCNN_MOE_WITH_VULKAN
+    const auto context = VulkanContext::acquire(layer_plan.vulkan_device_index, compiled.vulkan_runtime,
+                                                compiled.opt.optimization_flags);
+    if (context && QnkLinear_vulkan::can_fuse(qkv, context->device()->info.buffer_offset_alignment(), context->device()->info.physicalDeviceProperties().limits.maxStorageBufferRange))
+    {
+        fused_qkv = QnkLinear_vulkan::create_fused(qkv, qkv_biases, layer_plan.vulkan_device_index,
+                                                   compiled.vulkan_runtime, compiled.opt.optimization_flags);
+        if (!fused_qkv)
+            return Error{ErrorCode::InternalError, "failed to create fused native Vulkan projections"};
+        const CompiledOperatorHandle fused_handle = compiled.operators.allocate();
+        compiled.operators.at_mutable(fused_handle).qnk = fused_qkv;
+        plan.fused_qkv_operator = fused_handle;
+    }
+#endif
     std::array<CompiledOperator, 5> projections;
     for (size_t index = 0; index < projections.size(); ++index)
     {
         const TensorHandle handle = weights[index];
         if (handle == invalid_tensor_handle)
             continue;
+        if (fused_qkv && index < 3)
+        {
+            compiled.operators.at_weight_mutable(handle) = {};
+            continue;
+        }
 
         CompiledOperator& projection_operator = compiled.operators.at_weight_mutable(handle);
         if (projection_operator.qnk || projection_operator.float8)
@@ -1141,7 +1168,7 @@ static Result<void> prepare_native_attention(CompiledModel& compiled,
                                                               key_norm,
                                                               sinks,
                                                               projections,
-                                                              standard_attention_vulkan_config(compiled, plan));
+                                                              standard_attention_vulkan_config(compiled, plan), fused_qkv);
     if (!attention_operator)
         return Error{ErrorCode::InternalError,
                      "failed to create native Vulkan Standard Attention at layer "
@@ -1328,7 +1355,7 @@ uint64_t dense_vulkan_weight_storage_size(const CompiledModel& compiled,
     {
         if (is_qnk_dtype(matrix.dtype) && !has_flag(compiled.opt.optimization_flags, OptimizationVulkanQnK))
             return 0;
-        return QnkLinear_vulkan::storage_bytes(matrix, alignment);
+        return QnkLinear_vulkan::projection_storage_bytes(matrix, alignment);
     }
 #if NCNN_MOE_WITH_VULKAN
     if (matrix.dtype == DType::Float8E4M3)
@@ -1497,20 +1524,20 @@ uint64_t dense_vulkan_attention_storage_size(const CompiledModel& compiled,
                 const TensorData& matrix = compiled.weights.at(handle);
                 const uint64_t projection = matrix.dtype == DType::Float8E4M3
                                                 ? constant_buffer_storage_size({matrix.element_count(),
-                                                                                    matrix.quantization_scales.size() * sizeof(float),
-                                                                                    static_cast<uint64_t>(matrix.shape[0]) * sizeof(float)},
-                                                                                   alignment)
-                                                : QnkLinear_vulkan::storage_bytes(matrix, alignment);
+                                                                                matrix.quantization_scales.size() * sizeof(float),
+                                                                                static_cast<uint64_t>(matrix.shape[0]) * sizeof(float)},
+                                                                               alignment)
+                                                : QnkLinear_vulkan::projection_storage_bytes(matrix, alignment);
                 if (projection == 0)
                     return 0;
                 input = saturating_add_u64(input, projection);
             }
             constants = constant_buffer_storage_size({static_cast<uint64_t>(compiled.descriptor.hidden_size) * sizeof(float),
-                                                          static_cast<uint64_t>(attention.head_dimension) * sizeof(float),
-                                                          static_cast<uint64_t>(attention.head_dimension) * sizeof(float),
-                                                          static_cast<uint64_t>(attention.head_dimension / 2) * sizeof(float),
-                                                          static_cast<uint64_t>(attention.head_count) * sizeof(float)},
-                                                         alignment);
+                                                      static_cast<uint64_t>(attention.head_dimension) * sizeof(float),
+                                                      static_cast<uint64_t>(attention.head_dimension) * sizeof(float),
+                                                      static_cast<uint64_t>(attention.head_dimension / 2) * sizeof(float),
+                                                      static_cast<uint64_t>(attention.head_count) * sizeof(float)},
+                                                     alignment);
             state = dense_standard_attention_initial_state_size(compiled, attention, device_index);
             return saturating_add_u64(saturating_add_u64(input, constants), state);
         }
@@ -1547,23 +1574,23 @@ uint64_t dense_vulkan_attention_storage_size(const CompiledModel& compiled,
         if (input == 0 || output_size == 0)
             return 0;
         constants = constant_buffer_storage_size({static_cast<uint64_t>(compiled.descriptor.hidden_size) * sizeof(float),
-                                                      static_cast<uint64_t>(attention.head_dimension) * sizeof(float),
-                                                      static_cast<uint64_t>(attention.head_dimension) * sizeof(float),
-                                                      static_cast<uint64_t>(attention.head_dimension / 2) * sizeof(float),
-                                                      static_cast<uint64_t>(attention.head_count) * sizeof(float)},
-                                                     alignment);
+                                                  static_cast<uint64_t>(attention.head_dimension) * sizeof(float),
+                                                  static_cast<uint64_t>(attention.head_dimension) * sizeof(float),
+                                                  static_cast<uint64_t>(attention.head_dimension / 2) * sizeof(float),
+                                                  static_cast<uint64_t>(attention.head_count) * sizeof(float)},
+                                                 alignment);
         return saturating_add_u64(saturating_add_u64(input, output_size), saturating_add_u64(constants, state));
     }
     else if (attention.kind == AttentionKind::GatedDeltaNet)
     {
         input = bf16_fused_storage_size(compiled,
-                                              {attention.delta_qkv_weight, attention.delta_z_weight, attention.delta_beta_weight, attention.delta_alpha_weight}, alignment, device_index);
+                                        {attention.delta_qkv_weight, attention.delta_z_weight, attention.delta_beta_weight, attention.delta_alpha_weight}, alignment, device_index);
         const uint64_t convolution = compiled.weights.at(attention.delta_convolution_weight).element_count() * sizeof(float);
         constants = constant_buffer_storage_size({convolution,
-                                                      static_cast<uint64_t>(attention.head_count) * sizeof(float),
-                                                      static_cast<uint64_t>(attention.head_count) * sizeof(float),
-                                                      static_cast<uint64_t>(attention.value_head_dimension) * sizeof(float)},
-                                                     alignment);
+                                                  static_cast<uint64_t>(attention.head_count) * sizeof(float),
+                                                  static_cast<uint64_t>(attention.head_count) * sizeof(float),
+                                                  static_cast<uint64_t>(attention.value_head_dimension) * sizeof(float)},
+                                                 alignment);
         state = gated_delta_state_size(compiled, attention);
     }
     else
@@ -1986,8 +2013,6 @@ static uint64_t expert_wave_workspace_size(const CompiledModel& model, uint32_t 
     return workspace;
 }
 
-namespace {
-
 // One model-wide ledger shared by persistent preparation and Expert caching.
 // Shape-specific operators supply requests; policy is independent of family.
 class ResourcePlanner
@@ -2076,16 +2101,13 @@ const GpuResourcePlan* ResourcePlanner::find(uint32_t device) const
     return nullptr;
 }
 
-} // namespace
-
 // Backend products are published as a complete group. A failed creation or a
 // driver-budget change must preserve both the CPU weights and earlier groups.
-template <typename Prepare, typename Supported>
 static Result<bool> prepare_resource_group(CompiledModel& model, ResourcePlanner& resources,
                                            uint32_t device, GpuResourceRequest request,
                                            CompiledLayerPlan* layer, const std::string& operation,
-                                           const Prepare& prepare,
-                                           const Supported& supported)
+                                           const std::function<Result<void>()>& prepare,
+                                           const std::function<bool()>& supported)
 {
     // Zero denotes a capability decision made before selecting a GPU product.
     // Once a supported product is selected, allocation failure is an error.
@@ -2248,7 +2270,7 @@ static GpuResourceRequest ffn_resource_request(const CompiledModel& model, const
                                     && down_weight.dtype == DType::BFloat16
                                     && (!router_gate || model.weights.at(layer.moe.shared_expert_gate_weight).dtype == DType::BFloat16)
                                     && bf16_fused_storage_size(model,
-                                                                     {ffn.gate_weight, ffn.up_weight, layer.moe.shared_expert_gate_weight}, alignment, device)
+                                                               {ffn.gate_weight, ffn.up_weight, layer.moe.shared_expert_gate_weight}, alignment, device)
                                            != 0;
         // Shared Expert kernels support a narrower activation/router contract
         // than their individual projections (notably FP8 DeepSeek SwiGLU).
@@ -2589,7 +2611,7 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
         if (attention.kind == AttentionKind::GatedDeltaNet)
         {
             elements = GatedDeltaNet_vulkan::scratch_elements(attention.head_count, attention.kv_head_count,
-                attention.head_dimension, attention.value_head_dimension, rows);
+                                                              attention.head_dimension, attention.value_head_dimension, rows);
         }
         else if (attention.kind == AttentionKind::Standard && !has_flag(attention.flags, AttentionBlockQsa))
         {
@@ -2614,7 +2636,7 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
             if (kv_size == UINT64_MAX)
                 return Error{ErrorCode::InvalidArgument, "Vulkan Attention KV device is invalid"};
             elements = Attention_vulkan::scratch_elements(standard_attention_vulkan_config(model, attention),
-                rows, context_tokens, sequence_count, kv_size, direct_ring);
+                                                          rows, context_tokens, sequence_count, kv_size, direct_ring);
             for (TensorHandle weight : {attention.query_weight, attention.key_weight, attention.value_weight,
                                         attention.output_gate_weight, attention.output_weight})
             {
@@ -2685,15 +2707,11 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
             return Error{ErrorCode::InvalidArgument, "Vulkan FFN intermediate exceeds the allocation range"};
         const uint32_t width = static_cast<uint32_t>(intermediate);
         const bool router_gate = shared && layer.moe.shared_expert_gate_weight != invalid_tensor_handle;
-        const bool fp8_chain = !routed && (model.operators.at(expert.vulkan_operator).float8
-            || (shared && !router_gate && expert.activation == ExpertActivation::DeepSeekSwiGlu
-                && model.operators.at_weight(expert.gate_weight).float8
-                && model.operators.at_weight(expert.up_weight).float8
-                && model.operators.at_weight(expert.down_weight).float8));
+        const bool fp8_chain = !routed && (model.operators.at(expert.vulkan_operator).float8 || (shared && !router_gate && expert.activation == ExpertActivation::DeepSeekSwiGlu && model.operators.at_weight(expert.gate_weight).float8 && model.operators.at_weight(expert.up_weight).float8 && model.operators.at_weight(expert.down_weight).float8));
         std::vector<uint64_t> scratch;
         if (qnk)
             scratch = QnkExpert_vulkan::scratch_elements(width, model.descriptor.hidden_size,
-                expert.gate_up_weight == invalid_tensor_handle, router_gate, count);
+                                                         expert.gate_up_weight == invalid_tensor_handle, router_gate, count);
         else if (fp8_chain)
             scratch = Float8Linear_vulkan::swiglu_scratch_elements(model.descriptor.hidden_size, width, count, shared && resident_input);
         else if (fused_bfloat16 && !routed)
@@ -3176,7 +3194,8 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
             {
                 bytes /= 2;
                 const uint64_t previous = attention_session_state_size(compiled, layer.attention, layer.vulkan_device_index,
-                                                                       std::max(1u, result.context_tokens / 2)) / 2;
+                                                                       std::max(1u, result.context_tokens / 2))
+                                          / 2;
                 growth[layer.vulkan_device_index] = std::max(growth[layer.vulkan_device_index], previous);
             }
             uint64_t& total = states[layer.vulkan_device_index];

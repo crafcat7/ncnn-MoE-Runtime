@@ -248,7 +248,7 @@ static void qwen_ple_case(uint32_t device, DType dtype)
             qwen_check(residual_allocate(probe, 128, 2, context), "allocate Qwen refcount probe");
             ncnn::VkCompute probe_cmd(context->device());
             residual_record(pipeline.get(), 0, 32, 4, 2, 128, descriptor.norm_epsilon, descriptor.norm_weight_offset,
-                        {probe, probe, probe, probe, probe, probe}, probe_cmd);
+                            {probe, probe, probe, probe, probe, probe}, probe_cmd);
             qwen_check(probe.refcount && *probe.refcount == 1, "Qwen record releases binding references");
         }
         ncnn::VkCompute cmd(context->device());
@@ -305,18 +305,18 @@ static void qwen_ple_case(uint32_t device, DType dtype)
         for (const auto& constant : {key_norm, query_norm, conv_norm, conv_weight, state})
             residual_prepare_read(constant);
         residual_record(pipeline.get(), 7, plan.embedding_dimension, 4, rows, plan.embedding_dimension, 0, 0,
-                    {raw_gpu, raw_gpu, raw_gpu, raw_gpu, raw_gpu, decoded}, cmd,
-                    encoding, dimension, stride);
+                        {raw_gpu, raw_gpu, raw_gpu, raw_gpu, raw_gpu, decoded}, cmd,
+                        encoding, dimension, stride);
         residual_record(pipeline.get(), 0, 32, 4, rows, 128, descriptor.norm_epsilon, 1,
-                    {key_gpu, key_norm, key_gpu, key_gpu, key_gpu, key_normalized}, cmd);
+                        {key_gpu, key_norm, key_gpu, key_gpu, key_gpu, key_normalized}, cmd);
         residual_record(pipeline.get(), 0, 32, 4, rows, 128, descriptor.norm_epsilon, 1,
-                    {input_gpu, query_norm, input_gpu, input_gpu, input_gpu, query_normalized}, cmd);
+                        {input_gpu, query_norm, input_gpu, input_gpu, input_gpu, query_normalized}, cmd);
         residual_record(pipeline.get(), 5, 32, 4, rows, 128, 0, 0,
-                    {key_normalized, query_normalized, value_gpu, value_gpu, value_gpu, gated}, cmd);
+                        {key_normalized, query_normalized, value_gpu, value_gpu, value_gpu, gated}, cmd);
         residual_record(pipeline.get(), 0, 32, 4, rows, 128, descriptor.norm_epsilon, 1,
-                    {gated, conv_norm, gated, gated, gated, convolution_input}, cmd);
+                        {gated, conv_norm, gated, gated, gated, convolution_input}, cmd);
         residual_record(pipeline.get(), 6, 32, 4, rows, 128, 0, 0,
-                    {convolution_input, gated, conv_weight, input_gpu, state, output}, cmd, 3, 3, 6, slot);
+                        {convolution_input, gated, conv_weight, input_gpu, state, output}, cmd, 3, 3, 6, slot);
         qwen_check(prepare_staging_batch(output_staging, rows, 128, context->staging_allocator())
                        && prepare_staging_batch(decode_staging, rows, plan.embedding_dimension, context->staging_allocator())
                        && record_prepared_activation_staging_download(output, rows, 128, output_staging, cmd, context->device(), opt)

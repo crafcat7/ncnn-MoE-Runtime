@@ -1706,6 +1706,8 @@ Result<void> append_attention_context(const WeightStore& weights,
         && ((fused_qkv_gate_operator.bfloat16
              && fused_qkv_gate_operator.bfloat16->forward(*normalized,
                                                           fused_qkv))
+            || (fused_qkv_operator.qnk
+                && fused_qkv_operator.qnk->forward(*normalized, fused_qkv))
             || (fused_qkv_operator.bfloat16
                 && fused_qkv_operator.bfloat16->forward(*normalized,
                                                         fused_qkv))
@@ -1910,6 +1912,9 @@ Result<void> forward_attention(const WeightStore& weights,
                       && fused_qkv_gate_operator.bfloat16->forward(*normalized,
                                                                    fused_qkv);
     const bool fused_projection = gate_ready
+                                  || (backend == ExecutionBackend::Vulkan
+                                      && fused_qkv_operator.qnk
+                                      && fused_qkv_operator.qnk->forward(*normalized, fused_qkv))
                                   || (backend == ExecutionBackend::Vulkan
                                       && fused_qkv_operator.bfloat16
                                       && fused_qkv_operator.bfloat16->forward(*normalized,

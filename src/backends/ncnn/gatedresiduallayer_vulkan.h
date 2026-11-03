@@ -44,7 +44,7 @@ class GatedResidualLayer_vulkan
 public:
     ~GatedResidualLayer_vulkan();
     [[nodiscard]] static std::shared_ptr<GatedResidualLayer_vulkan> create(const CompiledModel& model,
-                                                                  const CompiledLayerPlan& layer);
+                                                                           const CompiledLayerPlan& layer);
     [[nodiscard]] static std::shared_ptr<GatedResidualLayer_vulkan> create_head(const CompiledModel& model);
     [[nodiscard]] bool forward(const ActivationBuffer& initial_hidden, std::span<const int32_t> tokens,
                                uint64_t position, LayerCache& cache, const ExpertDispatchOptions& options,

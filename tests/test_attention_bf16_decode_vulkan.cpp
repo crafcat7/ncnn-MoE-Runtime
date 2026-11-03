@@ -273,10 +273,10 @@ static void decode_storage(const DecodeCase& spec, const CompiledModel& gpu)
 }
 
 static void check_bfloat16_device_ring(const LayerCache& cache,
-                                      uint32_t head_dimension,
-                                      uint32_t kv_head_count,
-                                      const VulkanContext& context,
-                                      const std::string& phase)
+                                       uint32_t head_dimension,
+                                       uint32_t kv_head_count,
+                                       const VulkanContext& context,
+                                       const std::string& phase)
 {
     segment_check(cache.dtype == DType::BFloat16 && cache.vulkan_attention_cache
                       && cache.keys.empty() && cache.values.empty()
@@ -477,7 +477,7 @@ static void decode_sequence(const DecodeCase& spec, const CompiledModel& cpu, co
                   "decode Attention did not retain a device KV ring for the materialization oracle");
     const auto& device_cache = *gpu_cache.vulkan_attention_cache;
     const size_t physical_element_size = spec.cache_dtype == DType::BFloat16
-                                             && context->device()->info.support_bf16_storage()
+                                                 && context->device()->info.support_bf16_storage()
                                              ? sizeof(uint16_t)
                                              : sizeof(float);
     const auto valid_device_ring = [&](const ncnn::VkMat& ring) {
@@ -512,7 +512,8 @@ static void decode_sequence(const DecodeCase& spec, const CompiledModel& cpu, co
             view.n = 1;
             view.nstep = static_cast<size_t>(view.h) * view.w;
             view.offset += (static_cast<size_t>(head) * ring.cstep
-                            + static_cast<size_t>(gpu_cache.first_slot) * ring.w) * ring.elemsize;
+                            + static_cast<size_t>(gpu_cache.first_slot) * ring.w)
+                           * ring.elemsize;
             return view;
         };
         for (uint32_t head = 0; head < plan.kv_head_count; ++head)
@@ -539,11 +540,11 @@ static void decode_sequence(const DecodeCase& spec, const CompiledModel& cpu, co
                           && !cache.vulkan_attention_cache && cache.device_allocated_size == 0
                           && cache.vulkan_attention_promotion_disabled && !cache.vulkan_attention_state_unknown
                           && (bfloat16 ? cache.keys.empty() && cache.values.empty()
-                                       && cache.bfloat16_keys.size() == expected_elements
-                                       && cache.bfloat16_values.size() == expected_elements
+                                             && cache.bfloat16_keys.size() == expected_elements
+                                             && cache.bfloat16_values.size() == expected_elements
                                        : cache.bfloat16_keys.empty() && cache.bfloat16_values.empty()
-                                       && cache.keys.size() == expected_elements
-                                       && cache.values.size() == expected_elements),
+                                             && cache.keys.size() == expected_elements
+                                             && cache.values.size() == expected_elements),
                       std::string(phase) + " materialization did not restore a compact host KV cache");
     };
     valid_materialized_cache(gpu_cache, "decode Attention");
