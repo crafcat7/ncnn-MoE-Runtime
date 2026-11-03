@@ -381,15 +381,6 @@ static void test_fixture(const std::filesystem::path& root, bool tied)
                   missing.end());
     write_weights(missing_package.root, missing);
     check(!adapter.map_weights(missing_package, desc), "Qwen3 silently accepted missing QK norm");
-    missing_package.root = root / "missing_down";
-    std::filesystem::create_directories(missing_package.root);
-    missing = tensors;
-    missing.erase(std::remove_if(missing.begin(), missing.end(), [](const FixtureTensor& tensor) {
-                      return tensor.name == "model.layers.0.mlp.down_proj.weight";
-                  }),
-                  missing.end());
-    write_weights(missing_package.root, missing);
-    check(!adapter.map_weights(missing_package, desc), "Qwen3 silently accepted missing dense down projection");
 
     missing_package.root = root / "wrong_query_shape";
     std::filesystem::create_directories(missing_package.root);

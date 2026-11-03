@@ -2038,12 +2038,13 @@ class NativeQuantizedTests(unittest.TestCase):
                     self.compare(prepare_int4(root, method, moe), direct=True)
 
     def test_native_int4_families(self):
+        # hf_int4_paths already runs both import conventions on the Qwen layout;
+        # here each family contributes its own projection layout once.
         for family in ("gpt_oss", "deepseek_v4", "qwen4_exp"):
-            for method in ("awq", "gptq"):
-                with self.subTest(family=family, method=method):
-                    root = self.root / f"{family}-{method}"
-                    root.mkdir()
-                    self.compare(prepare_int4(root, method, True, family), direct=True)
+            with self.subTest(family=family):
+                root = self.root / family
+                root.mkdir()
+                self.compare(prepare_int4(root, "awq", True, family), direct=True)
 
     def test_deepseek_dspark_native_proposals(self):
         for method in ("awq", "gptq"):
