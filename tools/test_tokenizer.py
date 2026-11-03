@@ -66,6 +66,7 @@ def identify_family(model_dir: Path) -> tuple[str, str]:
     families = {
         "gpt_oss": "gpt_oss",
         "deepseek_v4": "deepseek_v4",
+        "qwen3": "qwen",
         "qwen3_5_moe": "qwen",
         "qwen3_5": "qwen",
         "qwen4_exp": "qwen",
@@ -391,6 +392,51 @@ def make_chat_cases() -> list[tuple[str, list[dict[str, Any]], bool]]:
     return [(name, messages, thinking) for name, messages in conversations for thinking in (False, True)]
 
 
+def make_qwen3_chat_cases() -> list[tuple[str, list[dict[str, Any]], bool]]:
+    conversations = [
+        ("qwen3-no-user", [{"role": "assistant", "content": "<think>old</think>Answer"}]),
+        ("qwen3-system-only", [{"role": "system", "content": "  Keep whitespace.\n"}]),
+        ("qwen3-leading-tools", [
+            {"role": "tool", "content": " First result \n"},
+            {"role": "tool", "content": " Second result \n"},
+            {"role": "user", "content": " Continue "},
+        ]),
+        ("qwen3-late-system", [
+            {"role": "user", "content": "Question"},
+            {"role": "system", "content": "  Keep whitespace.\n"},
+        ]),
+        ("qwen3-tool-history", [
+            {"role": "user", "content": "Question"},
+            {"role": "assistant", "content": "No reasoning block"},
+            {"role": "tool", "content": "Result"},
+        ]),
+        ("qwen3-tool-history-reasoning", [
+            {"role": "user", "content": "Question"},
+            {"role": "assistant", "content": "<think>\n  work \n</think>\nAnswer"},
+            {"role": "tool", "content": "Result"},
+        ]),
+        ("qwen3-tool-empty-reasoning", [
+            {"role": "user", "content": "Question"},
+            {"role": "assistant", "content": "\nAnswer", "reasoning_content": ""},
+            {"role": "tool", "content": "Result"},
+        ]),
+        ("qwen3-tool-newline-reasoning", [
+            {"role": "user", "content": "Question"},
+            {"role": "assistant", "content": "\nAnswer", "reasoning_content": "\n"},
+            {"role": "tool", "content": "Result"},
+        ]),
+    ]
+    for name, reasoning in (("string", "\n  Work. \n"), ("empty", ""), ("null", None),
+                            ("number", 42), ("object", {"ignored": True})):
+        for latest in (False, True):
+            messages = [{"role": "user", "content": "Question"},
+                        {"role": "assistant", "content": "<think>inline</think>\nAnswer", "reasoning_content": reasoning}]
+            if not latest:
+                messages.append({"role": "user", "content": "Follow up"})
+            conversations.append((f"qwen3-reasoning-{name}-{'latest' if latest else 'history'}", messages))
+    return [(name, messages, thinking) for name, messages in conversations for thinking in (False, True)]
+
+
 def make_qwen38_chat_cases() -> list[tuple[str, list[dict[str, Any]], bool]]:
     conversations = []
     for name, reasoning in (("string", "  Verify 中文 assumptions.\n"), ("empty", ""),
@@ -433,6 +479,7 @@ def add_case(
 
 def make_cases(model_dir: Path, family: str, oracle: dict[str, Any]) -> list[dict[str, Any]]:
     cases: list[dict[str, Any]] = []
+    qwen3 = read_json(model_dir / "config.json").get("model_type") == "qwen3"
     texts = make_text_cases()
     added_spellings = sorted(set(oracle.get("added_token_spellings", [])))
     if added_spellings:
@@ -486,6 +533,8 @@ def make_cases(model_dir: Path, family: str, oracle: dict[str, Any]) -> list[dic
                 ),
             )
         )
+    if qwen3:
+        chat_cases.extend(make_qwen3_chat_cases())
     template = oracle["config"].get("chat_template", "")
     if family == "qwen" and hashlib.sha256(template.encode()).hexdigest() == QWEN38_TEMPLATE_SHA256:
         chat_cases.extend(make_qwen38_chat_cases())
@@ -596,6 +645,10 @@ def make_cases(model_dir: Path, family: str, oracle: dict[str, Any]) -> list[dic
         ("decode-non-integer-id", json_line({"op": "decode", "ids": [1, "two"]})),
     ]
     for name, request in invalid_requests:
+        # The official Qwen3 template silently ignores unknown roles, covered
+        # above by the chat oracle rather than the invalid-request contract.
+        if qwen3 and name == "chat-unsupported-role":
+            continue
         add_case(cases, f"validation-{name}", "validation", request, {"ok": False})
 
     return cases

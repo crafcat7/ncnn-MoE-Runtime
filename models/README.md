@@ -14,6 +14,7 @@ directories in `models/` and are not version-controlled.
 | GPT-OSS-120B | Hugging Face Safetensors / native GGUF | BF16, native MXFP4, INT4 or Qn_K | [GPT-OSS](gpt-oss/README.md#reference-performance) |
 | DeepSeek-V4-Flash | Hugging Face Safetensors / native target GGUF | FP8/FP4, native INT4 or Qn_K | [DeepSeek V4 Flash](deepseek-v4/README.md#deepseek-v4-flash-matrix) |
 | DeepSeek-V4-Flash-DSpark | Hugging Face Safetensors; GGUF target-only | FP8/FP4, native INT4 or Qn_K | [DeepSeek V4 Flash DSpark](deepseek-v4/README.md#deepseek-v4-flash-dspark-matrix) |
+| Qwen3 dense (including 0.6B) | Hugging Face Safetensors (`qwen3`) | FP32/BF16; FP16 loaded as BF16 | [Native text interface](../README.md#unified-examples); CPU or Hybrid, original full-attention/unscaled-RoPE configuration |
 | Qwen3.6-35B-A3B text backbone | Hugging Face Safetensors / native GGUF | BF16, native INT4/Qn_K, or optional compiled MXFP4 Artifact | [Execution and performance](qwen3.6/README.md) |
 | Qwen3.5 / Qwen3.6 / Qwen3.8-27B dense text architecture | Hugging Face Safetensors / native GGUF (`qwen3_5`) | BF16, native AWQ/GPTQ INT4, or GGUF Qn_K | [Dense admission and validation boundary](qwen3.6/README.md#dense-text-models) |
 | Qwen3.8-Flash-Next text backbone | Hugging Face Safetensors / native GGUF | BF16, native INT4/Qn_K, or optional compiled MXFP4 Artifact | [Admission and execution](qwen3.8/README.md) |
@@ -60,7 +61,8 @@ keep intermediate projections and activation on the device in one submission;
 quantized Gated DeltaNet reuses the existing device recurrence and state cache.
 CPU execution remains available through the existing backend policy.
 
-AWQ/GPTQ Safetensors directories for all built-in families load directly through
+AWQ/GPTQ Safetensors directories for GPT-OSS, DeepSeek V4, Qwen3.5/3.6, and
+Qwen3.8 load directly through
 `Runtime::load_model` and the existing CLI: GPT-OSS-20B/120B, DeepSeek V4 Flash
 and DSpark, Qwen3.5/3.6 dense and MoE text backbones, Qwen3.8-27B, and
 Qwen3.8-Flash-Next. AWQ asymmetric GEMM 4-bit and legacy GPTQ 4-bit are
@@ -75,7 +77,7 @@ its tokenizer assets, leaving the source unchanged. The same adapters load
 the result. Matching canonical HF configuration and tokenizer assets are
 required for offline GGUF import.
 
-All built-in model families accept native GGUF through the existing
+GPT-OSS, DeepSeek V4, Qwen3.5/3.6, and Qwen3.8 accept native GGUF through the existing
 `--model` option, using a GGUF file or a directory containing a single package.
 Directory selection matches only files directly in that directory; it does
 not search subdirectories. Standard split shards are resolved in the same

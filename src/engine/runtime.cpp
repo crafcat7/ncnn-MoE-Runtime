@@ -6,6 +6,7 @@
 #include "modelloader.h"
 #include "models/modeladapter_gptoss.h"
 #include "models/modeladapter_deepseekv4.h"
+#include "models/modeladapter_qwen3.h"
 #include "models/modeladapter_qwen3_5.h"
 #include "models/modeladapter_qwen4exp.h"
 #include "models/tokenizer.h"
@@ -142,6 +143,7 @@ Runtime::Runtime()
 #endif
     register_adapter(std::make_shared<GptOssModelAdapter>());
     register_adapter(std::make_shared<DeepSeekV4ModelAdapter>());
+    register_adapter(std::make_shared<Qwen3Adapter>());
     register_adapter(std::make_shared<Qwen3_5MoeModelAdapter>());
     register_adapter(std::make_shared<Qwen4ExpModelAdapter>());
 }

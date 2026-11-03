@@ -137,9 +137,10 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 
 def _split_thinking(text: str, thinking: bool) -> Completion:
-    """Split the first generated Qwen thinking boundary, if present."""
+    """Split the first thinking boundary, accepting an optional opening tag."""
     if not thinking:
         return Completion("", text.strip())
+    text = text.lstrip().removeprefix("<think>")
     marker = "</think>"
     if marker in text:
         reasoning, answer = text.split(marker, 1)
@@ -193,6 +194,8 @@ class ModelAdapter:
             return "deepseek-v4"
         if model_type in {"qwen4_exp", "qwen4_exp_text", "qwen4exp"}:
             return "qwen3.8"
+        if model_type == "qwen3":
+            return "qwen3"
         if model_type in {"qwen3_5_moe", "qwen3_6", "qwen3.6", "qwen3_5", "qwen35", "qwen35moe"}:
             return "qwen3.6"
         raise AdapterError(f"unsupported model_type: {model_type or '<missing>'}")

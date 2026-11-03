@@ -183,6 +183,96 @@ static uint64_t merge_key(uint32_t left, uint32_t right) noexcept
     return key;
 }
 
+static const char qwen3_template[] = R"QWEN3({%- if tools %}
+    {{- '<|im_start|>system\n' }}
+    {%- if messages[0].role == 'system' %}
+        {{- messages[0].content + '\n\n' }}
+    {%- endif %}
+    {{- "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
+    {%- for tool in tools %}
+        {{- "\n" }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n" }}
+{%- else %}
+    {%- if messages[0].role == 'system' %}
+        {{- '<|im_start|>system\n' + messages[0].content + '<|im_end|>\n' }}
+    {%- endif %}
+{%- endif %}
+{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+{%- for message in messages[::-1] %}
+    {%- set index = (messages|length - 1) - loop.index0 %}
+    {%- if ns.multi_step_tool and message.role == "user" and message.content is string and not(message.content.startswith('<tool_response>') and message.content.endswith('</tool_response>')) %}
+        {%- set ns.multi_step_tool = false %}
+        {%- set ns.last_query_index = index %}
+    {%- endif %}
+{%- endfor %}
+{%- for message in messages %}
+    {%- if message.content is string %}
+        {%- set content = message.content %}
+    {%- else %}
+        {%- set content = '' %}
+    {%- endif %}
+    {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
+        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+    {%- elif message.role == "assistant" %}
+        {%- set reasoning_content = '' %}
+        {%- if message.reasoning_content is string %}
+            {%- set reasoning_content = message.reasoning_content %}
+        {%- else %}
+            {%- if '</think>' in content %}
+                {%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}
+                {%- set content = content.split('</think>')[-1].lstrip('\n') %}
+            {%- endif %}
+        {%- endif %}
+        {%- if loop.index0 > ns.last_query_index %}
+            {%- if loop.last or (not loop.last and reasoning_content) %}
+                {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}
+            {%- else %}
+                {{- '<|im_start|>' + message.role + '\n' + content }}
+            {%- endif %}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\n' + content }}
+        {%- endif %}
+        {%- if message.tool_calls %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if (loop.first and content) or (not loop.first) %}
+                    {{- '\n' }}
+                {%- endif %}
+                {%- if tool_call.function %}
+                    {%- set tool_call = tool_call.function %}
+                {%- endif %}
+                {{- '<tool_call>\n{"name": "' }}
+                {{- tool_call.name }}
+                {{- '", "arguments": ' }}
+                {%- if tool_call.arguments is string %}
+                    {{- tool_call.arguments }}
+                {%- else %}
+                    {{- tool_call.arguments | tojson }}
+                {%- endif %}
+                {{- '}\n</tool_call>' }}
+            {%- endfor %}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == "tool" %}
+        {%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {{- '\n<tool_response>\n' }}
+        {{- content }}
+        {{- '\n</tool_response>' }}
+        {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
+            {{- '<|im_end|>\n' }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if enable_thinking is defined and enable_thinking is false %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- endif %}
+{%- endif %})QWEN3";
+
 static const char qwen36_template[] = R"QWEN({%- set image_count = namespace(value=0) %}
 {%- set video_count = namespace(value=0) %}
 {%- macro render_content(content, do_vision_count, is_system_content=false) %}
@@ -1049,6 +1139,7 @@ bool Tokenizer::load_gguf_impl(const std::string& model_path, size_t vocabulary_
 
 bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_size)
 {
+    static const std::string qwen3_regex = R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
     static const std::string qwen_regex = R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
     static const std::string gpt_regex = R"GPT([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)GPT";
     static const std::array<std::string, 3> deepseek_regexes = {
@@ -1115,6 +1206,14 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
         total_vocab_size = 129280;
         split_regexes.assign(deepseek_regexes.begin(), deepseek_regexes.end());
     }
+    else if (model_type == "qwen3")
+    {
+        new_family = Family::Qwen3;
+        base_vocab_size = 151643;
+        total_vocab_size = 151936;
+        has_nfc = true;
+        split_regexes.push_back(qwen3_regex);
+    }
     else if (model_type == "qwen3_5_moe" || model_type == "qwen3_5")
     {
         new_family = Family::Qwen36;
@@ -1146,7 +1245,12 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
     else if (json_integer(model_config, "vocab_size") != std::optional<int64_t>(static_cast<int64_t>(total_vocab_size)))
         return false;
 
-    if (new_family == Family::Qwen36 || new_family == Family::Qwen38)
+    if (new_family == Family::Qwen3)
+    {
+        if (json_string(config, "chat_template") != std::optional<std::string>(qwen3_template))
+            return false;
+    }
+    else if (new_family == Family::Qwen36 || new_family == Family::Qwen38)
     {
         std::ifstream template_input(std::filesystem::path(model_directory) / "chat_template.jinja", std::ios::binary);
         if (!template_input)
@@ -1344,16 +1448,18 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
         if (json_string(stages[i], "type") != std::optional<std::string>("Split") || json_string(stages[i], "behavior") != std::optional<std::string>("Isolated") || json_boolean(stages[i], "invert") != std::optional<bool>(false) || json_string(pattern, "Regex") != std::optional<std::string>(split_regexes[i]))
             return false;
     }
-    const bool qwen_bytelevel = new_family == Family::Qwen36 || new_family == Family::Qwen38;
+    const bool qwen_bytelevel = new_family == Family::Qwen3 || new_family == Family::Qwen36 || new_family == Family::Qwen38;
     if (!is_byte_level(stages.back(), false, !qwen_bytelevel, false)
         || !is_byte_level(member(tokenizer, "post_processor"), !qwen_bytelevel, false, !qwen_bytelevel)
         || !is_byte_level(member(tokenizer, "decoder"), !qwen_bytelevel, !qwen_bytelevel, !qwen_bytelevel))
         return false;
 
-    if (new_family == Family::Qwen36 || new_family == Family::Qwen38)
+    if (qwen_bytelevel)
     {
-        require_size(config, 16);
-        if (json_string(config, "tokenizer_class") != std::optional<std::string>("Qwen2Tokenizer") || json_boolean(config, "clean_up_tokenization_spaces") != std::optional<bool>(false) || json_boolean(config, "add_prefix_space") != std::optional<bool>(false) || json_boolean(config, "split_special_tokens") != std::optional<bool>(false) || json_boolean(config, "add_bos_token") != std::optional<bool>(false) || json_string(config, "errors") != std::optional<std::string>("replace") || member(config, "bos_token") != "null" || member(config, "unk_token") != "null" || json_string(config, "eos_token") != std::optional<std::string>("<|im_end|>") || json_string(config, "pad_token") != std::optional<std::string>("<|endoftext|>") || json_string(config, "pretokenize_regex") != std::optional<std::string>(qwen_regex) || json_integer(config, "model_max_length") != std::optional<int64_t>(262144))
+        require_size(config, new_family == Family::Qwen3 ? 14 : 16);
+        if (json_string(config, "tokenizer_class") != std::optional<std::string>("Qwen2Tokenizer") || json_boolean(config, "clean_up_tokenization_spaces") != std::optional<bool>(false) || json_boolean(config, "add_prefix_space") != std::optional<bool>(false) || json_boolean(config, "split_special_tokens") != std::optional<bool>(false) || json_boolean(config, "add_bos_token") != std::optional<bool>(false) || json_string(config, "errors") != std::optional<std::string>("replace") || member(config, "bos_token") != "null" || member(config, "unk_token") != "null" || json_string(config, "eos_token") != std::optional<std::string>("<|im_end|>") || json_string(config, "pad_token") != std::optional<std::string>("<|endoftext|>") || json_integer(config, "model_max_length") != std::optional<int64_t>(new_family == Family::Qwen3 ? 131072 : 262144))
+            return false;
+        if (new_family != Family::Qwen3 && json_string(config, "pretokenize_regex") != std::optional<std::string>(qwen_regex))
             return false;
     }
     else if (new_family == Family::GptOss)
@@ -1386,7 +1492,7 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
         "<|box_start|>", "<|box_end|>", "<|quad_start|>", "<|quad_end|>",
         "<|vision_start|>", "<|vision_end|>", "<|vision_pad|>", "<|image_pad|>", "<|video_pad|>"};
     const std::array<std::pair<std::string_view, std::string_view>, 7> extra_expected = {{{"audio_bos_token", "<|audio_start|>"}, {"audio_eos_token", "<|audio_end|>"}, {"audio_token", "<|audio_pad|>"}, {"image_token", "<|image_pad|>"}, {"video_token", "<|video_pad|>"}, {"vision_bos_token", "<|vision_start|>"}, {"vision_eos_token", "<|vision_end|>"}}};
-    if (new_family == Family::Qwen36 || new_family == Family::Qwen38)
+    if (qwen_bytelevel)
     {
         const std::string_view extra_special_tokens = member(config, "additional_special_tokens");
         position = skip_space(extra_special_tokens, 0);
@@ -1408,12 +1514,15 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
         position = skip_space(extra_special_tokens, position);
         if (position >= extra_special_tokens.size() || extra_special_tokens[position++] != ']' || skip_space(extra_special_tokens, position) != extra_special_tokens.size())
             return false;
-        const std::string_view extra_map = member(config, "extra_special_tokens");
-        require_size(extra_map, 7);
-        for (const auto& expected : extra_expected)
+        if (new_family != Family::Qwen3)
         {
-            if (json_string(extra_map, expected.first) != std::optional<std::string>(expected.second))
-                return false;
+            const std::string_view extra_map = member(config, "extra_special_tokens");
+            require_size(extra_map, 7);
+            for (const auto& expected : extra_expected)
+            {
+                if (json_string(extra_map, expected.first) != std::optional<std::string>(expected.second))
+                    return false;
+            }
         }
     }
 
@@ -1585,8 +1694,9 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
     if (vocab.empty())
         return false;
 
+    const size_t qwen_added_count = new_family == Family::Qwen3 ? 26 : 33;
     auto read_added = [&](uint32_t id, std::string_view item, bool id_in_object) {
-        if (id >= total_vocab_size || ((new_family == Family::Qwen36 || new_family == Family::Qwen38) && (id < base_vocab_size || id > 248076)) || (new_family == Family::GptOss && (id < 199998 || id > 200018)))
+        if (id >= total_vocab_size || (qwen_bytelevel && (id < base_vocab_size || id >= base_vocab_size + qwen_added_count)) || (new_family == Family::GptOss && (id < 199998 || id > 200018)))
             throw std::runtime_error("AddedToken ID outside the supported range");
         size_t count = 0;
         if (!object_size(item, count) || count != (id_in_object ? 7u : 6u))
@@ -1661,9 +1771,9 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
         if (position >= added_json.size() || added_json[position] == ']')
             return false;
     }
-    const size_t expected_tokenizer_added_count = new_family == Family::Qwen36 ? 26 : new_family == Family::Qwen38 ? 33
-                                                                                  : new_family == Family::GptOss   ? 21
-                                                                                                                   : 1283;
+    const size_t expected_tokenizer_added_count = new_family == Family::Qwen3 || new_family == Family::Qwen36 ? 26 : new_family == Family::Qwen38 ? 33
+                                                                                                                 : new_family == Family::GptOss   ? 21
+                                                                                                                                                  : 1283;
     if (added_count != expected_tokenizer_added_count)
         return false;
 
@@ -1671,7 +1781,8 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
     if (new_family != Family::DeepSeekV4)
     {
         const std::string_view config_added = member(config, "added_tokens_decoder");
-        const size_t expected_config_added_count = new_family == Family::Qwen36 || new_family == Family::Qwen38 ? 33 : 21;
+        const size_t expected_config_added_count = new_family == Family::Qwen3 ? 26 : new_family == Family::Qwen36 || new_family == Family::Qwen38 ? 33
+                                                                                                                                                   : 21;
         require_size(config_added, expected_config_added_count);
         position = skip_space(config_added, 0);
         if (position >= config_added.size() || config_added[position++] != '{')
@@ -1722,7 +1833,9 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
         }
     }
     const size_t expected_union_added_count = new_family == Family::Qwen36 || new_family == Family::Qwen38 ? 33 : expected_tokenizer_added_count;
-    if ((new_family != Family::DeepSeekV4 && config_added_count != (new_family == Family::GptOss ? 21u : 33u)) || added_by_id.size() != expected_union_added_count)
+    if ((new_family != Family::DeepSeekV4 && config_added_count != (new_family == Family::GptOss ? 21u : new_family == Family::Qwen3 ? 26u
+                                                                                                                                     : 33u))
+        || added_by_id.size() != expected_union_added_count)
         return false;
     if (vocabulary_size != 0 && vocabulary_size != total_vocab_size)
         return false;
@@ -1757,7 +1870,7 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
         position = skip_space(merges_json, position);
         std::string left_piece;
         std::string right_piece;
-        if (new_family == Family::GptOss)
+        if (new_family == Family::GptOss || new_family == Family::Qwen3)
         {
             if (position >= merges_json.size() || merges_json[position++] != '[')
                 return false;
@@ -1872,9 +1985,9 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
             "<|fim_middle|>", "<|fim_suffix|>", "<|fim_pad|>", "<|repo_name|>", "<|file_sep|>", "<tool_response>",
             "</tool_response>", "<think>", "</think>", "<|audio_start|>", "<|audio_end|>", "<tts_pad>", "<tts_text_bos>",
             "<tts_text_eod>", "<tts_text_bos_single>", "<|audio_pad|>"};
-        for (size_t i = 0; i < expected_qwen_tokens.size(); ++i)
+        for (size_t i = 0; i < (new_family == Family::Qwen3 ? 26u : expected_qwen_tokens.size()); ++i)
         {
-            const uint32_t id = static_cast<uint32_t>(248044 + i);
+            const uint32_t id = static_cast<uint32_t>(base_vocab_size + i);
             const auto found = added_by_id.find(id);
             const bool expected_special = i < 14 || i >= 26;
             if (found == added_by_id.end() || found->second != expected_qwen_tokens[i] || (((new_index[id].flags & Special) != 0) != expected_special))
@@ -1914,7 +2027,7 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
     else
     {
         const auto eos = added_by_content.find("<|im_end|>");
-        if (eos == added_by_content.end() || eos->second != 248046 || (new_index[eos->second].flags & Special) == 0)
+        if (eos == added_by_content.end() || eos->second != base_vocab_size + 2 || (new_index[eos->second].flags & Special) == 0)
             return false;
         new_stops.push_back(static_cast<int32_t>(eos->second));
     }
@@ -1923,7 +2036,7 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
     const bool has_generation_config = std::filesystem::exists(generation_path, generation_error);
     if (generation_error)
         return false;
-    if (new_family == Family::Qwen36 || new_family == Family::Qwen38)
+    if (qwen_bytelevel)
     {
         if (has_generation_config)
         {
@@ -1991,7 +2104,7 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
             }
             if (ids.empty())
                 return false;
-            if (ids != std::vector<uint32_t>{248046, 248044})
+            if (ids != std::vector<uint32_t>{static_cast<uint32_t>(base_vocab_size + 2), static_cast<uint32_t>(base_vocab_size)})
                 return false;
             for (const uint32_t token_id : ids)
             {
@@ -2168,7 +2281,7 @@ void Tokenizer::encode_impl(std::string_view text,
     constexpr size_t cache_limit = 64 * 1024;
     auto& cache = scratch.cache;
 
-    const bool qwen = family == Family::Qwen36 || family == Family::Qwen38;
+    const bool qwen = family == Family::Qwen3 || family == Family::Qwen36 || family == Family::Qwen38;
     const bool gpt = family == Family::GptOss;
     const bool deepseek = family == Family::DeepSeekV4;
     std::string_view input;
@@ -2306,7 +2419,7 @@ void Tokenizer::encode_impl(std::string_view text,
                     pos = begin;
                     if (!gpt)
                     {
-                        while (pos < end && (props[pos] & (UnicodeLetter | UnicodeMark)) != 0)
+                        while (pos < end && (props[pos] & (UnicodeLetter | (family == Family::Qwen3 ? 0 : UnicodeMark))) != 0)
                             ++pos;
                     }
                     else
@@ -2344,7 +2457,7 @@ void Tokenizer::encode_impl(std::string_view text,
             {
                 const size_t begin = start + (points[start] == ' ' && attempt == 0 ? 1 : 0);
                 pos = begin;
-                while (pos < end && (deepseek ? (props[pos] & (UnicodePunctuation | UnicodeSymbol)) != 0 : (props[pos] & (UnicodeSpace | UnicodeLetter | UnicodeNumber | (qwen ? UnicodeMark : 0))) == 0))
+                while (pos < end && (deepseek ? (props[pos] & (UnicodePunctuation | UnicodeSymbol)) != 0 : (props[pos] & (UnicodeSpace | UnicodeLetter | UnicodeNumber | (qwen && family != Family::Qwen3 ? UnicodeMark : 0))) == 0))
                     ++pos;
                 if (pos > begin)
                 {
@@ -2475,6 +2588,7 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
         std::string role;
         std::string content;
         std::string reasoning;
+        bool reasoning_is_string = false;
         std::string_view text{};
     };
     std::vector<Message> messages;
@@ -2516,13 +2630,14 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
             if (position >= messages_json.size() || messages_json[position++] != ':')
                 throw std::invalid_argument("invalid message member");
             position = skip_space(messages_json, position);
-            const bool reasoning_field = family == Family::Qwen38 && key == "reasoning_content";
+            const bool reasoning_field = (family == Family::Qwen3 || family == Family::Qwen38) && key == "reasoning_content";
             if (key != "role" && key != "content" && !reasoning_field)
                 throw std::invalid_argument("message fields are limited to role and content strings");
             if (position >= messages_json.size())
                 throw std::invalid_argument("invalid message member");
             if (!reasoning_field && messages_json[position] != '"')
                 throw std::invalid_argument("message role and content must be strings");
+            const bool value_is_string = messages_json[position] == '"';
             std::string value;
             if (messages_json[position] == '"' ? !parse_json_string(messages_json, position, &value)
                                                : !parse_json_value(messages_json, position))
@@ -2547,6 +2662,7 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
                     throw std::invalid_argument("duplicate message reasoning_content");
                 has_reasoning = true;
                 message.reasoning = std::move(value);
+                message.reasoning_is_string = value_is_string;
             }
             position = skip_space(messages_json, position);
             if (position >= messages_json.size())
@@ -2753,6 +2869,9 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
 
     if (messages.empty())
         throw std::invalid_argument("No messages provided.");
+    // Qwen templates share the message framing, but Qwen3 preserves content
+    // whitespace and lets the model generate the opening thinking tag.
+    const bool qwen3 = family == Family::Qwen3;
     auto trim = [](std::string_view text) {
         size_t begin = text.size();
         size_t end = 0;
@@ -2769,7 +2888,7 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
         return end == 0 ? std::string_view() : text.substr(begin, end - begin);
     };
     for (Message& message : messages)
-        message.text = trim(message.content);
+        message.text = qwen3 ? std::string_view(message.content) : trim(message.content);
 
     static constexpr std::string_view reasoning_instruction = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
     std::string prompt;
@@ -2815,14 +2934,14 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
             prompt += "<|im_end|>\n";
         }
     }
-    else if (messages.front().role == "system")
+    else if (!qwen3 && messages.front().role == "system")
     {
         prompt += "<|im_start|>system\n";
         prompt += messages.front().text;
         prompt += "<|im_end|>\n";
     }
 
-    int32_t last_user_index = -1;
+    int32_t last_user_index = qwen3 ? static_cast<int32_t>(messages.size() - 1) : -1;
     for (size_t i = 0; i < messages.size(); ++i)
     {
         if (messages[i].role != "user")
@@ -2838,22 +2957,22 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
     {
         const Message& message = messages[i];
         const std::string_view content = message.text;
-        if (message.role == "system" || (merge_leading_system_messages && message.role == "developer"))
+        if (!qwen3 && (message.role == "system" || (merge_leading_system_messages && message.role == "developer")))
         {
             if (merge_leading_system_messages || i != 0)
                 throw std::invalid_argument("System message must be at the beginning.");
         }
-        else if (message.role == "user")
+        else if (message.role == "user" || (qwen3 && message.role == "system"))
         {
-            prompt += "<|im_start|>user\n";
+            prompt += "<|im_start|>" + message.role + "\n";
             prompt += content;
             prompt += "<|im_end|>\n";
         }
         else if (message.role == "assistant")
         {
-            std::string_view reasoning = trim(message.reasoning);
+            std::string_view reasoning = qwen3 ? std::string_view(message.reasoning) : trim(message.reasoning);
             std::string_view body = content;
-            if (family == Family::Qwen36)
+            if (family == Family::Qwen36 || (qwen3 && !message.reasoning_is_string))
             {
                 const size_t first_close = body.find("</think>");
                 if (first_close != std::string_view::npos)
@@ -2870,12 +2989,21 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
                     body.remove_prefix(last_close + 8);
                     while (!body.empty() && body.front() == '\n')
                         body.remove_prefix(1);
-                    reasoning = trim(reasoning);
+                    if (!qwen3) reasoning = trim(reasoning);
                 }
             }
             prompt += "<|im_start|>assistant\n";
-            if (family == Family::Qwen38 || static_cast<int32_t>(i) > last_user_index)
+            if (family == Family::Qwen38 || (static_cast<int32_t>(i) > last_user_index && (!qwen3 || i + 1 == messages.size() || !reasoning.empty())))
             {
+                if (qwen3)
+                {
+                    while (!reasoning.empty() && reasoning.front() == '\n')
+                        reasoning.remove_prefix(1);
+                    while (!reasoning.empty() && reasoning.back() == '\n')
+                        reasoning.remove_suffix(1);
+                    while (!body.empty() && body.front() == '\n')
+                        body.remove_prefix(1);
+                }
                 prompt += "<think>\n";
                 prompt += reasoning;
                 prompt += "\n</think>\n\n";
@@ -2885,7 +3013,7 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
         }
         else if (message.role == "tool")
         {
-            if (i > 0 && messages[i - 1].role != "tool")
+            if ((qwen3 && i == 0) || (i > 0 && messages[i - 1].role != "tool"))
                 prompt += "<|im_start|>user";
             prompt += "\n<tool_response>\n";
             prompt += content;
@@ -2893,12 +3021,15 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
             if ((i + 1 < messages.size() && messages[i + 1].role != "tool") || i + 1 == messages.size())
                 prompt += "<|im_end|>\n";
         }
-        else
+        else if (!qwen3)
             throw std::invalid_argument("Unexpected message role.");
     }
 
     prompt += "<|im_start|>assistant\n";
-    prompt += enable_thinking ? "<think>\n" : "<think>\n\n</think>\n\n";
+    if (!enable_thinking)
+        prompt += "<think>\n\n</think>\n\n";
+    else if (!qwen3)
+        prompt += "<think>\n";
     std::vector<int32_t> ids;
     encode_impl(prompt, true, scratch, ids);
     return ids;
@@ -2911,7 +3042,7 @@ std::string Tokenizer::decode(int32_t id, std::string& pending, bool final) cons
     if (id >= 0 && static_cast<size_t>(id) < index.size())
     {
         const Entry& entry = index[static_cast<size_t>(id)];
-        const bool skip_special = family == Family::Qwen36 || family == Family::Qwen38;
+        const bool skip_special = family == Family::Qwen3 || family == Family::Qwen36 || family == Family::Qwen38;
         if ((entry.flags & Present) != 0 && (!skip_special || (entry.flags & Special) == 0) && entry.length != 0)
             pending.append(reinterpret_cast<const char*>(bytes.data() + entry.offset), entry.length);
     }
