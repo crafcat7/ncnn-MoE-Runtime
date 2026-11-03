@@ -566,6 +566,25 @@ static void dequantize_q5_1(const uint8_t* block, QnKOutput& output) noexcept
 #endif
 }
 
+// First block of one weight row plus the byte distance to the next block.
+// Packed tiles interleave eight rows, so their blocks are eight slots apart.
+static inline const uint8_t* qnk_row0(const uint8_t* raw, const QnKPack* pack, size_t row,
+                                      uint32_t block_count, size_t block_bytes, size_t& stride) noexcept
+{
+    stride = pack ? block_bytes * 8 : block_bytes;
+    return pack ? qnk_packed_block(*pack, row, 0)
+                : raw + row * static_cast<size_t>(block_count) * block_bytes;
+}
+
+// Quantized activation row shared by every output row of one projection, so
+// the int8 kernels reuse qnk_gemm's threading and packed-weight policy.
+struct QnkQ8Row
+{
+    std::vector<int8_t> codes;
+    std::vector<float> scales;
+    std::vector<int32_t> sums;
+};
+
 template<bool paired>
 static void qnk_gemm(const uint8_t* raw,
                      const QnKPack* packed,
@@ -579,8 +598,12 @@ static void qnk_gemm(const uint8_t* raw,
                      size_t output_stride,
                      const TensorData* matrix2 = nullptr,
                      const QnKPack* packed2 = nullptr,
-                     ActivationBuffer* output2 = nullptr) noexcept
+                     ActivationBuffer* output2 = nullptr,
+                     const QnkQ8Row* q8 = nullptr) noexcept
 {
+#if !defined(NCNN_MOE_MSVC_X86_SIMD)
+    static_cast<void>(q8);
+#endif
     const uint32_t block_size = qnk_block_size(dtype);
     const uint32_t block_count = columns / block_size;
     const size_t block_bytes = qnk_block_bytes(dtype);
@@ -596,6 +619,12 @@ static void qnk_gemm(const uint8_t* raw,
         output_stride2 = output2->columns();
     }
 
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    // 32-value GGML blocks decode eight lanes per step inside the fused row
+    // kernel; the ISA check stays out of the per-block loop.
+    const MxFp4KernelKind simd_kind = block_size == 32 ? mxfp4_kernel_kind() : MxFp4KernelKind::Scalar;
+    const bool use_simd_block32 = simd_kind == MxFp4KernelKind::X86Avx2 || simd_kind == MxFp4KernelKind::X86Avx512;
+#endif
     const auto dot = [&](const uint8_t* data, const QnKPack* pack, float* result, size_t stride, size_t row)
 #if defined(__GNUC__) || defined(__clang__)
                          __attribute__((always_inline))
@@ -615,6 +644,35 @@ static void qnk_gemm(const uint8_t* raw,
         }
         result[row] = sum;
 #else
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+        if (q8 && token_count == 1)
+        {
+            size_t encoded_stride = 0;
+            const uint8_t* first = qnk_row0(data, pack, row, block_count, block_bytes, encoded_stride);
+            result[row] = msvc_avx2_qnk_q8_row(dtype,
+                                               first,
+                                               encoded_stride,
+                                               block_count,
+                                               q8->codes.data(),
+                                               q8->scales.data(),
+                                               q8->sums.data());
+            return;
+        }
+        if (use_simd_block32)
+        {
+            size_t encoded_stride = 0;
+            const uint8_t* first = qnk_row0(data, pack, row, block_count, block_bytes, encoded_stride);
+            for (size_t token = 0; token < token_count; ++token)
+            {
+                result[token * stride + row] = msvc_avx2_qnk_dot_row(dtype,
+                                                                     first,
+                                                                     encoded_stride,
+                                                                     block_count,
+                                                                     input + token * input_stride);
+            }
+            return;
+        }
+#endif
         for (size_t token = 0; token < token_count; ++token)
         {
             const float* token_input = input + token * input_stride;
@@ -670,6 +728,32 @@ static void qnk_gemm(const uint8_t* raw,
                 dot(raw2, packed2, output2_data, output_stride2, row);
         return;
     }
+#else
+    if (token_count == 1)
+    {
+#if defined(_OPENMP)
+        const uint64_t operation_count = static_cast<uint64_t>(rows + rows2) * columns;
+        // Every block layout benefits from row parallelism; 32-value formats are
+        // no longer the only ones that would otherwise run this GEMV on one thread.
+        const int team_size = static_cast<int>(std::min<size_t>(rows + rows2, static_cast<size_t>(cpu_linear_team_size(operation_count, dtype))));
+#endif
+        // Gate/up share one parallel region so a fused projection pays one fork.
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) num_threads(team_size) if (team_size > 1)
+#endif
+        for (int64_t index = 0; index < static_cast<int64_t>(rows + rows2); ++index)
+        {
+            if (static_cast<size_t>(index) < rows)
+                dot(raw, packed, output, output_stride, static_cast<size_t>(index));
+            else if constexpr (paired)
+                dot(raw2, packed2, output2_data, output_stride2, static_cast<size_t>(index) - rows);
+        }
+        return;
+    }
+#endif
+    // Prefill decodes one 8-row weight tile per block and reuses it across four
+    // tokens, matching the GPU kernel's token tile instead of re-decoding the
+    // same block for every token.
     const size_t first_tiles = (rows + 7) / 8;
     const size_t tile_count = first_tiles + (rows2 + 7) / 8;
 #if defined(_OPENMP)
@@ -738,25 +822,6 @@ static void qnk_gemm(const uint8_t* raw,
             }
         }
     }
-#else
-#if defined(_OPENMP)
-    const uint64_t operation_count = static_cast<uint64_t>(rows + rows2) * columns * token_count;
-    const int team_size = qnk_block_size(dtype) == 32
-                              ? static_cast<int>(std::min<size_t>(rows + rows2, static_cast<size_t>(cpu_linear_team_size(operation_count, dtype))))
-                              : 1;
-#pragma omp parallel for schedule(static) num_threads(team_size) if (team_size > 1)
-#endif
-    for (int64_t row = 0; row < static_cast<int64_t>(rows); ++row)
-        dot(raw, packed, output, output_stride, static_cast<size_t>(row));
-    if constexpr (paired)
-    {
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static) num_threads(team_size) if (team_size > 1)
-#endif
-        for (int64_t row = 0; row < static_cast<int64_t>(rows2); ++row)
-            dot(raw2, packed2, output2_data, output_stride2, static_cast<size_t>(row));
-    }
-#endif
 }
 
 static std::shared_ptr<const QnKPack> get_qnk_packed_weights(const TensorData& matrix,
@@ -906,6 +971,15 @@ void qnk_dequantize_block(DType dtype, const uint8_t* block, float* output) noex
 {
     if (!block || !output || !is_qnk_dtype(dtype))
         return;
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    if (qnk_block_size(dtype) == 32
+        && (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2
+            || mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512))
+    {
+        msvc_avx2_qnk_deq32(dtype, block, output);
+        return;
+    }
+#endif
     if (dtype == DType::Q6K)
     {
         QnKOutput destination;
@@ -934,6 +1008,15 @@ float qnk_dot_block(DType dtype, const uint8_t* block, const float* input) noexc
 #if defined(__aarch64__) || defined(_M_ARM64)
         return forward_qnk(dtype, block, input, nullptr);
 #else
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+        const MxFp4KernelKind simd_kind = mxfp4_kernel_kind();
+        if (simd_kind == MxFp4KernelKind::X86Avx2 || simd_kind == MxFp4KernelKind::X86Avx512)
+        {
+            // block_count 1 with a zero stride is the single-block case of the
+            // row kernel, so 32-value blocks have one dispatch site.
+            return msvc_avx2_qnk_dot_row(dtype, block, 0, 1, input);
+        }
+#endif
         const float scale = load_f16(block);
         float sum = 0.0f;
         if (dtype == DType::Q5_1)
@@ -1146,7 +1229,8 @@ bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
                         const ActivationBuffer& input,
                         std::initializer_list<ActivationBuffer*> outputs,
                         bool use_packed_weights,
-                        std::span<std::shared_ptr<const QnKPack>* const> sidecars) noexcept
+                        std::span<std::shared_ptr<const QnKPack>* const> sidecars,
+                        bool use_q8_activations) noexcept
 {
     const size_t matrix_count = matrices.size();
     if ((matrix_count != 1 && matrix_count != 2)
@@ -1193,8 +1277,8 @@ bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
         }
         std::array<ActivationBuffer, 2> projected;
         const bool success = matrix_count == 1
-                                 ? forward_linear_qnk({weights[0]}, *float_input, {&projected[0]}, use_packed_weights, sidecars)
-                                 : forward_linear_qnk({weights[0], weights[1]}, *float_input, {&projected[0], &projected[1]}, use_packed_weights, sidecars);
+                                 ? forward_linear_qnk({weights[0]}, *float_input, {&projected[0]}, use_packed_weights, sidecars, use_q8_activations)
+                                 : forward_linear_qnk({weights[0], weights[1]}, *float_input, {&projected[0], &projected[1]}, use_packed_weights, sidecars, use_q8_activations);
         if (!success)
             return false;
         for (size_t index = 0; index < matrix_count; ++index)
@@ -1237,10 +1321,37 @@ bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
         results[0]->reset(input.rows(), static_cast<uint32_t>(rows), false);
         if (input.rows() == 0)
             return true;
+        QnkQ8Row q8;
+        bool q8_enabled = false;
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+        // Single-token decode only. One quantized activation row serves every
+        // output row, and qnk_gemm keeps the threading and packed-weight policy,
+        // so this function no longer needs its own row loop.
+        q8_enabled = use_q8_activations && input.rows() == 1
+                     && qnk_block_size(matrix.dtype) == 32
+                     && (matrix.dtype == DType::Q4_0 || matrix.dtype == DType::Q4_1
+                         || matrix.dtype == DType::Q5_0 || matrix.dtype == DType::Q5_1
+                         || matrix.dtype == DType::Q8_0 || matrix.dtype == DType::IQ4NL)
+                     && (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2
+                         || mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512);
+        if (q8_enabled)
+        {
+            const uint32_t q8_block_count = columns / 32;
+            q8.codes.resize(columns);
+            q8.scales.resize(q8_block_count);
+            q8.sums.resize(q8_block_count);
+            msvc_avx2_qnk_q8_quant(input.row(0),
+                                   q8.codes.data(),
+                                   q8.scales.data(),
+                                   q8.sums.data(),
+                                   columns);
+        }
+#endif
         if (!use_packed_weights)
         {
             qnk_gemm<false>(raw.data(), nullptr, matrix.dtype, rows, columns,
-                            input.row(0), columns, input.rows(), results[0]->row(0), results[0]->columns());
+                            input.row(0), columns, input.rows(), results[0]->row(0), results[0]->columns(),
+                            nullptr, nullptr, nullptr, q8_enabled ? &q8 : nullptr);
             return true;
         }
         const std::shared_ptr<const QnKPack> packed = get_qnk_packed_weights(matrix,
@@ -1265,7 +1376,8 @@ bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
         }
 #endif
         qnk_gemm<false>(nullptr, packed.get(), matrix.dtype, rows, columns,
-                        input.row(0), columns, input.rows(), results[0]->row(0), results[0]->columns());
+                        input.row(0), columns, input.rows(), results[0]->row(0), results[0]->columns(),
+                        nullptr, nullptr, nullptr, q8_enabled ? &q8 : nullptr);
         return true;
     }
 

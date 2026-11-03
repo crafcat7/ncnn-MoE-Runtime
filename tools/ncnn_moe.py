@@ -294,6 +294,14 @@ def _add_worker_options(parser: argparse.ArgumentParser) -> None:
         choices=("off", "on"),
         help="Enable the optional CPU Expert weight repack (default: off)",
     )
+    parser.add_argument(
+        "--cpu-qnk-q8",
+        choices=("off", "on"),
+        help=(
+            "Quantize CPU activations to int8 for block-quantized projections, "
+            "cutting activation traffic fourfold at some accuracy cost (default: off)"
+        ),
+    )
     parser.add_argument("--host-memory-mb", type=int)
     parser.add_argument("--expert-cache-mb", type=int)
     parser.add_argument("--expert-gpu-cache-mb", type=int)
@@ -556,6 +564,14 @@ def context_budget(adapter: ModelAdapter, arguments: argparse.Namespace, ready: 
     return max(1, model_limit - reserve)
 
 
+def runtime_cpu_qnk_q8_args(args: list[str], arguments: argparse.Namespace) -> list[str]:
+    """Forward the opt-in int8 activation switch the shared runtime mapper does not know."""
+    value = getattr(arguments, "cpu_qnk_q8", None)
+    if value is None:
+        return args
+    return [*args, "--cpu-qnk-q8", str(value)]
+
+
 def open_worker(
     arguments: argparse.Namespace,
     model: Path,
@@ -577,7 +593,7 @@ def open_worker(
     client = WorkerClient(
         worker,
         model,
-        runtime_args_from_settings(initial),
+        runtime_cpu_qnk_q8_args(runtime_args_from_settings(initial), arguments),
         verbose=getattr(arguments, "verbose", False),
     )
     if select_adapter and adapter is None:
@@ -610,7 +626,7 @@ def open_worker(
         client = WorkerClient(
             worker,
             model,
-            runtime_args_from_settings(merged),
+            runtime_cpu_qnk_q8_args(runtime_args_from_settings(merged), arguments),
             verbose=getattr(arguments, "verbose", False),
         )
     return client, merged, profile_record, adapter

@@ -795,7 +795,8 @@ bool forward_linear(std::initializer_list<const TensorData*> matrices,
                                   input,
                                   outputs,
                                   has_flag(optimization_flags, OptimizationCpuPackedWeights),
-                                  sidecar_span);
+                                  sidecar_span,
+                                  has_flag(optimization_flags, OptimizationCpuQnkQ8));
     }
     if (is_qnk_dtype(dtype))
         return false;
@@ -1158,7 +1159,8 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
                                *linear_input,
                                {&output},
                                has_flag(optimization_flags, OptimizationCpuPackedWeights),
-                               sidecar_span))
+                               sidecar_span,
+                               has_flag(optimization_flags, OptimizationCpuQnkQ8)))
             return;
         throw std::runtime_error("invalid native GGML linear weight or activation shape");
     }

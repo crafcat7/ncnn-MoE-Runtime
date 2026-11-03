@@ -586,6 +586,14 @@ static Option parse_options(int argc, char** argv, int first_argument)
             result.expert_memory_mode = parse_expert_memory_mode(require_value(argc, argv, index, "--expert-memory"));
         else if (argument == "--cpu-packed-weights")
             result.cpu_packed_weight_mode = parse_cpu_packed_weight_mode(require_value(argc, argv, index, "--cpu-packed-weights"));
+        else if (argument == "--cpu-qnk-q8")
+        {
+            // Opt-in int8 activation kernels for block-quantized CPU projections.
+            if (parse_cpu_packed_weight_mode(require_value(argc, argv, index, "--cpu-qnk-q8")) == CpuPackedWeightMode::Enabled)
+                result.optimization_flags |= OptimizationCpuQnkQ8;
+            else
+                result.optimization_flags &= ~OptimizationCpuQnkQ8;
+        }
         else if (argument == "--vulkan-device")
             result.vulkan_device_index = static_cast<uint32_t>(std::stoul(require_value(argc, argv, index, "--vulkan-device")));
         else if (argument == "--vulkan-devices")
