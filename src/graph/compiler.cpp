@@ -765,25 +765,26 @@ static Result<void> compile_gated_delta_attention(const WeightStore& weights,
                                     plan.delta_convolution_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(weights,
-                                    layer_name + "attention.delta.time_bias",
-                                    {attention.head_count},
-                                    descriptor.activation_dtype,
-                                    plan.delta_time_bias);
+    // Gate scalars and the head norm stay FP32 in some checkpoints.
+    status = assign_required_linear_tensor(weights,
+                                          layer_name + "attention.delta.time_bias",
+                                          {attention.head_count},
+                                          descriptor.activation_dtype,
+                                          plan.delta_time_bias);
     if (!status)
         return status.error();
-    status = assign_required_tensor(weights,
-                                    layer_name + "attention.delta.decay_log",
-                                    {attention.head_count},
-                                    descriptor.activation_dtype,
-                                    plan.delta_decay_log);
+    status = assign_required_linear_tensor(weights,
+                                          layer_name + "attention.delta.decay_log",
+                                          {attention.head_count},
+                                          descriptor.activation_dtype,
+                                          plan.delta_decay_log);
     if (!status)
         return status.error();
-    status = assign_required_tensor(weights,
-                                    layer_name + "attention.delta.norm.weight",
-                                    {attention.value_head_dimension},
-                                    descriptor.activation_dtype,
-                                    plan.delta_norm_weight);
+    status = assign_required_linear_tensor(weights,
+                                          layer_name + "attention.delta.norm.weight",
+                                          {attention.value_head_dimension},
+                                          descriptor.activation_dtype,
+                                          plan.delta_norm_weight);
     if (!status)
         return status.error();
     return assign_required_linear_tensor(weights,

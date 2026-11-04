@@ -1,0 +1,86 @@
+#version 450
+
+// Per-head RMS norm and output gate for the gated delta rule. One workgroup owns
+// one value head so the reduction spans all value columns of that head.
+
+layout(binding = 0) readonly buffer fused_input_blob
+{
+    float fused_input[];
+};
+layout(binding = 1) readonly buffer norm_weight_blob
+{
+    float norm_weight[];
+};
+layout(binding = 2) buffer output_blob
+{
+    float output_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint convolution_size;
+    uint value_size;
+    uint fused_columns;
+    uint head_count;
+    uint kv_head_count;
+    uint head_dimension;
+    uint value_head_dimension;
+    uint kernel_size;
+    uint token_count;
+    float norm_epsilon;
+    uint sigmoid_gate;
+}
+p;
+
+float sigmoid(float value)
+{
+    if (value >= 0.0)
+        return 1.0 / (1.0 + exp(-value));
+    const float exponential = exp(value);
+    return exponential / (1.0 + exponential);
+}
+
+shared float partial_sum[128];
+
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint value_head = gl_WorkGroupID.x;
+
+    for (uint token = 0; token < p.token_count; ++token)
+    {
+        const uint input_row = token * p.fused_columns;
+        const uint output_base = token * p.value_size
+                                 + value_head * p.value_head_dimension;
+        float square_sum = 0.0;
+        for (uint value_column = lane;
+             value_column < p.value_head_dimension;
+             value_column += 128)
+        {
+            const float value = output_data[output_base + value_column];
+            square_sum += value * value;
+        }
+        partial_sum[lane] = square_sum;
+        barrier();
+        for (uint stride = 64; stride > 0; stride >>= 1)
+        {
+            if (lane < stride)
+                partial_sum[lane] += partial_sum[lane + stride];
+            barrier();
+        }
+        const float inverse_rms = 1.0 / sqrt(partial_sum[0] / float(p.value_head_dimension) + p.norm_epsilon);
+        const uint gate_base = input_row + p.convolution_size;
+        for (uint value_column = lane;
+             value_column < p.value_head_dimension;
+             value_column += 128)
+        {
+            const float gate = fused_input[gate_base
+                                           + value_head * p.value_head_dimension
+                                           + value_column];
+            output_data[output_base + value_column] *= inverse_rms
+                                                       * norm_weight[value_column]
+                                                       * (p.sigmoid_gate != 0 ? sigmoid(gate) : gate * sigmoid(gate));
+        }
+        barrier();
+    }
+}

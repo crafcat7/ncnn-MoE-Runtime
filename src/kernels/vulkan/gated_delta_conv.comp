@@ -1,0 +1,65 @@
+#version 450
+
+// Causal convolution and SiLU for the gated delta rule. Each workgroup owns 128
+// convolution channels: every channel keeps its own history, so shifting the
+// window and applying the kernel is independent across channels while the token
+// loop stays in order. The query/key RMS norm runs in gated_delta_qk.comp
+// because it reduces across the columns of each head.
+
+layout(binding = 0) buffer fused_input_blob
+{
+    float fused_input[];
+};
+layout(binding = 1) buffer convolution_state_blob
+{
+    float convolution_state[];
+};
+layout(binding = 2) readonly buffer convolution_weight_blob
+{
+    float convolution_weight[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint convolution_size;
+    uint value_size;
+    uint fused_columns;
+    uint head_count;
+    uint kv_head_count;
+    uint head_dimension;
+    uint value_head_dimension;
+    uint kernel_size;
+    uint token_count;
+    float norm_epsilon;
+    uint sigmoid_gate;
+}
+p;
+
+float sigmoid(float value)
+{
+    if (value >= 0.0)
+        return 1.0 / (1.0 + exp(-value));
+    const float exponential = exp(value);
+    return exponential / (1.0 + exponential);
+}
+
+void main()
+{
+    const uint channel = gl_WorkGroupID.x * 128 + gl_LocalInvocationID.x;
+    if (channel >= p.convolution_size)
+        return;
+    const uint state_base = channel * p.kernel_size;
+
+    for (uint token = 0; token < p.token_count; ++token)
+    {
+        const uint row = token * p.fused_columns + channel;
+        for (uint tap = 0; tap + 1 < p.kernel_size; ++tap)
+            convolution_state[state_base + tap] = convolution_state[state_base + tap + 1];
+        convolution_state[state_base + p.kernel_size - 1] = fused_input[row];
+        float sum = 0.0;
+        for (uint tap = 0; tap < p.kernel_size; ++tap)
+            sum += convolution_state[state_base + tap]
+                   * convolution_weight[state_base + tap];
+        fused_input[row] = sum * sigmoid(sum);
+    }
+}

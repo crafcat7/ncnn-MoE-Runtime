@@ -785,6 +785,18 @@ static const char qwen38_unsloth_template[] = R"QWEN38U({%- set image_count = na
 {%- endif %}
 {#- Unsloth fixes - developer role, merged system messages, tool calling #})QWEN38U";
 
+// Qwen3.5 dense keeps the Qwen3.6 message framing but changes the thinking
+// history rule, tool-argument serialization, and generation prompt. The native
+// encoder supports only string messages, so identify this revision by its
+// distinguishing fragments instead of embedding another template copy.
+static bool is_qwen35_chat(std::string_view chat)
+{
+    return chat.find("(preserve_thinking is defined and preserve_thinking is true)") == std::string_view::npos
+           && chat.find("loop.index0 > ns.last_query_index") != std::string_view::npos
+           && chat.find("args_value | tojson | safe if args_value is mapping") != std::string_view::npos
+           && chat.find("enable_thinking is defined and enable_thinking is true") != std::string_view::npos;
+}
+
 struct Tokenizer::EncodeScratch
 {
     struct Choice
@@ -918,24 +930,8 @@ bool Tokenizer::load_gguf_impl(const std::string& model_path, size_t vocabulary_
         }
         else if (*architecture != "qwen4exp")
         {
-            bool supported = *chat == std::string_view(qwen36_template, sizeof(qwen36_template) - 1);
-            if (!supported && *architecture == "qwen35")
-            {
-                std::string dense_template(qwen36_template, sizeof(qwen36_template) - 1);
-                const std::pair<std::string_view, std::string_view> differences[] = {
-                    {"(preserve_thinking is defined and preserve_thinking is true) or (loop.index0 > ns.last_query_index)", "loop.index0 > ns.last_query_index"},
-                    {"args_value | string if args_value is string else args_value | tojson | safe", "args_value | tojson | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string"},
-                };
-                for (const auto& difference : differences)
-                {
-                    const size_t position = dense_template.find(difference.first);
-                    if (position == std::string::npos)
-                        return false;
-                    dense_template.replace(position, difference.first.size(), difference.second);
-                }
-                supported = *chat == dense_template;
-            }
-            if (supported)
+            if (*chat == std::string_view(qwen36_template, sizeof(qwen36_template) - 1)
+                || (*architecture == "qwen35" && is_qwen35_chat(*chat)))
                 new_family = Family::Qwen36;
         }
         // Architecture and the BPE profile do not identify a chat revision.
@@ -1267,25 +1263,8 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
         const bool qwen38_chat = new_merge_leading_system_messages || template_file == std::string_view(qwen38_template, sizeof(qwen38_template) - 1);
         bool supported_template = qwen38_chat
                                   || (new_family == Family::Qwen36
-                                      && template_file == std::string_view(qwen36_template, sizeof(qwen36_template) - 1));
-        if (!supported_template && model_type == "qwen3_5")
-        {
-            // Qwen3.5 has the same string-message behavior with the default
-            // preserve_thinking value. Tool-call objects are outside this API.
-            std::string dense_template(qwen36_template, sizeof(qwen36_template) - 1);
-            const std::pair<std::string_view, std::string_view> differences[] = {
-                {"(preserve_thinking is defined and preserve_thinking is true) or (loop.index0 > ns.last_query_index)", "loop.index0 > ns.last_query_index"},
-                {"args_value | string if args_value is string else args_value | tojson | safe", "args_value | tojson | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string"},
-            };
-            for (const auto& difference : differences)
-            {
-                const size_t position = dense_template.find(difference.first);
-                if (position == std::string::npos)
-                    return false;
-                dense_template.replace(position, difference.first.size(), difference.second);
-            }
-            supported_template = template_file == dense_template;
-        }
+                                      && (template_file == std::string_view(qwen36_template, sizeof(qwen36_template) - 1)
+                                          || (model_type == "qwen3_5" && is_qwen35_chat(template_file))));
         if (!supported_template || !config_template || *config_template != template_file)
             return false;
         if (qwen38_chat)

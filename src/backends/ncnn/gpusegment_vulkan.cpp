@@ -217,8 +217,7 @@ bool GpuSegment_vulkan::supports(const CompiledModel& model, const CompiledLayer
     {
         const auto& operation = model.operators.at(layer.dense_ffn.vulkan_operator).qnk_expert;
         if (layer.dense_ffn.use_gpu_cache || !operation || !operation->vulkan_context()
-            || model.speculative.enabled() || layer.attention.kind != AttentionKind::Standard
-            || has_flag(layer.attention.flags, AttentionBlockQsa)
+            || model.speculative.enabled()
             || !segment_norm_supported(model, layer.dense_pre_ffn_norm_weight, layer.dense_pre_ffn_norm_bias,
                                        model.descriptor.hidden_size)) return false;
     }
@@ -1163,7 +1162,8 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
         const bool dense = model.graph.layer_plans[layer].dense_ffn.down_weight != invalid_tensor_handle;
         if (dense)
         {
-            if (!segment->d->dense || !segment->d->attention || segment->d->dense->context() != context
+            const bool attention_ready = segment->d->attention || segment->d->delta || segment->d->qsa;
+            if (!segment->d->dense || !attention_ready || segment->d->dense->context() != context
                 || (!model.gpu_expert_banks.empty() && model.gpu_expert_banks[layer]))
             {
                 error = "resident graph chain has incompatible dense operators";

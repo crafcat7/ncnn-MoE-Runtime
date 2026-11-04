@@ -853,7 +853,10 @@ static Result<void> validate_sampling_options(const SamplingOptions& opt)
     return {};
 }
 
-// Return the final sum so ordinary sampling can normalize only the scanned prefix.
+// Top-p truncation starts from a bounded candidate set that doubles while the
+// unselected tokens could still carry top_p mass; flat distributions fall back to
+// the full vocabulary. Ranked ids exist only for a strict subset or for ordering,
+// so selection is one logits scan and its softmax maximum comes from that set.
 static Result<float> sampling_distribution_into(std::span<const float> logits,
                                                 const SamplingOptions& opt,
                                                 std::vector<SampledToken>& candidates,
@@ -861,15 +864,6 @@ static Result<float> sampling_distribution_into(std::span<const float> logits,
                                                 std::vector<float>& exp_values)
 {
     candidates.clear();
-
-    float maximum_logit = -std::numeric_limits<float>::infinity();
-    for (float logit : logits)
-    {
-        if (std::isfinite(logit))
-            maximum_logit = std::max(maximum_logit, logit);
-    }
-    if (!std::isfinite(maximum_logit))
-        return Error{ErrorCode::InvalidArgument, "sampling requires at least one finite logit"};
 
     const auto logit_order = [logits](int32_t left, int32_t right) {
         const bool left_finite = std::isfinite(logits[left]);
@@ -885,70 +879,107 @@ static Result<float> sampling_distribution_into(std::span<const float> logits,
 
     const bool has_top_k = opt.top_k > 0 && opt.top_k < logits.size();
     const bool needs_order = opt.top_p < 1.0f;
-    const bool direct_ids = !has_top_k && !needs_order;
+    size_t keep = logits.size();
     if (has_top_k)
-    {
-        token_ids.resize(opt.top_k);
-        std::iota(token_ids.begin(), token_ids.end(), 0);
-        std::make_heap(token_ids.begin(), token_ids.end(), logit_order);
-        for (size_t token_id = opt.top_k; token_id < logits.size(); ++token_id)
-        {
-            const int32_t candidate = static_cast<int32_t>(token_id);
-            if (logit_order(candidate, token_ids.front()))
-            {
-                std::pop_heap(token_ids.begin(), token_ids.end(), logit_order);
-                token_ids.back() = candidate;
-                std::push_heap(token_ids.begin(), token_ids.end(), logit_order);
-            }
-        }
-        if (needs_order)
-            std::sort(token_ids.begin(), token_ids.end(), logit_order);
-    }
+        keep = opt.top_k;
     else if (needs_order)
-    {
-        token_ids.resize(logits.size());
-        std::iota(token_ids.begin(), token_ids.end(), 0);
-        std::sort(token_ids.begin(), token_ids.end(), logit_order);
-    }
+        keep = std::min(logits.size(), size_t{64});
+    const bool indexed = needs_order || keep < logits.size();
+    const auto id_at = [&](size_t index) {
+        return indexed ? token_ids[index] : static_cast<int32_t>(index);
+    };
 
-    const size_t token_count = direct_ids ? logits.size() : token_ids.size();
-    exp_values.resize(token_count);
-    candidates.reserve(token_count);
-    const float maximum = maximum_logit / opt.temperature;
-    for (size_t token_index = 0; token_index < token_count; ++token_index)
+    float maximum_logit = -std::numeric_limits<float>::infinity();
+    if (!indexed)
     {
-        const int32_t token_id = direct_ids ? static_cast<int32_t>(token_index)
-                                            : token_ids[token_index];
-        const float logit = logits[token_id];
-        exp_values[token_index] = std::isfinite(logit)
-                                      ? logit / opt.temperature - maximum
-                                      : 0.0f;
-    }
-    const size_t max_exp_count = static_cast<size_t>(std::numeric_limits<uint32_t>::max() - 16u);
-    for (size_t offset = 0; offset < exp_values.size();)
-    {
-        const size_t count = std::min(exp_values.size() - offset,
-                                      max_exp_count);
-        // Leave room for the 16-wide kernel's index + width checks.
-        float_exp_inplace(exp_values.data() + offset,
-                          static_cast<uint32_t>(count));
-        offset += count;
+        for (float logit : logits)
+        {
+            if (std::isfinite(logit))
+                maximum_logit = std::max(maximum_logit, logit);
+        }
     }
 
     float normalizer = 0.0f;
-    for (size_t token_index = 0; token_index < token_count; ++token_index)
+    for (;;)
     {
-        const int32_t token_id = direct_ids ? static_cast<int32_t>(token_index)
-                                            : token_ids[token_index];
-        const float logit = logits[token_id];
-        if (!std::isfinite(logit))
-            continue;
-        const float probability = exp_values[token_index];
-        candidates.push_back(SampledToken{token_id, probability});
-        normalizer += probability;
+        if (indexed)
+        {
+            token_ids.resize(keep);
+            std::iota(token_ids.begin(), token_ids.end(), 0);
+            if (keep < logits.size())
+            {
+                std::make_heap(token_ids.begin(), token_ids.end(), logit_order);
+                for (size_t token_id = keep; token_id < logits.size(); ++token_id)
+                {
+                    const int32_t candidate = static_cast<int32_t>(token_id);
+                    if (logit_order(candidate, token_ids.front()))
+                    {
+                        std::pop_heap(token_ids.begin(), token_ids.end(), logit_order);
+                        token_ids.back() = candidate;
+                        std::push_heap(token_ids.begin(), token_ids.end(), logit_order);
+                    }
+                }
+            }
+            if (needs_order)
+                std::sort(token_ids.begin(), token_ids.end(), logit_order);
+            // The best finite logit always survives selection, so the softmax
+            // maximum does not need a separate full-vocabulary scan.
+            maximum_logit = -std::numeric_limits<float>::infinity();
+            for (const int32_t token_id : token_ids)
+            {
+                const float logit = logits[token_id];
+                if (std::isfinite(logit))
+                    maximum_logit = std::max(maximum_logit, logit);
+            }
+        }
+        if (!std::isfinite(maximum_logit))
+            return Error{ErrorCode::InvalidArgument, "sampling requires at least one finite logit"};
+
+        const size_t token_count = indexed ? keep : logits.size();
+        const float maximum = maximum_logit / opt.temperature;
+        exp_values.resize(token_count);
+        for (size_t token_index = 0; token_index < token_count; ++token_index)
+        {
+            const int32_t token_id = id_at(token_index);
+            const float logit = logits[token_id];
+            exp_values[token_index] = std::isfinite(logit)
+                                          ? logit / opt.temperature - maximum
+                                          : 0.0f;
+        }
+        const size_t max_exp_count = static_cast<size_t>(std::numeric_limits<uint32_t>::max() - 16u);
+        for (size_t offset = 0; offset < exp_values.size();)
+        {
+            const size_t count = std::min(exp_values.size() - offset, max_exp_count);
+            // Leave room for the 16-wide kernel's index + width checks.
+            float_exp_inplace(exp_values.data() + offset, static_cast<uint32_t>(count));
+            offset += count;
+        }
+
+        candidates.reserve(token_count);
+        normalizer = 0.0f;
+        for (size_t token_index = 0; token_index < token_count; ++token_index)
+        {
+            const int32_t token_id = id_at(token_index);
+            if (!std::isfinite(logits[token_id]))
+                continue;
+            const float probability = exp_values[token_index];
+            candidates.push_back(SampledToken{token_id, probability});
+            normalizer += probability;
+        }
+        if (candidates.empty() || !std::isfinite(normalizer) || normalizer <= 0.0f)
+            return Error{ErrorCode::InvalidArgument, "sampling distribution is invalid"};
+
+        if (!needs_order || has_top_k || keep >= logits.size())
+            break;
+        // Unselected tokens are bounded by the weakest selected logit, so their
+        // total mass cannot exceed (V - K) * exp(worst - best). Grow the set
+        // only when that bound could still contain top_p mass.
+        const float tail = static_cast<float>(logits.size() - keep) * candidates.back().probability;
+        if (tail <= (1.0f - opt.top_p) * normalizer)
+            break;
+        keep = std::min(logits.size(), keep * 2);
     }
-    if (candidates.empty() || !std::isfinite(normalizer) || normalizer <= 0.0f)
-        return Error{ErrorCode::InvalidArgument, "sampling distribution is invalid"};
+
     for (SampledToken& candidate : candidates)
         candidate.probability /= normalizer;
 
@@ -958,13 +989,13 @@ static Result<float> sampling_distribution_into(std::span<const float> logits,
         for (const SampledToken& candidate : candidates)
             maximum_probability = std::max(maximum_probability, candidate.probability);
         const float threshold = maximum_probability * opt.min_p;
-        size_t count = 0;
+        size_t kept = 0;
         for (const SampledToken& candidate : candidates)
         {
             if (candidate.probability >= threshold)
-                candidates[count++] = candidate;
+                candidates[kept++] = candidate;
         }
-        candidates.resize(count);
+        candidates.resize(kept);
     }
 
     if (opt.top_p < 1.0f)

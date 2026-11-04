@@ -1,0 +1,67 @@
+#version 450
+
+// Query/key RMS norm for the gated delta rule. One workgroup owns one key head
+// and lanes cover its columns, so the reduction is a workgroup tree instead of a
+// serial lane loop.
+
+layout(binding = 0) buffer fused_input_blob
+{
+    float fused_input[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint convolution_size;
+    uint value_size;
+    uint fused_columns;
+    uint head_count;
+    uint kv_head_count;
+    uint head_dimension;
+    uint value_head_dimension;
+    uint kernel_size;
+    uint token_count;
+    float norm_epsilon;
+    uint sigmoid_gate;
+}
+p;
+
+shared float query_sum[128];
+shared float key_sum[128];
+
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint key_head = gl_WorkGroupID.x;
+    const uint key_size = p.kv_head_count * p.head_dimension;
+    const bool valid = lane < p.head_dimension;
+
+    for (uint token = 0; token < p.token_count; ++token)
+    {
+        const uint input_row = token * p.fused_columns;
+        const uint query_base = input_row + key_head * p.head_dimension;
+        const uint key_base = input_row + key_size + key_head * p.head_dimension;
+
+        const float query = valid ? fused_input[query_base + lane] : 0.0;
+        const float key = valid ? fused_input[key_base + lane] : 0.0;
+        query_sum[lane] = query * query;
+        key_sum[lane] = key * key;
+        barrier();
+        for (uint stride = 64; stride > 0; stride >>= 1)
+        {
+            if (lane < stride)
+            {
+                query_sum[lane] += query_sum[lane + stride];
+                key_sum[lane] += key_sum[lane + stride];
+            }
+            barrier();
+        }
+        const float query_inverse = 1.0 / sqrt(query_sum[0] + 1e-6);
+        const float key_inverse = 1.0 / sqrt(key_sum[0] + 1e-6);
+        if (valid)
+        {
+            fused_input[query_base + lane] *= query_inverse;
+            fused_input[key_base + lane] *= key_inverse;
+        }
+        barrier();
+    }
+}
