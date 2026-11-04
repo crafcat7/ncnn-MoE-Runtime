@@ -39,6 +39,7 @@ struct ExpertDispatchOptions
     RouterScoreFunction score_function = RouterScoreFunction::Softmax;
     RouterNormalization normalization = RouterNormalization::SelectedExperts;
     float routed_scaling_factor = 1.0f;
+    float jitter = 0.0f;
     std::span<const float> selection_bias;
     std::span<const uint32_t> explicit_expert_ids;
 };

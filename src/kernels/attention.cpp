@@ -1683,7 +1683,16 @@ Result<void> append_attention_context(const WeightStore& weights,
                                             ? &scratch.quantized_input
                                             : nullptr;
     const ActivationBuffer* normalized = &hidden;
-    if (plan.pre_attention_norm_weight != invalid_tensor_handle)
+    if (plan.pre_attention_norm_bias != invalid_tensor_handle)
+    {
+        forward_layer_norm(hidden,
+                           weights.at(plan.pre_attention_norm_weight),
+                           weights.at(plan.pre_attention_norm_bias),
+                           plan.norm_epsilon,
+                           scratch.normalized);
+        normalized = &scratch.normalized;
+    }
+    else if (plan.pre_attention_norm_weight != invalid_tensor_handle)
     {
         forward_rms_norm(hidden,
                          weights.at(plan.pre_attention_norm_weight),
@@ -1887,7 +1896,16 @@ Result<void> forward_attention(const WeightStore& weights,
                                             ? &scratch.quantized_input
                                             : nullptr;
     const ActivationBuffer* normalized = &hidden;
-    if (plan.pre_attention_norm_weight != invalid_tensor_handle)
+    if (plan.pre_attention_norm_bias != invalid_tensor_handle)
+    {
+        forward_layer_norm(hidden,
+                           weights.at(plan.pre_attention_norm_weight),
+                           weights.at(plan.pre_attention_norm_bias),
+                           plan.norm_epsilon,
+                           scratch.normalized);
+        normalized = &scratch.normalized;
+    }
+    else if (plan.pre_attention_norm_weight != invalid_tensor_handle)
     {
         forward_rms_norm(hidden,
                          weights.at(plan.pre_attention_norm_weight),

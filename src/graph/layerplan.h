@@ -64,6 +64,7 @@ struct AttentionBlockPlan
 
     // Projection and normalization weights.
     TensorHandle pre_attention_norm_weight = invalid_tensor_handle;
+    TensorHandle pre_attention_norm_bias = invalid_tensor_handle;
     TensorHandle query_weight = invalid_tensor_handle;
     TensorHandle query_bias = invalid_tensor_handle;
     TensorHandle query_norm_weight = invalid_tensor_handle;
@@ -183,6 +184,7 @@ struct PleBlockPlan
 struct MoeBlockPlan
 {
     TensorHandle pre_ffn_norm_weight = invalid_tensor_handle;
+    TensorHandle pre_ffn_norm_bias = invalid_tensor_handle;
     TensorHandle router_weight = invalid_tensor_handle;
     TensorHandle router_bias = invalid_tensor_handle;
     TensorHandle router_selection_bias = invalid_tensor_handle;
@@ -196,6 +198,7 @@ struct MoeBlockPlan
     RouterScoreFunction score_function = RouterScoreFunction::Softmax;
     RouterNormalization normalization = RouterNormalization::SelectedExperts;
     float routed_scaling_factor = 1.0f;
+    float jitter = 0.0f;
     bool has_shared_expert = false;
 };
 
@@ -210,6 +213,7 @@ struct CompiledLayerPlan
     PleBlockPlan ple;
     MoeBlockPlan moe;
     TensorHandle dense_pre_ffn_norm_weight = invalid_tensor_handle;
+    TensorHandle dense_pre_ffn_norm_bias = invalid_tensor_handle;
     ExpertPlan dense_ffn;
 };
 

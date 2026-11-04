@@ -3,6 +3,7 @@
 #include "expertbank_vulkan.h"
 #include "gateddeltanet_vulkan.h"
 #include "qsaattention_vulkan.h"
+#include "layernorm_vulkan.h"
 #include "linear.h"
 #include "modelpipeline.h"
 #include "rmsnorm_vulkan.h"
@@ -100,6 +101,7 @@ public:
     std::shared_ptr<QsaAttention_vulkan> qsa;
     std::shared_ptr<RmsNorm_vulkan> attention_norm;
     std::shared_ptr<RmsNorm_vulkan> ffn_norm;
+    std::shared_ptr<LayerNorm_vulkan> layer_norm;
     std::shared_ptr<Router_vulkan> router;
     std::shared_ptr<SharedFfn_vulkan> shared;
     std::shared_ptr<SharedFfn_vulkan> dense;
@@ -189,6 +191,12 @@ static bool segment_float_vector(const CompiledModel& model, TensorHandle handle
                || (value.dtype == DType::BFloat16 && value.bfloat16_values().size() == columns));
 }
 
+static bool segment_norm_supported(const CompiledModel& model, TensorHandle weight, TensorHandle bias, uint32_t columns) noexcept
+{
+    return segment_float_vector(model, weight, columns)
+           && (bias == invalid_tensor_handle || segment_float_vector(model, bias, columns));
+}
+
 static bool reset_segment_command(VulkanTransferSlot& slot)
 {
     if (slot.command_used && slot.command->reset() != 0) return false;
@@ -211,12 +219,14 @@ bool GpuSegment_vulkan::supports(const CompiledModel& model, const CompiledLayer
         if (layer.dense_ffn.use_gpu_cache || !operation || !operation->vulkan_context()
             || model.speculative.enabled() || layer.attention.kind != AttentionKind::Standard
             || has_flag(layer.attention.flags, AttentionBlockQsa)
-            || !segment_float_vector(model, layer.dense_pre_ffn_norm_weight, model.descriptor.hidden_size)) return false;
+            || !segment_norm_supported(model, layer.dense_pre_ffn_norm_weight, layer.dense_pre_ffn_norm_bias,
+                                       model.descriptor.hidden_size)) return false;
     }
     else
     {
         if (layer.moe.experts.empty() || layer.moe.top_k == 0 || layer.moe.top_k > 64 || layer.moe.experts.size() > 2048
-            || !segment_float_vector(model, layer.moe.pre_ffn_norm_weight, model.descriptor.hidden_size)
+            || !segment_norm_supported(model, layer.moe.pre_ffn_norm_weight, layer.moe.pre_ffn_norm_bias,
+                                       model.descriptor.hidden_size)
             || layer.moe.router_weight >= model.weights.size()) return false;
         const auto& router = model.weights.at(layer.moe.router_weight);
         if (router.shape.size() != 2 || router.shape[0] != layer.moe.experts.size()
@@ -247,7 +257,8 @@ bool GpuSegment_vulkan::supports_head(const CompiledModel& model) noexcept
     if (model.opt.hybrid_mode != HybridMode::HybridExperts || !has_flag(model.opt.optimization_flags, OptimizationVulkanCommandGraph)
         || model.descriptor.hyper_connection_kind != HyperConnectionKind::None
         || model.descriptor.hyper_connection_multiplier != 1
-        || !segment_float_vector(model, model.final_norm_weight, model.descriptor.hidden_size)) return false;
+        || !segment_norm_supported(model, model.final_norm_weight, model.final_norm_bias,
+                                   model.descriptor.hidden_size)) return false;
     const auto& operation = model.operators.at_weight(model.lm_head_weight);
     if (operation.qnk) return operation.qnk->vulkan_context() && vulkan_activation_storage_variant(operation.qnk->option()) == 0;
     if (operation.float8) return operation.float8->vulkan_context() && vulkan_activation_storage_variant(operation.float8->option()) == 0;
@@ -292,12 +303,26 @@ std::shared_ptr<GpuSegment_vulkan> GpuSegment_vulkan::create(const CompiledModel
     }
     impl.hidden = model.descriptor.hidden_size;
     const auto& limits = impl.context->device()->info.physicalDeviceProperties().limits;
-    impl.add_norm = limits.maxPerStageDescriptorStorageBuffers >= 5
-                    && limits.maxDescriptorSetStorageBuffers >= 5;
     const bool dense = layer.dense_ffn.down_weight != invalid_tensor_handle;
-    impl.ffn_norm = RmsNorm_vulkan::create(model.weights.at(dense ? layer.dense_pre_ffn_norm_weight : layer.moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon,
-                                           model.descriptor.norm_weight_offset, impl.context, impl.option,
-                                           nullptr, impl.add_norm);
+    const TensorHandle ffn_norm_weight = dense ? layer.dense_pre_ffn_norm_weight : layer.moe.pre_ffn_norm_weight;
+    const TensorHandle ffn_norm_bias = dense ? layer.dense_pre_ffn_norm_bias : layer.moe.pre_ffn_norm_bias;
+    const bool use_layer_norm = ffn_norm_bias != invalid_tensor_handle;
+    impl.add_norm = !use_layer_norm
+                    && limits.maxPerStageDescriptorStorageBuffers >= 5
+                    && limits.maxDescriptorSetStorageBuffers >= 5;
+    if (use_layer_norm)
+    {
+        impl.layer_norm = LayerNorm_vulkan::create(model.weights.at(ffn_norm_weight),
+                                                   model.weights.at(ffn_norm_bias),
+                                                   model.descriptor.norm_epsilon,
+                                                   impl.context, impl.option);
+    }
+    else
+    {
+        impl.ffn_norm = RmsNorm_vulkan::create(model.weights.at(ffn_norm_weight), model.descriptor.norm_epsilon,
+                                               model.descriptor.norm_weight_offset, impl.context, impl.option,
+                                               nullptr, impl.add_norm);
+    }
     if (dense)
         impl.dense = SharedFfn_vulkan::create(model, layer.dense_ffn);
     else
@@ -309,7 +334,7 @@ std::shared_ptr<GpuSegment_vulkan> GpuSegment_vulkan::create(const CompiledModel
         if (layer.moe.has_shared_expert) impl.shared = SharedFfn_vulkan::create(model, layer.moe);
     }
     impl.add = segment_add(impl.context, impl.option);
-    if (!impl.ffn_norm || !impl.add
+    if ((!impl.ffn_norm && !impl.layer_norm) || !impl.add
         || (dense ? !impl.dense || impl.dense->context() != impl.context
                   : !impl.router || impl.router->context() != impl.context)
         || (layer.moe.has_shared_expert && (!impl.shared || impl.shared->context() != impl.context))) return {};
@@ -351,10 +376,20 @@ std::shared_ptr<GpuSegment_vulkan> GpuSegment_vulkan::create_head(const Compiled
         impl.option = impl.lm_head.linear->option();
     }
     impl.option.use_packing_layout = false;
-    impl.ffn_norm = RmsNorm_vulkan::create(model.weights.at(model.final_norm_weight), model.descriptor.norm_epsilon,
-                                           model.descriptor.norm_weight_offset, impl.context, impl.option);
+    if (model.final_norm_bias != invalid_tensor_handle)
+    {
+        impl.layer_norm = LayerNorm_vulkan::create(model.weights.at(model.final_norm_weight),
+                                                   model.weights.at(model.final_norm_bias),
+                                                   model.descriptor.norm_epsilon,
+                                                   impl.context, impl.option);
+    }
+    else
+    {
+        impl.ffn_norm = RmsNorm_vulkan::create(model.weights.at(model.final_norm_weight), model.descriptor.norm_epsilon,
+                                               model.descriptor.norm_weight_offset, impl.context, impl.option);
+    }
     impl.add = segment_add(impl.context, impl.option);
-    if (!impl.ffn_norm || !impl.add) return {};
+    if ((!impl.ffn_norm && !impl.layer_norm) || !impl.add) return {};
     return result;
 #else
     (void)model;
@@ -622,7 +657,10 @@ public:
             if (d->add->forward({input, branch}, added, command, d->option) != 0 || added[0].empty()) return fail("cannot record Attention residual");
             residual = added[0];
             ++ffn_statistics.dispatches;
-            if (!d->ffn_norm->record(residual, normalized, command))
+            const bool norm_recorded = d->layer_norm
+                                           ? d->layer_norm->record(residual, normalized, command)
+                                           : d->ffn_norm->record(residual, normalized, command);
+            if (!norm_recorded)
                 return fail("cannot record Vulkan FFN norm");
         }
         if (d->dense) return true;
@@ -682,9 +720,12 @@ public:
             }
             else
             {
-                if (!d->ffn_norm->record(input, normalized, command))
+                const bool norm_recorded = d->layer_norm
+                                               ? d->layer_norm->record(input, normalized, command)
+                                               : d->ffn_norm->record(input, normalized, command);
+                if (!norm_recorded)
                 {
-                    error = "cannot record final Vulkan RMSNorm";
+                    error = "cannot record final Vulkan normalization";
                     return false;
                 }
                 if (d->lm_head.qnk)

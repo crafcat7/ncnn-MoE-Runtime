@@ -111,7 +111,8 @@ Result<void> validate_model_descriptor(const MoeModelDescriptor& descriptor)
                 return Error{ErrorCode::InvalidModel, "model descriptor layer has unknown MoE flags"};
             if (moe.score_function != RouterScoreFunction::Softmax
                 && moe.score_function != RouterScoreFunction::Sigmoid
-                && moe.score_function != RouterScoreFunction::SqrtSoftplus)
+                && moe.score_function != RouterScoreFunction::SqrtSoftplus
+                && moe.score_function != RouterScoreFunction::SparseMixer)
                 return Error{ErrorCode::InvalidModel, "model descriptor layer has an invalid router score function"};
             if (moe.activation != ExpertActivation::Relu
                 && moe.activation != ExpertActivation::Silu
@@ -862,6 +863,15 @@ static Result<void> compile_standard_attention(const WeightStore& weights, const
         if (!ret)
             return ret.error();
     }
+    else if (layer.pre_attention_norm == NormType::LayerNorm)
+    {
+        ret = assign_required_tensor(weights, layer_name + "pre_attention_norm.weight", {descriptor.hidden_size}, descriptor.activation_dtype, plan.pre_attention_norm_weight);
+        if (!ret)
+            return ret.error();
+        ret = assign_required_tensor(weights, layer_name + "pre_attention_norm.bias", {descriptor.hidden_size}, descriptor.activation_dtype, plan.pre_attention_norm_bias);
+        if (!ret)
+            return ret.error();
+    }
     ret = assign_required_linear_tensor(weights, layer_name + "attention.query.weight", {query_size, descriptor.hidden_size}, descriptor.activation_dtype, plan.query_weight);
     if (!ret)
         return ret.error();
@@ -1582,6 +1592,7 @@ static Result<void> compile_speculative_model(CompiledModel& compiled,
         layer_plan.moe.score_function = moe.score_function;
         layer_plan.moe.normalization = RouterNormalization::SelectedExperts;
         layer_plan.moe.routed_scaling_factor = moe.routed_scaling_factor;
+        layer_plan.moe.jitter = moe.jitter;
         layer_plan.moe.has_shared_expert = true;
 
         const uint32_t mix_count = (2 + multiplier) * multiplier;
@@ -1716,6 +1727,15 @@ static Result<void> compile_moe_layer(CompiledModel& compiled, const std::string
         if (!ret)
             return ret.error();
     }
+    else if (layer.pre_ffn_norm == NormType::LayerNorm)
+    {
+        auto ret = assign_required_tensor(compiled.weights, layer_name + "pre_ffn_norm.weight", {compiled.descriptor.hidden_size}, compiled.descriptor.activation_dtype, layer_plan.moe.pre_ffn_norm_weight);
+        if (!ret)
+            return ret.error();
+        ret = assign_required_tensor(compiled.weights, layer_name + "pre_ffn_norm.bias", {compiled.descriptor.hidden_size}, compiled.descriptor.activation_dtype, layer_plan.moe.pre_ffn_norm_bias);
+        if (!ret)
+            return ret.error();
+    }
 
     auto ret = assign_required_linear_tensor(compiled.weights, layer_name + "router.weight", {moe.expert_count, compiled.descriptor.hidden_size}, compiled.descriptor.activation_dtype, layer_plan.moe.router_weight);
     if (!ret)
@@ -1829,6 +1849,14 @@ static Result<void> compile_dense_layer(CompiledModel& compiled, const std::stri
                                          layer_plan.dense_pre_ffn_norm_weight);
     if (!status)
         return status.error();
+    if (layer.pre_ffn_norm == NormType::LayerNorm)
+    {
+        status = assign_required_tensor(compiled.weights, layer_name + "pre_ffn_norm.bias",
+                                        {hidden_size}, compiled.descriptor.activation_dtype,
+                                        layer_plan.dense_pre_ffn_norm_bias);
+        if (!status)
+            return status.error();
+    }
     ExpertPlan& ffn = layer_plan.dense_ffn;
     ffn.activation = layer.dense.activation;
     status = assign_required_linear_tensor(compiled.weights, layer_name + "ffn.gate.weight",
@@ -1992,6 +2020,17 @@ Result<void> compile_model(MoeModelDescriptor descriptor, WeightMapping mapping,
             return final_norm.error();
         compiled.final_norm_weight = final_norm.value();
     }
+    else if (compiled.descriptor.final_norm == NormType::LayerNorm)
+    {
+        auto final_norm = require_tensor(compiled.weights, "final_norm.weight", {compiled.descriptor.hidden_size}, compiled.descriptor.activation_dtype);
+        if (!final_norm)
+            return final_norm.error();
+        compiled.final_norm_weight = final_norm.value();
+        auto final_norm_bias = require_tensor(compiled.weights, "final_norm.bias", {compiled.descriptor.hidden_size}, compiled.descriptor.activation_dtype);
+        if (!final_norm_bias)
+            return final_norm_bias.error();
+        compiled.final_norm_bias = final_norm_bias.value();
+    }
     else if (compiled.descriptor.final_norm != NormType::None)
     {
         return Error{ErrorCode::UnsupportedModel, "unsupported final normalization"};
@@ -2001,6 +2040,13 @@ Result<void> compile_model(MoeModelDescriptor descriptor, WeightMapping mapping,
     if (!lm_head)
         return lm_head.error();
     compiled.lm_head_weight = lm_head.value();
+    if (compiled.weights.find_handle("lm_head.bias") != invalid_tensor_handle)
+    {
+        auto lm_head_bias = require_tensor(compiled.weights, "lm_head.bias", {compiled.descriptor.vocabulary_size}, compiled.descriptor.activation_dtype);
+        if (!lm_head_bias)
+            return lm_head_bias.error();
+        compiled.lm_head_bias = lm_head_bias.value();
+    }
     if (compiled.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
     {
         const uint32_t hyper_columns = compiled.descriptor.hyper_connection_multiplier * compiled.descriptor.hidden_size;
@@ -2035,9 +2081,10 @@ Result<void> compile_model(MoeModelDescriptor descriptor, WeightMapping mapping,
         const LayerDescriptor& layer = compiled.descriptor.layers[layer_id];
         const MoeDescriptor& moe = layer.moe;
         if (layer.pre_ffn_norm != NormType::RmsNorm
+            && layer.pre_ffn_norm != NormType::LayerNorm
             && !(compiled.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual
                  && layer.pre_ffn_norm == NormType::None))
-            return Error{ErrorCode::UnsupportedModel, "the reference runtime requires RMSNorm before each MoE block"};
+            return Error{ErrorCode::UnsupportedModel, "the reference runtime requires RMSNorm or LayerNorm before each MoE block"};
         if (has_flag(moe.flags, MoeDescriptorSharedExpertGate)
             && moe.shared_expert_count == 0)
         {
@@ -2063,6 +2110,7 @@ Result<void> compile_model(MoeModelDescriptor descriptor, WeightMapping mapping,
         layer_plan.moe.score_function = moe.score_function;
         layer_plan.moe.normalization = moe.normalization;
         layer_plan.moe.routed_scaling_factor = moe.routed_scaling_factor;
+        layer_plan.moe.jitter = moe.jitter;
         layer_plan.moe.has_shared_expert = moe.shared_expert_count != 0;
 
         const std::string layer_name = layer_prefix(layer_id);
@@ -2107,9 +2155,10 @@ Result<void> compile_model(MoeModelDescriptor descriptor, WeightMapping mapping,
         {
             const AttentionDescriptor& attention = layer.attention;
             if (layer.pre_attention_norm != NormType::RmsNorm
+                && layer.pre_attention_norm != NormType::LayerNorm
                 && !(compiled.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual
                      && layer.pre_attention_norm == NormType::None))
-                return Error{ErrorCode::UnsupportedModel, "attention requires a pre-attention RMSNorm"};
+                return Error{ErrorCode::UnsupportedModel, "attention requires a pre-attention RMSNorm or LayerNorm"};
             AttentionBlockPlan& plan = layer_plan.attention;
             plan.norm_epsilon = compiled.descriptor.norm_epsilon;
             plan.kv_cache_dtype = compiled.descriptor.kv_cache_dtype;

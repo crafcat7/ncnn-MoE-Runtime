@@ -229,14 +229,18 @@ enum class DType
 enum class NormType
 {
     None,
-    RmsNorm
+    RmsNorm,
+    LayerNorm
 };
 
 enum class RouterScoreFunction
 {
     Softmax,
     Sigmoid,
-    SqrtSoftplus
+    SqrtSoftplus,
+    // PhiMoE sparse mixer: two sequential masked softmaxes over the
+    // top-1 and top-2 logits.
+    SparseMixer
 };
 
 enum class RouterNormalization

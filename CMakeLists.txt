@@ -64,6 +64,7 @@ set(NCNN_MOE_SOURCES
     src/backends/ncnn/qsaattention_vulkan.cpp
     src/backends/ncnn/hyperconnection_vulkan.cpp
     src/backends/ncnn/rmsnorm_vulkan.cpp
+    src/backends/ncnn/layernorm_vulkan.cpp
     src/backends/ncnn/router_vulkan.cpp
     src/backends/ncnn/layerhead_vulkan.cpp
     src/backends/ncnn/latentlayer_vulkan.cpp

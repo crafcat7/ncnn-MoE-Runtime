@@ -107,7 +107,9 @@ struct CompiledModel
     CompiledOperatorTable operators;
     TensorHandle token_embedding = invalid_tensor_handle;
     TensorHandle final_norm_weight = invalid_tensor_handle;
+    TensorHandle final_norm_bias = invalid_tensor_handle;
     TensorHandle lm_head_weight = invalid_tensor_handle;
+    TensorHandle lm_head_bias = invalid_tensor_handle;
     TensorHandle hyper_head_function = invalid_tensor_handle;
     TensorHandle hyper_head_base = invalid_tensor_handle;
     TensorHandle hyper_head_scale = invalid_tensor_handle;

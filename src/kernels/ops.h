@@ -116,6 +116,9 @@ void forward_gate_up_mxfp4(const TensorData& matrix, const TensorData* bias, con
 [[nodiscard]] ActivationBuffer forward_rms_norm(const ActivationBuffer& input, const TensorData& weight, float epsilon, float weight_offset);
 // Input and output may be the same buffer; each row's RMS is computed before writing it.
 void forward_rms_norm(const ActivationBuffer& input, const TensorData& weight, float epsilon, ActivationBuffer& output, float weight_offset);
+[[nodiscard]] ActivationBuffer forward_layer_norm(const ActivationBuffer& input, const TensorData& weight, const TensorData& bias, float epsilon);
+// Input and output may be the same buffer; each row's statistics are computed before writing it.
+void forward_layer_norm(const ActivationBuffer& input, const TensorData& weight, const TensorData& bias, float epsilon, ActivationBuffer& output);
 void add_bias_inplace(ActivationBuffer& destination, const TensorData& bias);
 void add_batch_inplace(ActivationBuffer& destination, const ActivationBuffer& source);
 
