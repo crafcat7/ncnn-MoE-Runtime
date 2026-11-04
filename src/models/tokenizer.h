@@ -71,7 +71,8 @@ private:
         Qwen3,
         Qwen36,
         Qwen38,
-        Phi
+        Phi,
+        Ling
     };
 
     bool load_impl(const std::string& model_directory, size_t vocabulary_size);

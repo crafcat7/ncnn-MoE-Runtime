@@ -201,6 +201,8 @@ class ModelAdapter:
             return "qwen3.6"
         if model_type == "phimoe":
             return "phimoe"
+        if model_type == "bailing_hybrid":
+            return "ling"
         raise AdapterError(f"unsupported model_type: {model_type or '<missing>'}")
 
     @staticmethod

@@ -45,6 +45,7 @@ coverage/
 /models/gpt-oss/gpt-oss-120b/
 /models/deepseek-v4/DeepSeek-V4-Flash/
 /models/deepseek-v4/DeepSeek-V4-Flash-DSpark/
+/models/ling/Ling-3.0-tiny/
 /weights/
 /downloads/
 *.safetensors

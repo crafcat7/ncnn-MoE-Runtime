@@ -68,7 +68,8 @@ public:
                                                std::span<const ExpertDispatchOptions> options,
                                                bool produce_logits, bool last_row_only,
                                                ActivationBuffer& logits, std::string& error,
-                                               GpuSegmentWorkspace_vulkan* workspace = nullptr);
+                                               GpuSegmentWorkspace_vulkan* workspace = nullptr,
+                                               uint32_t layer_limit = 0);
 
     // Prepare a private transaction before entering the Expert command lock.
     // The Region records it only in the wave that completes its aggregate.

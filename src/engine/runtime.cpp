@@ -10,6 +10,7 @@
 #include "models/modeladapter_qwen3_5.h"
 #include "models/modeladapter_qwen4exp.h"
 #include "models/modeladapter_phimoe.h"
+#include "models/modeladapter_ling.h"
 #include "models/tokenizer.h"
 #include "kernels/mxfp4.h"
 #include "kernels/float8.h"
@@ -148,6 +149,7 @@ Runtime::Runtime()
     register_adapter(std::make_shared<Qwen3_5MoeModelAdapter>());
     register_adapter(std::make_shared<Qwen4ExpModelAdapter>());
     register_adapter(std::make_shared<PhiMoeModelAdapter>());
+    register_adapter(std::make_shared<LingModelAdapter>());
 }
 
 void Runtime::register_adapter(std::shared_ptr<ModelAdapter> adapter)

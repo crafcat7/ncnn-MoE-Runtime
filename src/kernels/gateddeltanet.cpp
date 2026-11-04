@@ -202,7 +202,12 @@ static void forward_gated_delta_recurrence(const WeightStore& weights,
         float* memory_values = memory.data() + static_cast<size_t>(parallelize_value_heads ? value_head : 0) * plan.value_head_dimension;
         float* delta_values = delta.data() + static_cast<size_t>(parallelize_value_heads ? value_head : 0) * plan.value_head_dimension;
         const float decay_scale = -float_approximate_exp(gated_delta_tensor_value(decay_log, value_head));
-        const float time_bias_value = gated_delta_tensor_value(time_bias, value_head);
+        const bool bounded_gate = has_flag(plan.flags, AttentionBlockDeltaGate);
+        const uint32_t gate_channels = plan.delta_gate_channels;
+        const float gate_scale = bounded_gate
+                                     ? float_approximate_exp(gated_delta_tensor_value(decay_log, value_head))
+                                     : 0.0f;
+        const size_t gate_offset = static_cast<size_t>(value_head) * gate_channels;
         for (size_t token_index = 0; token_index < row_count; ++token_index)
         {
             const float* token_qkv = qkv + token_index * qkv_stride;
@@ -212,11 +217,14 @@ static void forward_gated_delta_recurrence(const WeightStore& weights,
             const float* value = token_qkv + key_size * 2
                                  + static_cast<size_t>(value_head) * plan.value_head_dimension;
             const float* token_beta = beta_values + token_index * beta_stride;
-            const float* token_alpha = alpha_values + token_index * alpha_stride;
+            const float* token_alpha = alpha_values + token_index * alpha_stride
+                                       + static_cast<size_t>(value_head) * gate_channels;
             const float beta = gated_delta_sigmoid(token_beta[value_head]);
-            const float decay = float_approximate_exp(decay_scale
-                                                      * gated_delta_softplus(token_alpha[value_head]
-                                                                             + time_bias_value));
+            const float scalar_decay = bounded_gate
+                                           ? 0.0f
+                                           : float_approximate_exp(decay_scale
+                                                                   * gated_delta_softplus(token_alpha[0]
+                                                                                          + gated_delta_tensor_value(time_bias, gate_offset)));
             float* head_output = recurrent_output
                                  + token_index * scratch.recurrent_output.columns()
                                  + static_cast<size_t>(value_head) * plan.value_head_dimension;
@@ -231,6 +239,10 @@ static void forward_gated_delta_recurrence(const WeightStore& weights,
                  key_column < plan.head_dimension;
                  ++key_column)
             {
+                const float decay = bounded_gate
+                                        ? float_approximate_exp(plan.delta_lower_bound
+                                                                * gated_delta_sigmoid(gate_scale * (token_alpha[key_column] + gated_delta_tensor_value(time_bias, gate_offset + key_column))))
+                                        : scalar_decay;
                 float_scale_inplace_and_scaled_add(recurrent
                                                        + static_cast<size_t>(key_column)
                                                              * plan.value_head_dimension,
@@ -401,7 +413,8 @@ Result<void> forward_gated_delta(const WeightStore& weights,
     const uint32_t key_size = plan.kv_head_count * plan.head_dimension;
     const uint32_t value_size = plan.head_count * plan.value_head_dimension;
     const uint32_t convolution_size = key_size * 2 + value_size;
-    const uint32_t fused_columns = convolution_size + value_size + plan.head_count * 2;
+    const uint32_t fused_columns = convolution_size + value_size
+                                   + plan.head_count * (1 + plan.delta_gate_channels);
     const CompiledOperator& fused_delta_operator = operators.at(plan.fused_delta_input_operator);
     bool fused_input = (backend == ExecutionBackend::Vulkan
                         && fused_delta_operator.bfloat16

@@ -81,23 +81,70 @@ static void router_scores(const float* logits, uint32_t size, RouterScoreFunctio
         scores[index] = score_router_logit(logits[index], score_function);
 }
 
+static void insert_route(std::vector<RouteCandidate>& selected, const RouteCandidate& candidate, uint32_t top_k)
+{
+    if (selected.size() == top_k && route_precedes(selected.back(), candidate))
+        return;
+    const auto insertion = std::lower_bound(selected.begin(), selected.end(), candidate, route_precedes);
+    if (selected.size() == top_k && insertion == selected.end())
+        return;
+    selected.insert(insertion, candidate);
+    if (selected.size() > top_k)
+        selected.pop_back();
+}
+
 static void select_topk_routes(const float* scores, std::span<const float> selection_bias, uint32_t expert_count, uint32_t top_k, std::vector<RouteCandidate>& selected)
 {
     selected.clear();
     for (uint32_t expert_id = 0; expert_id < expert_count; ++expert_id)
     {
-        const RouteCandidate candidate{
-            expert_id,
-            scores[expert_id] + (selection_bias.empty() ? 0.0f : selection_bias[expert_id]),
-        };
-        if (selected.size() == top_k && route_precedes(selected.back(), candidate))
-            continue;
-        const auto insertion = std::lower_bound(selected.begin(), selected.end(), candidate, route_precedes);
-        if (selected.size() == top_k && insertion == selected.end())
-            continue;
-        selected.insert(insertion, candidate);
-        if (selected.size() > top_k)
-            selected.pop_back();
+        insert_route(selected,
+                     {expert_id, scores[expert_id] + (selection_bias.empty() ? 0.0f : selection_bias[expert_id])},
+                     top_k);
+    }
+}
+
+static void select_group_topk_routes(const float* scores, std::span<const float> selection_bias,
+                                     const ExpertDispatchOptions& options,
+                                     std::vector<std::pair<float, uint32_t>>& group_scores,
+                                     std::vector<RouteCandidate>& selected)
+{
+    const uint32_t group_count = options.group_count;
+    const uint32_t group_size = options.expert_count / group_count;
+    group_scores.resize(group_count);
+    for (uint32_t group = 0; group < group_count; ++group)
+    {
+        float first = -std::numeric_limits<float>::infinity();
+        float second = first;
+        for (uint32_t offset = 0; offset < group_size; ++offset)
+        {
+            const uint32_t expert_id = group * group_size + offset;
+            const float score = scores[expert_id] + (selection_bias.empty() ? 0.0f : selection_bias[expert_id]);
+            if (score > first)
+            {
+                second = first;
+                first = score;
+            }
+            else if (score > second)
+                second = score;
+        }
+        group_scores[group] = {first + second, group};
+    }
+    const auto group_precedes = [](const std::pair<float, uint32_t>& left, const std::pair<float, uint32_t>& right) {
+        return left.first > right.first || (left.first == right.first && left.second < right.second);
+    };
+    const auto end = group_scores.begin() + options.top_k_groups;
+    std::partial_sort(group_scores.begin(), end, group_scores.end(), group_precedes);
+    selected.clear();
+    for (auto group = group_scores.begin(); group != end; ++group)
+    {
+        for (uint32_t offset = 0; offset < group_size; ++offset)
+        {
+            const uint32_t expert_id = group->second * group_size + offset;
+            insert_route(selected,
+                         {expert_id, scores[expert_id] + (selection_bias.empty() ? 0.0f : selection_bias[expert_id])},
+                         options.top_k);
+        }
     }
 }
 
@@ -118,6 +165,12 @@ static Result<void> dispatch_experts_general(std::span<const float> router_logit
     }
     if (!options.selection_bias.empty() && options.selection_bias.size() != options.expert_count)
         return Error{ErrorCode::InvalidArgument, "router selection bias must match expert_count"};
+    if (options.group_count != 0
+        && (options.top_k_groups == 0 || options.top_k_groups > options.group_count
+            || options.expert_count % options.group_count != 0
+            || options.expert_count / options.group_count < 2
+            || options.top_k > options.expert_count / options.group_count * options.top_k_groups))
+        return Error{ErrorCode::InvalidArgument, "invalid group-limited routing dimensions"};
     if (!options.explicit_expert_ids.empty() && options.explicit_expert_ids.size() != static_cast<size_t>(token_count) * options.top_k)
         return Error{ErrorCode::InvalidArgument, "explicit expert ids must match token_count * top_k"};
     if (!std::isfinite(options.routed_scaling_factor) || options.routed_scaling_factor <= 0.0f)
@@ -136,6 +189,7 @@ static Result<void> dispatch_experts_general(std::span<const float> router_logit
     const bool renormalize = options.normalization == RouterNormalization::SelectedExperts;
     const bool softmax_topk = options.score_function == RouterScoreFunction::Softmax
                               && renormalize
+                              && options.group_count == 0
                               && options.selection_bias.empty()
                               && options.explicit_expert_ids.empty();
     const bool explicit_scores = !options.explicit_expert_ids.empty()
@@ -145,6 +199,7 @@ static Result<void> dispatch_experts_general(std::span<const float> router_logit
         scores.reserve(options.expert_count);
     std::vector<RouteCandidate>& selected = result.selected;
     selected.reserve(static_cast<size_t>(options.top_k) + 1);
+    std::vector<std::pair<float, uint32_t>> group_scores;
 
     // Stage by Expert id so a late routing error leaves the published plan intact.
     if (result.route_scratch.size() < options.expert_count)
@@ -204,7 +259,10 @@ static Result<void> dispatch_experts_general(std::span<const float> router_logit
                 router_scores(logits, options.expert_count, options.score_function, scores);
             if (options.explicit_expert_ids.empty())
             {
-                select_topk_routes(scores.data(), options.selection_bias, options.expert_count, options.top_k, selected);
+                if (options.group_count != 0)
+                    select_group_topk_routes(scores.data(), options.selection_bias, options, group_scores, selected);
+                else
+                    select_topk_routes(scores.data(), options.selection_bias, options.expert_count, options.top_k, selected);
             }
             else
             {
@@ -271,7 +329,8 @@ Result<void> forward_router(std::span<const float> router_logits,
         return dispatch_experts_general(router_logits, token_count, options, result);
     static constexpr uint32_t stack_top_k = 16;
     if (token_count != 1
-        || options.top_k > stack_top_k)
+        || options.top_k > stack_top_k
+        || options.group_count != 0)
     {
         return dispatch_experts_general(router_logits, token_count, options, result);
     }

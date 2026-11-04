@@ -20,6 +20,8 @@ layout(push_constant) uniform parameter
     uint has_explicit_ids;
     float scaling;
     float jitter;
+    uint group_count;
+    uint top_k_groups;
 }
 p;
 
@@ -176,7 +178,8 @@ void main()
         return;
     }
     const bool raw_topk = p.score_function == 0 && p.normalize != 0
-                          && p.has_bias == 0 && p.has_explicit_ids == 0;
+                          && p.has_bias == 0 && p.has_explicit_ids == 0
+                          && p.group_count == 0;
     if (!raw_topk)
     {
         float sum = 0.0;
@@ -218,8 +221,67 @@ void main()
     }
     else
     {
+        // Group-limited routing keeps the strongest Top-K groups by the sum of
+        // their two best biased scores, then selects Top-K experts inside them.
+        uint selected_groups[64];
+        uint selected_group_count = 0;
+        if (p.group_count != 0)
+        {
+            const uint group_size = p.expert_count / p.group_count;
+            float group_scores[64];
+            for (uint group = 0; group < p.group_count; ++group)
+            {
+                float first = -uintBitsToFloat(0x7f800000u);
+                float second = first;
+                for (uint offset = 0; offset < group_size; ++offset)
+                {
+                    const uint expert = group * group_size + offset;
+                    const float candidate = scores[expert] + (p.has_bias != 0 ? selection_bias[expert] : 0.0);
+                    if (candidate > first)
+                    {
+                        second = first;
+                        first = candidate;
+                    }
+                    else if (candidate > second)
+                        second = candidate;
+                }
+                group_scores[group] = first + second;
+            }
+            for (uint group = 0; group < p.group_count; ++group)
+            {
+                const float candidate = group_scores[group];
+                uint insertion = 0;
+                while (insertion < selected_group_count
+                       && (group_scores[selected_groups[insertion]] > candidate
+                           || (group_scores[selected_groups[insertion]] == candidate
+                               && selected_groups[insertion] < group)))
+                    ++insertion;
+                if (insertion >= p.top_k_groups)
+                    continue;
+                const uint last = min(selected_group_count, p.top_k_groups - 1);
+                for (uint index = last; index > insertion; --index)
+                    selected_groups[index] = selected_groups[index - 1];
+                selected_groups[insertion] = group;
+                selected_group_count = min(selected_group_count + 1, p.top_k_groups);
+            }
+        }
         for (uint expert = 0; expert < p.expert_count; ++expert)
         {
+            if (p.group_count != 0)
+            {
+                const uint group = expert / (p.expert_count / p.group_count);
+                bool allowed = false;
+                for (uint rank = 0; rank < selected_group_count; ++rank)
+                {
+                    if (selected_groups[rank] == group)
+                    {
+                        allowed = true;
+                        break;
+                    }
+                }
+                if (!allowed)
+                    continue;
+            }
             const float candidate = raw_topk ? logits[input_base + expert]
                                              : scores[expert] + (p.has_bias != 0 ? selection_bias[expert] : 0.0);
             if (count == p.top_k

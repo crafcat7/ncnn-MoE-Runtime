@@ -220,18 +220,21 @@ static bool record_latent_copy(const ncnn::Pipeline* pipeline,
                                ncnn::VkMat& destination,
                                uint64_t count,
                                uint64_t destination_offset,
-                               ncnn::VkCompute& cmd)
+                               ncnn::VkCompute& cmd,
+                               uint64_t source_offset = 0)
 {
     if (count == 0)
         return true;
     if (!pipeline || source.empty() || destination.empty()
         || count > std::numeric_limits<uint32_t>::max()
-        || destination_offset > std::numeric_limits<uint32_t>::max())
+        || destination_offset > std::numeric_limits<uint32_t>::max()
+        || source_offset > std::numeric_limits<uint32_t>::max())
         return false;
     const std::vector<ncnn::VkMat> bindings = {source, destination};
-    std::vector<ncnn::vk_constant_type> constants(2);
+    std::vector<ncnn::vk_constant_type> constants(3);
     constants[0].u32 = static_cast<uint32_t>(count);
     constants[1].u32 = static_cast<uint32_t>(destination_offset);
+    constants[2].u32 = static_cast<uint32_t>(source_offset);
     ncnn::VkMat dispatcher;
     dispatcher.w = static_cast<int>(count);
     dispatcher.h = 1;
@@ -266,6 +269,7 @@ public:
     CompiledOperator query_a;
     CompiledOperator query_b;
     CompiledOperator key_value;
+    CompiledOperator gate;
     CompiledOperator index_query;
     CompiledOperator index_weights;
     CompiledOperator compressor_value;
@@ -377,7 +381,7 @@ bool LatentAttention_vulkan::record_projection(const CompiledOperator& op,
 #endif
 
 std::shared_ptr<LatentAttention_vulkan> LatentAttention_vulkan::create(const AttentionBlockPlan& plan,
-                                                                       const TensorData& sinks,
+                                                                       const TensorData* sinks,
                                                                        std::shared_ptr<Float8Linear_vulkan> output_a,
                                                                        std::shared_ptr<Float8Linear_vulkan> output_b)
 {
@@ -389,17 +393,20 @@ std::shared_ptr<LatentAttention_vulkan> LatentAttention_vulkan::create(const Att
 }
 
 std::shared_ptr<LatentAttention_vulkan> LatentAttention_vulkan::create(const AttentionBlockPlan& plan,
-                                                                       const TensorData& sinks,
+                                                                       const TensorData* sinks,
                                                                        const CompiledOperator& output_a,
                                                                        const CompiledOperator& output_b)
 {
 #if NCNN_MOE_WITH_VULKAN
+    const bool latent_value = has_flag(plan.flags, AttentionBlockLatentValue);
     const uint64_t query_columns = static_cast<uint64_t>(plan.head_count) * plan.head_dimension;
-    if (plan.kind != AttentionKind::MultiHeadLatent || plan.head_dimension == 0 || plan.head_dimension > 512
-        || plan.head_count == 0 || plan.sliding_window == 0 || plan.norm_epsilon <= 0.0f
+    if (plan.kind != AttentionKind::MultiHeadLatent || plan.head_dimension == 0
+        || plan.head_dimension > (latent_value ? 640u : 512u)
+        || plan.head_count == 0 || (!latent_value && plan.sliding_window == 0) || plan.norm_epsilon <= 0.0f
         || plan.rope_head_dimension > plan.head_dimension || plan.rope_head_dimension % 2 != 0
         || query_columns > static_cast<uint64_t>(std::numeric_limits<int>::max())
-        || sinks.dtype != DType::Float32 || sinks.float32_values().size() != plan.head_count
+        || (sinks && (sinks->dtype != DType::Float32 || sinks->float32_values().size() != plan.head_count))
+        || (latent_value && (plan.output_group_count == 0 || plan.output_lora_rank == 0))
         || !projection_context(output_a) || !projection_option(output_a)
         || projection_context(output_a) != projection_context(output_b)
         || projection_input_columns(output_a) != query_columns
@@ -420,7 +427,10 @@ std::shared_ptr<LatentAttention_vulkan> LatentAttention_vulkan::create(const Att
     implementation.opt.use_bf16_storage = false;
     implementation.opt.blob_vkallocator = implementation.context->blob_allocator();
     implementation.opt.workspace_vkallocator = implementation.context->blob_allocator();
-    implementation.host_sinks.assign(sinks.float32_values().begin(), sinks.float32_values().end());
+    if (sinks)
+        implementation.host_sinks.assign(sinks->float32_values().begin(), sinks->float32_values().end());
+    else
+        implementation.host_sinks.assign(plan.head_count, -1.0e30f);
     const std::lock_guard<std::mutex> lock(implementation.context->command_mutex());
     if (!create_latent_pipeline(implementation.context, implementation.opt,
                                 latent_attention_query_shader, static_cast<int>(sizeof(latent_attention_query_shader) - 1), implementation.query_pipeline)
@@ -430,10 +440,14 @@ std::shared_ptr<LatentAttention_vulkan> LatentAttention_vulkan::create(const Att
                                    latent_attention_core_shader, static_cast<int>(sizeof(latent_attention_core_shader) - 1), implementation.attention_pipeline))
         return {};
     // Parallel scoring is optional; preparation failures retain the GPU core.
-    (void)create_latent_pipeline(implementation.context, implementation.opt,
-                                 latent_attention_score_shader, static_cast<int>(sizeof(latent_attention_score_shader) - 1), implementation.score_pipeline);
-    (void)create_latent_pipeline(implementation.context, implementation.opt,
-                                 latent_attention_scored_core_shader, static_cast<int>(sizeof(latent_attention_scored_core_shader) - 1), implementation.scored_attention_pipeline);
+    // The expanded-value path records its core directly and needs no scorer.
+    if (!latent_value)
+    {
+        (void)create_latent_pipeline(implementation.context, implementation.opt,
+                                     latent_attention_score_shader, static_cast<int>(sizeof(latent_attention_score_shader) - 1), implementation.score_pipeline);
+        (void)create_latent_pipeline(implementation.context, implementation.opt,
+                                     latent_attention_scored_core_shader, static_cast<int>(sizeof(latent_attention_scored_core_shader) - 1), implementation.scored_attention_pipeline);
+    }
     return result;
 #else
     (void)plan;
@@ -454,6 +468,8 @@ bool LatentAttention_vulkan::forward_batch(std::span<const uint64_t> positions,
 #if NCNN_MOE_WITH_VULKAN
     Implementation& implementation = *d;
     const AttentionBlockPlan& plan = implementation.plan;
+    if (has_flag(plan.flags, AttentionBlockLatentValue))
+        return false;
     const size_t rows = positions.size();
     const uint32_t query_columns = plan.head_count * plan.head_dimension;
     if (rows == 0 || rows != caches.size() || rows != contexts.size()
@@ -661,8 +677,8 @@ bool LatentAttention_vulkan::forward_batch(std::span<const uint64_t> positions,
             cmd.record_pipeline(implementation.query_pipeline.get(), bindings, constants, dispatcher);
         }
         {
-            const std::vector<ncnn::VkMat> bindings = {normalized_query, state->window, state->compressed.empty() ? state->window : state->compressed, current.indices, next_sinks, current.rope, attention};
-            std::vector<ncnn::vk_constant_type> constants(10);
+            const std::vector<ncnn::VkMat> bindings = {normalized_query, state->window, state->compressed.empty() ? state->window : state->compressed, current.indices, next_sinks, current.rope, attention, normalized_query};
+            std::vector<ncnn::vk_constant_type> constants(12);
             constants[0].u32 = plan.head_dimension;
             constants[1].u32 = plan.head_count;
             constants[2].u32 = plan.rope_head_dimension;
@@ -673,6 +689,8 @@ bool LatentAttention_vulkan::forward_batch(std::span<const uint64_t> positions,
             constants[7].u32 = context.selected_compressed_indices ? static_cast<uint32_t>(context.compressed_indices.size()) : context.compressed_count;
             constants[8].u32 = context.selected_compressed_indices ? 1 : 0;
             constants[9].f = 1.0f / std::sqrt(static_cast<float>(plan.head_dimension));
+            constants[10].u32 = 1;
+            constants[11].u32 = 0;
             ncnn::VkMat dispatcher;
             dispatcher.w = 128;
             dispatcher.h = 1;
@@ -836,18 +854,22 @@ static bool record_latent_transform(const std::shared_ptr<ncnn::Pipeline>& pipel
                                     uint32_t flags,
                                     uint32_t head_count,
                                     float epsilon,
-                                    ncnn::VkCompute& cmd)
+                                    ncnn::VkCompute& cmd,
+                                    uint32_t norm_dimension = 0)
 {
     if (!pipeline || input.empty() || output.empty())
         return false;
+    if (norm_dimension == 0)
+        norm_dimension = dimension;
     const std::vector<ncnn::VkMat> bindings = {input, norm, rope, output};
-    std::vector<ncnn::vk_constant_type> constants(6);
+    std::vector<ncnn::vk_constant_type> constants(7);
     constants[0].u32 = dimension;
     constants[1].u32 = rope_dimension;
     constants[2].u32 = input_offset;
     constants[3].u32 = output_offset;
     constants[4].u32 = flags;
     constants[5].f = epsilon;
+    constants[6].u32 = norm_dimension;
     ncnn::VkMat dispatcher;
     dispatcher.w = 128;
     dispatcher.h = 1;
@@ -874,6 +896,75 @@ static bool tensor_latent_values(const TensorData& tensor, uint64_t count, std::
     return true;
 }
 #endif
+
+class LatentValueWork_vulkan::Implementation
+{
+public:
+#if NCNN_MOE_WITH_VULKAN
+    struct Entry
+    {
+        LayerCache* cache = nullptr;
+        uint64_t position = 0;
+        uint32_t width = 0;
+        std::shared_ptr<LatentCache_vulkan> state;
+    };
+    std::vector<Entry> entries;
+    bool committed = false;
+    ~Implementation()
+    {
+        if (!committed)
+        {
+            for (Entry& entry : entries)
+            {
+                entry.cache->latent_device_state.reset();
+                entry.cache->device_allocated_size = 0;
+            }
+        }
+    }
+#endif
+};
+
+LatentValueWork_vulkan::LatentValueWork_vulkan()
+    : d(new Implementation)
+{
+}
+
+LatentValueWork_vulkan::~LatentValueWork_vulkan() = default;
+
+bool LatentValueWork_vulkan::commit() noexcept
+{
+#if NCNN_MOE_WITH_VULKAN
+    Implementation& work = *d;
+    if (work.committed || work.entries.empty())
+        return false;
+    for (Implementation::Entry& entry : work.entries)
+    {
+        entry.cache->latent_device_state = entry.state;
+        entry.cache->columns = entry.width;
+        entry.cache->latent_cache = true;
+        entry.cache->latent_token_count = entry.position + 1;
+        entry.cache->capacity_tokens = entry.state->window_capacity;
+        entry.cache->device_allocated_size = entry.state->allocated_bytes();
+    }
+    work.committed = true;
+    return true;
+#else
+    return false;
+#endif
+}
+
+void LatentValueWork_vulkan::abort() noexcept
+{
+#if NCNN_MOE_WITH_VULKAN
+    Implementation& work = *d;
+    for (Implementation::Entry& entry : work.entries)
+    {
+        entry.cache->latent_device_state.reset();
+        entry.cache->device_allocated_size = 0;
+    }
+    work.committed = true;
+#endif
+}
 
 class LatentAttentionWork_vulkan::Implementation
 {
@@ -972,6 +1063,229 @@ bool LatentAttentionWork_vulkan::commit()
     work.committed = true;
     return true;
 #else
+    return false;
+#endif
+}
+
+bool LatentAttention_vulkan::forward_value_batch(std::span<const uint64_t> positions,
+                                                 std::span<LayerCache* const> caches,
+                                                 const ActivationBuffer& query,
+                                                 const ActivationBuffer& key_value,
+                                                 const ActivationBuffer& gate,
+                                                 ActivationBuffer& output) const
+{
+#if NCNN_MOE_WITH_VULKAN
+    Implementation& implementation = *d;
+    const AttentionBlockPlan& plan = implementation.plan;
+    const size_t rows = positions.size();
+    const uint32_t width = plan.head_dimension;
+    const uint32_t query_columns = plan.head_count * width;
+    if (!has_flag(plan.flags, AttentionBlockLatentValue) || rows == 0 || rows != caches.size()
+        || query.rows() != rows || query.columns() != query_columns || query.dtype() != DType::Float32
+        || key_value.rows() != rows || key_value.columns() != width || key_value.dtype() != DType::Float32
+        || gate.rows() != rows || gate.columns() != plan.head_count || gate.dtype() != DType::Float32
+        || rows > static_cast<size_t>(std::numeric_limits<int>::max())
+        || width > 640 || plan.rope_head_dimension > width)
+        return false;
+    for (size_t row = 0; row < rows; ++row)
+    {
+        const LayerCache* cache = caches[row];
+        if (!cache || cache->transaction.latent_active
+            || positions[row] == std::numeric_limits<uint64_t>::max()
+            || cache->latent_token_count < positions[row] + 1
+            || cache->latent_window.size() < static_cast<size_t>(positions[row] + 1) * width
+            || positions[row] + 1 > std::numeric_limits<uint32_t>::max())
+            return false;
+    }
+
+    struct MirrorGuard
+    {
+        std::span<LayerCache* const> caches;
+        bool committed = false;
+        ~MirrorGuard()
+        {
+            if (committed)
+                return;
+            for (LayerCache* cache : caches)
+            {
+                cache->latent_device_state.reset();
+                cache->device_allocated_size = 0;
+            }
+        }
+    } mirror_guard{caches};
+    VulkanTransferLease transfer_lease = implementation.context->acquire_transfer_slot();
+    VulkanTransferSlot& transfer_slot = transfer_lease.slot();
+    const std::lock_guard<std::mutex> lock(implementation.context->command_mutex());
+    ncnn::VkCompute& cmd = *transfer_slot.command;
+    if (transfer_slot.command_used)
+    {
+        if (cmd.reset() != 0)
+            return false;
+    }
+    transfer_slot.command_used = true;
+    uint64_t uploads = 0;
+
+    // Staging buffers must stay resident until the single submission completes.
+    ncnn::VkMat sink_staging;
+    ncnn::VkMat query_staging;
+    ncnn::VkMat kv_staging;
+    ncnn::VkMat gate_staging;
+    ncnn::VkMat refresh_staging;
+    ncnn::VkMat next_sinks = implementation.sinks;
+    if (next_sinks.empty())
+    {
+        if (!fill_staging_values(implementation.host_sinks.data(), implementation.host_sinks.size(), sizeof(float), sink_staging, transfer_slot.staging_allocator)
+            || !record_mapped_upload(sink_staging, next_sinks, cmd, implementation.opt))
+            return false;
+        ++uploads;
+    }
+    ncnn::VkMat uploaded_query;
+    if (!fill_staging_values(query.row(0), rows * query_columns, sizeof(float), query_staging, transfer_slot.staging_allocator)
+        || !record_mapped_upload(query_staging, uploaded_query, cmd, implementation.opt))
+        return false;
+    ++uploads;
+    ncnn::VkMat uploaded_kv;
+    if (!fill_staging_values(key_value.row(0), rows * width, sizeof(float), kv_staging, transfer_slot.staging_allocator)
+        || !record_mapped_upload(kv_staging, uploaded_kv, cmd, implementation.opt))
+        return false;
+    ++uploads;
+    ncnn::VkMat uploaded_gate;
+    if (!fill_staging_values(gate.row(0), rows * plan.head_count, sizeof(float), gate_staging, transfer_slot.staging_allocator)
+        || !record_mapped_upload(gate_staging, uploaded_gate, cmd, implementation.opt))
+        return false;
+    ++uploads;
+
+    ncnn::VkMat attention;
+    attention.create(static_cast<int>(query_columns), static_cast<int>(rows), sizeof(float), implementation.context->blob_allocator());
+    if (attention.empty())
+        return false;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(width));
+    for (size_t first = 0; first < rows;)
+    {
+        size_t last = first;
+        while (last + 1 < rows && caches[last + 1] == caches[first])
+            ++last;
+        LayerCache& cache = *caches[first];
+        std::shared_ptr<LatentCache_vulkan> state = cache.latent_device_state;
+        const bool shared_state = state && state.use_count() != 1;
+        const bool refresh = shared_state || !state || state->context != implementation.context
+                             || state->dimension != width
+                             || (state->token_count != positions[first] && state->token_count != positions[last] + 1);
+        if (refresh)
+        {
+            state = std::make_shared<LatentCache_vulkan>();
+            state->context = implementation.context;
+            state->dimension = width;
+            uint64_t capacity = 128;
+            while (capacity < cache.latent_token_count)
+                capacity *= 2;
+            if (capacity > std::numeric_limits<uint32_t>::max())
+                return false;
+            state->window_capacity = static_cast<uint32_t>(capacity);
+            if (!allocate_latent_buffer(state->window, capacity * width, implementation.context))
+                return false;
+            if (cache.latent_token_count != 0)
+            {
+                const uint64_t count = cache.latent_token_count * width;
+                ncnn::VkMat uploaded;
+                if (!fill_staging_values(cache.latent_window.data(), static_cast<size_t>(count), sizeof(float), refresh_staging, transfer_slot.staging_allocator)
+                    || !record_mapped_upload(refresh_staging, uploaded, cmd, implementation.opt)
+                    || !record_latent_copy(implementation.append_pipeline.get(), uploaded, state->window, count, 0, cmd))
+                    return false;
+                ++uploads;
+                state->token_count = cache.latent_token_count;
+            }
+        }
+        else if (state->token_count == positions[first])
+        {
+            const uint64_t count = static_cast<uint64_t>(last - first + 1) * width;
+            if (state->window_capacity < cache.latent_token_count)
+            {
+                uint32_t capacity = state->window_capacity;
+                while (capacity < cache.latent_token_count)
+                    capacity *= 2;
+                ncnn::VkMat grown;
+                if (!allocate_latent_buffer(grown, static_cast<uint64_t>(capacity) * width, implementation.context)
+                    || !record_latent_copy(implementation.append_pipeline.get(), state->window, grown,
+                                           static_cast<uint64_t>(state->token_count) * width, 0, cmd))
+                    return false;
+                state->window = std::move(grown);
+                state->window_capacity = capacity;
+            }
+            if (!record_latent_copy(implementation.append_pipeline.get(), uploaded_kv, state->window, count,
+                                    static_cast<uint64_t>(positions[first]) * width, cmd,
+                                    static_cast<uint64_t>(first) * width))
+                return false;
+            state->token_count = positions[last] + 1;
+        }
+        cache.latent_device_state = state;
+        if (!state->window.empty())
+        {
+            state->window.data->access_flags = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            state->window.data->stage_flags = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        }
+        for (size_t row = first; row <= last; ++row)
+        {
+            const std::vector<ncnn::VkMat> bindings = {uploaded_query, state->window, state->window, state->window,
+                                                       next_sinks, state->window, attention, uploaded_gate};
+            std::vector<ncnn::vk_constant_type> constants(12);
+            constants[0].u32 = width;
+            constants[1].u32 = plan.head_count;
+            constants[2].u32 = plan.rope_head_dimension;
+            constants[3].u32 = static_cast<uint32_t>(row);
+            constants[4].u32 = state->window_capacity;
+            constants[5].u32 = 0;
+            constants[6].u32 = static_cast<uint32_t>(positions[row] + 1);
+            constants[7].u32 = 0;
+            constants[8].u32 = 0;
+            constants[9].f = scale;
+            constants[10].u32 = 0;
+            constants[11].u32 = 1;
+            ncnn::VkMat dispatcher;
+            dispatcher.w = 128;
+            dispatcher.h = 1;
+            dispatcher.c = static_cast<int>(plan.head_count);
+            cmd.record_pipeline(implementation.attention_pipeline.get(), bindings, constants, dispatcher);
+        }
+        first = last + 1;
+    }
+
+    ncnn::VkMat output_rank;
+    ncnn::VkMat final_output;
+    std::vector<ncnn::VkMat> projection_storage;
+    const uint32_t output_columns = projection_output_columns(implementation.output_b);
+    const DType output_dtype = output.dtype();
+    if (!record_projection(implementation.output_a, attention, output_rank, cmd, projection_storage)
+        || !record_projection(implementation.output_b, output_rank, final_output, cmd, projection_storage)
+        || !prepare_staging_batch(transfer_slot.download, rows, output_columns, transfer_slot.staging_allocator, output.element_size())
+        || !record_prepared_activation_staging_download(final_output, rows, output_columns, transfer_slot.download, cmd,
+                                                        implementation.context->device(), implementation.opt, output_dtype))
+        return false;
+    if (submit_compute_and_wait(cmd, implementation.context->device()) != 0)
+        return false;
+    ActivationBuffer completed(rows, output_columns, output_dtype);
+    if (!copy_staging_to_cpu_batch(transfer_slot.download, completed))
+        return false;
+    output.swap(completed);
+    implementation.sinks = std::move(next_sinks);
+    for (LayerCache* cache : caches)
+    {
+        if (cache->latent_device_state)
+            cache->device_allocated_size = cache->latent_device_state->allocated_bytes();
+    }
+    VulkanRuntimeState& runtime_state = implementation.context->runtime_state();
+    runtime_state.batch_uploads += uploads;
+    runtime_state.batch_downloads += 1;
+    runtime_state.attention_blocks += rows;
+    mirror_guard.committed = true;
+    return true;
+#else
+    (void)positions;
+    (void)caches;
+    (void)query;
+    (void)key_value;
+    (void)gate;
+    (void)output;
     return false;
 #endif
 }
@@ -1147,6 +1461,246 @@ bool LatentAttention_vulkan::prepare(const WeightStore& weights, const CompiledO
     return false;
 #endif
 }
+
+bool LatentAttention_vulkan::prepare_value(const WeightStore& weights,
+                                           const CompiledOperatorTable& operators)
+{
+#if NCNN_MOE_WITH_VULKAN
+    Implementation& implementation = *d;
+    const AttentionBlockPlan& plan = implementation.plan;
+    if (!has_flag(plan.flags, AttentionBlockLatentValue) || implementation.prepared)
+        return false;
+    const CompiledOperator& query_a = operators.at_weight(plan.query_a_weight);
+    const CompiledOperator& query_b = operators.at_weight(plan.query_b_absorbed_weight);
+    const CompiledOperator& key_value = operators.at_weight(plan.key_value_weight);
+    const CompiledOperator& gate = operators.at_weight(plan.output_gate_weight);
+    if (!projection_context(query_a) || !projection_option(query_a)
+        || projection_context(query_a) != implementation.context
+        || projection_context(query_b) != implementation.context
+        || projection_context(key_value) != implementation.context
+        || projection_context(gate) != implementation.context
+        || projection_input_columns(query_a) != projection_input_columns(key_value)
+        || projection_input_columns(query_a) != projection_input_columns(gate)
+        || projection_output_columns(query_a) != plan.query_lora_rank
+        || projection_input_columns(query_b) != plan.query_lora_rank
+        || projection_output_columns(query_b) != plan.head_count * plan.head_dimension
+        || projection_output_columns(key_value) != plan.head_dimension
+        || projection_output_columns(gate) != plan.head_count)
+        return false;
+    implementation.query_a = latent_projection(query_a);
+    implementation.query_b = latent_projection(query_b);
+    implementation.key_value = latent_projection(key_value);
+    implementation.gate = latent_projection(gate);
+    implementation.query_rank_norm = RmsNorm_vulkan::create(weights.at(plan.query_norm_weight),
+                                                            plan.norm_epsilon, 0.0f,
+                                                            implementation.context, implementation.opt);
+    if (!implementation.query_rank_norm)
+        return false;
+    std::vector<float> norm_values;
+    if (!tensor_latent_values(weights.at(plan.key_value_norm_weight), plan.kv_lora_rank, norm_values))
+        return false;
+    ncnn::VkCompute cmd(implementation.context->device());
+    std::vector<ncnn::VkMat> staging;
+    const auto upload = [&](const float* values, size_t count, ncnn::VkMat& destination) {
+        staging.emplace_back();
+        return fill_staging_values(values, count, sizeof(float), staging.back(),
+                                   implementation.context->staging_allocator())
+               && record_mapped_upload(staging.back(), destination, cmd, implementation.opt);
+    };
+    if (!upload(norm_values.data(), norm_values.size(), implementation.key_norm)
+        || !upload(implementation.host_sinks.data(), implementation.host_sinks.size(), implementation.sinks))
+        return false;
+    {
+        const std::lock_guard<std::mutex> lock(implementation.context->command_mutex());
+        if (!create_latent_pipeline(implementation.context, implementation.opt,
+                                    latent_attention_transform_shader,
+                                    static_cast<int>(sizeof(latent_attention_transform_shader) - 1),
+                                    implementation.transform_pipeline))
+            return false;
+    }
+    if (submit_compute_and_wait(cmd, implementation.context->device()) != 0)
+        return false;
+    implementation.context->runtime_state().compute_submissions += 1;
+    implementation.context->runtime_state().batch_uploads += staging.size();
+    implementation.prepared = true;
+    return true;
+#else
+    (void)weights;
+    (void)operators;
+    return false;
+#endif
+}
+
+#if NCNN_MOE_WITH_VULKAN
+bool LatentAttention_vulkan::record_value_forward(const ncnn::VkMat& input,
+                                                  std::span<const uint64_t> positions,
+                                                  std::span<LayerCache* const> caches,
+                                                  ncnn::VkMat& output,
+                                                  ncnn::VkCompute& cmd,
+                                                  LatentValueWork_vulkan& work,
+                                                  std::vector<ncnn::VkMat>& storage) const
+{
+    const Implementation& implementation = *d;
+    const AttentionBlockPlan& plan = implementation.plan;
+    const size_t rows = positions.size();
+    const uint32_t heads = plan.head_count;
+    const uint32_t width = plan.head_dimension;
+    const uint32_t lora = plan.kv_lora_rank;
+    const uint32_t rope = plan.rope_head_dimension;
+    if (!implementation.prepared || rows == 0 || rows != caches.size()
+        || input.empty() || input.dims != 2 || input.elempack != 1
+        || input.elemsize != sizeof(float)
+        || input.w != static_cast<int>(projection_input_columns(implementation.query_a))
+        || input.h != static_cast<int>(rows))
+        return false;
+    const auto allocate = [&](ncnn::VkMat& destination, uint64_t columns, size_t row_count) {
+        if (columns == 0 || row_count == 0
+            || columns > static_cast<uint64_t>(std::numeric_limits<int>::max())
+            || row_count > static_cast<size_t>(std::numeric_limits<int>::max()))
+            return false;
+        destination.create(static_cast<int>(columns), static_cast<int>(row_count), sizeof(float),
+                           implementation.opt.blob_vkallocator);
+        return !destination.empty();
+    };
+    ncnn::VkMat query_rank;
+    ncnn::VkMat query_rank_normed;
+    ncnn::VkMat query;
+    ncnn::VkMat key_value;
+    ncnn::VkMat gate;
+    ncnn::VkMat query_rope;
+    ncnn::VkMat kv_rope;
+    ncnn::VkMat latent;
+    ncnn::VkMat output_rank;
+    if (!allocate(query_rank, plan.query_lora_rank, rows)
+        || !allocate(query_rank_normed, plan.query_lora_rank, rows)
+        || !allocate(query, static_cast<uint64_t>(heads) * width, rows)
+        || !allocate(key_value, width, rows)
+        || !allocate(gate, heads, rows)
+        || !allocate(query_rope, static_cast<uint64_t>(heads) * width, rows)
+        || !allocate(kv_rope, width, rows)
+        || !allocate(latent, static_cast<uint64_t>(heads) * width, rows))
+        return false;
+    if (!record_projection(implementation.query_a, input, query_rank, cmd, storage)
+        || !implementation.query_rank_norm->record(query_rank, query_rank_normed, cmd)
+        || !record_projection(implementation.query_b, query_rank_normed, query, cmd, storage)
+        || !record_projection(implementation.key_value, input, key_value, cmd, storage)
+        || !record_projection(implementation.gate, input, gate, cmd, storage))
+        return false;
+    for (size_t row = 0; row < rows; ++row)
+    {
+        LayerCache& cache = *caches[row];
+        const uint64_t position = positions[row];
+        std::vector<float> coefficients;
+        prepare_latent_rope(plan, position, coefficients);
+        ncnn::VkMat rope_staging;
+        ncnn::VkMat rope_values;
+        if (!fill_staging_values(coefficients.data(), coefficients.size(), sizeof(float),
+                                 rope_staging, implementation.context->staging_allocator())
+            || !record_mapped_upload(rope_staging, rope_values, cmd, implementation.opt))
+            return false;
+        storage.push_back(std::move(rope_staging));
+        storage.push_back(rope_values);
+        if (!record_latent_transform(implementation.transform_pipeline, query, implementation.key_norm,
+                                     rope_values, query_rope, width, rope,
+                                     static_cast<uint32_t>(row) * heads * width,
+                                     static_cast<uint32_t>(row) * heads * width,
+                                     0, heads, plan.norm_epsilon, cmd, width)
+            || !record_latent_transform(implementation.transform_pipeline, key_value, implementation.key_norm,
+                                        rope_values, kv_rope, width, rope,
+                                        static_cast<uint32_t>(row) * width,
+                                        static_cast<uint32_t>(row) * width,
+                                        1, 1, plan.norm_epsilon, cmd, lora))
+            return false;
+        std::shared_ptr<LatentCache_vulkan> state = cache.latent_device_state;
+        const bool refresh = !state || state->context != implementation.context
+                             || state->dimension != width || state->token_count != position;
+        if (refresh)
+        {
+            state = std::make_shared<LatentCache_vulkan>();
+            state->context = implementation.context;
+            state->dimension = width;
+            uint64_t capacity = 128;
+            while (capacity < position + 1)
+                capacity *= 2;
+            if (capacity > std::numeric_limits<uint32_t>::max())
+                return false;
+            state->window_capacity = static_cast<uint32_t>(capacity);
+            if (!allocate_latent_buffer(state->window, capacity * width, implementation.context))
+                return false;
+            if (cache.latent_window.empty() && position != 0)
+                return false;
+            if (!cache.latent_window.empty())
+            {
+                ncnn::VkMat staging;
+                ncnn::VkMat uploaded;
+                const uint64_t count = static_cast<uint64_t>(cache.latent_token_count) * width;
+                if (!fill_staging_values(cache.latent_window.data(), static_cast<size_t>(count), sizeof(float),
+                                         staging, implementation.context->staging_allocator())
+                    || !record_mapped_upload(staging, uploaded, cmd, implementation.opt)
+                    || !record_latent_copy(implementation.append_pipeline.get(), uploaded, state->window,
+                                           count, 0, cmd))
+                    return false;
+                storage.push_back(std::move(staging));
+                storage.push_back(uploaded);
+                state->token_count = cache.latent_token_count;
+            }
+        }
+        if (state->window_capacity < position + 1)
+        {
+            uint32_t capacity = state->window_capacity;
+            while (capacity < position + 1)
+                capacity *= 2;
+            ncnn::VkMat grown;
+            if (!allocate_latent_buffer(grown, static_cast<uint64_t>(capacity) * width, implementation.context)
+                || !record_latent_copy(implementation.append_pipeline.get(), state->window, grown,
+                                       static_cast<uint64_t>(state->token_count) * width, 0, cmd))
+                return false;
+            state->window = std::move(grown);
+            state->window_capacity = capacity;
+        }
+        if (!record_latent_copy(implementation.append_pipeline.get(), kv_rope, state->window, width,
+                                position * width, cmd, static_cast<uint64_t>(row) * width))
+            return false;
+        state->token_count = position + 1;
+        if (!state->window.empty())
+        {
+            state->window.data->access_flags = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            state->window.data->stage_flags = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        }
+        cache.latent_device_state = state;
+        if (!work.d->entries.empty()
+            && work.d->entries.back().cache == &cache
+            && work.d->entries.back().position + 1 == position)
+            work.d->entries.back().position = position;
+        else
+            work.d->entries.push_back({&cache, position, width, state});
+        const std::vector<ncnn::VkMat> bindings = {query_rope, state->window, state->window, state->window,
+                                                   implementation.sinks, state->window, latent, gate};
+        std::vector<ncnn::vk_constant_type> constants(12);
+        constants[0].u32 = width;
+        constants[1].u32 = heads;
+        constants[2].u32 = rope;
+        constants[3].u32 = static_cast<uint32_t>(row);
+        constants[4].u32 = state->window_capacity;
+        constants[5].u32 = 0;
+        constants[6].u32 = static_cast<uint32_t>(position + 1);
+        constants[7].u32 = 0;
+        constants[8].u32 = 0;
+        constants[9].f = 1.0f / std::sqrt(static_cast<float>(width));
+        constants[10].u32 = 0;
+        constants[11].u32 = 1;
+        ncnn::VkMat dispatcher;
+        dispatcher.w = 128;
+        dispatcher.h = 1;
+        dispatcher.c = static_cast<int>(heads);
+        cmd.record_pipeline(implementation.attention_pipeline.get(), bindings, constants, dispatcher);
+    }
+    if (!record_projection(implementation.output_a, latent, output_rank, cmd, storage)
+        || !record_projection(implementation.output_b, output_rank, output, cmd, storage))
+        return false;
+    return !output.empty();
+}
+#endif
 
 #if NCNN_MOE_WITH_VULKAN
 bool LatentAttention_vulkan::can_record() const noexcept
@@ -1584,8 +2138,8 @@ bool LatentAttention_vulkan::record_batch(const ncnn::VkMat& input,
         }
         {
             const std::vector<ncnn::VkMat> bindings = {normalized_query, state->window, state->compressed.empty() ? state->window : state->compressed,
-                                                       indices, implementation.sinks, rope, attention};
-            std::vector<ncnn::vk_constant_type> constants(10);
+                                                       indices, implementation.sinks, rope, attention, normalized_query};
+            std::vector<ncnn::vk_constant_type> constants(12);
             constants[0].u32 = plan.head_dimension;
             constants[1].u32 = plan.head_count;
             constants[2].u32 = plan.rope_head_dimension;
@@ -1597,6 +2151,8 @@ bool LatentAttention_vulkan::record_batch(const ncnn::VkMat& input,
             constants[7].u32 = selected ? current.selected_count : next_count;
             constants[8].u32 = selected ? 1 : 0;
             constants[9].f = 1.0f / std::sqrt(static_cast<float>(plan.head_dimension));
+            constants[10].u32 = 1;
+            constants[11].u32 = 0;
             ncnn::VkMat dispatcher;
             dispatcher.w = 128;
             dispatcher.h = 1;
@@ -1616,7 +2172,7 @@ bool LatentAttention_vulkan::record_batch(const ncnn::VkMat& input,
                 score_dispatcher.h = static_cast<int>((candidate_count + 65534) / 65535);
                 score_dispatcher.c = static_cast<int>(plan.head_count);
                 cmd.record_pipeline(implementation.score_pipeline.get(), score_bindings, constants, score_dispatcher);
-                std::vector<ncnn::VkMat> scored_bindings = bindings;
+                std::vector<ncnn::VkMat> scored_bindings(bindings.begin(), bindings.begin() + 7);
                 scored_bindings[0] = scores;
                 cmd.record_pipeline(implementation.scored_attention_pipeline.get(), scored_bindings, constants, dispatcher);
                 recording.storage.push_back(scores);

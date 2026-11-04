@@ -17,10 +17,11 @@ layout(push_constant) uniform parameter
     uint output_offset;
     uint flags;
     float epsilon;
+    uint norm_dimension;
 }
 p;
 
-shared float values[512];
+shared float values[640];
 shared float partial[128];
 
 float fp8(float value)
@@ -73,7 +74,8 @@ void main()
     {
         const float value = input_data[input_base + column];
         values[column] = value;
-        sum += value * value;
+        if (column < p.norm_dimension)
+            sum += value * value;
     }
     partial[lane] = sum;
     barrier();
@@ -85,9 +87,9 @@ void main()
                 partial[lane] += partial[lane + stride];
             barrier();
         }
-        const float inverse_rms = inversesqrt(partial[0] / float(p.dimension) + p.epsilon);
+        const float inverse_rms = inversesqrt(partial[0] / float(p.norm_dimension) + p.epsilon);
         for (uint column = lane; column < p.dimension; column += 128)
-            values[column] *= inverse_rms * norm_data[column];
+            values[column] *= column < p.norm_dimension ? inverse_rms * norm_data[column] : inverse_rms;
         barrier();
     }
     const uint rope_offset = p.dimension - p.rope_dimension;

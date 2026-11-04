@@ -16,6 +16,8 @@ namespace moe {
 #define NCNN_MOE_ATTN_OUTPUT_GATE_BIT  3
 #define NCNN_MOE_ATTN_QSA_BIT          4
 #define NCNN_MOE_ATTN_SIGMOID_GATE_BIT 5
+#define NCNN_MOE_ATTN_LATENT_VALUE_BIT 6
+#define NCNN_MOE_ATTN_DELTA_GATE_BIT   7
 
 enum AttentionDescriptorFlag : uint32_t
 {
@@ -24,7 +26,12 @@ enum AttentionDescriptorFlag : uint32_t
     AttentionDescriptorQueryKeyNorm = UINT32_C(1) << NCNN_MOE_ATTN_QK_NORM_BIT,
     AttentionDescriptorOutputGate = UINT32_C(1) << NCNN_MOE_ATTN_OUTPUT_GATE_BIT,
     AttentionDescriptorQsa = UINT32_C(1) << NCNN_MOE_ATTN_QSA_BIT,
-    AttentionDescriptorSigmoidGate = UINT32_C(1) << NCNN_MOE_ATTN_SIGMOID_GATE_BIT
+    AttentionDescriptorSigmoidGate = UINT32_C(1) << NCNN_MOE_ATTN_SIGMOID_GATE_BIT,
+    // DeepSeek-V2/V3-style MLA: a separate value projection expands the
+    // cached KV latent instead of reusing it as the value vector.
+    AttentionDescriptorLatentValue = UINT32_C(1) << NCNN_MOE_ATTN_LATENT_VALUE_BIT,
+    // Bounded per-channel DeltaNet decay: lower_bound * sigmoid(exp(A) * (f + dt_bias)).
+    AttentionDescriptorDeltaGate = UINT32_C(1) << NCNN_MOE_ATTN_DELTA_GATE_BIT
 };
 
 enum class AttentionKind
@@ -63,6 +70,7 @@ struct AttentionDescriptor
     float rope_scaling_factor = 1.0f;
     float rope_ntk_alpha = 1.0f;
     float rope_ntk_beta = 32.0f;
+    float delta_lower_bound = 0.0f;
     DType projection_weight_dtype = DType::Float32;
     uint32_t flags = 0;
 };

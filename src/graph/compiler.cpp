@@ -92,6 +92,16 @@ Result<void> validate_model_descriptor(const MoeModelDescriptor& descriptor)
         {
             if (moe.expert_count == 0 || moe.top_k == 0 || moe.top_k > moe.expert_count)
                 return Error{ErrorCode::InvalidModel, "invalid expert_count/top_k"};
+            if (moe.router_group_count != 0 || moe.router_top_k_groups != 0)
+            {
+                const uint32_t groups = moe.router_group_count;
+                if (groups == 0 || moe.router_top_k_groups == 0 || moe.router_top_k_groups > groups
+                    || moe.expert_count % groups != 0
+                    || moe.top_k > moe.expert_count / groups * moe.router_top_k_groups)
+                {
+                    return Error{ErrorCode::InvalidModel, "invalid group-limited routing dimensions"};
+                }
+            }
             if (moe.intermediate_size == 0)
                 return Error{ErrorCode::InvalidModel, "intermediate_size must be non-zero"};
             if (moe.expert_count != descriptor.expert_count
@@ -165,11 +175,14 @@ Result<void> validate_model_descriptor(const MoeModelDescriptor& descriptor)
                                          | AttentionDescriptorQueryKeyNorm
                                          | AttentionDescriptorOutputGate
                                          | AttentionDescriptorQsa
-                                         | AttentionDescriptorSigmoidGate;
+                                         | AttentionDescriptorSigmoidGate
+                                         | AttentionDescriptorLatentValue
+                                         | AttentionDescriptorDeltaGate;
             if ((attention.flags & ~known_flags) != 0)
                 return Error{ErrorCode::InvalidModel, "model descriptor layer has unknown attention flags"};
 
-            uint32_t allowed_flags = AttentionDescriptorSinks | AttentionDescriptorQueryKeyNorm;
+            uint32_t allowed_flags = AttentionDescriptorSinks | AttentionDescriptorQueryKeyNorm
+                                     | AttentionDescriptorLatentValue;
             if (attention.kind == AttentionKind::Standard)
             {
                 allowed_flags = AttentionDescriptorBias
@@ -180,8 +193,10 @@ Result<void> validate_model_descriptor(const MoeModelDescriptor& descriptor)
             }
             else if (attention.kind == AttentionKind::GatedDeltaNet)
             {
-                allowed_flags = AttentionDescriptorSigmoidGate;
+                allowed_flags = AttentionDescriptorSigmoidGate | AttentionDescriptorDeltaGate;
             }
+            if (attention.kind == AttentionKind::MultiHeadLatent)
+                allowed_flags |= AttentionDescriptorOutputGate;
             if ((attention.flags & ~allowed_flags) != 0)
                 return Error{ErrorCode::InvalidModel, "model descriptor layer has incompatible attention flags"};
         }
@@ -587,24 +602,57 @@ static Result<void> compile_latent_attention(const WeightStore& weights,
                                              const AttentionDescriptor& attention,
                                              AttentionBlockPlan& plan)
 {
+    const bool latent_value = has_flag(attention.flags, AttentionDescriptorLatentValue);
+    const uint32_t kv_width = latent_value
+                                  ? attention.kv_lora_rank + attention.qk_rope_head_dimension
+                                  : attention.head_dimension;
     if (attention.query_lora_rank == 0
         || attention.head_count == 0
         || attention.head_dimension == 0
         || attention.qk_rope_head_dimension == 0
-        || attention.qk_rope_head_dimension >= attention.head_dimension
-        || attention.output_group_count == 0
-        || attention.head_count % attention.output_group_count != 0
-        || attention.output_lora_rank == 0)
+        || attention.qk_rope_head_dimension > attention.head_dimension)
         return Error{ErrorCode::InvalidModel, "invalid multi-head latent attention dimensions"};
-    if (attention.compression_ratio != 0 && attention.compression_ratio != 4 && attention.compression_ratio != 128)
+    if (latent_value)
+    {
+        if (attention.qk_nope_head_dimension == 0
+            || attention.qk_nope_head_dimension + attention.qk_rope_head_dimension != attention.head_dimension
+            || attention.kv_lora_rank == 0
+            || attention.value_head_dimension == 0
+            || attention.kv_head_count != attention.head_count
+            || attention.output_group_count != attention.head_count
+            || attention.output_lora_rank != attention.value_head_dimension
+            || attention.compression_ratio != 0)
+            return Error{ErrorCode::InvalidModel, "invalid expanded-value latent attention dimensions"};
+    }
+    else if (attention.qk_rope_head_dimension == attention.head_dimension
+             || attention.output_group_count == 0
+             || attention.head_count % attention.output_group_count != 0
+             || attention.output_lora_rank == 0)
+    {
+        return Error{ErrorCode::InvalidModel, "invalid multi-head latent attention dimensions"};
+    }
+    if (!latent_value
+        && attention.compression_ratio != 0 && attention.compression_ratio != 4 && attention.compression_ratio != 128)
         return Error{ErrorCode::UnsupportedModel, "compressed latent attention only supports ratios 4 and 128"};
 
     plan.kind = AttentionKind::MultiHeadLatent;
-    plan.flags |= AttentionBlockSink | AttentionBlockQueryKeyNorm;
+    if (latent_value)
+    {
+        plan.flags |= AttentionBlockLatentValue;
+        if (has_flag(attention.flags, AttentionDescriptorOutputGate))
+            plan.flags |= AttentionBlockOutputGate;
+    }
+    else
+        plan.flags |= AttentionBlockSink | AttentionBlockQueryKeyNorm;
     plan.head_count = attention.head_count;
     plan.kv_head_count = attention.kv_head_count;
-    plan.head_dimension = attention.head_dimension;
-    plan.sliding_window = attention.sliding_window;
+    plan.qk_head_dimension = attention.head_dimension;
+    plan.head_dimension = latent_value ? attention.kv_lora_rank + attention.qk_rope_head_dimension
+                                       : attention.head_dimension;
+    plan.value_head_dimension = latent_value ? attention.value_head_dimension : attention.head_dimension;
+    plan.kv_lora_rank = latent_value ? attention.kv_lora_rank : 0;
+    plan.qk_nope_head_dimension = latent_value ? attention.qk_nope_head_dimension : 0;
+    plan.sliding_window = latent_value ? 0 : attention.sliding_window;
     plan.initial_context_length = attention.initial_context_length;
     plan.query_lora_rank = attention.query_lora_rank;
     plan.rope_head_dimension = attention.qk_rope_head_dimension;
@@ -632,12 +680,30 @@ static Result<void> compile_latent_attention(const WeightStore& weights,
     status = assign_required_linear_tensor(weights, layer_name + "attention.query_b.weight", {attention.head_count * attention.head_dimension, attention.query_lora_rank}, attention.projection_weight_dtype, plan.query_b_weight);
     if (!status)
         return status.error();
-    status = assign_required_linear_tensor(weights, layer_name + "attention.key_value.weight", {attention.head_dimension, descriptor.hidden_size}, attention.projection_weight_dtype, plan.key_value_weight);
+    status = assign_required_linear_tensor(weights, layer_name + "attention.key_value.weight", {kv_width, descriptor.hidden_size}, attention.projection_weight_dtype, plan.key_value_weight);
     if (!status)
         return status.error();
-    status = assign_required_tensor(weights, layer_name + "attention.key_value_norm.weight", {attention.head_dimension}, descriptor.activation_dtype, plan.key_value_norm_weight);
+    status = assign_required_tensor(weights, layer_name + "attention.key_value_norm.weight", {latent_value ? attention.kv_lora_rank : attention.head_dimension}, descriptor.activation_dtype, plan.key_value_norm_weight);
     if (!status)
         return status.error();
+    if (latent_value)
+    {
+        status = assign_required_linear_tensor(weights, layer_name + "attention.query_b_absorbed.weight", {attention.head_count * plan.head_dimension, attention.query_lora_rank}, attention.projection_weight_dtype, plan.query_b_absorbed_weight);
+        if (!status)
+            return status.error();
+        status = assign_required_linear_tensor(weights, layer_name + "attention.key_value_b.weight", {attention.head_count * (attention.qk_nope_head_dimension + attention.value_head_dimension), attention.kv_lora_rank}, attention.projection_weight_dtype, plan.key_value_b_weight);
+        if (!status)
+            return status.error();
+        status = assign_required_linear_tensor(weights, layer_name + "attention.output_a.weight", {attention.output_group_count * attention.output_lora_rank, plan.head_dimension}, attention.projection_weight_dtype, plan.output_a_weight);
+        if (!status)
+            return status.error();
+        status = assign_required_linear_tensor(weights, layer_name + "attention.output.weight", {descriptor.hidden_size, attention.head_count * attention.value_head_dimension}, attention.projection_weight_dtype, plan.output_b_weight);
+        if (!status)
+            return status.error();
+        if (!has_flag(attention.flags, AttentionDescriptorOutputGate))
+            return {};
+        return assign_required_linear_tensor(weights, layer_name + "attention.output_gate.weight", {attention.head_count, descriptor.hidden_size}, descriptor.activation_dtype, plan.output_gate_weight);
+    }
     status = assign_required_tensor(weights, layer_name + "attention.sinks", {attention.head_count}, DType::Float32, plan.sinks);
     if (!status)
         return status.error();
@@ -709,6 +775,13 @@ static Result<void> compile_gated_delta_attention(const WeightStore& weights,
         plan.flags |= AttentionBlockExternalResidual;
     if (has_flag(attention.flags, AttentionDescriptorSigmoidGate))
         plan.flags |= AttentionBlockSigmoidGate;
+    const bool bounded_gate = has_flag(attention.flags, AttentionDescriptorDeltaGate);
+    if (bounded_gate)
+    {
+        plan.flags |= AttentionBlockDeltaGate;
+        plan.delta_gate_channels = attention.head_dimension;
+        plan.delta_lower_bound = attention.delta_lower_bound;
+    }
     plan.head_count = attention.head_count;
     plan.kv_head_count = attention.kv_head_count;
     plan.head_dimension = attention.head_dimension;
@@ -719,6 +792,7 @@ static Result<void> compile_gated_delta_attention(const WeightStore& weights,
     const uint32_t key_size = attention.kv_head_count * attention.head_dimension;
     const uint32_t value_size = attention.head_count * attention.value_head_dimension;
     const uint32_t convolution_size = key_size * 2 + value_size;
+    const uint32_t gate_size = attention.head_count * plan.delta_gate_channels;
     Result<void> status;
     if (descriptor.hyper_connection_kind != HyperConnectionKind::GatedResidual)
     {
@@ -753,7 +827,7 @@ static Result<void> compile_gated_delta_attention(const WeightStore& weights,
         return status.error();
     status = assign_required_linear_tensor(weights,
                                            layer_name + "attention.delta.alpha.weight",
-                                           {attention.head_count, descriptor.hidden_size},
+                                           {gate_size, descriptor.hidden_size},
                                            descriptor.activation_dtype,
                                            plan.delta_alpha_weight);
     if (!status)
@@ -767,24 +841,24 @@ static Result<void> compile_gated_delta_attention(const WeightStore& weights,
         return status.error();
     // Gate scalars and the head norm stay FP32 in some checkpoints.
     status = assign_required_linear_tensor(weights,
-                                          layer_name + "attention.delta.time_bias",
-                                          {attention.head_count},
-                                          descriptor.activation_dtype,
-                                          plan.delta_time_bias);
+                                           layer_name + "attention.delta.time_bias",
+                                           {gate_size},
+                                           descriptor.activation_dtype,
+                                           plan.delta_time_bias);
     if (!status)
         return status.error();
     status = assign_required_linear_tensor(weights,
-                                          layer_name + "attention.delta.decay_log",
-                                          {attention.head_count},
-                                          descriptor.activation_dtype,
-                                          plan.delta_decay_log);
+                                           layer_name + "attention.delta.decay_log",
+                                           {attention.head_count},
+                                           descriptor.activation_dtype,
+                                           plan.delta_decay_log);
     if (!status)
         return status.error();
     status = assign_required_linear_tensor(weights,
-                                          layer_name + "attention.delta.norm.weight",
-                                          {attention.value_head_dimension},
-                                          descriptor.activation_dtype,
-                                          plan.delta_norm_weight);
+                                           layer_name + "attention.delta.norm.weight",
+                                           {attention.value_head_dimension},
+                                           descriptor.activation_dtype,
+                                           plan.delta_norm_weight);
     if (!status)
         return status.error();
     return assign_required_linear_tensor(weights,
@@ -1921,10 +1995,9 @@ Result<void> compile_model(MoeModelDescriptor descriptor, WeightMapping mapping,
     for (const LayerDescriptor& layer : descriptor.layers)
     {
         const MoeDescriptor& moe = layer.moe;
-        if (moe.router_group_count != 0 || moe.router_top_k_groups != 0)
-        {
-            return Error{ErrorCode::UnsupportedModel, "group-limited routing is not yet executable"};
-        }
+        if ((moe.router_group_count != 0 || moe.router_top_k_groups != 0)
+            && moe.score_function != RouterScoreFunction::Sigmoid)
+            return Error{ErrorCode::UnsupportedModel, "group-limited routing requires sigmoid scores"};
     }
 
     compiled.descriptor = std::move(descriptor);
@@ -2108,6 +2181,8 @@ Result<void> compile_model(MoeModelDescriptor descriptor, WeightMapping mapping,
         layer_plan.layer_id = layer_id;
         layer_plan.vulkan_device_index = choose_layer_device(use_vulkan_dense, dense_device_indices, device_layer_counts, smooth_device_scores, total_device_score);
         layer_plan.moe.top_k = moe.top_k;
+        layer_plan.moe.router_group_count = moe.router_group_count;
+        layer_plan.moe.router_top_k_groups = moe.router_top_k_groups;
         layer_plan.moe.score_function = moe.score_function;
         layer_plan.moe.normalization = moe.normalization;
         layer_plan.moe.routed_scaling_factor = moe.routed_scaling_factor;

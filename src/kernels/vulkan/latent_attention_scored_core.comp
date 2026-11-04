@@ -28,6 +28,8 @@ layout(push_constant) uniform parameter
     uint compressed_count;
     uint selected;
     float scale;
+    uint inverse_rope;
+    uint gate;
 }
 p;
 

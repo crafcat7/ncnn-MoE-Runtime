@@ -127,6 +127,9 @@ struct CompiledModel
     // arena planning; executable banks are published only after all uploads.
     std::vector<ExpertBankPlan_vulkan> gpu_expert_bank_plans;
     std::vector<std::shared_ptr<ExpertBank_vulkan>> gpu_expert_banks;
+    // Prefix of layers whose routed FFNs are banked. Zero disables the chain;
+    // layers at or after this limit stream through the ExpertCache.
+    uint32_t resident_bank_layers = 0;
     uint64_t gpu_expert_bank_size = 0;
     SpeculativeModelPlan speculative;
     std::shared_ptr<ExpertCache> expert_cache;

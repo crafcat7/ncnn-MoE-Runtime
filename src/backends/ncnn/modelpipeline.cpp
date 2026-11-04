@@ -231,6 +231,12 @@ bool support_vulkan_attention(const CompiledOperatorTable& operators,
         if (handle == invalid_tensor_handle || !uses_vulkan_dense_operator(operators.at_weight(handle)))
             return false;
     }
+    if (has_flag(attention.flags, AttentionBlockLatentValue)
+        && (attention.query_b_absorbed_weight == invalid_tensor_handle
+            || !uses_vulkan_dense_operator(operators.at_weight(attention.query_b_absorbed_weight))
+            || attention.output_gate_weight == invalid_tensor_handle
+            || !uses_vulkan_dense_operator(operators.at_weight(attention.output_gate_weight))))
+        return false;
     if (attention.compression_ratio != 0)
         for (TensorHandle handle : {attention.compressor_key_value_weight, attention.compressor_gate_weight})
             if (handle == invalid_tensor_handle || !uses_vulkan_dense_operator(operators.at_weight(handle)))
@@ -784,7 +790,9 @@ static Result<void> prepare_latent_attention_operators(CompiledModel& compiled,
     const TensorHandle latent_linear_handles[] = {
         plan.query_a_weight,
         plan.query_b_weight,
+        plan.query_b_absorbed_weight,
         plan.key_value_weight,
+        plan.output_gate_weight,
         plan.output_b_weight,
         plan.indexer_query_weight,
         plan.indexer_weights_weight,
@@ -857,7 +865,7 @@ static Result<void> prepare_latent_attention_operators(CompiledModel& compiled,
     if (attention_core_enabled
         && has_flag(compiled.opt.optimization_flags, OptimizationVulkanAttention))
     {
-        compiled.operators.at_weight_mutable(plan.query_a_weight).latent_attention = LatentAttention_vulkan::create(plan, compiled.weights.at(plan.sinks),
+        compiled.operators.at_weight_mutable(plan.query_a_weight).latent_attention = LatentAttention_vulkan::create(plan, plan.sinks == invalid_tensor_handle ? nullptr : &compiled.weights.at(plan.sinks),
                                                                                                                     output_a, output_b);
         const auto& latent = compiled.operators.at_weight(plan.query_a_weight).latent_attention;
         if (!latent)
@@ -874,11 +882,17 @@ static Result<void> prepare_latent_attention_operators(CompiledModel& compiled,
         // Disabling a fusion keeps the complete segmented GPU implementation.
         // Once a supported recorder is selected, allocation/preparation failure
         // must be reported instead of changing the execution path at runtime.
-        const bool prepare_recording = recording_types && recording_shape
+        const bool prepare_recording = !has_flag(plan.flags, AttentionBlockLatentValue)
+                                       && recording_types && recording_shape
                                        && has_flag(compiled.opt.optimization_flags, OptimizationVulkanLatentInputRmsNorm)
                                        && (plan.compression_ratio == 0
                                            || has_flag(compiled.opt.optimization_flags, OptimizationVulkanLatentCompressor));
-        if (prepare_recording && !latent->prepare(compiled.weights, compiled.operators, compiled.opt.optimization_flags))
+        if (has_flag(plan.flags, AttentionBlockLatentValue))
+        {
+            if (!latent->prepare_value(compiled.weights, compiled.operators))
+                return Error{ErrorCode::InternalError, "failed to prepare " + std::string(diagnostic_prefix) + "Vulkan expanded-value latent Attention"};
+        }
+        else if (prepare_recording && !latent->prepare(compiled.weights, compiled.operators, compiled.opt.optimization_flags))
             return Error{ErrorCode::InternalError, "failed to prepare " + std::string(diagnostic_prefix) + "Vulkan latent Attention recorder"};
     }
     return {};
@@ -969,6 +983,7 @@ static void prepare_gated_delta_attention_operators(CompiledModel& compiled,
                                                             plan.head_count, plan.kv_head_count, plan.head_dimension,
                                                             plan.value_head_dimension, plan.convolution_kernel_size,
                                                             plan.norm_epsilon, has_flag(plan.flags, AttentionBlockSigmoidGate),
+                                                            plan.delta_gate_channels, plan.delta_lower_bound,
                                                             layer_plan.vulkan_device_index, compiled.vulkan_runtime,
                                                             compiled.opt.optimization_flags);
         if (!gated)
@@ -1025,6 +1040,8 @@ static void prepare_gated_delta_attention_operators(CompiledModel& compiled,
                                                                                         plan.convolution_kernel_size,
                                                                                         plan.norm_epsilon,
                                                                                         has_flag(plan.flags, AttentionBlockSigmoidGate),
+                                                                                        plan.delta_gate_channels,
+                                                                                        plan.delta_lower_bound,
                                                                                         layer_plan.vulkan_device_index,
                                                                                         compiled.vulkan_runtime,
                                                                                         compiled.opt.optimization_flags);
@@ -1669,6 +1686,19 @@ static uint64_t attention_session_state_size(const CompiledModel& compiled,
     }
     if (attention.kind != AttentionKind::MultiHeadLatent)
         return 0;
+    if (has_flag(attention.flags, AttentionBlockLatentValue))
+    {
+        // Expanded-value MLA grows a linear latent cache; plan for the
+        // requested context (or the default prefill chunk) plus growth copy.
+        const uint64_t tokens = context_tokens == 0 ? SessionOptions{}.prefill_chunk_size : context_tokens;
+        uint64_t capacity = 128;
+        while (capacity < tokens)
+            capacity = saturating_multiply_u64(capacity, 2);
+        const uint64_t elements = saturating_multiply_u64(capacity, attention.head_dimension);
+        if (capacity == UINT64_MAX || elements == UINT64_MAX)
+            return UINT64_MAX;
+        return saturating_multiply_u64(elements, sizeof(float) * 2);
+    }
     const uint64_t window = saturating_multiply_u64(attention.sliding_window, attention.head_dimension);
     uint64_t elements = window;
     if (attention.compression_ratio != 0)
@@ -2265,7 +2295,8 @@ static Result<GpuResourceRequest> attention_resource_request(const CompiledModel
         return request;
     }
     if (attention.kind != AttentionKind::MultiHeadLatent) return GpuResourceRequest{};
-    for (TensorHandle handle : {attention.query_a_weight, attention.query_b_weight, attention.key_value_weight,
+    for (TensorHandle handle : {attention.query_a_weight, attention.query_b_weight,
+                                attention.query_b_absorbed_weight, attention.key_value_weight,
                                 attention.output_a_weight, attention.output_b_weight, attention.indexer_query_weight,
                                 attention.indexer_weights_weight, attention.compressor_key_value_weight,
                                 attention.compressor_gate_weight, attention.indexer_compressor_key_value_weight,
@@ -2542,6 +2573,32 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
                 compiled.resident_submission_rows = SessionOptions{}.prefill_chunk_size;
             }
         }
+        // A mixed graph may contain a dense FFN beside routed layers. The
+        // dense layer still needs a segment so the routed chain can continue
+        // through it (and so a resident Expert bank chain can be selected).
+        for (size_t index = 0; index < compiled.graph.layer_plans.size(); ++index)
+        {
+            CompiledLayerPlan& layer = compiled.graph.layer_plans[index];
+            if (layer.dense_ffn.down_weight == invalid_tensor_handle || compiled.gpu_segments[index]) continue;
+            if (!GpuSegment_vulkan::supports(compiled, layer)) continue;
+            const uint32_t dense_device = layer.vulkan_device_index;
+            const uint64_t dense_alignment = gpu_buffer_alignment(compiled, dense_device);
+            GpuResourceRequest request;
+            request.persistent_size = constant_storage(compiled, {layer.dense_pre_ffn_norm_weight, layer.dense_pre_ffn_norm_bias}, dense_alignment);
+            request.persistent_size = saturating_add_u64(request.persistent_size, saturating_multiply_u64(dense_alignment, 8));
+            request.workspace_size = saturating_multiply_u64(SessionOptions{}.prefill_chunk_size,
+                                                             saturating_multiply_u64(compiled.descriptor.hidden_size, 4 * sizeof(float)));
+            std::shared_ptr<GpuSegment_vulkan> segment;
+            auto prepared = prepare_resource_group(compiled, resources, dense_device, request, &layer, "dense segment at layer " + std::to_string(layer.layer_id), [&]() -> Result<void> {
+                                                       segment = GpuSegment_vulkan::create(compiled, layer);
+                                                       if (!segment)
+                                                           return Error{ErrorCode::InternalError, "cannot prepare selected dense Vulkan segment at layer " + std::to_string(layer.layer_id)};
+                                                       return {}; }, [&] { return GpuSegment_vulkan::supports(compiled, layer); }, true);
+            if (!prepared) return prepared.error();
+            if (prepared.value())
+                compiled.gpu_segments[index] = std::move(segment);
+        }
+
         for (size_t index = 0; index < compiled.graph.layer_plans.size(); ++index)
         {
             const auto& layer = compiled.graph.layer_plans[index];
@@ -2602,7 +2659,8 @@ static bool graph_has_resident_chain(const CompiledModel& model, const Execution
 
 static bool graph_has_expert_banks(const CompiledModel& model, const ExecutionGraph& graph)
 {
-    return graph_has_resident_chain(model, graph) && model.gpu_expert_bank_plans.size() == graph.layer_plans.size();
+    return graph_has_resident_chain(model, graph) && model.resident_bank_layers != 0
+           && model.gpu_expert_bank_plans.size() == graph.layer_plans.size();
 }
 
 static uint64_t graph_tensor_elements(const CompiledModel& model, const ExecutionGraph& graph,
@@ -2719,7 +2777,8 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
         if (attention.kind == AttentionKind::GatedDeltaNet)
         {
             elements = GatedDeltaNet_vulkan::scratch_elements(attention.head_count, attention.kv_head_count,
-                                                              attention.head_dimension, attention.value_head_dimension, rows);
+                                                              attention.head_dimension, attention.value_head_dimension,
+                                                              attention.delta_gate_channels, rows);
         }
         else if (attention.kind == AttentionKind::Standard && !has_flag(attention.flags, AttentionBlockQsa))
         {
@@ -2780,7 +2839,8 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
     {
         const bool routed = node.type == ExecutionNodeType::ExpertGroup;
         const bool shared = node.type == ExecutionNodeType::SharedExpertGroup;
-        if (routed && graph_has_expert_banks(model, graph))
+        if (routed && graph_has_expert_banks(model, graph)
+            && node.layer_plan_index < model.resident_bank_layers)
         {
             const ExpertBankPlan_vulkan& bank = model.gpu_expert_bank_plans[node.layer_plan_index];
             for (uint64_t elements : ExpertBank_vulkan::scratch_elements(bank, rows, layer.moe.top_k))

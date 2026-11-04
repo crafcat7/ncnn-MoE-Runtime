@@ -771,6 +771,276 @@ static Result<void> forward_output(const WeightStore& weights,
     return {};
 }
 
+// Expanded-value MLA keeps the compressed KV latent in its cache and expands
+// keys and values per head. The query absorbs the key projection once per
+// token so attention still traverses one latent vector per candidate.
+static void matrix_rows_accumulate(const TensorData& matrix, uint32_t first_row, uint32_t row_count,
+                                   const float* input, float* output)
+{
+    const uint32_t columns = matrix.shape[1];
+    std::fill_n(output, columns, 0.0f);
+    if (matrix.dtype == DType::BFloat16)
+    {
+        const std::span<const uint16_t> values = matrix.bfloat16_values();
+        for (uint32_t row = 0; row < row_count; ++row)
+        {
+            const float scale = input[row];
+            const uint16_t* weights = values.data() + static_cast<size_t>(first_row + row) * columns;
+            for (uint32_t column = 0; column < columns; ++column)
+                output[column] += scale * bfloat16_to_float(weights[column]);
+        }
+        return;
+    }
+    const std::span<const float> values = matrix.float32_values();
+    for (uint32_t row = 0; row < row_count; ++row)
+    {
+        const float scale = input[row];
+        const float* weights = values.data() + static_cast<size_t>(first_row + row) * columns;
+        for (uint32_t column = 0; column < columns; ++column)
+            output[column] += scale * weights[column];
+    }
+}
+
+static int latent_task_team_size(size_t tasks) noexcept
+{
+#if defined(_OPENMP)
+    if (tasks <= 1)
+        return 1;
+    return std::max(1, std::min(static_cast<int>(tasks), static_cast<int>(cpu_linear_num_threads())));
+#else
+    (void)tasks;
+    return 1;
+#endif
+}
+
+static Result<void> forward_latent_value_attention_batch(const WeightStore& weights,
+                                                         const CompiledOperatorTable& operators,
+                                                         const AttentionBlockPlan& plan,
+                                                         ExecutionBackend backend,
+                                                         std::span<const uint64_t> positions,
+                                                         std::span<LayerCache* const> caches,
+                                                         AttentionScratch& scratch,
+                                                         const ActivationBuffer& input,
+                                                         ActivationBuffer& output,
+                                                         uint64_t optimization_flags)
+{
+    if (backend != ExecutionBackend::Cpu)
+        return Error{ErrorCode::InternalError, "expanded-value latent attention requires the CPU backend"};
+    const uint32_t heads = plan.head_count;
+    const uint32_t nope = plan.qk_nope_head_dimension;
+    const uint32_t rope = plan.rope_head_dimension;
+    const uint32_t vdim = plan.value_head_dimension;
+    const uint32_t lora = plan.kv_lora_rank;
+    const uint32_t qdim = plan.qk_head_dimension;
+    const uint32_t width = lora + rope;
+    const uint32_t value_size = heads * vdim;
+    const size_t rows = input.rows();
+    if (qdim != nope + rope || width == 0 || rows != positions.size()
+        || rows != caches.size()
+        || input.columns() != weights.at(plan.pre_attention_norm_weight).shape[0])
+        return Error{ErrorCode::InvalidArgument, "invalid expanded-value latent attention execution plan"};
+    for (const LayerCache* cache : caches)
+    {
+        if (!cache)
+            return Error{ErrorCode::InvalidArgument, "latent attention cache cannot be null"};
+    }
+    if (&input == &output)
+        return Error{ErrorCode::InvalidArgument, "latent attention input/output must be distinct"};
+
+    ActivationBuffer& normalized = scratch.normalized;
+    ActivationBuffer& query_rank = scratch.projected;
+    ActivationBuffer& query = scratch.query;
+    ActivationBuffer& key_value = scratch.key;
+    ActivationBuffer& absorbed = scratch.value;
+    ActivationBuffer& latent_output = scratch.fused_qkv;
+    ActivationBuffer& attention_output = scratch.attention;
+    ActivationBuffer& gate = scratch.gate;
+    const TensorData& key_value_b = weights.at(plan.key_value_b_weight);
+    if (key_value_b.dtype != DType::Float32 && key_value_b.dtype != DType::BFloat16)
+        return Error{ErrorCode::UnsupportedModel, "expanded-value latent attention requires float32 or bfloat16 value projections"};
+
+    forward_rms_norm(input, weights.at(plan.pre_attention_norm_weight),
+                     plan.norm_epsilon, normalized, plan.norm_weight_offset);
+    forward_linear(weights.at(plan.query_a_weight), normalized, query_rank,
+                   optimization_flags, operators.find_weight(plan.query_a_weight));
+    forward_rms_norm(query_rank, weights.at(plan.query_norm_weight),
+                     plan.norm_epsilon, query_rank, plan.norm_weight_offset);
+    forward_linear(weights.at(plan.query_b_weight), query_rank, query,
+                   optimization_flags, operators.find_weight(plan.query_b_weight));
+    forward_linear(weights.at(plan.key_value_weight), normalized, key_value,
+                   optimization_flags, operators.find_weight(plan.key_value_weight));
+    if (plan.output_gate_weight != invalid_tensor_handle)
+    {
+        forward_linear(weights.at(plan.output_gate_weight), normalized, gate,
+                       optimization_flags, operators.find_weight(plan.output_gate_weight));
+    }
+
+    absorbed.reset(rows, heads * width, false);
+    latent_output.reset(rows, heads * lora, false);
+    attention_output.reset(rows, value_size, false);
+
+    const int task_team = latent_task_team_size(rows * heads);
+    const int64_t task_count = static_cast<int64_t>(rows) * heads;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(qdim));
+
+    // Absorb the key projection and append each token's compressed KV. Rows of
+    // one prefill share a cache and are appended in position order.
+    for (size_t row = 0; row < rows; ++row)
+    {
+        const uint64_t position = positions[row];
+        LayerCache& cache = *caches[row];
+        if (cache.latent_window.size() < static_cast<size_t>(position + 1) * width)
+        {
+            uint64_t capacity = std::max<uint64_t>(cache.capacity_tokens, 16);
+            while (capacity <= position)
+                capacity *= 2;
+            cache.latent_window.resize(static_cast<size_t>(capacity) * width);
+            cache.capacity_tokens = capacity;
+        }
+        cache.columns = width;
+        cache.latent_cache = true;
+        if (cache.latent_token_count < position + 1)
+        {
+            float* stored = cache.latent_window.data() + static_cast<size_t>(position) * width;
+            std::copy_n(key_value.row(row), width, stored);
+            normalize_vector(stored, lora, weights.at(plan.key_value_norm_weight), plan.norm_epsilon);
+            apply_rope(stored + lora, rope, position, plan, false);
+            cache.latent_token_count = position + 1;
+        }
+    }
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) num_threads(task_team) if (task_team > 1)
+#endif
+    for (int64_t task = 0; task < task_count; ++task)
+    {
+        const size_t row = static_cast<size_t>(task) / heads;
+        const uint32_t head = static_cast<uint32_t>(task) % heads;
+        const uint64_t position = positions[row];
+        const float* query_row = query.row(row) + static_cast<size_t>(head) * qdim;
+        float* absorbed_head = absorbed.row(row) + static_cast<size_t>(head) * width;
+        matrix_rows_accumulate(key_value_b, head * (nope + vdim), nope, query_row, absorbed_head);
+        std::copy_n(query_row + nope, rope, absorbed_head + lora);
+        apply_rope(absorbed_head + lora, rope, position, plan, false);
+
+        LayerCache& cache = *caches[row];
+        const uint32_t candidate_count = static_cast<uint32_t>(position + 1);
+        const float* candidate = cache.latent_window.data();
+        float* latent = latent_output.row(row) + static_cast<size_t>(head) * lora;
+        float maximum = float_dot(absorbed_head, candidate, width) * scale;
+        std::copy_n(candidate, lora, latent);
+        float denominator = 1.0f;
+        for (uint32_t index = 1; index < candidate_count; ++index)
+        {
+            candidate += width;
+            const float score = float_dot(absorbed_head, candidate, width) * scale;
+            if (score > maximum)
+            {
+                const float rescale = float_approximate_exp(maximum - score);
+                float_scale_inplace(latent, rescale, lora);
+                denominator *= rescale;
+                maximum = score;
+            }
+            const float weight = float_approximate_exp(score - maximum);
+            denominator += weight;
+            float_scaled_add(latent, candidate, weight, lora);
+        }
+        float_scale_inplace(latent, 1.0f / denominator, lora);
+
+        float* head_output = attention_output.row(row) + static_cast<size_t>(head) * vdim;
+        matrix_rows_dot(key_value_b, head * (nope + vdim) + nope, vdim, latent, head_output);
+        if (plan.output_gate_weight != invalid_tensor_handle)
+        {
+            const float head_gate = gate.row(row)[head];
+            float_scale_inplace(head_output, 1.0f / (1.0f + float_approximate_exp(-head_gate)), vdim);
+        }
+    }
+
+    ActivationBuffer& projected = (&output == &input || &output == &attention_output)
+                                      ? scratch.latent_token_input
+                                      : output;
+    forward_linear(weights.at(plan.output_b_weight), attention_output, projected,
+                   optimization_flags, operators.find_weight(plan.output_b_weight));
+    if (&projected != &output)
+        output.swap(projected);
+    return {};
+}
+
+// The device core consumes the absorbed query and the normalized/RoPE'd KV
+// latent. Projection and normalization remain on the selected projections;
+// only the context traversal and the grouped value projection run on device.
+static Result<void> forward_latent_value_vulkan(const WeightStore& weights,
+                                                const CompiledOperatorTable& operators,
+                                                const AttentionBlockPlan& plan,
+                                                std::span<const uint64_t> positions,
+                                                std::span<LayerCache* const> caches,
+                                                AttentionScratch& scratch,
+                                                const ActivationBuffer& input,
+                                                ActivationBuffer& output,
+                                                uint64_t optimization_flags)
+{
+    const auto& latent = operators.at_weight(plan.query_a_weight).latent_attention;
+    if (!latent)
+        return Error{ErrorCode::InternalError, "expanded-value latent attention has no device core"};
+    const uint32_t heads = plan.head_count;
+    const uint32_t lora = plan.kv_lora_rank;
+    const uint32_t rope = plan.rope_head_dimension;
+    const uint32_t width = plan.head_dimension;
+    const size_t rows = input.rows();
+    if (rows != positions.size() || rows != caches.size())
+        return Error{ErrorCode::InvalidArgument, "invalid expanded-value latent attention execution plan"};
+
+    ActivationBuffer& normalized = scratch.normalized;
+    ActivationBuffer& query_rank = scratch.projected;
+    ActivationBuffer& query = scratch.query;
+    ActivationBuffer& key_value = scratch.key;
+    ActivationBuffer& gate = scratch.gate;
+    forward_rms_norm(input, weights.at(plan.pre_attention_norm_weight),
+                     plan.norm_epsilon, normalized, plan.norm_weight_offset);
+    forward_linear(weights.at(plan.query_a_weight), normalized, query_rank, optimization_flags,
+                   operators.find_weight(plan.query_a_weight), ExecutionBackend::Vulkan,
+                   &scratch.quantized_input);
+    forward_rms_norm(query_rank, weights.at(plan.query_norm_weight),
+                     plan.norm_epsilon, query_rank, plan.norm_weight_offset);
+    forward_linear(weights.at(plan.query_b_absorbed_weight), query_rank, query, optimization_flags,
+                   operators.find_weight(plan.query_b_absorbed_weight), ExecutionBackend::Vulkan,
+                   &scratch.quantized_input);
+    forward_linear(weights.at(plan.key_value_weight), normalized, key_value, optimization_flags,
+                   operators.find_weight(plan.key_value_weight), ExecutionBackend::Vulkan,
+                   &scratch.quantized_input);
+    forward_linear(weights.at(plan.output_gate_weight), normalized, gate, optimization_flags,
+                   nullptr, ExecutionBackend::Cpu);
+
+    for (size_t row = 0; row < rows; ++row)
+    {
+        const uint64_t position = positions[row];
+        LayerCache& cache = *caches[row];
+        float* kv = key_value.row(row);
+        normalize_vector(kv, lora, weights.at(plan.key_value_norm_weight), plan.norm_epsilon);
+        apply_rope(kv + lora, rope, position, plan, false);
+        float* absorbed = query.row(row);
+        for (uint32_t head = 0; head < heads; ++head)
+            apply_rope(absorbed + static_cast<size_t>(head) * width + lora, rope, position, plan, false);
+        if (cache.latent_window.size() < static_cast<size_t>(position + 1) * width)
+        {
+            uint64_t capacity = std::max<uint64_t>(cache.capacity_tokens, 16);
+            while (capacity <= position)
+                capacity *= 2;
+            cache.latent_window.resize(static_cast<size_t>(capacity) * width);
+            cache.capacity_tokens = capacity;
+        }
+        cache.columns = width;
+        cache.latent_cache = true;
+        if (cache.latent_token_count < position + 1)
+        {
+            std::copy_n(kv, width, cache.latent_window.data() + static_cast<size_t>(position) * width);
+            cache.latent_token_count = position + 1;
+        }
+    }
+    if (!latent->forward_value_batch(positions, caches, query, key_value, gate, output))
+        return Error{ErrorCode::InternalError, "Vulkan expanded-value latent attention execution failed"};
+    return {};
+}
+
 Result<void> forward_latent_attention_batch(const WeightStore& weights,
                                             const CompiledOperatorTable& operators,
                                             const AttentionBlockPlan& plan,
@@ -786,8 +1056,20 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
         || input.columns() != weights.at(plan.pre_attention_norm_weight).shape[0]
         || input.rows() != positions.size()
         || input.rows() != caches.size()
-        || plan.sliding_window == 0)
+        || (plan.sliding_window == 0 && !has_flag(plan.flags, AttentionBlockLatentValue)))
         return Error{ErrorCode::InvalidArgument, "invalid latent attention execution plan"};
+    if (has_flag(plan.flags, AttentionBlockLatentValue))
+    {
+        if (backend == ExecutionBackend::Vulkan
+            && operators.at_weight(plan.query_a_weight).latent_attention)
+        {
+            return forward_latent_value_vulkan(weights, operators, plan, positions, caches,
+                                               scratch, input, output, optimization_flags);
+        }
+        return forward_latent_value_attention_batch(weights, operators, plan, ExecutionBackend::Cpu,
+                                                    positions, caches, scratch, input, output,
+                                                    optimization_flags);
+    }
     for (const LayerCache* cache : caches)
     {
         if (!cache)

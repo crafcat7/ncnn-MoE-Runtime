@@ -2,6 +2,7 @@
 #include "attention_vulkan.h"
 #include "expertbank_vulkan.h"
 #include "gateddeltanet_vulkan.h"
+#include "latentattention_vulkan.h"
 #include "qsaattention_vulkan.h"
 #include "layernorm_vulkan.h"
 #include "linear.h"
@@ -45,6 +46,7 @@ public:
     std::shared_ptr<SharedFfn_vulkan> shared;
     std::shared_ptr<const DeviceTensor_vulkan> residual;
     std::shared_ptr<const DeviceTensor_vulkan> combined;
+    bool dense_ready = false;
 
     bool record_hidden(ncnn::VkMat& output, ncnn::VkCompute& command,
                        std::vector<ncnn::VkMat>& storage, FfnRecordStatistics_vulkan& statistics,
@@ -98,6 +100,7 @@ public:
     ncnn::Option option;
     std::shared_ptr<Attention_vulkan> attention;
     std::shared_ptr<GatedDeltaNet_vulkan> delta;
+    std::shared_ptr<LatentAttention_vulkan> mla;
     std::shared_ptr<QsaAttention_vulkan> qsa;
     std::shared_ptr<RmsNorm_vulkan> attention_norm;
     std::shared_ptr<RmsNorm_vulkan> ffn_norm;
@@ -215,8 +218,12 @@ bool GpuSegment_vulkan::supports(const CompiledModel& model, const CompiledLayer
     const bool dense = layer.dense_ffn.down_weight != invalid_tensor_handle;
     if (dense)
     {
-        const auto& operation = model.operators.at(layer.dense_ffn.vulkan_operator).qnk_expert;
-        if (layer.dense_ffn.use_gpu_cache || !operation || !operation->vulkan_context()
+        const auto& operation = model.operators.at(layer.dense_ffn.vulkan_operator);
+        const bool dense_ffn = operation.qnk_expert
+                                   ? operation.qnk_expert->vulkan_context() != nullptr
+                                   : operation.bfloat16
+                                         && model.operators.at_weight(layer.dense_ffn.down_weight).bfloat16;
+        if (layer.dense_ffn.use_gpu_cache || !dense_ffn
             || model.speculative.enabled()
             || !segment_norm_supported(model, layer.dense_pre_ffn_norm_weight, layer.dense_pre_ffn_norm_bias,
                                        model.descriptor.hidden_size)) return false;
@@ -237,6 +244,15 @@ bool GpuSegment_vulkan::supports(const CompiledModel& model, const CompiledLayer
     {
         const auto& operation = model.operators.at(layer.attention.gated_delta_vulkan_operator).gated_delta;
         return operation && vulkan_activation_storage_variant(operation->option()) == 0;
+    }
+    if (layer.attention.kind == AttentionKind::MultiHeadLatent)
+    {
+        if (!has_flag(layer.attention.flags, AttentionBlockLatentValue))
+            return false;
+        const auto& operation = model.operators.at_weight(layer.attention.query_a_weight).latent_attention;
+        const bool supported = operation && operation->can_record()
+                               && vulkan_activation_storage_variant(operation->option()) == 0;
+        return supported;
     }
     if (layer.attention.kind != AttentionKind::Standard) return false;
     const auto& operation = model.operators.at(layer.attention.vulkan_attention_operator);
@@ -285,6 +301,19 @@ std::shared_ptr<GpuSegment_vulkan> GpuSegment_vulkan::create(const CompiledModel
         {
             impl.attention_norm = RmsNorm_vulkan::create(model.weights.at(attention.pre_attention_norm_weight), attention.norm_epsilon,
                                                          attention.norm_weight_offset, impl.context, impl.option);
+            if (!impl.attention_norm) return {};
+        }
+    }
+    else if (attention.kind == AttentionKind::MultiHeadLatent)
+    {
+        impl.mla = model.operators.at_weight(attention.query_a_weight).latent_attention;
+        impl.context = impl.mla->vulkan_context();
+        impl.option = impl.mla->option();
+        if (attention.pre_attention_norm_weight != invalid_tensor_handle)
+        {
+            impl.attention_norm = RmsNorm_vulkan::create(model.weights.at(attention.pre_attention_norm_weight),
+                                                         attention.norm_epsilon, attention.norm_weight_offset,
+                                                         impl.context, impl.option);
             if (!impl.attention_norm) return {};
         }
     }
@@ -507,6 +536,7 @@ public:
     std::vector<std::unique_ptr<AttentionWork_vulkan>> attention_work;
     size_t attention_work_used = 0;
     std::vector<std::unique_ptr<GatedDeltaWork_vulkan>> delta_work;
+    std::vector<std::unique_ptr<LatentValueWork_vulkan>> mla_work;
     std::vector<std::unique_ptr<QsaAttentionWork_vulkan>> qsa_work;
     RouterWorkspace_vulkan router_work;
     FfnRecordStatistics_vulkan ffn_statistics;
@@ -515,6 +545,7 @@ public:
     ActivationBuffer pending_logits;
     // Mapped views are destroyed before their lease and dedicated allocator.
     ncnn::VkMat upload, input, normalized_attention, branch, residual, normalized, output, selected_staging;
+    ncnn::VkMat dense_output;
     uint32_t selected_columns = 0;
     size_t output_rows = 0;
     bool uploaded = false, standalone = false, produce_logits = false, last_row_only = false, fused_head = false;
@@ -532,11 +563,12 @@ public:
         attention_work_used = 0;
         // These tickets do not yet expose a reusable-state API.
         delta_work.clear();
+        mla_work.clear();
         qsa_work.clear();
         storage.clear();
         router_work = {};
         for (auto* value : {&upload, &input, &normalized_attention, &branch,
-                            &residual, &normalized, &output, &selected_staging})
+                            &residual, &normalized, &output, &selected_staging, &dense_output})
             value->release();
         pending_logits.clear();
         host_output.reset();
@@ -626,6 +658,15 @@ public:
                 if (positions[first] != caches[first]->gated_delta_token_count
                     || !d->delta->record_forward(source, *caches[first], count, output, command, *delta_work.back(), d->delta->has_input_rms_norm())) return fail("GatedDeltaNet device recording failed");
             }
+            else if (d->mla)
+            {
+                mla_work.push_back(std::make_unique<LatentValueWork_vulkan>());
+                if (!d->mla->record_value_forward(source,
+                                                  std::span<const uint64_t>(positions).subspan(first, count),
+                                                  std::span<LayerCache* const>(caches).subspan(first, count),
+                                                  output, command, *mla_work.back(), storage))
+                    return fail("expanded-value latent attention device recording failed");
+            }
             else
             {
                 qsa_work.push_back(std::make_unique<QsaAttentionWork_vulkan>());
@@ -662,7 +703,20 @@ public:
             if (!norm_recorded)
                 return fail("cannot record Vulkan FFN norm");
         }
-        if (d->dense) return true;
+        if (d->dense)
+        {
+            ncnn::VkMat ffn_output;
+            if (!d->dense->record(normalized, ffn_output, command, storage, ffn_statistics))
+                return fail("cannot record Vulkan dense FFN");
+            std::vector<ncnn::VkMat> added(1);
+            if (d->add->forward({residual, ffn_output}, added, command, d->option) != 0 || added[0].empty())
+                return fail("cannot record Vulkan dense FFN residual");
+            storage.push_back(ffn_output);
+            storage.push_back(added[0]);
+            ++ffn_statistics.dispatches;
+            dense_output = added[0];
+            return true;
+        }
         if (!d->router->record(normalized, options, router_work, command))
             return fail("cannot record Vulkan router");
         selected_columns = Router_vulkan::selected_columns(options.top_k);
@@ -854,9 +908,14 @@ public:
                 coefficients.fixed_ffn_per_row = expert_work(plan.dense_ffn);
             else
             {
-                const auto& bank = model.gpu_expert_banks[layer]->description();
-                coefficients.routed_expert_per_selection_row = 2.0 * bank.intermediate_columns
-                                                               * (2.0 * bank.input_columns + bank.output_columns);
+                // Tail layers beyond a partial bank are not part of the
+                // recorded prefix and keep streaming through the normal path.
+                if (layer < model.gpu_expert_banks.size() && model.gpu_expert_banks[layer])
+                {
+                    const auto& bank = model.gpu_expert_banks[layer]->description();
+                    coefficients.routed_expert_per_selection_row = 2.0 * bank.intermediate_columns
+                                                                   * (2.0 * bank.input_columns + bank.output_columns);
+                }
                 if (plan.moe.has_shared_expert)
                     coefficients.fixed_ffn_per_row = expert_work(plan.moe.shared_expert);
             }
@@ -935,6 +994,7 @@ void GpuSegmentContinuation_vulkan::abort() noexcept
     {
         for (auto& work : d->active_attention_work()) work->mark_submit_failed();
         for (auto& work : d->delta_work) work->mark_submit_failed();
+        for (auto& work : d->mla_work) work->abort();
         // QSA can append into a shared allocation before metadata publication.
         // A submitted, discarded transaction cannot leave it reusable as old KV.
         if (!d->qsa_work.empty())
@@ -1033,20 +1093,32 @@ bool GpuSegmentContinuation_vulkan::publish(ExpertDispatchPlan& routes, GpuSegme
     ExpertDispatchPlan decoded;
     auto normalized = std::make_shared<DeviceTensor_vulkan>();
     auto residual = std::make_shared<DeviceTensor_vulkan>();
-    if (!copy_staging_to_cpu_batch(d->selected_staging, selected)) return fail("cannot read compact Vulkan routes");
-    const auto decoded_result = Router_vulkan::decode_selected(selected, d->options, decoded);
-    if (!decoded_result)
+    std::shared_ptr<DeviceTensor_vulkan> dense_hidden;
+    if (!target.dense)
     {
-        error = decoded_result.error().message;
-        abort();
-        return false;
+        if (!copy_staging_to_cpu_batch(d->selected_staging, selected)) return fail("cannot read compact Vulkan routes");
+        const auto decoded_result = Router_vulkan::decode_selected(selected, d->options, decoded);
+        if (!decoded_result)
+        {
+            error = decoded_result.error().message;
+            abort();
+            return false;
+        }
     }
     if (!normalized->assign_completed(d->normalized, target.context) || !residual->assign_completed(d->residual, target.context))
         return fail("cannot publish completed Vulkan segment activations");
+    if (target.dense)
+    {
+        dense_hidden = std::make_shared<DeviceTensor_vulkan>();
+        if (!dense_hidden->assign_completed(d->dense_output, target.context))
+            return fail("cannot publish completed Vulkan dense layer");
+    }
     for (auto& work : d->active_attention_work())
         if (!work->commit()) return fail("Standard Attention cache publication failed");
     for (auto& work : d->delta_work)
         if (!work->commit()) return fail("GatedDeltaNet state publication failed");
+    for (auto& work : d->mla_work)
+        if (!work->commit()) return fail("expanded-value latent attention cache publication failed");
     for (auto& work : d->qsa_work)
         if (!work->commit()) return fail("QSA cache publication failed");
     auto& current = *workspace.d;
@@ -1054,9 +1126,11 @@ bool GpuSegmentContinuation_vulkan::publish(ExpertDispatchPlan& routes, GpuSegme
     current.option = target.option;
     current.add = target.add;
     current.shared = target.shared;
-    current.normalized = std::move(normalized);
+    current.normalized = target.dense ? std::shared_ptr<const DeviceTensor_vulkan>(dense_hidden)
+                                      : std::shared_ptr<const DeviceTensor_vulkan>(normalized);
     current.residual = std::move(residual);
     current.combined.reset();
+    current.dense_ready = target.dense != nullptr;
     routes = std::move(decoded);
     auto& counters = target.context->runtime_state();
     counters.dispatches += d->ffn_statistics.dispatches + 3;
@@ -1133,16 +1207,19 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
                                          std::span<const uint64_t> positions, std::span<LayerCache* const> caches,
                                          std::span<const ExpertDispatchOptions> options,
                                          bool produce_logits, bool last_row_only, ActivationBuffer& logits, std::string& error,
-                                         GpuSegmentWorkspace_vulkan* workspace)
+                                         GpuSegmentWorkspace_vulkan* workspace, uint32_t layer_limit)
 {
 #if NCNN_MOE_WITH_VULKAN
     const size_t layers = model.graph.layer_plans.size();
     const size_t rows = positions.size();
-    if (layers == 0 || rows == 0 || rows > static_cast<size_t>(std::numeric_limits<int>::max())
+    const size_t limit = layer_limit == 0 ? layers : std::min(layers, static_cast<size_t>(layer_limit));
+    if (layers == 0 || limit == 0 || rows == 0 || rows > static_cast<size_t>(std::numeric_limits<int>::max())
         || layers > std::numeric_limits<size_t>::max() / rows || caches.size() != layers * rows
         || (!options.empty() && options.size() != layers)
         || (!model.gpu_expert_banks.empty() && model.gpu_expert_banks.size() != layers)
-        || model.gpu_segments.size() != layers || !model.gpu_head || model.resident_submission_rows == 0
+        || model.gpu_segments.size() != layers || (!model.gpu_head && limit == layers)
+        || model.resident_submission_rows == 0
+        || (limit < layers && produce_logits)
         || initial_hidden.dtype() != DType::Float32 || initial_hidden.rows() != rows
         || initial_hidden.columns() != model.descriptor.hidden_size
         || std::any_of(caches.begin(), caches.end(), [](auto* cache) { return cache == nullptr || cache->vulkan_attention_state_unknown; }))
@@ -1150,8 +1227,8 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
         error = "invalid resident graph chain inputs";
         return false;
     }
-    const auto context = model.gpu_head->context();
-    for (size_t layer = 0; layer < layers; ++layer)
+    const auto context = model.gpu_head ? model.gpu_head->context() : model.gpu_segments.front()->context();
+    for (size_t layer = 0; layer < limit; ++layer)
     {
         const auto& segment = model.gpu_segments[layer];
         if (!context || !segment || segment->context() != context)
@@ -1179,7 +1256,7 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
             return false;
         }
     }
-    const uint32_t chunk_layers = resident_chunk_layers(model, static_cast<uint32_t>(rows));
+    const uint32_t chunk_layers = std::max<uint32_t>(1, std::min<uint32_t>(resident_chunk_layers(model, static_cast<uint32_t>(rows)), static_cast<uint32_t>(limit)));
     std::optional<GpuSegmentWorkspace_vulkan> local_workspace;
     if (!workspace) local_workspace.emplace();
     auto& output_workspace = workspace ? *workspace : *local_workspace;
@@ -1198,10 +1275,10 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
     VulkanComputeBatch batches(*context);
     pooled.prepare_work_coefficients(model);
     auto& layer_work = pooled.layer_work;
-    layer_work.resize(layers);
+    layer_work.resize(limit);
     const double head_work = produce_logits ? pooled.head_work_per_row * (last_row_only ? 1.0 : rows) : 0;
     double total_work = head_work;
-    for (size_t layer = 0; layer < layers; ++layer)
+    for (size_t layer = 0; layer < limit; ++layer)
     {
         const auto& coefficients = pooled.layer_work_coefficients[layer];
         auto& estimate = layer_work[layer];
@@ -1221,6 +1298,7 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
                 {
                     for (auto& attention : pending->active_attention_work()) attention->mark_submit_failed();
                     for (auto& delta : pending->delta_work) delta->mark_submit_failed();
+                    for (auto& mla : pending->mla_work) mla->abort();
                 }
             // A partially executed chain cannot be replayed against the old
             // Session position, including layers committed by an earlier chunk.
@@ -1233,7 +1311,7 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
     };
     std::unique_ptr<void, decltype(cleanup)> guard(reinterpret_cast<void*>(1), cleanup);
     auto fail = [&](const std::string& reason) { error = reason; return false; };
-    for (size_t first = 0; first < layers; first += chunk_layers)
+    for (size_t first = 0; first < limit; first += chunk_layers)
     {
         auto* recording = batches.next();
         if (!recording) return fail("cannot acquire ordered resident graph command");
@@ -1248,7 +1326,7 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
             hidden.data->access_flags = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
             hidden.data->stage_flags = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
         }
-        const size_t end = std::min(layers, first + chunk_layers);
+        const size_t end = std::min(limit, first + chunk_layers);
         const bool routed = std::any_of(model.gpu_segments.begin() + first, model.gpu_segments.begin() + end,
                                         [](const auto& segment) { return !segment->d->dense; });
         const auto& option = model.gpu_segments[first]->d->option;
@@ -1318,7 +1396,7 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
             }
             budget.record(layer_work[layer].ffn);
         }
-        if (end == layers)
+        if (end == limit && limit == layers)
         {
             if (produce_logits && !flush_before(head_work)) return false;
             auto& head = pooled.acquire();
@@ -1349,7 +1427,7 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
                 return fail("resident Expert bank rejected invalid GPU routing data");
         }
         ActivationBuffer completed;
-        if (end == layers && produce_logits)
+        if (end == limit && limit == layers && produce_logits)
         {
             auto& head = *work.back();
             if (!VulkanHostOutput::complete(head.selected_staging, head.pending_logits))
@@ -1362,6 +1440,8 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
                 if (!attention->commit()) return fail("resident graph Attention cache publication failed");
             for (auto& delta : pending->delta_work)
                 if (!delta->commit()) return fail("resident graph GatedDeltaNet publication failed");
+            for (auto& mla : pending->mla_work)
+                if (!mla->commit()) return fail("resident graph expanded-value latent attention publication failed");
             for (auto& qsa : pending->qsa_work)
                 if (!qsa->commit()) return fail("resident graph QSA publication failed");
             auto& counters = context->runtime_state();
@@ -1380,9 +1460,20 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
         counters.compute_submissions += chunk_submissions;
         counters.resident_graph_submissions += chunk_submissions;
         counters.batch_uploads += (first == 0 ? 1 : 0) + (routed ? 1 : 0);
-        counters.batch_downloads += (end == layers && produce_logits ? 1 : 0) + (routed ? 1 : 0);
+        counters.batch_downloads += (end == limit && limit == layers && produce_logits ? 1 : 0) + (routed ? 1 : 0);
         if (first == 0) counters.resident_graph_activation_upload_bytes += rows * model.descriptor.hidden_size * sizeof(float);
-        if (end == layers && produce_logits) logits.swap(completed);
+        if (end == limit && limit == layers && produce_logits) logits.swap(completed);
+        if (end == limit && limit < layers)
+        {
+            auto completed_hidden = std::make_shared<DeviceTensor_vulkan>();
+            if (!completed_hidden->assign_completed(hidden, context))
+                return fail("cannot publish resident graph prefix hidden");
+            output_workspace.d->context = context;
+            output_workspace.d->option = option;
+            output_workspace.d->normalized = completed_hidden;
+            output_workspace.d->residual = completed_hidden;
+            output_workspace.d->dense_ready = true;
+        }
         chunk_attempted = false;
         // Release completed private operands before the next recording chunk.
         pooled.retire();
@@ -1510,9 +1601,11 @@ bool GpuSegment_vulkan::materialize_hidden(GpuSegmentWorkspace_vulkan& workspace
     bool successful = false;
     const auto cleanup = [&](void*) { if (!successful) (void)command.reset(); };
     std::unique_ptr<void, decltype(cleanup)> guard(reinterpret_cast<void*>(1), cleanup);
-    const size_t rows = current.residual->rows();
-    const uint32_t columns = current.residual->columns();
-    if (!current.record_hidden(output, command, storage, statistics)
+    const size_t rows = current.dense_ready ? current.normalized->rows() : current.residual->rows();
+    const uint32_t columns = current.dense_ready ? current.normalized->columns() : current.residual->columns();
+    if (current.dense_ready)
+        output = *current.normalized->value();
+    if ((!current.dense_ready && !current.record_hidden(output, command, storage, statistics))
         || !prepare_staging_batch(slot.download, rows, columns, slot.staging_allocator)
         || !record_prepared_activation_staging_download(output, rows, columns, slot.download, command, context->device(), current.option)
         || submit_compute_and_wait(command, context->device()) != 0)
@@ -1539,6 +1632,7 @@ bool GpuSegment_vulkan::materialize_hidden(GpuSegmentWorkspace_vulkan& workspace
     current.normalized.reset();
     current.residual.reset();
     current.combined.reset();
+    current.dense_ready = false;
     current.shared.reset();
     current.add.reset();
     current.context.reset();

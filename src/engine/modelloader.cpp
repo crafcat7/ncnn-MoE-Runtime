@@ -1086,6 +1086,19 @@ Result<void> ModelLoader::load(const std::filesystem::path& model_path)
 
     if (model.gpu_expert_banks.empty())
     {
+        // A dense segment only pays off when the resident Expert bank chain
+        // owns the whole graph. Without it, keep the ordinary dense node path
+        // instead of materializing the device hidden at that layer.
+        for (size_t index = 0; index < model.gpu_segments.size()
+                               && index < model.graph.layer_plans.size();
+             ++index)
+            if (model.graph.layer_plans[index].dense_ffn.down_weight != invalid_tensor_handle)
+                model.gpu_segments[index].reset();
+    }
+    const bool partial_banks = model.resident_bank_layers != 0
+                               && model.resident_bank_layers < model.graph.layer_plans.size();
+    if (model.gpu_expert_banks.empty() || partial_banks)
+    {
         ret = configure_expert_cache();
         if (!ret)
             return ret.error();
@@ -1093,7 +1106,7 @@ Result<void> ModelLoader::load(const std::filesystem::path& model_path)
         if (!ret)
             return ret.error();
     }
-    if (!model.expert_backend && model.gpu_expert_banks.empty()
+    if (!model.expert_backend && (model.gpu_expert_banks.empty() || partial_banks)
         && std::any_of(model.graph.nodes.begin(), model.graph.nodes.end(), [](const ExecutionNode& node) {
                return node.type == ExecutionNodeType::ExpertGroup && node.backend == ExecutionBackend::Vulkan;
            }))

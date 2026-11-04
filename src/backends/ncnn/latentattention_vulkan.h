@@ -49,6 +49,23 @@ public:
     [[nodiscard]] uint64_t allocated_bytes() const noexcept;
 };
 
+class LatentValueWork_vulkan
+{
+public:
+    LatentValueWork_vulkan();
+    ~LatentValueWork_vulkan();
+    LatentValueWork_vulkan(const LatentValueWork_vulkan&) = delete;
+    LatentValueWork_vulkan& operator=(const LatentValueWork_vulkan&) = delete;
+    // Publish the appended latent rows only after the segment fence.
+    [[nodiscard]] bool commit() noexcept;
+    void abort() noexcept;
+
+private:
+    friend class LatentAttention_vulkan;
+    class Implementation;
+    std::unique_ptr<Implementation> d;
+};
+
 class LatentAttentionWork_vulkan
 {
 public:
@@ -75,11 +92,11 @@ public:
     ~LatentAttention_vulkan();
 
     [[nodiscard]] static std::shared_ptr<LatentAttention_vulkan> create(const AttentionBlockPlan& plan,
-                                                                        const TensorData& sinks,
+                                                                        const TensorData* sinks,
                                                                         std::shared_ptr<Float8Linear_vulkan> output_a,
                                                                         std::shared_ptr<Float8Linear_vulkan> output_b);
     [[nodiscard]] static std::shared_ptr<LatentAttention_vulkan> create(const AttentionBlockPlan& plan,
-                                                                        const TensorData& sinks,
+                                                                        const TensorData* sinks,
                                                                         const CompiledOperator& output_a,
                                                                         const CompiledOperator& output_b);
     // CPU caches have already committed the current row. Mirrors are optional
@@ -91,13 +108,32 @@ public:
                                      const DeviceTensor_vulkan* device_query,
                                      ActivationBuffer& output) const;
 
+    // Expanded-value MLA: query and key_value already carry the absorbed
+    // representation, norm, and RoPE. gate is the per-head output gate logit.
+    [[nodiscard]] bool forward_value_batch(std::span<const uint64_t> positions,
+                                           std::span<LayerCache* const> caches,
+                                           const ActivationBuffer& query,
+                                           const ActivationBuffer& key_value,
+                                           const ActivationBuffer& gate,
+                                           ActivationBuffer& output) const;
+
     [[nodiscard]] bool forward_projected_batch(const ActivationBuffer& input,
                                                std::span<const uint64_t> positions,
                                                std::span<LayerCache* const> caches,
                                                ActivationBuffer& output) const;
 
     [[nodiscard]] bool prepare(const WeightStore& weights, const CompiledOperatorTable& operators, uint64_t optimization_flags);
+    // Expanded-value MLA keeps activations on the device for the resident
+    // command graph. The caller supplies the pre-attention normalized input.
+    [[nodiscard]] bool prepare_value(const WeightStore& weights, const CompiledOperatorTable& operators);
 #if NCNN_MOE_WITH_VULKAN
+    [[nodiscard]] bool record_value_forward(const ncnn::VkMat& input,
+                                            std::span<const uint64_t> positions,
+                                            std::span<LayerCache* const> caches,
+                                            ncnn::VkMat& output,
+                                            ncnn::VkCompute& cmd,
+                                            LatentValueWork_vulkan& work,
+                                            std::vector<ncnn::VkMat>& storage) const;
     [[nodiscard]] bool can_record() const noexcept;
     // The caller owns the recorder and holds the context command lock.
     [[nodiscard]] bool record_batch(const ncnn::VkMat& input,

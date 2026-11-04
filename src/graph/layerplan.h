@@ -42,6 +42,8 @@ struct ExpertPlan
 #define NCNN_MOE_ATTN_PLAN_QSA_BIT      3
 #define NCNN_MOE_ATTN_PLAN_EXTERNAL_BIT 4
 #define NCNN_MOE_ATTN_PLAN_SIGMOID_BIT  5
+#define NCNN_MOE_ATTN_PLAN_LATENT_BIT   6
+#define NCNN_MOE_ATTN_PLAN_DELTA_BIT    7
 
 enum AttentionBlockFlag : uint32_t
 {
@@ -50,7 +52,9 @@ enum AttentionBlockFlag : uint32_t
     AttentionBlockOutputGate = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_GATE_BIT,
     AttentionBlockQsa = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_QSA_BIT,
     AttentionBlockExternalResidual = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_EXTERNAL_BIT,
-    AttentionBlockSigmoidGate = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_SIGMOID_BIT
+    AttentionBlockSigmoidGate = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_SIGMOID_BIT,
+    AttentionBlockLatentValue = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_LATENT_BIT,
+    AttentionBlockDeltaGate = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_DELTA_BIT
 };
 
 struct AttentionBlockPlan
@@ -87,12 +91,16 @@ struct AttentionBlockPlan
     TensorHandle delta_time_bias = invalid_tensor_handle;
     TensorHandle delta_decay_log = invalid_tensor_handle;
     TensorHandle delta_norm_weight = invalid_tensor_handle;
+    uint32_t delta_gate_channels = 1;
+    float delta_lower_bound = 0.0f;
 
     // Latent attention and compressed index weights.
     TensorHandle query_a_weight = invalid_tensor_handle;
     TensorHandle query_b_weight = invalid_tensor_handle;
+    TensorHandle query_b_absorbed_weight = invalid_tensor_handle;
     TensorHandle key_value_weight = invalid_tensor_handle;
     TensorHandle key_value_norm_weight = invalid_tensor_handle;
+    TensorHandle key_value_b_weight = invalid_tensor_handle;
     TensorHandle output_a_weight = invalid_tensor_handle;
     TensorHandle output_b_weight = invalid_tensor_handle;
     TensorHandle compressor_position = invalid_tensor_handle;
@@ -119,6 +127,9 @@ struct AttentionBlockPlan
     uint32_t sliding_window = 0;
     uint32_t initial_context_length = 0;
     uint32_t query_lora_rank = 0;
+    uint32_t qk_head_dimension = 0;
+    uint32_t kv_lora_rank = 0;
+    uint32_t qk_nope_head_dimension = 0;
     uint32_t rope_head_dimension = 0;
     uint32_t output_lora_rank = 0;
     uint32_t output_group_count = 0;
@@ -195,6 +206,8 @@ struct MoeBlockPlan
     ExpertPlan shared_expert;
 
     uint32_t top_k = 0;
+    uint32_t router_group_count = 0;
+    uint32_t router_top_k_groups = 0;
     RouterScoreFunction score_function = RouterScoreFunction::Softmax;
     RouterNormalization normalization = RouterNormalization::SelectedExperts;
     float routed_scaling_factor = 1.0f;

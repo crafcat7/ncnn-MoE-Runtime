@@ -98,14 +98,36 @@ std::shared_ptr<SharedFfn_vulkan> SharedFfn_vulkan::create(const CompiledModel& 
 {
 #if NCNN_MOE_WITH_VULKAN
     if (model.opt.hybrid_mode != HybridMode::HybridExperts || ffn.use_gpu_cache) return {};
-    const auto& native = model.operators.at(ffn.vulkan_operator).qnk_expert;
-    if (!native || !native->vulkan_context()) return {};
     auto result = std::shared_ptr<SharedFfn_vulkan>(new SharedFfn_vulkan);
     auto& prepared = *result->d;
-    prepared.qnk = native;
-    prepared.context = native->vulkan_context();
-    prepared.input_columns = native->input_columns();
-    prepared.output_columns = native->output_columns();
+    prepared.activation = ffn.activation;
+    prepared.activation_limit = ffn.activation_limit;
+    const auto& native = model.operators.at(ffn.vulkan_operator).qnk_expert;
+    if (native && native->vulkan_context())
+    {
+        prepared.qnk = native;
+        prepared.context = native->vulkan_context();
+        prepared.input_columns = native->input_columns();
+        prepared.output_columns = native->output_columns();
+    }
+    else
+    {
+        const auto& bf16_gate = model.operators.at(ffn.vulkan_operator).bfloat16;
+        const auto& bf16_down = model.operators.at_weight(ffn.down_weight).bfloat16;
+        if ((ffn.activation == ExpertActivation::Silu || ffn.activation == ExpertActivation::DeepSeekSwiGlu)
+            && bf16_gate && bf16_down && bf16_gate->vulkan_context() == bf16_down->vulkan_context()
+            && bf16_down->input_columns() != 0 && bf16_down->input_columns() % 128 == 0
+            && static_cast<uint64_t>(bf16_gate->output_columns()) == static_cast<uint64_t>(bf16_down->input_columns()) * 2)
+        {
+            prepared.bfloat16 = bf16_gate;
+            prepared.bfloat16_down = bf16_down;
+            prepared.context = bf16_gate->vulkan_context();
+            prepared.input_columns = bf16_gate->input_columns();
+            prepared.output_columns = bf16_down->output_columns();
+            prepared.intermediate_columns = bf16_down->input_columns();
+        }
+    }
+    if (!prepared.context || prepared.input_columns == 0 || prepared.output_columns == 0) return {};
     return result;
 #else
     (void)model;

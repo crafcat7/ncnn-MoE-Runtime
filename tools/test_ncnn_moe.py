@@ -53,6 +53,7 @@ FAMILY_CASES = (
     ("qwen3", "qwen3", [151645, 151643]),
     ("qwen3_5_moe", "qwen3.6", [248046, 248044]),
     ("qwen4_exp", "qwen3.8", [248046, 248044]),
+    ("bailing_hybrid", "ling", [156895]),
 )
 
 
