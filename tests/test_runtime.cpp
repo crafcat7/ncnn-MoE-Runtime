@@ -19856,6 +19856,18 @@ void test_sampling_and_streaming_generation()
     check(static_cast<bool>(bounded));
     check(static_cast<bool>(bounded.value().token_id == 1 || bounded.value().token_id == 2));
 
+    // Top-p without top-k grows a bounded candidate set until the retained
+    // mass reaches top_p, then truncates that prefix.
+    std::vector<float> flat_logits(200, 0.0f);
+    SamplingOptions flat_options;
+    for (const auto& item : std::vector<std::pair<float, float>>{{0.5f, 0.01f}, {0.999f, 0.005f}})
+    {
+        flat_options.top_p = item.first;
+        const auto flat = session.value()->sample(flat_logits, flat_options);
+        check(static_cast<bool>(flat));
+        check_near(flat.value().probability, item.second, 1e-3f);
+    }
+
     SamplingOptions invalid_options;
     invalid_options.top_p = 0.0f;
     auto invalid = session.value()->sample(logits, invalid_options);
