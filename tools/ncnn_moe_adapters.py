@@ -182,7 +182,8 @@ class ModelAdapter:
         resolved_type = (native_type or config_type) if self._gguf else (config_type or native_type)
         self.model_type = str(resolved_type or "unknown").lower()
         self.name = self._model_name(self.model_type)
-        self.thinking = bool(thinking)
+        # PhiMoE is a plain instruct model without a reasoning channel.
+        self.thinking = bool(thinking) and self.name != "phimoe"
         self._stop_tokens = self._validate_stop_tokens(native_stop_tokens)
         self.model_fingerprint, self.legacy_model_fingerprints = self._fingerprints()
 
@@ -198,6 +199,8 @@ class ModelAdapter:
             return "qwen3"
         if model_type in {"qwen3_5_moe", "qwen3_6", "qwen3.6", "qwen3_5", "qwen35", "qwen35moe"}:
             return "qwen3.6"
+        if model_type == "phimoe":
+            return "phimoe"
         raise AdapterError(f"unsupported model_type: {model_type or '<missing>'}")
 
     @staticmethod
@@ -317,6 +320,8 @@ class ModelAdapter:
             raise AdapterError(
                 "GPT-OSS completion decoding requires native token events to preserve Harmony boundaries"
             )
+        if self.name == "phimoe":
+            return Completion("", text.strip())
         if self.name == "deepseek-v4":
             return _decode_deepseek(text, self.thinking)
         return _split_thinking(text, self.thinking)
