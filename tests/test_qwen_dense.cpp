@@ -665,11 +665,25 @@ static bool test_dynamic_gpu_cache(const std::filesystem::path& root, const GpuI
         auto loaded = runtime.load_model(root, automatic);
         check(static_cast<bool>(loaded), loaded ? "" : loaded.error().message);
         const CompiledModel& model = model_compiled(*loaded.value());
-        check_dynamic_dense_plan(model, entry_size, true);
-        check(model.opt.expert_gpu_cache_size >= entry_size && model.opt.expert_gpu_cache_size <= entry_size * 2,
-              "automatic dense cache did not resolve to the eligible FFN payload");
-        check_budget_trace(execute_budget_model(model), expected, context + " automatic cache");
-        check(model.expert_backend->statistics().executions >= 4, "automatic dense cache was created but not executed");
+        check(!model.expert_backend && model.opt.expert_gpu_cache_size == 0,
+              "fully resident dense FFNs retained an unnecessary demand cache");
+        for (const CompiledLayerPlan& layer : model.graph.layer_plans)
+        {
+            check(!layer.dense_ffn.use_gpu_cache && support_vulkan_dense_ffn(model.operators, layer.dense_ffn),
+                  "automatic dense placement did not prepare a complete persistent GPU FFN");
+            for (TensorHandle handle : {layer.dense_ffn.gate_weight, layer.dense_ffn.up_weight, layer.dense_ffn.down_weight})
+                check(model.weights.at(handle).bfloat16_values().empty(), "resident dense FFN retained its host weights");
+        }
+        for (const GpuResourcePlan& plan : model.memory_plan.gpu_devices)
+            check(plan.expert_cache_reserve == 0, "fully resident dense FFNs retained an automatic cache reservation");
+        const auto before = get_vulkan_statistics(model.vulkan_runtime);
+        check_budget_trace(execute_budget_model(model), expected, context + " automatic residency");
+        // A second pass must reuse the resident products instead of uploading them.
+        (void)execute_budget_model(model);
+        const auto after = get_vulkan_statistics(model.vulkan_runtime);
+        check(after.weight_upload_bytes == before.weight_upload_bytes
+                  && after.weight_transfer_submissions == before.weight_transfer_submissions,
+              "persistent dense execution uploaded model weights again");
     }
     {
         Option insufficient = opt;
@@ -686,6 +700,7 @@ static bool test_dynamic_gpu_cache(const std::filesystem::path& root, const GpuI
         release_opt.flags = BackendCpuExecution | BackendVulkanDense | BackendVulkanExperts;
         release_opt.device_index = gpu.device_index;
         release_opt.gpu_heap_budget = gpu.heap_available;
+        release_opt.gpu_expert_cache_reserve = entry_size;
         release_opt.vulkan_runtime = create_vulkan_runtime();
         CompiledModel model;
         auto compiled = compile_model(descriptor.value(), mapping.value(), model, HybridMode::HybridExperts, release_opt);
@@ -701,6 +716,7 @@ static bool test_dynamic_gpu_cache(const std::filesystem::path& root, const GpuI
         CompilerOption failing_opt;
         failing_opt.flags = BackendCpuExecution | BackendVulkanDense | BackendVulkanExperts;
         failing_opt.device_index = gpu.device_index;
+        failing_opt.gpu_expert_cache_reserve = entry_size;
         failing_opt.vulkan_runtime = create_vulkan_runtime();
         CompiledModel model;
         auto compiled = compile_model(descriptor.value(), mapping.value(), model, HybridMode::HybridExperts, failing_opt);

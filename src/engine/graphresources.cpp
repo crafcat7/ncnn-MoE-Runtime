@@ -269,8 +269,8 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
         if (supported && (expert_budget == 0 || total <= expert_budget))
         {
             model.gpu_expert_bank_plans = std::move(plans);
-            model.bank_submission_rows = std::max(1u, prefill_rows);
-            auto graph = plan_model_graph_memory(model, model.bank_submission_rows, std::max(1u, model.opt.num_concurrent_sessions));
+            model.resident_submission_rows = std::max(1u, prefill_rows);
+            auto graph = plan_model_graph_memory(model, model.resident_submission_rows, std::max(1u, model.opt.num_concurrent_sessions));
             if (!graph) return graph.error();
             auto candidate = model.memory_plan.gpu_devices;
             auto resource = std::find_if(candidate.begin(), candidate.end(), [&](const auto& item) { return item.initial.device_index == device; });
@@ -298,7 +298,7 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
                 // Selection ends here. All subsequent failures are terminal;
                 // no partially prepared bank is changed to streaming/CPU.
                 model.memory_plan.gpu_devices = std::move(candidate);
-                auto prepared = prepare_model_graph_resources(model, model.bank_submission_rows, std::move(graph).value());
+                auto prepared = prepare_model_graph_resources(model, model.resident_submission_rows, std::move(graph).value());
                 if (!prepared) return prepared.error();
                 const auto live = bank_live_resources(model, device);
                 if (live.heap_usage > live.heap_budget || total > live.heap_budget - live.heap_usage)
@@ -332,7 +332,7 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
                 return {};
             }
             model.gpu_expert_bank_plans.clear();
-            model.bank_submission_rows = 0;
+            model.resident_submission_rows = 0;
         }
     }
 #else

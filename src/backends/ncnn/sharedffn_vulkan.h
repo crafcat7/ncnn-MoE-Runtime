@@ -12,6 +12,7 @@ class VkCompute;
 namespace moe {
 struct CompiledModel;
 struct MoeBlockPlan;
+struct ExpertPlan;
 class VulkanContext;
 
 // Recorded work is counted by the command owner only after successful
@@ -32,6 +33,8 @@ public:
     ~SharedFfn_vulkan();
     [[nodiscard]] static std::shared_ptr<SharedFfn_vulkan> create(const CompiledModel& model,
                                                                   const MoeBlockPlan& moe);
+    [[nodiscard]] static std::shared_ptr<SharedFfn_vulkan> create(const CompiledModel& model,
+                                                                  const ExpertPlan& ffn);
     [[nodiscard]] const std::shared_ptr<VulkanContext>& context() const noexcept;
 #if NCNN_MOE_WITH_VULKAN
     // Caller holds the context lock and retains input/output/workspace and

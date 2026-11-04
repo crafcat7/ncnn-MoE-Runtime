@@ -40,8 +40,8 @@ struct CompilerOption
     // placing persistent attention and output projections.
     uint64_t gpu_expert_cache_reserve = 0;
     std::vector<GpuResourceSnapshot> gpu_resources;
-    // Parallel to gpu_resources; includes explicit executable/victim caches
-    // and the minimum GPU Expert working set retained during preparation.
+    // Parallel to gpu_resources; explicit executable/victim cache reservations.
+    // Resource planning adds the automatic minimum GPU Expert working set.
     std::vector<uint64_t> gpu_expert_cache_reserves;
     uint64_t optimization_flags = OptimizationDefaultFlags;
     VulkanRuntimePtr vulkan_runtime;

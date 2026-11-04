@@ -68,6 +68,7 @@ private:
         None,
         GptOss,
         DeepSeekV4,
+        Qwen3,
         Qwen36,
         Qwen38
     };

@@ -92,8 +92,8 @@ public:
     ~Implementation();
     std::shared_ptr<VulkanContext> context;
 #if NCNN_MOE_WITH_VULKAN
-    class BankWorkspace;
-    std::unique_ptr<BankWorkspace> bank_workspace;
+    class ResidentWorkspace;
+    std::unique_ptr<ResidentWorkspace> resident_workspace;
     ncnn::Option option;
     std::shared_ptr<Attention_vulkan> attention;
     std::shared_ptr<GatedDeltaNet_vulkan> delta;
@@ -102,6 +102,7 @@ public:
     std::shared_ptr<RmsNorm_vulkan> ffn_norm;
     std::shared_ptr<Router_vulkan> router;
     std::shared_ptr<SharedFfn_vulkan> shared;
+    std::shared_ptr<SharedFfn_vulkan> dense;
     std::shared_ptr<ncnn::Layer> add;
     CompiledOperator lm_head;
     uint32_t hidden = 0;
@@ -202,15 +203,27 @@ bool GpuSegment_vulkan::supports(const CompiledModel& model, const CompiledLayer
     if (model.opt.hybrid_mode != HybridMode::HybridExperts || has_flag(model.opt.flags, OptionRouterPrediction)
         || !has_flag(model.opt.optimization_flags, OptimizationVulkanCommandGraph)
         || model.opt.vulkan_device_indices.size() > 1 || model.descriptor.hyper_connection_kind != HyperConnectionKind::None
-        || model.descriptor.hyper_connection_multiplier != 1 || layer.ple.enabled()
-        || layer.moe.experts.empty() || layer.moe.top_k == 0 || layer.moe.top_k > 64 || layer.moe.experts.size() > 2048
-        || !segment_float_vector(model, layer.moe.pre_ffn_norm_weight, model.descriptor.hidden_size)
-        || layer.moe.router_weight >= model.weights.size()) return false;
-    const auto& router = model.weights.at(layer.moe.router_weight);
-    if (router.shape.size() != 2 || router.shape[0] != layer.moe.experts.size()
-        || router.shape[1] != model.descriptor.hidden_size
-        || (router.dtype != DType::Float32 && router.dtype != DType::BFloat16)) return false;
-    if (layer.moe.has_shared_expert && !support_vulkan_shared_experts(model.operators, layer.moe)) return false;
+        || model.descriptor.hyper_connection_multiplier != 1 || layer.ple.enabled()) return false;
+    const bool dense = layer.dense_ffn.down_weight != invalid_tensor_handle;
+    if (dense)
+    {
+        const auto& operation = model.operators.at(layer.dense_ffn.vulkan_operator).qnk_expert;
+        if (layer.dense_ffn.use_gpu_cache || !operation || !operation->vulkan_context()
+            || model.speculative.enabled() || layer.attention.kind != AttentionKind::Standard
+            || has_flag(layer.attention.flags, AttentionBlockQsa)
+            || !segment_float_vector(model, layer.dense_pre_ffn_norm_weight, model.descriptor.hidden_size)) return false;
+    }
+    else
+    {
+        if (layer.moe.experts.empty() || layer.moe.top_k == 0 || layer.moe.top_k > 64 || layer.moe.experts.size() > 2048
+            || !segment_float_vector(model, layer.moe.pre_ffn_norm_weight, model.descriptor.hidden_size)
+            || layer.moe.router_weight >= model.weights.size()) return false;
+        const auto& router = model.weights.at(layer.moe.router_weight);
+        if (router.shape.size() != 2 || router.shape[0] != layer.moe.experts.size()
+            || router.shape[1] != model.descriptor.hidden_size
+            || (router.dtype != DType::Float32 && router.dtype != DType::BFloat16)) return false;
+        if (layer.moe.has_shared_expert && !support_vulkan_shared_experts(model.operators, layer.moe)) return false;
+    }
     if (layer.attention.kind == AttentionKind::GatedDeltaNet)
     {
         const auto& operation = model.operators.at(layer.attention.gated_delta_vulkan_operator).gated_delta;
@@ -281,16 +294,24 @@ std::shared_ptr<GpuSegment_vulkan> GpuSegment_vulkan::create(const CompiledModel
     const auto& limits = impl.context->device()->info.physicalDeviceProperties().limits;
     impl.add_norm = limits.maxPerStageDescriptorStorageBuffers >= 5
                     && limits.maxDescriptorSetStorageBuffers >= 5;
-    impl.ffn_norm = RmsNorm_vulkan::create(model.weights.at(layer.moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon,
+    const bool dense = layer.dense_ffn.down_weight != invalid_tensor_handle;
+    impl.ffn_norm = RmsNorm_vulkan::create(model.weights.at(dense ? layer.dense_pre_ffn_norm_weight : layer.moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon,
                                            model.descriptor.norm_weight_offset, impl.context, impl.option,
                                            nullptr, impl.add_norm);
-    impl.router = Router_vulkan::create(model.weights.at(layer.moe.router_weight),
-                                        layer.moe.router_bias == invalid_tensor_handle ? nullptr : &model.weights.at(layer.moe.router_bias),
-                                        layer.moe.router_selection_bias == invalid_tensor_handle ? nullptr : &model.weights.at(layer.moe.router_selection_bias),
-                                        layer.vulkan_device_index, model.vulkan_runtime, model.opt.optimization_flags);
-    if (layer.moe.has_shared_expert) impl.shared = SharedFfn_vulkan::create(model, layer.moe);
+    if (dense)
+        impl.dense = SharedFfn_vulkan::create(model, layer.dense_ffn);
+    else
+    {
+        impl.router = Router_vulkan::create(model.weights.at(layer.moe.router_weight),
+                                            layer.moe.router_bias == invalid_tensor_handle ? nullptr : &model.weights.at(layer.moe.router_bias),
+                                            layer.moe.router_selection_bias == invalid_tensor_handle ? nullptr : &model.weights.at(layer.moe.router_selection_bias),
+                                            layer.vulkan_device_index, model.vulkan_runtime, model.opt.optimization_flags);
+        if (layer.moe.has_shared_expert) impl.shared = SharedFfn_vulkan::create(model, layer.moe);
+    }
     impl.add = segment_add(impl.context, impl.option);
-    if (!impl.ffn_norm || !impl.router || !impl.add || impl.router->context() != impl.context
+    if (!impl.ffn_norm || !impl.add
+        || (dense ? !impl.dense || impl.dense->context() != impl.context
+                  : !impl.router || impl.router->context() != impl.context)
         || (layer.moe.has_shared_expert && (!impl.shared || impl.shared->context() != impl.context))) return {};
     return result;
 #else
@@ -604,6 +625,7 @@ public:
             if (!d->ffn_norm->record(residual, normalized, command))
                 return fail("cannot record Vulkan FFN norm");
         }
+        if (d->dense) return true;
         if (!d->router->record(normalized, options, router_work, command))
             return fail("cannot record Vulkan router");
         selected_columns = Router_vulkan::selected_columns(options.top_k);
@@ -736,7 +758,7 @@ public:
 };
 
 #if NCNN_MOE_WITH_VULKAN
-class GpuSegment_vulkan::Implementation::BankWorkspace
+class GpuSegment_vulkan::Implementation::ResidentWorkspace
 {
 public:
     // One pool per compiled head, serialized by its Context command mutex.
@@ -749,12 +771,12 @@ public:
     {
         double attention_router_per_row = 0;
         double routed_expert_per_selection_row = 0;
-        double shared_per_row = 0;
+        double fixed_ffn_per_row = 0;
     };
     struct LayerWork
     {
         double attention_router = 0;
-        double experts = 0;
+        double ffn = 0;
     };
     std::vector<LayerWorkCoefficients> layer_work_coefficients;
     std::vector<LayerWork> layer_work;
@@ -788,11 +810,16 @@ public:
                                 a.query_a_weight, a.query_b_weight, a.key_value_weight, a.output_a_weight, a.output_b_weight,
                                 a.qsa_query_key_weight, plan.moe.router_weight})
                 coefficients.attention_router_per_row += projection_work(handle);
-            const auto& bank = model.gpu_expert_banks[layer]->description();
-            coefficients.routed_expert_per_selection_row = 2.0 * bank.intermediate_columns
-                                                           * (2.0 * bank.input_columns + bank.output_columns);
-            if (plan.moe.has_shared_expert)
-                coefficients.shared_per_row = expert_work(plan.moe.shared_expert);
+            if (plan.dense_ffn.down_weight != invalid_tensor_handle)
+                coefficients.fixed_ffn_per_row = expert_work(plan.dense_ffn);
+            else
+            {
+                const auto& bank = model.gpu_expert_banks[layer]->description();
+                coefficients.routed_expert_per_selection_row = 2.0 * bank.intermediate_columns
+                                                               * (2.0 * bank.input_columns + bank.output_columns);
+                if (plan.moe.has_shared_expert)
+                    coefficients.fixed_ffn_per_row = expert_work(plan.moe.shared_expert);
+            }
         }
         const double prepared_head_work = projection_work(model.lm_head_weight);
         layer_work_coefficients = std::move(prepared);
@@ -1062,46 +1089,65 @@ bool GpuSegmentContinuation_vulkan::publish_head(ActivationBuffer& logits, GpuSe
 #endif
 }
 
-bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const ActivationBuffer& initial_hidden,
-                                      std::span<const uint64_t> positions, std::span<LayerCache* const> caches,
-                                      std::span<const ExpertDispatchOptions> options,
-                                      bool produce_logits, bool last_row_only, ActivationBuffer& logits, std::string& error,
-                                      GpuSegmentWorkspace_vulkan* workspace)
+bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const ActivationBuffer& initial_hidden,
+                                         std::span<const uint64_t> positions, std::span<LayerCache* const> caches,
+                                         std::span<const ExpertDispatchOptions> options,
+                                         bool produce_logits, bool last_row_only, ActivationBuffer& logits, std::string& error,
+                                         GpuSegmentWorkspace_vulkan* workspace)
 {
 #if NCNN_MOE_WITH_VULKAN
     const size_t layers = model.graph.layer_plans.size();
     const size_t rows = positions.size();
     if (layers == 0 || rows == 0 || rows > static_cast<size_t>(std::numeric_limits<int>::max())
         || layers > std::numeric_limits<size_t>::max() / rows || caches.size() != layers * rows
-        || options.size() != layers || model.gpu_expert_banks.size() != layers || model.gpu_segments.size() != layers
-        || !model.gpu_head || model.bank_submission_rows == 0
+        || (!options.empty() && options.size() != layers)
+        || (!model.gpu_expert_banks.empty() && model.gpu_expert_banks.size() != layers)
+        || model.gpu_segments.size() != layers || !model.gpu_head || model.resident_submission_rows == 0
         || initial_hidden.dtype() != DType::Float32 || initial_hidden.rows() != rows
         || initial_hidden.columns() != model.descriptor.hidden_size
         || std::any_of(caches.begin(), caches.end(), [](auto* cache) { return cache == nullptr || cache->vulkan_attention_state_unknown; }))
     {
-        error = "invalid resident Expert bank chain inputs";
+        error = "invalid resident graph chain inputs";
         return false;
     }
     const auto context = model.gpu_head->context();
     for (size_t layer = 0; layer < layers; ++layer)
-        if (!model.gpu_segments[layer] || !model.gpu_expert_banks[layer]
-            || model.gpu_segments[layer]->context() != context || model.gpu_expert_banks[layer]->context() != context
-            || options[layer].expert_count != model.gpu_expert_banks[layer]->description().expert_count
-            || options[layer].top_k == 0 || options[layer].top_k > options[layer].expert_count)
+    {
+        const auto& segment = model.gpu_segments[layer];
+        if (!context || !segment || segment->context() != context)
         {
-            error = "resident Expert bank chain has incompatible device or routing metadata";
+            error = "resident graph chain has incompatible devices";
             return false;
         }
-    const uint32_t chunk_layers = bank_chunk_layers(model, static_cast<uint32_t>(rows));
+        const bool dense = model.graph.layer_plans[layer].dense_ffn.down_weight != invalid_tensor_handle;
+        if (dense)
+        {
+            if (!segment->d->dense || !segment->d->attention || segment->d->dense->context() != context
+                || (!model.gpu_expert_banks.empty() && model.gpu_expert_banks[layer]))
+            {
+                error = "resident graph chain has incompatible dense operators";
+                return false;
+            }
+        }
+        else if (segment->d->dense || options.size() != layers || model.gpu_expert_banks.size() != layers
+                 || !model.gpu_expert_banks[layer] || model.gpu_expert_banks[layer]->context() != context
+                 || options[layer].expert_count != model.gpu_expert_banks[layer]->description().expert_count
+                 || options[layer].top_k == 0 || options[layer].top_k > options[layer].expert_count)
+        {
+            error = "resident graph chain has incompatible bank or routing metadata";
+            return false;
+        }
+    }
+    const uint32_t chunk_layers = resident_chunk_layers(model, static_cast<uint32_t>(rows));
     std::optional<GpuSegmentWorkspace_vulkan> local_workspace;
     if (!workspace) local_workspace.emplace();
     auto& output_workspace = workspace ? *workspace : *local_workspace;
     if (!output_workspace.d->host_output) output_workspace.d->host_output = std::make_shared<VulkanHostOutput>();
     const std::lock_guard<std::mutex> lock(context->command_mutex());
     auto& head_implementation = *model.gpu_head->d;
-    if (!head_implementation.bank_workspace)
-        head_implementation.bank_workspace = std::make_unique<Implementation::BankWorkspace>();
-    auto& pooled = *head_implementation.bank_workspace;
+    if (!head_implementation.resident_workspace)
+        head_implementation.resident_workspace = std::make_unique<Implementation::ResidentWorkspace>();
+    auto& pooled = *head_implementation.resident_workspace;
     ncnn::VkMat hidden;
     ncnn::VkMat validation_upload, validation, validation_download;
     auto& work = pooled.work;
@@ -1119,8 +1165,9 @@ bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const Activati
         const auto& coefficients = pooled.layer_work_coefficients[layer];
         auto& estimate = layer_work[layer];
         estimate.attention_router = std::max(1.0, rows * coefficients.attention_router_per_row);
-        estimate.experts = std::max(1.0, rows * (options[layer].top_k * coefficients.routed_expert_per_selection_row + coefficients.shared_per_row));
-        total_work += estimate.attention_router + estimate.experts;
+        const uint32_t selected = model.gpu_segments[layer]->d->dense ? 0 : options[layer].top_k;
+        estimate.ffn = std::max(1.0, rows * (selected * coefficients.routed_expert_per_selection_row + coefficients.fixed_ffn_per_row));
+        total_work += estimate.attention_router + estimate.ffn;
     }
     GpuSubmissionBudget budget(total_work);
     bool successful = false, submitted = false, chunk_attempted = false;
@@ -1148,7 +1195,7 @@ bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const Activati
     for (size_t first = 0; first < layers; first += chunk_layers)
     {
         auto* recording = batches.next();
-        if (!recording) return fail("cannot acquire ordered resident Expert bank command");
+        if (!recording) return fail("cannot acquire ordered resident graph command");
         validation_upload.release();
         validation.release();
         validation_download.release();
@@ -1160,19 +1207,24 @@ bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const Activati
             hidden.data->access_flags = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
             hidden.data->stage_flags = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
         }
-        const uint32_t zero = 0;
-        const auto& option = model.gpu_segments[first]->d->option;
-        if (!fill_staging_values(&zero, 1, sizeof(zero), validation_upload, context->staging_allocator())
-            || !record_mapped_upload(validation_upload, validation, *recording, option))
-            return fail("cannot initialize resident Expert bank validation");
         const size_t end = std::min(layers, first + chunk_layers);
+        const bool routed = std::any_of(model.gpu_segments.begin() + first, model.gpu_segments.begin() + end,
+                                        [](const auto& segment) { return !segment->d->dense; });
+        const auto& option = model.gpu_segments[first]->d->option;
+        if (routed)
+        {
+            const uint32_t zero = 0;
+            if (!fill_staging_values(&zero, 1, sizeof(zero), validation_upload, context->staging_allocator())
+                || !record_mapped_upload(validation_upload, validation, *recording, option))
+                return fail("cannot initialize resident Expert bank validation");
+        }
         const auto flush_before = [&](double next_work) {
             if (!budget.would_flush_before(next_work)) return true;
             submitted = chunk_attempted = true;
-            if (batches.submit() != 0) return fail("resident Expert bank asynchronous submit failed");
+            if (batches.submit() != 0) return fail("resident graph asynchronous submit failed");
             budget.submitted();
             recording = batches.next();
-            if (!recording) return fail("cannot acquire next resident Expert bank command");
+            if (!recording) return fail("cannot acquire next resident graph command");
             return true;
         };
         for (size_t layer = first; layer < end; ++layer)
@@ -1182,7 +1234,7 @@ bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const Activati
             current.target = model.gpu_segments[layer]->d;
             current.positions.assign(positions.begin(), positions.end());
             current.caches.assign(caches.begin() + layer * rows, caches.begin() + (layer + 1) * rows);
-            current.options = options[layer];
+            if (!current.target->dense) current.options = options[layer];
             current.initial_hidden = &initial_hidden;
             if (!current.record_layer(nullptr, *recording, hidden.empty() ? nullptr : &hidden, false))
                 return fail(current.error);
@@ -1190,25 +1242,40 @@ bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const Activati
             // Submit completed record-only stages before a large successor.
             // All operands and producer access metadata survive until the
             // original chunk fence, including Router IDs consumed below.
-            if (!flush_before(layer_work[layer].experts)) return false;
+            if (!flush_before(layer_work[layer].ffn)) return false;
             auto& command = *recording;
             auto& target = *current.target;
-            ncnn::VkMat shared;
-            const ncnn::VkMat* shared_input = nullptr;
-            if (target.shared)
+            if (target.dense)
             {
-                if (!target.shared->record(current.normalized, shared, command, current.storage, current.ffn_statistics))
-                    return fail("cannot record resident shared Expert");
-                current.storage.push_back(shared);
-                shared_input = &shared;
+                ncnn::VkMat output;
+                if (!target.dense->record(current.normalized, output, command, current.storage, current.ffn_statistics))
+                    return fail("cannot record resident dense FFN");
+                std::vector<ncnn::VkMat> added(1);
+                if (target.add->forward({current.residual, output}, added, command, target.option) != 0 || added[0].empty())
+                    return fail("cannot record resident dense FFN residual");
+                hidden = added[0];
+                current.storage.push_back(hidden);
+                ++current.ffn_statistics.dispatches;
             }
-            ncnn::VkMat combined;
-            if (!model.gpu_expert_banks[layer]->record(current.normalized, current.router_work.selected,
-                                                       options[layer].top_k, combined, validation, command, bank_storage,
-                                                       shared_input, &current.residual))
-                return fail("cannot record resident indexed Expert bank");
-            hidden = combined;
-            budget.record(layer_work[layer].experts);
+            else
+            {
+                ncnn::VkMat shared;
+                const ncnn::VkMat* shared_input = nullptr;
+                if (target.shared)
+                {
+                    if (!target.shared->record(current.normalized, shared, command, current.storage, current.ffn_statistics))
+                        return fail("cannot record resident shared Expert");
+                    current.storage.push_back(shared);
+                    shared_input = &shared;
+                }
+                ncnn::VkMat combined;
+                if (!model.gpu_expert_banks[layer]->record(current.normalized, current.router_work.selected,
+                                                           options[layer].top_k, combined, validation, command, bank_storage,
+                                                           shared_input, &current.residual))
+                    return fail("cannot record resident indexed Expert bank");
+                hidden = combined;
+            }
+            budget.record(layer_work[layer].ffn);
         }
         if (end == layers)
         {
@@ -1223,41 +1290,42 @@ bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const Activati
             if (produce_logits) budget.record(head_work);
         }
         auto& command = *recording;
-        if (!prepare_staging_batch(validation_download, 1, 1, context->staging_allocator())
-            || !record_prepared_activation_staging_download(validation, 1, 1, validation_download,
-                                                            command, context->device(), option))
+        if (routed && (!prepare_staging_batch(validation_download, 1, 1, context->staging_allocator()) || !record_prepared_activation_staging_download(validation, 1, 1, validation_download, command, context->device(), option)))
             return fail("cannot record resident Expert bank validation download");
         submitted = chunk_attempted = true;
         if (batches.submit() != 0)
-            return fail("resident Expert bank submit or fence wait failed");
+            return fail("resident graph submit failed");
         budget.submitted();
         const size_t chunk_submissions = batches.submission_count();
         // reset drains submitted commands and clears the batch counters.
         // Do it before readback/publication so a reset error still aborts the chunk.
-        if (batches.reset() != 0) return fail("resident Expert bank submit or fence wait failed");
-        ActivationBuffer checked(1, 1);
-        if (!copy_staging_to_cpu_batch(validation_download, checked)
-            || std::bit_cast<uint32_t>(checked.row(0)[0]) != 0)
-            return fail("resident Expert bank rejected invalid GPU routing data");
+        if (batches.reset() != 0) return fail("resident graph fence wait failed");
+        if (routed)
+        {
+            ActivationBuffer checked(1, 1);
+            if (!copy_staging_to_cpu_batch(validation_download, checked)
+                || std::bit_cast<uint32_t>(checked.row(0)[0]) != 0)
+                return fail("resident Expert bank rejected invalid GPU routing data");
+        }
         ActivationBuffer completed;
         if (end == layers && produce_logits)
         {
             auto& head = *work.back();
             if (!VulkanHostOutput::complete(head.selected_staging, head.pending_logits))
-                return fail("cannot read resident Expert bank logits");
+                return fail("cannot read resident graph logits");
             completed.swap(head.pending_logits);
         }
         for (auto& pending : work)
         {
             for (auto& attention : pending->active_attention_work())
-                if (!attention->commit()) return fail("resident Expert bank Attention cache publication failed");
+                if (!attention->commit()) return fail("resident graph Attention cache publication failed");
             for (auto& delta : pending->delta_work)
-                if (!delta->commit()) return fail("resident Expert bank GatedDeltaNet publication failed");
+                if (!delta->commit()) return fail("resident graph GatedDeltaNet publication failed");
             for (auto& qsa : pending->qsa_work)
-                if (!qsa->commit()) return fail("resident Expert bank QSA publication failed");
+                if (!qsa->commit()) return fail("resident graph QSA publication failed");
             auto& counters = context->runtime_state();
             const auto& stats = pending->ffn_statistics;
-            counters.dispatches += stats.dispatches + (pending->target->head ? (produce_logits ? (pending->fused_head ? 1 : 2) : 0) : 6);
+            counters.dispatches += stats.dispatches + (pending->target->head ? (produce_logits ? (pending->fused_head ? 1 : 2) : 0) : (pending->target->dense ? 1 : 6));
             counters.int4_dispatches += stats.int4_dispatches
                                         + (pending->target->head && produce_logits && pending->target->lm_head.qnk
                                                    && pending->target->lm_head.qnk->dtype() == DType::Int4
@@ -1270,8 +1338,8 @@ bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const Activati
         auto& counters = context->runtime_state();
         counters.compute_submissions += chunk_submissions;
         counters.resident_graph_submissions += chunk_submissions;
-        counters.batch_uploads += first == 0 ? 2 : 1; // Hidden plus the shared validation word.
-        counters.batch_downloads += end == layers && produce_logits ? 2 : 1;
+        counters.batch_uploads += (first == 0 ? 1 : 0) + (routed ? 1 : 0);
+        counters.batch_downloads += (end == layers && produce_logits ? 1 : 0) + (routed ? 1 : 0);
         if (first == 0) counters.resident_graph_activation_upload_bytes += rows * model.descriptor.hidden_size * sizeof(float);
         if (end == layers && produce_logits) logits.swap(completed);
         chunk_attempted = false;
@@ -1291,7 +1359,7 @@ bool GpuSegment_vulkan::forward_banks(const CompiledModel& model, const Activati
     (void)last_row_only;
     (void)logits;
     (void)workspace;
-    error = "resident Expert banks are unavailable in this build";
+    error = "resident graphs are unavailable in this build";
     return false;
 #endif
 }

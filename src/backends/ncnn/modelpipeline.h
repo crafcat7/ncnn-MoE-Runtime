@@ -22,8 +22,8 @@ struct CompiledLayerPlan;
 Result<void> prepare_model_pipeline(CompiledModel& compiled,
                                     const CompilerOption& opt);
 
-// Recording work is bounded independently of immutable bank residency.
-[[nodiscard]] uint32_t bank_chunk_layers(const CompiledModel& model, uint32_t rows) noexcept;
+// Recording work is bounded independently of persistent weight residency.
+[[nodiscard]] uint32_t resident_chunk_layers(const CompiledModel& model, uint32_t rows) noexcept;
 
 // Measure the already scheduled placement for representative prefill and
 // decode execution. Persistent KV/recurrent state is reported separately from

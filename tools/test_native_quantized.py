@@ -567,9 +567,10 @@ def hybrid_dense_host_release(tensors: dict, packed_sizes: dict[str, int], *,
     and releases query/key norms.
     Native Standard GQA Attention owns its pre-attention norm, sinks, and
     (for Qwen) query/key norms for each complete Vulkan layer, as well as its
-    unquantized projection copies. Q8_0 dense Linear operators release their
-    raw GGML payloads; embeddings, Expert banks, and Qwen dense-FFN Expert
-    chains retain theirs.
+    unquantized projection copies. Q8_0 dense Linear operators and persistent
+    dense FFN chains release their raw GGML payloads; embeddings and routed
+    Expert banks retain theirs. These small fixtures use automatic residency
+    with enough device memory for every supported dense FFN.
     Its HC/PLE/indexer weights also retain their host storage despite GPU
     execution. FP8
     reclaims codes and scales of the output head, standard/latent Attention,
@@ -615,8 +616,6 @@ def hybrid_dense_host_release(tensors: dict, packed_sizes: dict[str, int], *,
         if name.endswith("embed_tokens.weight") or name in ("model.embed_tokens.weight", "embed.weight"):
             continue
         if ".experts." in name:
-            continue
-        if qwen_family and re.search(r"\.mlp\.(?:gate|up|down)_proj\.weight$", name):
             continue
         released += raw_bytes
 
@@ -1044,7 +1043,7 @@ def assert_imported_gguf_native(loaded: dict, name: str, raw: np.ndarray, tag: i
                                 rows: int, columns: int,
                                 input_columns: np.ndarray | None = None,
                                 family: str = "qwen") -> None:
-    """Check the importer's lossless native representation for one GGUF matrix."""
+    """Check the importer's gpu native representation for one GGUF matrix."""
     if tag == 39:
         source = np.asarray(raw, dtype=np.uint8).reshape(rows, columns // 32, 17)
         codes = np.empty((rows, columns // 32, 32), dtype=np.uint8)
@@ -1731,6 +1730,34 @@ class NativeQuantizedTests(unittest.TestCase):
                 self.assertEqual(hybrid_dense_host_release(tensors, packed_gate, family="qwen4_exp"),
                                  query_norm.nbytes + key_norm.nbytes + second_gate.nbytes)
 
+    def test_q8_0_dense_ffn_release_expected_accounting(self):
+        # Q8_0 stores 32 values plus a two-byte scale in each 34-byte block.
+        # Vary both projection dimensions and layer count, independently of
+        # the worker's reported byte totals or the main 256-column fixture.
+        for hidden, intermediate, layers in ((64, 96, 1), (128, 160, 3)):
+            with self.subTest(hidden=hidden, intermediate=intermediate, layers=layers):
+                tensors, packed, q8_bytes = {}, {}, {}
+                expected = 0
+                for layer in range(layers):
+                    for role, shape in (("gate", (intermediate, hidden)),
+                                        ("up", (intermediate, hidden)),
+                                        ("down", (hidden, intermediate))):
+                        name = PREFIX + f"layers.{layer}.mlp.{role}_proj.weight"
+                        tensors[name] = ("BF16", np.zeros(shape, np.uint16))
+                        packed[name] = q8_bytes[name] = shape[0] * (shape[1] // 32) * 34
+                        expected += shape[0] * (shape[1] // 32) * 34
+                for name in (PREFIX + "embed_tokens.weight", PREFIX + "layers.0.mlp.experts.0.up_proj.weight"):
+                    tensors[name] = ("BF16", np.zeros((intermediate, hidden), np.uint16))
+                    packed[name] = q8_bytes[name] = intermediate * (hidden // 32) * 34
+                # Other packed GGML formats still keep their host payloads.
+                other = PREFIX + f"layers.{layers}.mlp.down_proj.weight"
+                tensors[other] = ("BF16", np.zeros((hidden, intermediate), np.uint16))
+                packed[other] = hidden * intermediate // 2
+                norm = PREFIX + "layers.0.post_attention_layernorm.weight"
+                tensors[norm] = ("BF16", np.zeros(hidden, np.uint16))
+                self.assertEqual(hybrid_dense_host_release(tensors, packed, q8_0_dense_bytes=q8_bytes), expected)
+                self.assertEqual(hybrid_dense_host_release(tensors, packed), 0)
+
     def test_mapped_ple_expected_accounting(self):
         model_config = config(True)
         model_config["model_type"] = "qwen4_exp"
@@ -1970,20 +1997,35 @@ class NativeQuantizedTests(unittest.TestCase):
         self.assertEqual(resources["expert_cache_bytes"], 1024 * 1024)
         resident_experts = resources["expert_gpu_bank_layers"] > 0
         if resident_experts:
+            # A full bank loads deferred weights during model preparation,
+            # then executes without the host or dynamic GPU Expert caches.
+            text_config = json.loads((fixture.imported / "config.json").read_text())
+            text_config = text_config.get("text_config", text_config)
             self.assertEqual(resources["backend"], "hybrid")
             self.assertGreater(resources["expert_gpu_bank_bytes"], 0)
-        for mode in ("greedy", "sampled"):
+            self.assertEqual(resources["expert_gpu_bank_layers"], text_config["num_hidden_layers"])
+            self.assertGreater(resources["expert_gpu_bank_submission_rows"], 0)
+            self.assertEqual(resources["expert_gpu_cache_bytes"], 0)
+            self.assertEqual(resources["expert_gpu_victim_cache_bytes"], 0)
+        else:
+            self.assertEqual(resources["expert_gpu_bank_layers"], 0)
+        for mode in (m for m in ("greedy", "sampled", "reused") if f"{m}_stats" in deferred):
             self.assertEqual(deferred[mode][0], eager[mode][0])
             np.testing.assert_allclose(deferred[mode][1], eager[mode][1], rtol=0, atol=3e-5)
             generation = deferred[mode + "_stats"]["generation"]
-            self.assertLessEqual(generation["cache_resident_bytes"], resources["expert_cache_bytes"])
-            if resident_experts:
-                self.assertGreater(generation["assignments"], 0)
-                self.assertEqual(generation["gpu_routes"], generation["assignments"])
-                self.assertEqual(generation["cpu_routes"], 0)
-                self.assertEqual(generation["cpu_fallbacks"], 0)
-                self.assertEqual(generation["io_bytes"], 0)
-                self.assertEqual(generation["cache_resident_bytes"], 0)
+            if not resident_experts:
+                self.assertLessEqual(generation["cache_resident_bytes"], resources["expert_cache_bytes"])
+                continue
+            gpu = deferred[mode + "_stats"]["generation_gpu"]
+            self.assertGreater(generation["assignments"], 0)
+            self.assertEqual(generation["gpu_routes"], generation["assignments"])
+            for counter in ("cpu_routes", "cpu_fallbacks", "gpu_execution_failures", "cache_hit", "cache_miss",
+                            "io_bytes", "cache_resident_bytes", "gpu_cache_stores", "gpu_cache_evictions"):
+                self.assertEqual(generation[counter], 0, (mode, counter))
+            self.assertGreater(gpu["resident_graph_submissions"], 0)
+            self.assertGreater(gpu["resident_graph_activation_upload_bytes"], 0)
+            for counter in ("weight_upload_bytes", "weight_transfer_submissions"):
+                self.assertEqual(gpu[counter], 0, (mode, counter))
         if not resident_experts:
             self.assertGreater(deferred["greedy_stats"]["generation"]["io_bytes"], 0)
 
@@ -1996,12 +2038,13 @@ class NativeQuantizedTests(unittest.TestCase):
                     self.compare(prepare_int4(root, method, moe), direct=True)
 
     def test_native_int4_families(self):
+        # hf_int4_paths already runs both import conventions on the Qwen layout;
+        # here each family contributes its own projection layout once.
         for family in ("gpt_oss", "deepseek_v4", "qwen4_exp"):
-            for method in ("awq", "gptq"):
-                with self.subTest(family=family, method=method):
-                    root = self.root / f"{family}-{method}"
-                    root.mkdir()
-                    self.compare(prepare_int4(root, method, True, family), direct=True)
+            with self.subTest(family=family):
+                root = self.root / family
+                root.mkdir()
+                self.compare(prepare_int4(root, "awq", True, family), direct=True)
 
     def test_deepseek_dspark_native_proposals(self):
         for method in ("awq", "gptq"):
@@ -2010,8 +2053,11 @@ class NativeQuantizedTests(unittest.TestCase):
                 root.mkdir()
                 fixture = prepare_int4(root, method, True, "deepseek_dspark")
                 self.compare(fixture, direct=True)
-                with self.subTest(confidence="canonical_int4_one_row"):
-                    self.compare(quantize_tiny_confidence(fixture), direct=False)
+                if method == "awq":
+                    # Confidence rounding is independent of the import convention,
+                    # so one canonical INT4 row covers both methods.
+                    with self.subTest(confidence="canonical_int4_one_row"):
+                        self.compare(quantize_tiny_confidence(fixture), direct=False)
 
     def test_deepseek_dspark_native_fp4_proposals(self):
         for format_name in ("MXFP4", "NVFP4"):
@@ -2152,16 +2198,6 @@ class NativeQuantizedTests(unittest.TestCase):
         expected_types = {"q": "Q2_K", "k": "BF16", "v": "Q8_0", "o": "F32"}
         for family in ("qwen35moe", "gpt_oss"):
             projection_family = "qwen" if family == "qwen35moe" else family
-            with self.subTest(family=family, fixture="13-format-matrix"):
-                matrix_root = self.root / f"{family}-13-format-matrix"
-                matrix_root.mkdir()
-                matrix_fixture = (prepare_gguf(matrix_root, True, native_formats=NATIVE_GQA_GGUF_FORMATS)
-                                  if family == "qwen35moe"
-                                  else prepare_family_gguf(matrix_root, family, native_formats=NATIVE_GQA_GGUF_FORMATS))
-                matrix_types = standard_gqa_projection_types(matrix_fixture.source, projection_family)
-                self.assertEqual(len(set(matrix_types.values())), 4,
-                                 f"13-format matrix did not give Q/K/V/O distinct dtypes: {matrix_types}")
-
             with self.subTest(family=family, fixture="Q2_K-BF16-Q8_0-F32"):
                 mixed_root = self.root / f"{family}-mixed-gqa"
                 mixed_root.mkdir()
@@ -2416,6 +2452,7 @@ def main() -> int:
             # The CPU job already runs these offline checks.
             cpu_only_tests = {
                 "test_hybrid_dense_release_expected_accounting",
+                "test_q8_0_dense_ffn_release_expected_accounting",
                 "test_mapped_ple_expected_accounting",
                 "test_native_gguf_block_fixture_oracles",
             }

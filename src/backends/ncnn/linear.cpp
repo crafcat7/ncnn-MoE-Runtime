@@ -178,7 +178,7 @@ static void record_projection_matvec(const ncnn::Pipeline* pipeline, bool bfloat
     dispatch.w = static_cast<int>(((static_cast<uint64_t>(output_columns) + outputs_per_group - 1) / outputs_per_group) * 128);
     dispatch.h = 1;
     dispatch.c = 1;
-    command.record_pipeline_readonly(pipeline, {input, weights, bias, output}, {1, 1, 1, 0}, constants, dispatch);
+    command.record_pipeline_readonly(pipeline, {input, weights, bias, output}, {1, 0, 0, 0}, constants, dispatch);
 }
 #endif
 
@@ -2037,7 +2037,7 @@ bool Bfloat16Linear_vulkan::Implementation::record_projection(const ncnn::VkMat&
             dispatcher.c = 1;
             command.record_pipeline_readonly(cooperative_pipeline.get(),
                                              bindings,
-                                             {1, 1, 1, 0},
+                                             {1, 0, 0, 0},
                                              constants,
                                              dispatcher);
             return true;
@@ -2054,7 +2054,7 @@ bool Bfloat16Linear_vulkan::Implementation::record_projection(const ncnn::VkMat&
     dispatcher.c = 1;
     command.record_pipeline_readonly(pipeline.get(),
                                      bindings,
-                                     {1, 1, 1, 0},
+                                     {1, 0, 0, 0},
                                      constants,
                                      dispatcher);
     return false;
@@ -2091,7 +2091,7 @@ void Bfloat16Linear_vulkan::record_scalar_projection(const ncnn::VkMat& input,
     dispatcher.c = 1;
     cmd.record_pipeline_readonly(implementation.pipeline.get(),
                                  bindings,
-                                 {1, 1, 1, 0},
+                                 {1, 0, 0, 0},
                                  constants,
                                  dispatcher);
 #else
@@ -2129,7 +2129,7 @@ void Bfloat16Linear_vulkan::record_rms_norm_projection(const ncnn::VkMat& input,
     dispatcher.c = 1;
     cmd.record_pipeline_readonly(implementation.rms_norm_projection_pipeline.get(),
                                  bindings,
-                                 {1, 1, 1, 1, 0},
+                                 {1, 0, 0, 0, 0},
                                  constants,
                                  dispatcher);
 #else
@@ -3409,7 +3409,7 @@ void Float8Linear_vulkan::Implementation::record_projection(const ncnn::VkMat& i
     dispatcher.c = 1;
     command.record_pipeline_readonly(pipeline.get(),
                                      bindings,
-                                     {1, 1, 1, 1, 0},
+                                     {1, 0, 0, 0, 0},
                                      constants,
                                      dispatcher);
 }
@@ -6347,6 +6347,11 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
     if (!uploaded)
         return {};
 
+    // Weights and bias become views of one allocation, so a projection binds one
+    // allocation under several bindings. ncnn tracks a single access state per
+    // allocation and cannot honor a readonly claim on one view while another
+    // view of it is bound, so recorders keep the prepared operands writable and
+    // mark only activations readonly.
     const auto storage_view = [&implementation](size_t offset, size_t bytes) {
         ncnn::VkMat view = implementation.storage;
         view.dims = 1;
@@ -6459,7 +6464,7 @@ void QnkLinear_vulkan::record(const ncnn::VkMat& input,
     dispatcher.w = static_cast<int>(column_groups * pipeline->local_size_x());
     dispatcher.h = static_cast<int>((constants[3].u32 + tile_rows - 1) / tile_rows);
     dispatcher.c = static_cast<int>((output_groups + column_groups - 1) / column_groups);
-    command.record_pipeline_readonly(pipeline.get(), bindings, {1, 1, 1, 0}, constants, dispatcher);
+    command.record_pipeline_readonly(pipeline.get(), bindings, {1, 0, 0, 0}, constants, dispatcher);
 #else
     (void)input;
     (void)output;

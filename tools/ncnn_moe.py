@@ -1095,6 +1095,14 @@ class ConversationApp:
         marker = "</think>"
         if state["phase"] == "reasoning":
             combined = state["marker_carry"] + text
+            if not state.get("opening_marker_done"):
+                combined = combined.lstrip()
+                opening = "<think>"
+                if len(combined) < len(opening) and opening.startswith(combined):
+                    state["marker_carry"] = combined
+                    return
+                combined = combined.removeprefix(opening)
+                state["opening_marker_done"] = True
             marker_index = combined.find(marker)
             if marker_index >= 0:
                 self._stream_segment(combined[:marker_index], "reasoning", state, streamed, terminal=True)

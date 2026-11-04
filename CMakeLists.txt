@@ -111,6 +111,7 @@ set(NCNN_MOE_SOURCES
     src/models/modeladapter.cpp
     src/models/modeladapter_gptoss.cpp
     src/models/modeladapter_deepseekv4.cpp
+    src/models/modeladapter_qwen3.cpp
     src/models/modeladapter_qwen3_5.cpp
     src/models/modeladapter_qwen4exp.cpp
     src/models/safetensors.cpp
@@ -563,6 +564,16 @@ if(NCNN_MOE_BUILD_TESTS)
     endif()
 
     # --- Model and package fixtures -------------------------------------------
+
+    add_executable(ncnn_moe_qwen3_test tests/test_qwen3.cpp)
+    target_link_libraries(ncnn_moe_qwen3_test PRIVATE ncnn::moe)
+    target_compile_features(ncnn_moe_qwen3_test PRIVATE cxx_std_20)
+    target_include_directories(ncnn_moe_qwen3_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME ncnn_moe_qwen3 COMMAND ncnn_moe_qwen3_test)
+    if(NCNN_MOE_WITH_VULKAN)
+        add_test(NAME ncnn_moe_qwen3_vulkan COMMAND ncnn_moe_qwen3_test --vulkan)
+        set_tests_properties(ncnn_moe_qwen3_vulkan PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
 
     add_executable(ncnn_moe_qwen_dense_test tests/test_qwen_dense.cpp)
     target_link_libraries(ncnn_moe_qwen_dense_test PRIVATE ncnn::moe)

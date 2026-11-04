@@ -565,7 +565,7 @@ static CompiledModel bank_model(bool gpu, DType dtype, bool native_delta, bool r
     {
         segment_check(model.gpu_expert_banks.size() == segment_layers
                           && std::all_of(model.gpu_expert_banks.begin(), model.gpu_expert_banks.end(), [](const auto& bank) { return static_cast<bool>(bank); })
-                          && model.gpu_expert_bank_size > 0 && !model.expert_backend,
+                          && model.gpu_expert_bank_size > 0 && model.resident_submission_rows > 0 && !model.expert_backend,
                       "an admitted model did not select every bank before reserving its graph arena");
         uint64_t persistent = 0;
         for (const auto& device : model.memory_plan.gpu_devices)
@@ -579,7 +579,7 @@ static CompiledModel bank_model(bool gpu, DType dtype, bool native_delta, bool r
     }
     else
     {
-        segment_check(model.gpu_expert_banks.empty() && model.gpu_expert_bank_size == 0,
+        segment_check(model.gpu_expert_banks.empty() && model.gpu_expert_bank_size == 0 && model.resident_submission_rows == 0,
                       "insufficient expert budget did not preserve the statically selected streaming plan");
         model.expert_backend = create_vulkan_expert_backend(UINT64_C(16) * 1024 * 1024, options.device_index, {}, model.vulkan_runtime, bank_flags);
         segment_check(static_cast<bool>(model.expert_backend), "cannot create the original GPU streaming backend");
@@ -699,7 +699,11 @@ static void bank_chain_abort(const CompiledModel& gpu)
     std::string error;
     options[0].top_k = 0;
     const auto before = get_vulkan_statistics(gpu.vulkan_runtime);
-    segment_check(!GpuSegment_vulkan::forward_banks(gpu, input, positions, pointers, options, true, true, logits, error)
+    segment_check(!GpuSegment_vulkan::forward_resident(gpu, input, positions, pointers, {}, true, true, logits, error)
+                      && logits.rows() == 1 && logits.columns() == 1 && logits.row(0)[0] == -73.0f
+                      && get_vulkan_statistics(gpu.vulkan_runtime).compute_submissions == before.compute_submissions,
+                  "a resident MoE chain accepted missing dispatch options or published output");
+    segment_check(!GpuSegment_vulkan::forward_resident(gpu, input, positions, pointers, options, true, true, logits, error)
                       && logits.rows() == 1 && logits.columns() == 1 && logits.row(0)[0] == -73.0f
                       && get_vulkan_statistics(gpu.vulkan_runtime).compute_submissions == before.compute_submissions,
                   "invalid unsubmitted full-bank transaction published output or submitted work");
@@ -711,7 +715,7 @@ static void bank_chain_abort(const CompiledModel& gpu)
                   "unknown-state regression requires a fresh GDN cache");
     caches[1].vulkan_attention_state_unknown = true;
     error.clear();
-    segment_check(!GpuSegment_vulkan::forward_banks(gpu, input, positions, pointers, options, true, true, logits, error)
+    segment_check(!GpuSegment_vulkan::forward_resident(gpu, input, positions, pointers, options, true, true, logits, error)
                       && !error.empty() && logits.rows() == 1 && logits.columns() == 1 && logits.row(0)[0] == -73.0f
                       && get_vulkan_statistics(gpu.vulkan_runtime).compute_submissions == before.compute_submissions,
                   "fresh unknown GDN state was submitted or published by the resident bank chain");
@@ -729,7 +733,7 @@ static void bank_chain_abort(const CompiledModel& gpu)
         std::array<LayerCache*, segment_layers> late_pointers;
         for (size_t layer = 0; layer < segment_layers; ++layer) late_pointers[layer] = &late_caches[layer];
         late_caches[1].gated_delta_token_count = std::numeric_limits<uint64_t>::max();
-        segment_check(!GpuSegment_vulkan::forward_banks(gpu, input, positions, late_pointers, options, true, true, logits, error)
+        segment_check(!GpuSegment_vulkan::forward_resident(gpu, input, positions, late_pointers, options, true, true, logits, error)
                           && logits.rows() == 1 && logits.columns() == 1 && logits.row(0)[0] == -73.0f,
                       "recording failure after an asynchronous submit published output");
         for (const auto& cache : late_caches)
@@ -737,12 +741,12 @@ static void bank_chain_abort(const CompiledModel& gpu)
                           "late recording failure did not drain and invalidate the partially submitted chain");
         segment_check(late_caches[1].gated_delta_token_count == std::numeric_limits<uint64_t>::max(),
                       "late recording failure published GDN state");
-        segment_check(!GpuSegment_vulkan::forward_banks(gpu, input, positions, late_pointers, options, true, true, logits, error),
+        segment_check(!GpuSegment_vulkan::forward_resident(gpu, input, positions, late_pointers, options, true, true, logits, error),
                       "partially submitted state was replayed without reset");
     }
     const std::array<uint32_t, 4> duplicate = {0, 0, 1, 2};
     options[0].explicit_expert_ids = duplicate;
-    segment_check(!GpuSegment_vulkan::forward_banks(gpu, input, positions, pointers, options, true, true, logits, error)
+    segment_check(!GpuSegment_vulkan::forward_resident(gpu, input, positions, pointers, options, true, true, logits, error)
                       && logits.row(0)[0] == -73.0f && error.find("invalid GPU routing") != std::string::npos,
                   "a submitted invalid GPU route was published or retried on another backend");
     for (const auto& cache : caches)
@@ -750,7 +754,7 @@ static void bank_chain_abort(const CompiledModel& gpu)
                       "failed submitted bank transaction did not poison its unpublished in-place state");
     options[0].explicit_expert_ids = {};
     const auto failed = get_vulkan_statistics(gpu.vulkan_runtime);
-    segment_check(!GpuSegment_vulkan::forward_banks(gpu, input, positions, pointers, options, true, true, logits, error)
+    segment_check(!GpuSegment_vulkan::forward_resident(gpu, input, positions, pointers, options, true, true, logits, error)
                       && get_vulkan_statistics(gpu.vulkan_runtime).compute_submissions == failed.compute_submissions
                       && logits.row(0)[0] == -73.0f,
                   "a bank transaction reused submitted state after failure without reset");
@@ -822,8 +826,8 @@ static void bank_persistent_logits(const CompiledModel& cpu, const CompiledModel
         // The final successful call exercises local workspace teardown while
         // its externally leased logits and committed caches remain observable.
         GpuSegmentWorkspace_vulkan* call_workspace = !explicit_reservation && step == 2 ? nullptr : &workspace;
-        segment_check(GpuSegment_vulkan::forward_banks(gpu, input, positions, pointers, options, true, false,
-                                                       logits, error, call_workspace),
+        segment_check(GpuSegment_vulkan::forward_resident(gpu, input, positions, pointers, options, true, false,
+                                                          logits, error, call_workspace),
                       "persistent bank output execution failed: " + error);
         segment_compare(logits.values(), expected.logits.values(), "persistent bank complete logits step " + std::to_string(step));
         if (step == 1)
@@ -851,8 +855,8 @@ static void bank_persistent_logits(const CompiledModel& cpu, const CompiledModel
     for (size_t layer = 0; layer < segment_layers; ++layer) pointers[layer] = &caches[layer];
     const auto before = get_vulkan_statistics(gpu.vulkan_runtime);
     options[0].top_k = 0;
-    segment_check(!GpuSegment_vulkan::forward_banks(gpu, input, positions, pointers, options, true, true,
-                                                    logits, error, &workspace)
+    segment_check(!GpuSegment_vulkan::forward_resident(gpu, input, positions, pointers, options, true, true,
+                                                       logits, error, &workspace)
                       && get_vulkan_statistics(gpu.vulkan_runtime).compute_submissions == before.compute_submissions
                       && logits.bytes().data() == published_pointer
                       && std::equal(logits.values().begin(), logits.values().end(), published.values().begin()),
@@ -860,8 +864,8 @@ static void bank_persistent_logits(const CompiledModel& cpu, const CompiledModel
     options[0].top_k = 4;
     const std::array<uint32_t, 4> duplicate{0, 0, 1, 2};
     options[0].explicit_expert_ids = duplicate;
-    segment_check(!GpuSegment_vulkan::forward_banks(gpu, input, positions, pointers, options, true, true,
-                                                    logits, error, &workspace)
+    segment_check(!GpuSegment_vulkan::forward_resident(gpu, input, positions, pointers, options, true, true,
+                                                       logits, error, &workspace)
                       && error.find("invalid GPU routing") != std::string::npos
                       && logits.bytes().data() == published_pointer
                       && std::equal(logits.values().begin(), logits.values().end(), published.values().begin()),
