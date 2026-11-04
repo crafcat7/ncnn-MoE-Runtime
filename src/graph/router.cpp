@@ -32,6 +32,34 @@ static float score_router_logit(float logit, RouterScoreFunction score_function)
     return std::sqrt(stable_softplus(logit));
 }
 
+static float mixer_weight(const float* logits, uint32_t n, uint32_t keep, uint32_t skip, float eps)
+{
+    float max = -std::numeric_limits<float>::infinity();
+    for (uint32_t i = 0; i < n; ++i)
+        if (i != skip)
+            max = std::max(max, logits[i]);
+    if (!std::isfinite(max))
+        return 0.0f;
+
+    const float lim = 2.0f * eps;
+    float sum = 0.0f;
+    float chosen = 0.0f;
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        if (i == skip)
+            continue;
+        const float v = logits[i];
+        const float f = std::max(std::abs(v), max);
+        if (f > 0.0f && ((max - v) / f) > lim)
+            continue;
+        const float w = float_approximate_exp(v - max);
+        sum += w;
+        if (i == keep)
+            chosen = w;
+    }
+    return sum > 0.0f ? chosen / sum : 0.0f;
+}
+
 static void router_scores(const float* logits, uint32_t size, RouterScoreFunction score_function, std::vector<float>& scores)
 {
     scores.resize(size);
@@ -96,6 +124,9 @@ static Result<void> dispatch_experts_general(std::span<const float> router_logit
         return Error{ErrorCode::InvalidArgument, "routed scaling factor must be finite and positive"};
     if (options.normalization != RouterNormalization::None && options.normalization != RouterNormalization::SelectedExperts)
         return Error{ErrorCode::InvalidArgument, "router normalization must be None or SelectedExperts"};
+    if (options.score_function == RouterScoreFunction::SparseMixer
+        && (options.top_k != 2 || !std::isfinite(options.jitter) || options.jitter < 0.0f))
+        return Error{ErrorCode::InvalidModel, "sparse mixer requires top_k 2 and a finite non-negative jitter"};
     for (float logit : router_logits)
     {
         if (!std::isfinite(logit))
@@ -124,6 +155,38 @@ static Result<void> dispatch_experts_general(std::span<const float> router_logit
     for (uint32_t token_index = 0; token_index < token_count; ++token_index)
     {
         const float* logits = router_logits.data() + static_cast<size_t>(token_index) * options.expert_count;
+        if (options.score_function == RouterScoreFunction::SparseMixer)
+        {
+            uint32_t id0 = 0;
+            uint32_t id1 = 0;
+            float max0 = -std::numeric_limits<float>::infinity();
+            float max1 = -std::numeric_limits<float>::infinity();
+            for (uint32_t i = 0; i < options.expert_count; ++i)
+            {
+                const float v = logits[i];
+                if (!std::isfinite(v))
+                    return Error{ErrorCode::InvalidArgument, "router logits must be finite"};
+                if (v > max0)
+                {
+                    max1 = max0;
+                    id1 = id0;
+                    max0 = v;
+                    id0 = i;
+                }
+                else if (v > max1)
+                {
+                    max1 = v;
+                    id1 = i;
+                }
+            }
+            const float w0 = mixer_weight(logits, options.expert_count, id0, options.expert_count, options.jitter)
+                             * options.routed_scaling_factor;
+            const float w1 = mixer_weight(logits, options.expert_count, id1, id0, options.jitter)
+                             * options.routed_scaling_factor;
+            result.route_scratch[id0].push_back({token_index, 0, w0});
+            result.route_scratch[id1].push_back({token_index, 1, w1});
+            continue;
+        }
         float selected_sum = 0.0f;
         if (softmax_topk)
         {
@@ -204,6 +267,8 @@ Result<void> forward_router(std::span<const float> router_logits,
                             const ExpertDispatchOptions& options,
                             ExpertDispatchPlan& result)
 {
+    if (options.score_function == RouterScoreFunction::SparseMixer)
+        return dispatch_experts_general(router_logits, token_count, options, result);
     static constexpr uint32_t stack_top_k = 16;
     if (token_count != 1
         || options.top_k > stack_top_k)

@@ -124,18 +124,21 @@ public:
     [[nodiscard]] static std::shared_ptr<Attention_vulkan> create(const TensorData& norm_weight, const TensorData* sinks,
                                                                   std::shared_ptr<Linear> fused_qkv,
                                                                   std::shared_ptr<Linear> output_projection,
-                                                                  const AttentionConfig_vulkan& config);
+                                                                  const AttentionConfig_vulkan& config,
+                                                                  const TensorData* norm_bias = nullptr);
     [[nodiscard]] static std::shared_ptr<Attention_vulkan> create(const TensorData& norm_weight, const TensorData* sinks,
                                                                   std::shared_ptr<Bfloat16Linear_vulkan> fused_qkv,
                                                                   std::shared_ptr<Bfloat16Linear_vulkan> output_projection,
-                                                                  const AttentionConfig_vulkan& config);
+                                                                  const AttentionConfig_vulkan& config,
+                                                                  const TensorData* norm_bias = nullptr);
     [[nodiscard]] static std::shared_ptr<Attention_vulkan> create(const TensorData& norm_weight,
                                                                   const TensorData& query_norm_weight,
                                                                   const TensorData& key_norm_weight,
                                                                   const TensorData* sinks,
                                                                   std::shared_ptr<Bfloat16Linear_vulkan> fused_qkv_gate,
                                                                   std::shared_ptr<Bfloat16Linear_vulkan> output_projection,
-                                                                  const AttentionConfig_vulkan& config);
+                                                                  const AttentionConfig_vulkan& config,
+                                                                  const TensorData* norm_bias = nullptr);
     [[nodiscard]] static std::shared_ptr<Attention_vulkan> create_native(const TensorData& norm_weight,
                                                                          const TensorData* query_norm_weight,
                                                                          const TensorData* key_norm_weight,
@@ -143,7 +146,8 @@ public:
                                                                          // Q, K, V, output projection, and optional output gate.
                                                                          const std::array<CompiledOperator, 5>& projections,
                                                                          const AttentionConfig_vulkan& config,
-                                                                         std::shared_ptr<QnkLinear_vulkan> fused_native_qkv = {});
+                                                                         std::shared_ptr<QnkLinear_vulkan> fused_native_qkv = {},
+                                                                         const TensorData* norm_bias = nullptr);
     // One upload, one submission, and one download per Attention block.
     [[nodiscard]] bool forward(uint64_t position_offset, LayerCache& cache, const ActivationBuffer& input, ActivationBuffer& output) const;
     // Materializes an otherwise valid device KV ring into the CPU cache.  This
@@ -222,7 +226,8 @@ private:
                                                                        std::shared_ptr<Bfloat16Linear_vulkan> output_projection_bfloat16,
                                                                        std::array<CompiledOperator, 5> native_projections,
                                                                        const AttentionConfig_vulkan& config,
-                                                                       std::shared_ptr<QnkLinear_vulkan> fused_native_qkv = {});
+                                                                       std::shared_ptr<QnkLinear_vulkan> fused_native_qkv = {},
+                                                                       const TensorData* norm_bias = nullptr);
     std::unique_ptr<Implementation> d;
 };
 

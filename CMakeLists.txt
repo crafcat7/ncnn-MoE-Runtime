@@ -64,6 +64,7 @@ set(NCNN_MOE_SOURCES
     src/backends/ncnn/qsaattention_vulkan.cpp
     src/backends/ncnn/hyperconnection_vulkan.cpp
     src/backends/ncnn/rmsnorm_vulkan.cpp
+    src/backends/ncnn/layernorm_vulkan.cpp
     src/backends/ncnn/router_vulkan.cpp
     src/backends/ncnn/layerhead_vulkan.cpp
     src/backends/ncnn/latentlayer_vulkan.cpp
@@ -114,6 +115,7 @@ set(NCNN_MOE_SOURCES
     src/models/modeladapter_qwen3.cpp
     src/models/modeladapter_qwen3_5.cpp
     src/models/modeladapter_qwen4exp.cpp
+    src/models/modeladapter_phimoe.cpp
     src/models/safetensors.cpp
     src/models/gguf.cpp
     src/models/ggufmodel.cpp

@@ -22,6 +22,8 @@ admitted, with generated-model execution and official-tokenizer parity tests.
 Full-checkpoint generation and performance for those dense variants have not yet been measured.
 Qwen3 dense Safetensors models (`model_type: qwen3`) also have a native adapter,
 including Q/K RMSNorm, grouped-query attention, SwiGLU, and tied embeddings.
+Phi-mini-MoE-instruct (`model_type: phimoe`) uses the native BF16 Safetensors
+adapter with LayerNorm, attention bias, and sparse-mixer Top-2 routing.
 
 [Runtime capabilities](#runtime-capabilities) | [Architecture](#architecture) |
 [Supported models and data](#supported-models-and-reference-data) |
@@ -45,6 +47,7 @@ matrix.
 | Qwen3.8-Flash-Next | Hybrid, on-demand Experts | Not yet published | Not yet published | [Qwen3.8 admission](models/qwen3.8/README.md) |
 | Qwen3.5 / Qwen3.6 dense text | CPU or mixed Attention/FFN | Not yet published | Not yet published | [Dense admission](models/qwen3.6/README.md#dense-text-models) |
 | Qwen3 dense (including 0.6B) | CPU or Hybrid, Safetensors | Not yet published | Not yet published | [Native text interface](#unified-examples) |
+| Phi-mini-MoE-instruct | CPU or Hybrid, BF16 Safetensors | Not yet published | Not yet published | [PhiMoE admission](models/phimoe/README.md) |
 
 Model-specific prompts, kernels, quantization formats, and service policies
 differ, so these rows are reference points rather than a cross-model ranking.
@@ -75,7 +78,7 @@ requiring a resident copy of every routed weight.
 | Area | Release capability |
 | --- | --- |
 | Runtime API | `Runtime`, immutable shared `Model`, per-request `Session`, and cross-Session `BatchScheduler` |
-| Model integration | Public `ModelAdapter` contract and model-neutral `MoeModelDescriptor`; built-in GPT-OSS, DeepSeek V4, Qwen3, Qwen3.6, and Qwen3.8 text adapters |
+| Model integration | Public `ModelAdapter` contract and model-neutral `MoeModelDescriptor`; built-in GPT-OSS, DeepSeek V4, Qwen3, Qwen3.6, Qwen3.8, and Phi-mini-MoE text adapters |
 | Compiler | Descriptor validation, weight resolution, execution-graph construction, and immutable compilation |
 | Execution graph | Tensor and node dependencies, backend candidates and placement, and dependency-ordered nodes |
 | Dense path | Portable CPU with runtime-dispatched FP8 E4M3 scalar/AVX2/AVX-512 Linear, and mixed ncnn Vulkan Dense/Attention execution |
@@ -532,7 +535,7 @@ the Runtime API and its public model guides.
 | Capability | Public behavior |
 | --- | --- |
 | Adapter interface | Public `ModelAdapter` descriptor and weight-mapping contract |
-| Built-in reference adapters | GPT-OSS-20B/120B, DeepSeek-V4-Flash/DSpark, Qwen3 dense, and the Qwen3.6-35B-A3B and Qwen3.8-Flash-Next text backbones |
+| Built-in reference adapters | GPT-OSS-20B/120B, DeepSeek-V4-Flash/DSpark, Qwen3 dense, Phi-mini-MoE-instruct, and the Qwen3.6-35B-A3B and Qwen3.8-Flash-Next text backbones |
 | CPU execution | Complete portable path |
 | Heterogeneous execution | Vulkan Dense/Attention with CPU routing and Experts |
 | Native Vulkan Experts | MXFP4, INT4 and Qn_K cache and resident execution, with CPU recovery for missing or failed work |
@@ -542,7 +545,7 @@ the Runtime API and its public model guides.
 | Output | Full logits with native sampling and streaming |
 
 The distributed release includes validated GPT-OSS, DeepSeek V4, Qwen3 dense,
-Qwen3.6, and Qwen3.8 text production adapters. The Qwen3.6 and Qwen3.8 admissions
+Phi-mini-MoE, Qwen3.6, and Qwen3.8 text production adapters. The Qwen3.6 and Qwen3.8 admissions
 exclude their vision encoders. Qwen3.6 admits its one-layer MTP payload with the
 checkpoint-bound compiled Artifact, while Qwen3.8 does not execute its MTP tensors. Additional
 adapters use the same public descriptor and

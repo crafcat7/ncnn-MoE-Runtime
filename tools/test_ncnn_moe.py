@@ -571,6 +571,16 @@ class AdapterTests(unittest.TestCase):
                     self.assertTrue(adapter.thinking)
                     self.assertFalse(load_adapter(_arguments(no_thinking=True), model, _ready(expected_stops)).thinking)
 
+    def test_phimoe_adapter_is_non_reasoning(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ncnn-moe-phimoe-adapter-") as directory:
+            model = _model(Path(directory), "phimoe")
+            ready = _ready([32000, 32001, 32007])
+            adapter = load_adapter(_arguments(), model, ready)
+            self.assertEqual(adapter.name, "phimoe")
+            self.assertEqual(adapter.stop_tokens, [32000, 32001, 32007])
+            self.assertFalse(adapter.thinking)
+            self.assertEqual(adapter.decode_completion_text("hello"), Completion("", "hello"))
+
     def test_native_unavailable_or_wrong_protocol_fails_explicitly(self) -> None:
         arguments = _arguments()
         with tempfile.TemporaryDirectory(prefix="ncnn-moe-native-unavailable-") as directory:

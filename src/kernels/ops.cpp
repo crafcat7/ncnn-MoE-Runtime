@@ -2868,6 +2868,44 @@ ActivationBuffer forward_rms_norm(const ActivationBuffer& input, const TensorDat
     return output;
 }
 
+void forward_layer_norm(const ActivationBuffer& input, const TensorData& weight, const TensorData& bias, float epsilon, ActivationBuffer& output)
+{
+    assert(weight.element_count() == input.columns());
+    assert(bias.element_count() == input.columns());
+    require_dense_host_storage(weight, "normalization weight");
+    require_dense_host_storage(bias, "normalization bias");
+    output.reset(input.rows(), input.columns(), false);
+    const int64_t row_count = static_cast<int64_t>(input.rows());
+    const int team_size = static_cast<int>(std::min<int64_t>(std::max<int64_t>(1, row_count), cpu_linear_num_threads()));
+#pragma omp parallel for schedule(static) num_threads(team_size) if (team_size > 1 && allow_openmp_parallel_region())
+    for (int64_t token = 0; token < row_count; ++token)
+    {
+        const size_t token_index = static_cast<size_t>(token);
+        const float* source = input.row(token_index);
+        float* destination = output.row(token_index);
+        float mean = 0.0f;
+        float variance = 0.0f;
+        for (uint32_t column = 0; column < input.columns(); ++column)
+        {
+            const float value = source[column];
+            mean += value;
+            variance += value * value;
+        }
+        mean /= static_cast<float>(input.columns());
+        variance = variance / static_cast<float>(input.columns()) - mean * mean;
+        const float inverse_std = 1.0f / std::sqrt(variance + epsilon);
+        for (uint32_t column = 0; column < input.columns(); ++column)
+            destination[column] = (source[column] - mean) * inverse_std * tensor_value(weight, column) + tensor_value(bias, column);
+    }
+}
+
+ActivationBuffer forward_layer_norm(const ActivationBuffer& input, const TensorData& weight, const TensorData& bias, float epsilon)
+{
+    ActivationBuffer output;
+    forward_layer_norm(input, weight, bias, epsilon, output);
+    return output;
+}
+
 void add_bias_inplace(ActivationBuffer& destination, const TensorData& bias)
 {
     assert(bias.shape.size() == 1 && bias.shape[0] == destination.columns());

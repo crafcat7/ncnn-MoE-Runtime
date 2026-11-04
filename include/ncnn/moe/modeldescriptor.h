@@ -98,6 +98,8 @@ struct MoeDescriptor
 
     float activation_limit = 0.0f;
     float routed_scaling_factor = 1.0f;
+    // Sparse-mixer relative mask threshold.
+    float jitter = 0.0f;
     uint32_t flags = 0;
 };
 

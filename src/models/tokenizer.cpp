@@ -1186,6 +1186,8 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
     if (model_input.bad())
         return false;
     const std::optional<std::string> model_type = json_string(model_config, "model_type");
+    if (model_type == std::optional<std::string>("phimoe"))
+        return load_phi(tokenizer, config_text, model_config, vocabulary_size);
     Family new_family = Family::None;
     bool new_merge_leading_system_messages = false;
     size_t base_vocab_size = 0;
@@ -2160,12 +2162,350 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
     return true;
 }
 
+bool Tokenizer::load_phi(std::string_view tokenizer, std::string_view config, std::string_view model_config,
+                         size_t vocabulary_size)
+{
+    try
+    {
+        if (tokenizer.empty() || config.empty() || model_config.empty())
+            return false;
+        if (json_string(model_config, "model_type") != std::optional<std::string>("phimoe"))
+            return false;
+        if (json_string(config, "tokenizer_class") != std::optional<std::string>("LlamaTokenizer")
+            || json_integer(config, "model_max_length") != std::optional<int64_t>(4096)
+            || json_boolean(config, "add_bos_token") != std::optional<bool>(false)
+            || json_boolean(config, "add_eos_token") != std::optional<bool>(false)
+            || json_string(config, "bos_token") != std::optional<std::string>("<s>")
+            || json_string(config, "eos_token") != std::optional<std::string>("<|endoftext|>"))
+            return false;
+        const auto config_vocab_size = json_integer(model_config, "vocab_size");
+        const uint32_t total_vocabulary = config_vocab_size ? static_cast<uint32_t>(*config_vocab_size) : 32064;
+        if (total_vocabulary == 0 || (vocabulary_size != 0 && vocabulary_size != total_vocabulary))
+            return false;
+
+        auto raw_member = [](std::string_view json, std::string_view key) -> std::string_view {
+            const auto value = find_manifest_member(json, key);
+            if (!value)
+                throw std::runtime_error("missing Phi tokenizer member: " + std::string(key));
+            return *value;
+        };
+        auto take_value = [](std::string_view text, size_t& position, std::string_view& value) {
+            position = skip_space(text, position);
+            if (position >= text.size())
+                return false;
+            const size_t begin = position;
+            if (text[position] == '"')
+            {
+                if (!parse_json_string(text, position, nullptr))
+                    return false;
+            }
+            else if (text[position] == '{' || text[position] == '[')
+            {
+                std::vector<char> delimiters{text[position++]};
+                while (position < text.size() && !delimiters.empty())
+                {
+                    if (text[position] == '"')
+                    {
+                        if (!parse_json_string(text, position, nullptr))
+                            return false;
+                        continue;
+                    }
+                    const char current = text[position++];
+                    if (current == '{' || current == '[')
+                        delimiters.push_back(current);
+                    else if (current == '}' || current == ']')
+                    {
+                        if ((current == '}' && delimiters.back() != '{') || (current == ']' && delimiters.back() != '['))
+                            return false;
+                        delimiters.pop_back();
+                    }
+                }
+                if (!delimiters.empty())
+                    return false;
+            }
+            else
+            {
+                while (position < text.size() && text[position] != ',' && text[position] != '}' && text[position] != ']' && !is_space(text[position]))
+                    ++position;
+                if (begin == position)
+                    return false;
+            }
+            value = text.substr(begin, position - begin);
+            return true;
+        };
+        auto require_array = [&](std::string_view json, std::string_view key) {
+            const auto value = find_manifest_member(json, key);
+            if (!value)
+                throw std::runtime_error("missing Phi tokenizer array: " + std::string(key));
+            const std::string_view array = *value;
+            if (array.empty() || array.front() != '[')
+                throw std::runtime_error("invalid Phi tokenizer array: " + std::string(key));
+            return array;
+        };
+
+        const std::string_view model = raw_member(tokenizer, "model");
+        if (json_string(model, "type") != std::optional<std::string>("BPE"))
+            return false;
+        if (json_boolean(model, "byte_fallback") != std::optional<bool>(true))
+            return false;
+        if (json_boolean(model, "fuse_unk") != std::optional<bool>(true))
+            return false;
+        if (json_string(model, "unk_token") != std::optional<std::string>("<unk>"))
+            return false;
+        const auto continuing_prefix = find_manifest_member(model, "continuing_subword_prefix");
+        const auto word_suffix = find_manifest_member(model, "end_of_word_suffix");
+        if (!continuing_prefix || *continuing_prefix != "null" || !word_suffix || *word_suffix != "null")
+            return false;
+
+        std::unordered_map<std::string, uint32_t> vocab;
+        vocab.reserve(total_vocabulary);
+        index.assign(total_vocabulary, Entry{});
+        rstrip.assign(total_vocabulary, 0);
+        bytes.clear();
+        merges.clear();
+        raw_piece_ids.clear();
+        added_token_trie.assign(1, AddedTokenNode{});
+        std::array<int32_t, 256> phi_byte_ids{};
+        phi_byte_ids.fill(-1);
+
+        auto set_entry = [&](uint32_t id, std::string_view token, bool special) {
+            if (id >= total_vocabulary)
+                return false;
+            Entry& entry = index[id];
+            entry.offset = static_cast<uint32_t>(bytes.size());
+            for (const unsigned char byte : token)
+                bytes.push_back(byte);
+            entry.length = static_cast<uint32_t>(bytes.size() - entry.offset);
+            entry.flags = static_cast<uint8_t>(Present | (special ? Special : 0));
+            return true;
+        };
+        auto byte_of = [](std::string_view token) -> int {
+            if (token.size() != 6 || token[0] != '<' || token[1] != '0' || token[2] != 'x' || token[5] != '>')
+                return -1;
+            auto hex = [](char value) -> int {
+                if (value >= '0' && value <= '9')
+                    return value - '0';
+                if (value >= 'a' && value <= 'f')
+                    return value - 'a' + 10;
+                if (value >= 'A' && value <= 'F')
+                    return value - 'A' + 10;
+                return -1;
+            };
+            const int high = hex(token[3]);
+            const int low = hex(token[4]);
+            return high < 0 || low < 0 ? -1 : high * 16 + low;
+        };
+
+        const std::string_view vocab_json = raw_member(model, "vocab");
+        size_t position = skip_space(vocab_json, 0);
+        if (position >= vocab_json.size() || vocab_json[position++] != '{')
+            return false;
+        std::string piece;
+        for (;;)
+        {
+            position = skip_space(vocab_json, position);
+            if (position >= vocab_json.size())
+                return false;
+            if (vocab_json[position] == '}')
+            {
+                ++position;
+                break;
+            }
+            if (!parse_json_string(vocab_json, position, &piece))
+                return false;
+            position = skip_space(vocab_json, position);
+            if (position >= vocab_json.size() || vocab_json[position++] != ':')
+                return false;
+            position = skip_space(vocab_json, position);
+            const size_t begin = position;
+            while (position < vocab_json.size() && vocab_json[position] != ',' && vocab_json[position] != '}' && !is_space(vocab_json[position]))
+                ++position;
+            uint32_t id = 0;
+            const auto parsed = std::from_chars(vocab_json.data() + begin, vocab_json.data() + position, id);
+            if (parsed.ec != std::errc() || parsed.ptr != vocab_json.data() + position || id >= total_vocabulary)
+                return false;
+            if (!vocab.emplace(piece, id).second)
+                return false;
+            const int byte = byte_of(piece);
+            if (byte >= 0)
+            {
+                Entry& entry = index[id];
+                entry.offset = static_cast<uint32_t>(bytes.size());
+                bytes.push_back(static_cast<uint8_t>(byte));
+                entry.length = 1;
+                entry.flags = Present;
+                phi_byte_ids[static_cast<size_t>(byte)] = static_cast<int32_t>(id);
+            }
+            else
+            {
+                if (!set_entry(id, piece, false))
+                    return false;
+                size_t character_offset = 0;
+                const uint32_t codepoint = read_utf8(piece, character_offset);
+                if (character_offset == piece.size())
+                    char_ids.emplace(codepoint, id);
+            }
+            position = skip_space(vocab_json, position);
+            if (position >= vocab_json.size())
+                return false;
+            if (vocab_json[position] == '}')
+            {
+                ++position;
+                break;
+            }
+            if (vocab_json[position++] != ',')
+                return false;
+            position = skip_space(vocab_json, position);
+            if (position >= vocab_json.size() || vocab_json[position] == '}')
+                return false;
+        }
+        if (vocab.empty())
+            return false;
+
+        const std::string_view merges_json = raw_member(model, "merges");
+        position = skip_space(merges_json, 0);
+        if (position >= merges_json.size() || merges_json[position++] != '[')
+            return false;
+        for (uint32_t rank = 0;; ++rank)
+        {
+            position = skip_space(merges_json, position);
+            if (position >= merges_json.size())
+                return false;
+            if (merges_json[position] == ']')
+            {
+                ++position;
+                break;
+            }
+            std::string merge_text;
+            if (!parse_json_string(merges_json, position, &merge_text))
+                return false;
+            const size_t separator = merge_text.find(' ');
+            if (separator == std::string::npos || separator == 0 || separator + 1 >= merge_text.size())
+                return false;
+            const std::string left = merge_text.substr(0, separator);
+            const std::string right = merge_text.substr(separator + 1);
+            const auto left_id = vocab.find(left);
+            const auto right_id = vocab.find(right);
+            const auto merged_id = vocab.find(left + right);
+            if (left_id == vocab.end() || right_id == vocab.end() || merged_id == vocab.end())
+                return false;
+            if (!merges.emplace(merge_key(left_id->second, right_id->second), Merge{rank, merged_id->second}).second)
+                return false;
+            position = skip_space(merges_json, position);
+            if (position >= merges_json.size())
+                return false;
+            if (merges_json[position] == ']')
+            {
+                ++position;
+                break;
+            }
+            if (merges_json[position++] != ',')
+                return false;
+            position = skip_space(merges_json, position);
+            if (position >= merges_json.size() || merges_json[position] == ']')
+                return false;
+        }
+
+        auto add_token = [&](uint32_t id, const std::string& content, bool special, bool strip) {
+            if (id >= total_vocabulary || content.empty())
+                return false;
+            if (!set_entry(id, content, special))
+                return false;
+            rstrip[id] = strip ? 1 : 0;
+            uint32_t node_index = 0;
+            for (const char character : content)
+            {
+                const uint8_t byte = static_cast<uint8_t>(static_cast<unsigned char>(character));
+                auto& edges = added_token_trie[node_index].edges;
+                auto edge = std::lower_bound(edges.begin(), edges.end(), byte,
+                                             [](const auto& item, uint8_t value) { return item.first < value; });
+                if (edge == edges.end() || edge->first != byte)
+                {
+                    if (added_token_trie.size() >= std::numeric_limits<uint32_t>::max())
+                        return false;
+                    const uint32_t child = static_cast<uint32_t>(added_token_trie.size());
+                    added_token_trie.emplace_back();
+                    auto& parent_edges = added_token_trie[node_index].edges;
+                    const auto insert_at = std::lower_bound(parent_edges.begin(), parent_edges.end(), byte,
+                                                            [](const auto& item, uint8_t value) { return item.first < value; });
+                    parent_edges.insert(insert_at, {byte, child});
+                    node_index = child;
+                }
+                else
+                    node_index = edge->second;
+            }
+            AddedTokenNode& terminal = added_token_trie[node_index];
+            if (terminal.terminal && terminal.token_id != id)
+                return false;
+            terminal.token_id = id;
+            terminal.terminal = true;
+            return true;
+        };
+
+        const std::string_view added_array = require_array(tokenizer, "added_tokens");
+        position = skip_space(added_array, 1);
+        if (position < added_array.size() && added_array[position] == ']')
+            return false;
+        for (;;)
+        {
+            position = skip_space(added_array, position);
+            if (position >= added_array.size())
+                return false;
+            if (added_array[position] == ']')
+            {
+                ++position;
+                break;
+            }
+            std::string_view item;
+            if (!take_value(added_array, position, item))
+                return false;
+            const auto id = json_integer(item, "id");
+            const auto content = json_string(item, "content");
+            const auto special = json_boolean(item, "special");
+            const auto rstrip = json_boolean(item, "rstrip");
+            if (!id || !content || !special || !rstrip || *id < 0 || static_cast<uint64_t>(*id) >= total_vocabulary)
+                return false;
+            if (!add_token(static_cast<uint32_t>(*id), *content, *special, *rstrip))
+                return false;
+            position = skip_space(added_array, position);
+            if (position >= added_array.size())
+                return false;
+            if (added_array[position] == ']')
+            {
+                ++position;
+                break;
+            }
+            if (added_array[position++] != ',')
+                return false;
+            position = skip_space(added_array, position);
+            if (position >= added_array.size() || added_array[position] == ']')
+                return false;
+        }
+
+        for (size_t byte = 0; byte < phi_byte_ids.size(); ++byte)
+        {
+            if (phi_byte_ids[byte] < 0)
+                return false;
+            byte_ids[byte] = phi_byte_ids[byte];
+        }
+        stops = {32000, 32001, 32007};
+        family = Family::Phi;
+        ignore_merges = false;
+        merge_leading_system_messages = false;
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
 void Tokenizer::bpe(std::string_view raw,
                     std::vector<int32_t>& ids,
                     EncodeScratch& scratch) const
 {
-    const size_t count = raw.size();
-    if (count == 0)
+    const size_t raw_count = raw.size();
+    if (raw_count == 0)
         return;
 
     if (ignore_merges)
@@ -2178,11 +2518,40 @@ void Tokenizer::bpe(std::string_view raw,
         }
     }
 
+    // SentencePiece-style BPE (Phi) starts from Unicode character symbols and
+    // falls back to UTF-8 byte tokens only for characters absent from the
+    // vocabulary. ByteLevel families start from byte symbols directly.
+    std::vector<uint32_t> phi_symbols;
+    size_t count = raw_count;
+    if (family == Family::Phi)
+    {
+        phi_symbols.reserve(raw_count);
+        for (size_t offset = 0; offset < raw.size();)
+        {
+            const size_t start = offset;
+            const uint32_t codepoint = read_utf8(raw, offset);
+            const auto found = char_ids.find(codepoint);
+            if (found != char_ids.end())
+                phi_symbols.push_back(found->second);
+            else
+            {
+                for (size_t index = start; index < offset; ++index)
+                    phi_symbols.push_back(static_cast<uint32_t>(byte_ids[static_cast<uint8_t>(raw[index])]));
+            }
+        }
+        count = phi_symbols.size();
+        if (count == 0)
+            return;
+    }
+
     std::vector<EncodeScratch::Node>& nodes = scratch.nodes;
     nodes.resize(count);
     for (size_t i = 0; i < count; ++i)
     {
-        nodes[i] = {byte_ids[static_cast<uint8_t>(raw[i])], i == 0 ? count : i - 1,
+        const int32_t symbol = family == Family::Phi
+                                   ? static_cast<int32_t>(phi_symbols[i])
+                                   : byte_ids[static_cast<uint8_t>(raw[i])];
+        nodes[i] = {symbol, i == 0 ? count : i - 1,
                     i + 1 == count ? count : i + 1};
     }
 
@@ -2319,6 +2688,28 @@ void Tokenizer::encode_impl(std::string_view text,
     auto encode_segment = [&](std::string_view segment) {
         if (segment.empty())
             return;
+        if (family == Family::Phi)
+        {
+            std::string& normalized = scratch.normalized;
+            normalized.clear();
+            normalized.reserve(segment.size() + 1);
+            normalized.push_back('\xe2');
+            normalized.push_back('\x96');
+            normalized.push_back('\x81');
+            for (const char character : segment)
+            {
+                if (character == ' ')
+                {
+                    normalized.push_back('\xe2');
+                    normalized.push_back('\x96');
+                    normalized.push_back('\x81');
+                }
+                else
+                    normalized.push_back(character);
+            }
+            bpe(normalized, ids, scratch);
+            return;
+        }
         std::vector<uint32_t>& points = scratch.points;
         std::vector<uint8_t>& props = scratch.props;
         std::vector<size_t>& offsets = scratch.offsets;
@@ -2574,6 +2965,17 @@ void Tokenizer::encode_impl(std::string_view text,
         if (match_start > cursor)
             encode_segment(text.substr(cursor, match_start - cursor));
         ids.push_back(static_cast<int32_t>(match_id));
+        if (family == Family::Phi && match_id < rstrip.size() && rstrip[match_id] != 0)
+        {
+            while (match_end < text.size())
+            {
+                const char next = text[match_end];
+                if (next == ' ' || next == '\t' || next == '\r' || next == '\n')
+                    ++match_end;
+                else
+                    break;
+            }
+        }
         cursor = match_end;
     }
 }
@@ -2867,6 +3269,26 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
         return ids;
     }
 
+    if (family == Family::Phi)
+    {
+        if (messages.empty())
+            throw std::invalid_argument("No messages provided.");
+        std::string prompt;
+        for (const Message& message : messages)
+        {
+            if (message.role != "system" && message.role != "developer" && message.role != "user" && message.role != "assistant")
+                throw std::invalid_argument("Unknown PhiMoE role");
+            const std::string role = message.role == "developer" ? "system" : message.role;
+            prompt += "<|" + role + "|>\n";
+            prompt += message.content;
+            prompt += "<|end|>\n";
+        }
+        prompt += "<|assistant|>\n";
+        std::vector<int32_t> ids;
+        encode_impl(prompt, true, scratch, ids);
+        return ids;
+    }
+
     if (messages.empty())
         throw std::invalid_argument("No messages provided.");
     // Qwen templates share the message framing, but Qwen3 preserves content
@@ -3042,9 +3464,26 @@ std::string Tokenizer::decode(int32_t id, std::string& pending, bool final) cons
     if (id >= 0 && static_cast<size_t>(id) < index.size())
     {
         const Entry& entry = index[static_cast<size_t>(id)];
-        const bool skip_special = family == Family::Qwen3 || family == Family::Qwen36 || family == Family::Qwen38;
+        const bool skip_special = family == Family::Qwen3 || family == Family::Qwen36 || family == Family::Qwen38 || family == Family::Phi;
         if ((entry.flags & Present) != 0 && (!skip_special || (entry.flags & Special) == 0) && entry.length != 0)
-            pending.append(reinterpret_cast<const char*>(bytes.data() + entry.offset), entry.length);
+        {
+            const char* entry_bytes = reinterpret_cast<const char*>(bytes.data() + entry.offset);
+            if (family == Family::Phi)
+            {
+                for (size_t index = 0; index < entry.length;)
+                {
+                    if (entry.length - index >= 3 && entry_bytes[index] == '\xe2' && entry_bytes[index + 1] == '\x96' && entry_bytes[index + 2] == '\x81')
+                    {
+                        pending.push_back(' ');
+                        index += 3;
+                    }
+                    else
+                        pending.push_back(entry_bytes[index++]);
+                }
+            }
+            else
+                pending.append(entry_bytes, entry.length);
+        }
     }
 
     std::string output;
@@ -3075,6 +3514,26 @@ std::string Tokenizer::decode(int32_t id, std::string& pending, bool final) cons
             output.push_back(static_cast<char>(lead));
             ++offset;
             continue;
+        }
+        if (family == Family::Phi && lead == 0xe2)
+        {
+            const size_t available = pending.size() - offset;
+            if (available < 3)
+            {
+                if (!final)
+                    break;
+                replacement();
+                offset += available;
+                continue;
+            }
+            const uint8_t second = static_cast<uint8_t>(static_cast<unsigned char>(pending[offset + 1]));
+            const uint8_t third = static_cast<uint8_t>(static_cast<unsigned char>(pending[offset + 2]));
+            if (second == 0x96 && third == 0x81)
+            {
+                output.push_back(' ');
+                offset += 3;
+                continue;
+            }
         }
         const size_t need = sequence_length(lead);
         if (need == 0)

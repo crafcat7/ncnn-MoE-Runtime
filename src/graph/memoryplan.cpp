@@ -799,7 +799,7 @@ static Result<uint64_t> dense_size(const MoeModelDescriptor& descriptor)
 
     const uint64_t final_norm_elements = descriptor.final_norm == NormType::None
                                              ? 0
-                                             : descriptor.hidden_size;
+                                             : descriptor.hidden_size * (descriptor.final_norm == NormType::LayerNorm ? 2u : 1u);
     auto final_norm = checked_multiply(final_norm_elements, element_size, "final norm");
     if (!final_norm)
         return final_norm.error();

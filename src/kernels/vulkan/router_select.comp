@@ -19,6 +19,7 @@ layout(push_constant) uniform parameter
     uint has_bias;
     uint has_explicit_ids;
     float scaling;
+    float jitter;
 }
 p;
 
@@ -104,6 +105,74 @@ void main()
     {
         if (lane == 0)
             selected[output_base + p.top_k * 2] = 1.0;
+        return;
+    }
+    if (p.score_function == 3u)
+    {
+        // PhiMoE sparse mixer: two sequential masked softmaxes over the
+        // top-1 and top-2 logits. This path is limited to Top-2 routing.
+        if (lane != 0)
+            return;
+        const float negative_infinity = -uintBitsToFloat(0x7f800000u);
+        uint first = 0;
+        uint second = 0;
+        float first_logit = negative_infinity;
+        float second_logit = negative_infinity;
+        for (uint expert = 0; expert < p.expert_count; ++expert)
+        {
+            const float logit = logits[input_base + expert];
+            if (logit > first_logit)
+            {
+                second_logit = first_logit;
+                second = first;
+                first_logit = logit;
+                first = expert;
+            }
+            else if (logit > second_logit)
+            {
+                second_logit = logit;
+                second = expert;
+            }
+        }
+        const float threshold = 2.0 * p.jitter;
+        float first_weight = 0.0;
+        float second_weight = 0.0;
+        for (uint pass = 0; pass < 2u; ++pass)
+        {
+            const uint excluded = pass == 0u ? p.expert_count : first;
+            const uint selected_expert = pass == 0u ? first : second;
+            float maximum = negative_infinity;
+            for (uint expert = 0; expert < p.expert_count; ++expert)
+            {
+                if (expert != excluded)
+                    maximum = max(maximum, logits[input_base + expert]);
+            }
+            float denominator = 0.0;
+            float selected_value = 0.0;
+            for (uint expert = 0; expert < p.expert_count; ++expert)
+            {
+                if (expert == excluded)
+                    continue;
+                const float logit = logits[input_base + expert];
+                const float factor = max(abs(logit), maximum);
+                if (factor > 0.0 && ((maximum - logit) / factor) > threshold)
+                    continue;
+                const float value = approximate_exp(logit - maximum);
+                denominator += value;
+                if (expert == selected_expert)
+                    selected_value = value;
+            }
+            const float weight = denominator > 0.0 ? selected_value / denominator : 0.0;
+            if (pass == 0u)
+                first_weight = weight;
+            else
+                second_weight = weight;
+        }
+        selected[output_base] = float(first);
+        selected[output_base + 1] = float(second);
+        selected[output_base + p.top_k] = first_weight * p.scaling;
+        selected[output_base + p.top_k + 1] = second_weight * p.scaling;
+        selected[output_base + p.top_k * 2] = 0.0;
         return;
     }
     const bool raw_topk = p.score_function == 0 && p.normalize != 0

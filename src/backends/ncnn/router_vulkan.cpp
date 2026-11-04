@@ -19,7 +19,21 @@ namespace moe {
 static bool valid_router_options(const ExpertDispatchOptions& options,
                                  size_t rows)
 {
-    if (rows == 0 || options.expert_count == 0 || options.expert_count > 2048 || options.top_k == 0 || options.top_k > options.expert_count || options.top_k > 64 || !std::isfinite(options.routed_scaling_factor) || options.routed_scaling_factor <= 0.0f || (options.normalization != RouterNormalization::None && options.normalization != RouterNormalization::SelectedExperts) || (options.score_function != RouterScoreFunction::Softmax && options.score_function != RouterScoreFunction::Sigmoid && options.score_function != RouterScoreFunction::SqrtSoftplus) || (!options.selection_bias.empty() && options.selection_bias.size() != options.expert_count) || (!options.explicit_expert_ids.empty() && options.explicit_expert_ids.size() != rows * options.top_k))
+    const bool known_score = options.score_function == RouterScoreFunction::Softmax
+                             || options.score_function == RouterScoreFunction::Sigmoid
+                             || options.score_function == RouterScoreFunction::SqrtSoftplus
+                             || options.score_function == RouterScoreFunction::SparseMixer;
+    if (rows == 0 || options.expert_count == 0 || options.expert_count > 2048
+        || options.top_k == 0 || options.top_k > options.expert_count || options.top_k > 64
+        || !std::isfinite(options.routed_scaling_factor) || options.routed_scaling_factor <= 0.0f
+        || (options.normalization != RouterNormalization::None
+            && options.normalization != RouterNormalization::SelectedExperts)
+        || !known_score
+        || (!options.selection_bias.empty() && options.selection_bias.size() != options.expert_count)
+        || (!options.explicit_expert_ids.empty() && options.explicit_expert_ids.size() != rows * options.top_k))
+        return false;
+    if (options.score_function == RouterScoreFunction::SparseMixer
+        && (options.top_k != 2 || !std::isfinite(options.jitter) || options.jitter < 0.0f))
         return false;
     for (float value : options.selection_bias)
         if (!std::isfinite(value))
@@ -336,7 +350,7 @@ bool Router_vulkan::record(const ncnn::VkMat& input,
                                      {workspace.logits, workspace.selected}, {1, 0}, constants, dispatcher);
         return true;
     }
-    std::vector<ncnn::vk_constant_type> constants(7);
+    std::vector<ncnn::vk_constant_type> constants(8);
     constants[0].u32 = options.expert_count;
     constants[1].u32 = options.top_k;
     constants[2].u32 = static_cast<uint32_t>(options.score_function);
@@ -344,6 +358,7 @@ bool Router_vulkan::record(const ncnn::VkMat& input,
     constants[4].u32 = !options.selection_bias.empty() ? 1u : 0u;
     constants[5].u32 = !options.explicit_expert_ids.empty() ? 1u : 0u;
     constants[6].f = options.routed_scaling_factor;
+    constants[7].f = options.jitter;
     ncnn::VkMat dispatcher;
     dispatcher.w = 128;
     dispatcher.h = input.h;

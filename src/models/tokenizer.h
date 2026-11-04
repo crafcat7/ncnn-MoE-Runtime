@@ -70,10 +70,13 @@ private:
         DeepSeekV4,
         Qwen3,
         Qwen36,
-        Qwen38
+        Qwen38,
+        Phi
     };
 
     bool load_impl(const std::string& model_directory, size_t vocabulary_size);
+    bool load_phi(std::string_view tokenizer, std::string_view config, std::string_view model_config,
+                  size_t vocabulary_size);
     bool load_gguf_impl(const std::string& model_path, size_t vocabulary_size);
     void encode_impl(std::string_view text,
                      bool use_added,
@@ -88,6 +91,8 @@ private:
     std::vector<AddedTokenNode> added_token_trie;
     std::vector<int32_t> stops;
     std::array<int32_t, 256> byte_ids{};
+    std::vector<uint8_t> rstrip;
+    std::unordered_map<uint32_t, uint32_t> char_ids;
     Family family = Family::None;
     bool ignore_merges = false;
     bool merge_leading_system_messages = false;

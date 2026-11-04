@@ -1,4 +1,5 @@
 #include "attention_vulkan.h"
+#include "layernorm_vulkan.h"
 #include "attentiondecode_vulkan.h"
 #include "linear.h"
 #include "rmsnorm_vulkan.h"
@@ -115,6 +116,7 @@ public:
         if (vulkan_context)
         {
             norm.reset();
+            layer_norm.reset();
             qkv_rope_pipeline.reset();
             qkv_norm_rope_pipeline.reset();
             output_gate_pipeline.reset();
@@ -139,6 +141,7 @@ public:
     }
 
     std::shared_ptr<RmsNorm_vulkan> norm;
+    std::shared_ptr<LayerNorm_vulkan> layer_norm;
     ncnn::Layer* slice_qkv = nullptr;
     ncnn::Layer* reshape_query = nullptr;
     ncnn::Layer* reshape_key_value = nullptr;
@@ -1219,7 +1222,8 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create(const TensorData& nor
                                                            const TensorData* sinks,
                                                            std::shared_ptr<Linear> fused_qkv,
                                                            std::shared_ptr<Linear> output_projection,
-                                                           const AttentionConfig_vulkan& config)
+                                                           const AttentionConfig_vulkan& config,
+                                                           const TensorData* norm_bias)
 {
     return create_impl(norm_weight,
                        nullptr,
@@ -1230,7 +1234,9 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create(const TensorData& nor
                        {},
                        {},
                        {},
-                       config);
+                       config,
+                       {},
+                       norm_bias);
 }
 
 std::shared_ptr<Attention_vulkan>
@@ -1238,7 +1244,8 @@ Attention_vulkan::create(const TensorData& norm_weight,
                          const TensorData* sinks,
                          std::shared_ptr<Bfloat16Linear_vulkan> fused_qkv,
                          std::shared_ptr<Bfloat16Linear_vulkan> output_projection,
-                         const AttentionConfig_vulkan& config)
+                         const AttentionConfig_vulkan& config,
+                         const TensorData* norm_bias)
 {
     return create_impl(norm_weight,
                        nullptr,
@@ -1249,7 +1256,9 @@ Attention_vulkan::create(const TensorData& norm_weight,
                        std::move(fused_qkv),
                        std::move(output_projection),
                        {},
-                       config);
+                       config,
+                       {},
+                       norm_bias);
 }
 
 std::shared_ptr<Attention_vulkan>
@@ -1259,7 +1268,8 @@ Attention_vulkan::create(const TensorData& norm_weight,
                          const TensorData* sinks,
                          std::shared_ptr<Bfloat16Linear_vulkan> fused_qkv_gate,
                          std::shared_ptr<Bfloat16Linear_vulkan> output_projection,
-                         const AttentionConfig_vulkan& config)
+                         const AttentionConfig_vulkan& config,
+                         const TensorData* norm_bias)
 {
     return create_impl(norm_weight,
                        &query_norm_weight,
@@ -1270,7 +1280,9 @@ Attention_vulkan::create(const TensorData& norm_weight,
                        std::move(fused_qkv_gate),
                        std::move(output_projection),
                        {},
-                       config);
+                       config,
+                       {},
+                       norm_bias);
 }
 
 std::shared_ptr<Attention_vulkan> Attention_vulkan::create_native(const TensorData& norm_weight,
@@ -1279,7 +1291,8 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_native(const TensorDa
                                                                   const TensorData* sinks,
                                                                   const std::array<CompiledOperator, 5>& projections,
                                                                   const AttentionConfig_vulkan& config,
-                                                                  std::shared_ptr<QnkLinear_vulkan> fused_native_qkv)
+                                                                  std::shared_ptr<QnkLinear_vulkan> fused_native_qkv,
+                                                                  const TensorData* norm_bias)
 {
     return create_impl(norm_weight,
                        query_norm_weight,
@@ -1290,7 +1303,7 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_native(const TensorDa
                        {},
                        {},
                        projections,
-                       config, std::move(fused_native_qkv));
+                       config, std::move(fused_native_qkv), norm_bias);
 }
 
 std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData& norm_weight,
@@ -1303,7 +1316,8 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
                                                                 std::shared_ptr<Bfloat16Linear_vulkan> output_projection_bfloat16,
                                                                 std::array<CompiledOperator, 5> native_projections,
                                                                 const AttentionConfig_vulkan& config,
-                                                                std::shared_ptr<QnkLinear_vulkan> fused_native_qkv)
+                                                                std::shared_ptr<QnkLinear_vulkan> fused_native_qkv,
+                                                                const TensorData* norm_bias)
 {
 #if NCNN_MOE_WITH_VULKAN
 #if !NCNN_BATCH
@@ -1321,6 +1335,9 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
         || config.head_count % config.kv_head_count != 0
         || config.activation_dtype != config.kv_cache_dtype
         || norm_weight.shape != std::vector<uint32_t>{config.hidden_size}
+        || (norm_bias != nullptr
+            && (norm_bias->shape != std::vector<uint32_t>{config.hidden_size}
+                || norm_bias->dtype != norm_weight.dtype))
         || (has_flag(config.flags, AttentionSink)
             && (!sinks || sinks->shape != std::vector<uint32_t>{config.head_count}))
         || (query_norm_weight == nullptr) != (key_norm_weight == nullptr)
@@ -1660,11 +1677,22 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
     implementation.weight_staging_allocator.reset(new ncnn::VkWeightStagingAllocator(vkdev));
     // Keep normalization weights in the same persistent constant arena as
     // RoPE/sinks, so the graph's storage estimate and allocator lifetime agree.
-    implementation.norm = RmsNorm_vulkan::create(norm_weight, config.norm_epsilon,
-                                                 config.norm_weight_offset, implementation.vulkan_context,
-                                                 implementation.option, implementation.weight_allocator.get());
-    if (!implementation.norm)
-        return {};
+    if (norm_bias)
+    {
+        implementation.layer_norm = LayerNorm_vulkan::create(norm_weight, *norm_bias, config.norm_epsilon,
+                                                             implementation.vulkan_context, implementation.option,
+                                                             implementation.weight_allocator.get());
+        if (!implementation.layer_norm)
+            return {};
+    }
+    else
+    {
+        implementation.norm = RmsNorm_vulkan::create(norm_weight, config.norm_epsilon,
+                                                     config.norm_weight_offset, implementation.vulkan_context,
+                                                     implementation.option, implementation.weight_allocator.get());
+        if (!implementation.norm)
+            return {};
+    }
     {
         const std::lock_guard<std::mutex> lock(implementation.vulkan_context->command_mutex());
         const bool needs_norm_rope = query_key_norm || output_gate
@@ -1777,6 +1805,7 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
     (void)norm_weight;
     (void)query_norm_weight;
     (void)key_norm_weight;
+    (void)norm_bias;
     (void)sinks;
     (void)fused_qkv;
     (void)output_projection;
@@ -2174,7 +2203,10 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
         }
     }
     auto& normalized_gpu = ticket.keep_buffer();
-    if (!implementation.norm->record(input_gpu, normalized_gpu, command))
+    const bool normalized = implementation.layer_norm
+                                ? implementation.layer_norm->record(input_gpu, normalized_gpu, command)
+                                : implementation.norm->record(input_gpu, normalized_gpu, command);
+    if (!normalized)
     {
         return false;
     }
@@ -3245,7 +3277,10 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
                 return AttentionBatchResult_vulkan::NotExecuted;
             }
         }
-        if (!implementation.norm->record(work.input_gpu, work.normalized_gpu, command))
+        const bool normalized = implementation.layer_norm
+                                    ? implementation.layer_norm->record(work.input_gpu, work.normalized_gpu, command)
+                                    : implementation.norm->record(work.input_gpu, work.normalized_gpu, command);
+        if (!normalized)
         {
             return AttentionBatchResult_vulkan::NotExecuted;
         }

@@ -110,14 +110,15 @@ static Result<void> prepare_vulkan_linear_operator(WeightStore& weights,
 static Result<void> prepare_lm_head_operator(CompiledModel& compiled, bool allow_float32_fallback = true,
                                              bool prefer_bfloat16_vulkan = true)
 {
-    auto prepared = prepare_vulkan_linear_operator(compiled.weights, compiled.operators, compiled.lm_head_weight, invalid_tensor_handle,
+    auto prepared = prepare_vulkan_linear_operator(compiled.weights, compiled.operators, compiled.lm_head_weight, compiled.lm_head_bias,
                                                    compiled.opt.vulkan_device_index, compiled.vulkan_runtime,
                                                    compiled.opt.optimization_flags, 1, prefer_bfloat16_vulkan, allow_float32_fallback);
     if (!prepared)
         return prepared.error();
     const CompiledOperator& lm_head_operator = compiled.operators.at_weight(compiled.lm_head_weight);
     if (lm_head_operator.bfloat16
-        && compiled.final_norm_weight != invalid_tensor_handle)
+        && compiled.final_norm_weight != invalid_tensor_handle
+        && compiled.descriptor.final_norm == NormType::RmsNorm)
     {
         (void)lm_head_operator.bfloat16->prepare_rms_norm(compiled.weights.at(compiled.final_norm_weight),
                                                           compiled.descriptor.norm_epsilon,
@@ -1171,12 +1172,15 @@ static Result<void> prepare_native_attention(CompiledModel& compiled,
     const TensorData* sinks = plan.sinks == invalid_tensor_handle
                                   ? nullptr
                                   : &compiled.weights.at(plan.sinks);
+    const TensorData* norm_bias = plan.pre_attention_norm_bias == invalid_tensor_handle
+                                      ? nullptr
+                                      : &compiled.weights.at(plan.pre_attention_norm_bias);
     auto attention_operator = Attention_vulkan::create_native(compiled.weights.at(plan.pre_attention_norm_weight),
                                                               query_norm,
                                                               key_norm,
                                                               sinks,
                                                               projections,
-                                                              standard_attention_vulkan_config(compiled, plan), fused_qkv);
+                                                              standard_attention_vulkan_config(compiled, plan), fused_qkv, norm_bias);
     if (!attention_operator)
         return Error{ErrorCode::InternalError,
                      "failed to create native Vulkan Standard Attention at layer "
@@ -1279,16 +1283,19 @@ static Result<void> prepare_standard_attention_operators(CompiledModel& compiled
             }
             const CompiledOperator& fused_operator = compiled.operators.at(plan.fused_qkv_operator);
             const TensorData* sinks = plan.sinks == invalid_tensor_handle ? nullptr : &compiled.weights.at(plan.sinks);
+            const TensorData* norm_bias = plan.pre_attention_norm_bias == invalid_tensor_handle
+                                              ? nullptr
+                                              : &compiled.weights.at(plan.pre_attention_norm_bias);
             if (use_bfloat16_fusion)
                 attention_operator = Attention_vulkan::create(compiled.weights.at(plan.pre_attention_norm_weight), sinks,
                                                               fused_operator.bfloat16,
                                                               compiled.operators.at_weight(plan.output_weight).bfloat16,
-                                                              attention_config);
+                                                              attention_config, norm_bias);
             else
                 attention_operator = Attention_vulkan::create(compiled.weights.at(plan.pre_attention_norm_weight), sinks,
                                                               fused_operator.linear,
                                                               compiled.operators.at_weight(plan.output_weight).linear,
-                                                              attention_config);
+                                                              attention_config, norm_bias);
         }
         else
         {
@@ -1301,13 +1308,16 @@ static Result<void> prepare_standard_attention_operators(CompiledModel& compiled
                                  + std::to_string(layer_plan.layer_id)};
             }
             const CompiledOperator& fused_operator = compiled.operators.at(plan.fused_qkv_gate_bfloat16_operator);
+            const TensorData* norm_bias = plan.pre_attention_norm_bias == invalid_tensor_handle
+                                              ? nullptr
+                                              : &compiled.weights.at(plan.pre_attention_norm_bias);
             attention_operator = Attention_vulkan::create(compiled.weights.at(plan.pre_attention_norm_weight),
                                                           compiled.weights.at(plan.query_norm_weight),
                                                           compiled.weights.at(plan.key_norm_weight),
                                                           plan.sinks == invalid_tensor_handle ? nullptr : &compiled.weights.at(plan.sinks),
                                                           fused_operator.bfloat16,
                                                           compiled.operators.at_weight(plan.output_weight).bfloat16,
-                                                          attention_config);
+                                                          attention_config, norm_bias);
         }
         if (attention_operator)
         {
@@ -2267,11 +2277,11 @@ static Result<GpuResourceRequest> attention_resource_request(const CompiledModel
         request.persistent_size = saturating_add_u64(request.persistent_size, size);
     }
     request.persistent_size = saturating_add_u64(request.persistent_size,
-                                                 constant_storage(model, {attention.pre_attention_norm_weight, attention.query_norm_weight, attention.key_value_norm_weight, attention.sinks, attention.compressor_position, attention.compressor_norm_weight, attention.indexer_compressor_position, attention.indexer_compressor_norm_weight}, alignment));
+                                                 constant_storage(model, {attention.pre_attention_norm_weight, attention.pre_attention_norm_bias, attention.query_norm_weight, attention.key_value_norm_weight, attention.sinks, attention.compressor_position, attention.compressor_norm_weight, attention.indexer_compressor_position, attention.indexer_compressor_norm_weight}, alignment));
     // The optional contiguous MLA layer additionally owns these hyper weights.
     if (model.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
         request.persistent_size = saturating_add_u64(request.persistent_size,
-                                                     constant_storage(model, {layer.hyper_connection.attention_function, layer.hyper_connection.attention_scale, layer.hyper_connection.attention_base, layer.hyper_connection.ffn_function, layer.hyper_connection.ffn_scale, layer.hyper_connection.ffn_base, layer.moe.pre_ffn_norm_weight}, alignment));
+                                                     constant_storage(model, {layer.hyper_connection.attention_function, layer.hyper_connection.attention_scale, layer.hyper_connection.attention_base, layer.hyper_connection.ffn_function, layer.hyper_connection.ffn_scale, layer.hyper_connection.ffn_base, layer.moe.pre_ffn_norm_weight, layer.moe.pre_ffn_norm_bias}, alignment));
     return request;
 }
 
@@ -2367,7 +2377,7 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
         const uint32_t device = compiled.opt.vulkan_device_index;
         const uint64_t alignment = gpu_buffer_alignment(compiled, device);
         GpuResourceRequest request;
-        request.persistent_size = projection_storage(compiled, compiled.lm_head_weight, alignment, device);
+        request.persistent_size = projection_storage(compiled, compiled.lm_head_weight, alignment, device, compiled.lm_head_bias);
         // This semantic chain owns more state than independent operators. The
         // shape estimate is retained; admission uses the common device ledger.
         const GpuResourceRequest execution = gated_residual_resources(compiled, device);
@@ -2449,10 +2459,10 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
 
     const uint32_t device = compiled.opt.vulkan_device_index;
     const uint64_t alignment = gpu_buffer_alignment(compiled, device);
-    uint64_t head_size = projection_storage(compiled, compiled.lm_head_weight, alignment, device);
+    uint64_t head_size = projection_storage(compiled, compiled.lm_head_weight, alignment, device, compiled.lm_head_bias);
     if (head_size != 0)
     {
-        head_size = saturating_add_u64(head_size, constant_storage(compiled, {compiled.final_norm_weight}, alignment));
+        head_size = saturating_add_u64(head_size, constant_storage(compiled, {compiled.final_norm_weight, compiled.final_norm_bias}, alignment));
         if (compiled.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
             head_size = saturating_add_u64(head_size, constant_storage(compiled,
                                                                        {compiled.hyper_head_function, compiled.hyper_head_scale, compiled.hyper_head_base}, alignment));
@@ -2509,10 +2519,10 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
         if (dense_chain)
         {
             GpuResourceRequest request;
-            request.persistent_size = constant_storage(compiled, {compiled.final_norm_weight}, alignment);
+            request.persistent_size = constant_storage(compiled, {compiled.final_norm_weight, compiled.final_norm_bias}, alignment);
             for (const auto& layer : compiled.graph.layer_plans)
                 request.persistent_size = saturating_add_u64(request.persistent_size,
-                                                             saturating_add_u64(constant_storage(compiled, {layer.dense_pre_ffn_norm_weight}, alignment), alignment * 8));
+                                                             saturating_add_u64(constant_storage(compiled, {layer.dense_pre_ffn_norm_weight, layer.dense_pre_ffn_norm_bias}, alignment), alignment * 8));
             request.workspace_size = saturating_multiply_u64(SessionOptions{}.prefill_chunk_size,
                                                              saturating_multiply_u64(compiled.descriptor.hidden_size, 4 * sizeof(float)));
             if (resources.can_admit(device, request))
@@ -2545,7 +2555,7 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
             const auto& router = compiled.weights.at(layer.moe.router_weight);
             GpuResourceRequest request;
             request.persistent_size = saturating_add_u64(saturating_multiply_u64(router.element_count(), sizeof(float)),
-                                                         constant_storage(compiled, {layer.moe.pre_ffn_norm_weight, layer.attention.pre_attention_norm_weight, layer.moe.router_bias, layer.moe.router_selection_bias}, segment_alignment));
+                                                         constant_storage(compiled, {layer.moe.pre_ffn_norm_weight, layer.moe.pre_ffn_norm_bias, layer.attention.pre_attention_norm_weight, layer.attention.pre_attention_norm_bias, layer.moe.router_bias, layer.moe.router_selection_bias}, segment_alignment));
             request.persistent_size = saturating_add_u64(request.persistent_size, saturating_multiply_u64(segment_alignment, 8));
             const uint64_t columns = saturating_add_u64(saturating_multiply_u64(compiled.descriptor.hidden_size, 4),
                                                         saturating_add_u64(layer.moe.experts.size(), Router_vulkan::selected_columns(layer.moe.top_k)));
@@ -2563,7 +2573,7 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
         if (!compiled.gpu_head && !compiled.gpu_segments.empty() && compiled.gpu_segments.back()
             && GpuSegment_vulkan::supports_head(compiled))
         {
-            GpuResourceRequest request{constant_storage(compiled, {compiled.final_norm_weight}, alignment), 0, 0};
+            GpuResourceRequest request{constant_storage(compiled, {compiled.final_norm_weight, compiled.final_norm_bias}, alignment), 0, 0};
             if (!resources.can_admit(device, request))
                 return Error{ErrorCode::InvalidArgument, "Vulkan resource plan cannot allocate resident graph head"};
             compiled.gpu_head = GpuSegment_vulkan::create_head(compiled);

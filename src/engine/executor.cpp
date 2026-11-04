@@ -241,8 +241,16 @@ static Result<void> forward_dense_layer(const CompiledModel& model,
                                         LayerState& scratch,
                                         ExecutionBackend backend)
 {
-    forward_rms_norm(hidden, model.weights.at(layer.dense_pre_ffn_norm_weight),
-                     model.descriptor.norm_epsilon, scratch.normalized, model.descriptor.norm_weight_offset);
+    if (layer.dense_pre_ffn_norm_bias != invalid_tensor_handle)
+    {
+        forward_layer_norm(hidden, model.weights.at(layer.dense_pre_ffn_norm_weight),
+                           model.weights.at(layer.dense_pre_ffn_norm_bias), model.descriptor.norm_epsilon, scratch.normalized);
+    }
+    else
+    {
+        forward_rms_norm(hidden, model.weights.at(layer.dense_pre_ffn_norm_weight),
+                         model.descriptor.norm_epsilon, scratch.normalized, model.descriptor.norm_weight_offset);
+    }
     try
     {
         forward_dense_ffn(model, layer.dense_ffn, scratch.normalized, scratch.shared_expert_output,
@@ -268,6 +276,7 @@ static ExpertDispatchOptions latent_router_options(const CompiledModel& model,
     options.score_function = moe.score_function;
     options.normalization = moe.normalization;
     options.routed_scaling_factor = moe.routed_scaling_factor;
+    options.jitter = moe.jitter;
     if (moe.router_selection_bias != invalid_tensor_handle)
         options.selection_bias = model.weights.at(moe.router_selection_bias).float32_values();
     explicit_ids.clear();
@@ -568,6 +577,15 @@ Result<void> forward_model(const CompiledModel& model,
                                  model.descriptor.norm_weight_offset);
                 hidden.swap(state.expert_scratch.staged_output);
             }
+            else if (model.descriptor.final_norm == NormType::LayerNorm)
+            {
+                forward_layer_norm(hidden,
+                                   model.weights.at(node->weight_inputs[0]),
+                                   model.weights.at(model.final_norm_bias),
+                                   model.descriptor.norm_epsilon,
+                                   state.expert_scratch.staged_output);
+                hidden.swap(state.expert_scratch.staged_output);
+            }
             if (needs_mtp_final_hidden)
             {
                 for (size_t row = 0; row < hidden.rows(); ++row)
@@ -644,12 +662,25 @@ Result<void> forward_model(const CompiledModel& model,
                 }
                 deferred_final_norm = false;
             }
-            forward_linear(lm_head,
-                           *lm_head_input,
-                           state.logits,
-                           model.opt.optimization_flags,
-                           model.operators.find_weight(node->weight_inputs[0]),
-                           node->backend);
+            if (model.lm_head_bias != invalid_tensor_handle)
+            {
+                forward_linear(lm_head,
+                               model.weights.at(model.lm_head_bias),
+                               *lm_head_input,
+                               state.logits,
+                               model.opt.optimization_flags,
+                               model.operators.find_weight(node->weight_inputs[0]),
+                               node->backend);
+            }
+            else
+            {
+                forward_linear(lm_head,
+                               *lm_head_input,
+                               state.logits,
+                               model.opt.optimization_flags,
+                               model.operators.find_weight(node->weight_inputs[0]),
+                               node->backend);
+            }
             produced_logits = true;
             continue;
         }
@@ -938,6 +969,12 @@ Result<void> forward_model(const CompiledModel& model,
                     return mixed.error();
                 forward_rms_norm(layer_state.ffn_hyper_mix.reduced, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset);
             }
+            else if (moe.pre_ffn_norm_bias != invalid_tensor_handle)
+            {
+                forward_layer_norm(hidden, model.weights.at(moe.pre_ffn_norm_weight),
+                                   model.weights.at(moe.pre_ffn_norm_bias), model.descriptor.norm_epsilon,
+                                   layer_state.normalized);
+            }
             else
             {
                 forward_rms_norm(hidden, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset);
@@ -969,6 +1006,7 @@ Result<void> forward_model(const CompiledModel& model,
             options.score_function = moe.score_function;
             options.normalization = moe.normalization;
             options.routed_scaling_factor = moe.routed_scaling_factor;
+            options.jitter = moe.jitter;
             if (moe.router_selection_bias != invalid_tensor_handle)
                 options.selection_bias = model.weights.at(moe.router_selection_bias).float32_values();
             std::vector<uint32_t>& explicit_expert_ids = state.expert_scratch.explicit_expert_ids;
@@ -1645,7 +1683,8 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             if (node->weight_inputs.size() != 2)
                 return Error{ErrorCode::InternalError, "final norm node has an invalid weight binding"};
             const CompiledOperator& lm_head_operator = model.operators.at_weight(node->weight_inputs[1]);
-            if (hyper_multiplier == 1
+            if (model.descriptor.final_norm == NormType::RmsNorm
+                && hyper_multiplier == 1
                 && model.descriptor.hyper_connection_kind == HyperConnectionKind::None
                 && !use_speculative_context
                 && requested_count > 0
@@ -1704,8 +1743,16 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             {
                 return Error{ErrorCode::InternalError, "cannot merge staged hidden rows"};
             }
-            forward_rms_norm(merged, model.weights.at(node->weight_inputs[0]), model.descriptor.norm_epsilon, scratch.staged_output,
-                             model.descriptor.norm_weight_offset);
+            if (model.descriptor.final_norm == NormType::LayerNorm)
+            {
+                forward_layer_norm(merged, model.weights.at(node->weight_inputs[0]), model.weights.at(model.final_norm_bias),
+                                   model.descriptor.norm_epsilon, scratch.staged_output);
+            }
+            else
+            {
+                forward_rms_norm(merged, model.weights.at(node->weight_inputs[0]), model.descriptor.norm_epsilon, scratch.staged_output,
+                                 model.descriptor.norm_weight_offset);
+            }
             if (!split_hidden_rows(scratch.staged_output))
                 return Error{ErrorCode::InternalError, "cannot split staged final norm rows"};
             if (model.speculative.kind == SpeculativeModelKind::Mtp)
@@ -1804,12 +1851,25 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                                      model.descriptor.norm_weight_offset);
                     deferred_final_norm = false;
                 }
-                forward_linear(lm_head,
-                               merged,
-                               scratch.staged_output,
-                               model.opt.optimization_flags,
-                               model.operators.find_weight(node->weight_inputs[0]),
-                               node->backend);
+                if (model.lm_head_bias != invalid_tensor_handle)
+                {
+                    forward_linear(lm_head,
+                                   model.weights.at(model.lm_head_bias),
+                                   merged,
+                                   scratch.staged_output,
+                                   model.opt.optimization_flags,
+                                   model.operators.find_weight(node->weight_inputs[0]),
+                                   node->backend);
+                }
+                else
+                {
+                    forward_linear(lm_head,
+                                   merged,
+                                   scratch.staged_output,
+                                   model.opt.optimization_flags,
+                                   model.operators.find_weight(node->weight_inputs[0]),
+                                   node->backend);
+                }
             }
             if (scratch.staged_output.rows() != requested_count)
             {
@@ -2184,6 +2244,12 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                                 layer_state.ffn_hyper_mix.combine.data());
                 }
             }
+            else if (moe.pre_ffn_norm_bias != invalid_tensor_handle)
+            {
+                forward_layer_norm(merged_hyper, model.weights.at(moe.pre_ffn_norm_weight),
+                                   model.weights.at(moe.pre_ffn_norm_bias), model.descriptor.norm_epsilon,
+                                   merged_hidden);
+            }
             else
             {
                 forward_rms_norm(merged_hyper, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, merged_hidden,
@@ -2226,6 +2292,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                 options.score_function = moe.score_function;
                 options.normalization = moe.normalization;
                 options.routed_scaling_factor = moe.routed_scaling_factor;
+                options.jitter = moe.jitter;
                 if (moe.router_selection_bias != invalid_tensor_handle)
                 {
                     const TensorData& selection_bias = model.weights.at(moe.router_selection_bias);
@@ -2900,6 +2967,7 @@ static Result<RouterPredictionOutcome> run_router_prediction(const CompiledModel
     options.score_function = next_layer.moe.score_function;
     options.normalization = next_layer.moe.normalization;
     options.routed_scaling_factor = next_layer.moe.routed_scaling_factor;
+    options.jitter = next_layer.moe.jitter;
     if (next_layer.moe.router_selection_bias != invalid_tensor_handle)
     {
         options.selection_bias = model.weights.at(next_layer.moe.router_selection_bias).float32_values();
