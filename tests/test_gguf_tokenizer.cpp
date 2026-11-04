@@ -666,12 +666,25 @@ static Fixture fixture(const std::string& architecture, bool qwen38 = false, boo
             {
                 for (const auto& change : std::vector<std::pair<std::string, std::string>>{
                          {"(preserve_thinking is defined and preserve_thinking is true) or (loop.index0 > ns.last_query_index)", "loop.index0 > ns.last_query_index"},
-                         {"args_value | string if args_value is string else args_value | tojson | safe", "args_value | tojson | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string"}})
+                         {"args_value | string if args_value is string else args_value | tojson | safe", "args_value | tojson | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string"},
+                         {"enable_thinking is defined and enable_thinking is false", "enable_thinking is defined and enable_thinking is true"}})
                 {
                     const size_t position = result.chat.find(change.first);
                     check(position != std::string::npos, "pinned dense Qwen template change is absent");
                     result.chat.replace(position, change.first.size(), change.second);
                 }
+                // Qwen3.5 opens the thinking block by default, so the two
+                // generation-prompt bodies are swapped as well.
+                const size_t condition = result.chat.rfind("{%- if enable_thinking is defined and enable_thinking is true %}");
+                const size_t first = condition == std::string::npos ? std::string::npos : result.chat.find("{{- '", condition);
+                const size_t second = first == std::string::npos ? std::string::npos : result.chat.find("{{- '", first + 1);
+                check(first != std::string::npos && second != std::string::npos, "pinned dense Qwen template bodies are absent");
+                const size_t first_end = result.chat.find("' }}", first) + sizeof("' }}") - 1;
+                const size_t second_end = result.chat.find("' }}", second) + sizeof("' }}") - 1;
+                const std::string first_body = result.chat.substr(first, first_end - first);
+                const std::string second_body = result.chat.substr(second, second_end - second);
+                result.chat.replace(second, second_body.size(), first_body);
+                result.chat.replace(first, first_body.size(), second_body);
             }
         }
     }

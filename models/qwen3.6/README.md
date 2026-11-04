@@ -14,9 +14,10 @@ existing CPU/mixed backends, including Vulkan dense FFNs.
 Use the same `run` and `chat` commands below with the dense model directory.
 The dense path is text-only and target-only; vision and MTP tensors are not
 executed. Native text accepts the validated Qwen3.5 and Qwen3.6 tokenizer and
-string-message templates. Automated tests cover generated tiny packages and
-the official tokenizer assets; full-checkpoint generation and throughput have
-not yet been measured for these dense models.
+string-message templates; Qwen3.5-0.8B generation was validated on the CPU and
+mixed Vulkan backends. Automated tests cover generated tiny packages and the
+official tokenizer assets; end-to-end throughput has not been benchmarked for
+these dense models.
 
 Dense FFN projections may retain native affine INT4 or raw Q2_K–Q8_K blocks.
 Each gate/up/down projection has its own dtype, including mixed Q4_K/Q6_K
