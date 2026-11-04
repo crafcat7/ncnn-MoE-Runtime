@@ -403,7 +403,10 @@ if(NCNN_MOE_WITH_VULKAN)
         src/kernels/vulkan/float8_rms_norm_quantize.comp
         src/kernels/vulkan/float8_swiglu_quantize.comp
         src/kernels/vulkan/projection_matvec.comp
-        src/kernels/vulkan/gated_delta_net.comp
+        src/kernels/vulkan/gated_delta_conv.comp
+        src/kernels/vulkan/gated_delta_rule.comp
+        src/kernels/vulkan/gated_delta_qk.comp
+        src/kernels/vulkan/gated_delta_norm.comp
         src/kernels/vulkan/residual_ple.comp
         src/kernels/vulkan/qsa_norm_rope.comp
         src/kernels/vulkan/qsa_cache_write.comp

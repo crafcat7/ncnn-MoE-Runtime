@@ -1,0 +1,150 @@
+#version 450
+
+// Recurrent gated delta rule, tiled across the key dimension. A workgroup owns
+// one value-column block of one head: 32 value lanes keep each state access
+// coalesced while 4 key lanes shorten the reduction chain that used to visit all
+// key columns in a single lane. Value heads and blocks are independent, so the
+// cross-token ordering is preserved per state element without serializing them.
+// The per-head RMS norm and output gate run in gated_delta_norm.comp because
+// they span every value column of the head.
+
+layout(binding = 0) readonly buffer fused_input_blob
+{
+    float fused_input[];
+};
+layout(binding = 1) buffer recurrent_state_blob
+{
+    float recurrent_state[];
+};
+layout(binding = 2) readonly buffer time_bias_blob
+{
+    float time_bias[];
+};
+layout(binding = 3) readonly buffer decay_log_blob
+{
+    float decay_log[];
+};
+layout(binding = 4) buffer output_blob
+{
+    float output_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint convolution_size;
+    uint value_size;
+    uint fused_columns;
+    uint head_count;
+    uint kv_head_count;
+    uint head_dimension;
+    uint value_head_dimension;
+    uint kernel_size;
+    uint token_count;
+    float norm_epsilon;
+    uint sigmoid_gate;
+}
+p;
+
+#define KEY_LANES 4
+#define VALUE_LANES 32
+
+float sigmoid(float value)
+{
+    if (value >= 0.0)
+        return 1.0 / (1.0 + exp(-value));
+    const float exponential = exp(value);
+    return exponential / (1.0 + exponential);
+}
+
+float softplus(float value)
+{
+    if (value > 20.0)
+        return value;
+    if (value < -20.0)
+        return exp(value);
+    return log(1.0 + exp(value));
+}
+
+shared float partial_sum[KEY_LANES * VALUE_LANES];
+
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint key_lane = lane / VALUE_LANES;
+    const uint value_lane = lane % VALUE_LANES;
+    const uint blocks = (p.value_head_dimension + VALUE_LANES - 1) / VALUE_LANES;
+    const uint value_head = gl_WorkGroupID.x / blocks;
+    const uint value_column = (gl_WorkGroupID.x % blocks) * VALUE_LANES + value_lane;
+    const uint key_size = p.kv_head_count * p.head_dimension;
+    const uint head_ratio = p.head_count / p.kv_head_count;
+    const float query_scale = 1.0 / sqrt(float(p.head_dimension));
+    const uint key_head = value_head / head_ratio;
+    const uint recurrent_base = value_head * p.head_dimension * p.value_head_dimension;
+    const bool valid = value_column < p.value_head_dimension;
+
+    for (uint token = 0; token < p.token_count; ++token)
+    {
+        const uint input_row = token * p.fused_columns;
+        const uint query_base = input_row + key_head * p.head_dimension;
+        const uint key_base = input_row + key_size + key_head * p.head_dimension;
+        const uint value_base = input_row + key_size * 2
+                                + value_head * p.value_head_dimension;
+        const uint output_base = token * p.value_size
+                                 + value_head * p.value_head_dimension;
+        const float beta = sigmoid(fused_input[input_row + p.convolution_size
+                                               + p.value_size + value_head]);
+        const uint alpha_base = input_row + p.convolution_size + p.value_size
+                                + p.head_count;
+        const float decay = exp(-exp(decay_log[value_head])
+                                * softplus(fused_input[alpha_base + value_head] + time_bias[value_head]));
+
+        float memory_value = 0.0;
+        if (valid)
+        {
+            for (uint key_column = key_lane; key_column < p.head_dimension; key_column += KEY_LANES)
+            {
+                memory_value += recurrent_state[recurrent_base
+                                                + key_column * p.value_head_dimension
+                                                + value_column]
+                                * fused_input[key_base + key_column];
+            }
+        }
+        partial_sum[lane] = memory_value * decay;
+        barrier();
+        float memory = partial_sum[value_lane];
+        for (uint offset = VALUE_LANES; offset < KEY_LANES * VALUE_LANES; offset += VALUE_LANES)
+            memory += partial_sum[value_lane + offset];
+        barrier();
+
+        if (valid)
+        {
+            const float value = fused_input[value_base + value_column];
+            const float delta = (value - memory) * beta;
+            for (uint key_column = key_lane; key_column < p.head_dimension; key_column += KEY_LANES)
+            {
+                const uint state_index = recurrent_base + key_column * p.value_head_dimension + value_column;
+                recurrent_state[state_index] = recurrent_state[state_index] * decay
+                                               + fused_input[key_base + key_column] * delta;
+            }
+            float output_value = 0.0;
+            for (uint key_column = key_lane; key_column < p.head_dimension; key_column += KEY_LANES)
+            {
+                output_value += recurrent_state[recurrent_base
+                                                + key_column * p.value_head_dimension
+                                                + value_column]
+                                * fused_input[query_base + key_column];
+            }
+            partial_sum[lane] = output_value;
+        }
+        else
+            partial_sum[lane] = 0.0;
+        barrier();
+        float output_value = partial_sum[value_lane];
+        for (uint offset = VALUE_LANES; offset < KEY_LANES * VALUE_LANES; offset += VALUE_LANES)
+            output_value += partial_sum[value_lane + offset];
+        barrier();
+
+        if (valid)
+            output_data[output_base + value_column] = output_value * query_scale;
+    }
+}
