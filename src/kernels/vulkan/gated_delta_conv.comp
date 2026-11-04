@@ -32,6 +32,8 @@ layout(push_constant) uniform parameter
     uint token_count;
     float norm_epsilon;
     uint sigmoid_gate;
+    uint gate_channels;
+    float lower_bound;
 }
 p;
 

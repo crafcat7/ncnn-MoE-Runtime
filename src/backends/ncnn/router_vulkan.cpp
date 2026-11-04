@@ -32,6 +32,15 @@ static bool valid_router_options(const ExpertDispatchOptions& options,
         || (!options.selection_bias.empty() && options.selection_bias.size() != options.expert_count)
         || (!options.explicit_expert_ids.empty() && options.explicit_expert_ids.size() != rows * options.top_k))
         return false;
+    if (options.group_count != 0
+        && (options.group_count > 64 || options.top_k_groups == 0
+            || options.top_k_groups > options.group_count
+            || options.expert_count % options.group_count != 0
+            || options.expert_count / options.group_count < 2
+            || options.top_k > options.expert_count / options.group_count * options.top_k_groups))
+        return false;
+    if (options.group_count == 0 && options.top_k_groups != 0)
+        return false;
     if (options.score_function == RouterScoreFunction::SparseMixer
         && (options.top_k != 2 || !std::isfinite(options.jitter) || options.jitter < 0.0f))
         return false;
@@ -335,6 +344,7 @@ bool Router_vulkan::record(const ncnn::VkMat& input,
         return false;
     const bool raw_topk = options.score_function == RouterScoreFunction::Softmax
                           && options.normalization == RouterNormalization::SelectedExperts
+                          && options.group_count == 0
                           && options.selection_bias.empty() && options.explicit_expert_ids.empty();
     if (raw_topk && implementation.raw_pipeline)
     {
@@ -350,7 +360,7 @@ bool Router_vulkan::record(const ncnn::VkMat& input,
                                      {workspace.logits, workspace.selected}, {1, 0}, constants, dispatcher);
         return true;
     }
-    std::vector<ncnn::vk_constant_type> constants(8);
+    std::vector<ncnn::vk_constant_type> constants(10);
     constants[0].u32 = options.expert_count;
     constants[1].u32 = options.top_k;
     constants[2].u32 = static_cast<uint32_t>(options.score_function);
@@ -359,6 +369,8 @@ bool Router_vulkan::record(const ncnn::VkMat& input,
     constants[5].u32 = !options.explicit_expert_ids.empty() ? 1u : 0u;
     constants[6].f = options.routed_scaling_factor;
     constants[7].f = options.jitter;
+    constants[8].u32 = options.group_count;
+    constants[9].u32 = options.top_k_groups;
     ncnn::VkMat dispatcher;
     dispatcher.w = 128;
     dispatcher.h = input.h;

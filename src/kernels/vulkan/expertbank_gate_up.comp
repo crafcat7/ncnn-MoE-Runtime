@@ -15,6 +15,8 @@ layout(binding = 0) readonly buffer input_blob_v4
 { vec4 input_data_v4[]; };
 layout(binding = 1) readonly buffer weight_blob
 { uint weights[]; };
+layout(binding = 1) readonly buffer weight_blob_v4
+{ uvec4 weights_v4[]; };
 layout(binding = 2) readonly buffer selected_blob
 { float selected[]; };
 layout(binding = 3) writeonly buffer output_blob
@@ -50,6 +52,24 @@ float native_weight(uint base, uint index)
 {
     if (weight_format == 0u) return uintBitsToFloat(weights[base + index]);
     return uintBitsToFloat(((weights[base + (index >> 1)] >> ((index & 1u) * 16u)) & 65535u) << 16);
+}
+
+// Eight BF16 values from four packed words, converted exactly to FP32.
+// Each word holds two consecutive values; keep the original element order.
+vec4 bf16_first(uvec4 word)
+{
+    return vec4(uintBitsToFloat((word.x & 0xffffu) << 16u),
+                uintBitsToFloat(word.x & 0xffff0000u),
+                uintBitsToFloat((word.y & 0xffffu) << 16u),
+                uintBitsToFloat(word.y & 0xffff0000u));
+}
+
+vec4 bf16_second(uvec4 word)
+{
+    return vec4(uintBitsToFloat((word.z & 0xffffu) << 16u),
+                uintBitsToFloat(word.z & 0xffff0000u),
+                uintBitsToFloat((word.w & 0xffffu) << 16u),
+                uintBitsToFloat(word.w & 0xffff0000u));
 }
 
 shared float fp4_lut[16];
@@ -255,11 +275,27 @@ void main()
         const uint base = uint(id_value) * p.gate_stride;
         const uint gate_row = 2u * column;
         const uint up_row = gate_row + 1u;
-        for (uint k = lane; k < p.input_columns; k += 32u)
+        if (weight_format == 1u && (p.input_columns & 7u) == 0u)
         {
-            const float x = input_data[row * p.input_columns + k];
-            gate_sum += native_weight(base, gate_row * p.input_columns + k) * x;
-            up_sum += native_weight(base, up_row * p.input_columns + k) * x;
+            // Each lane consumes eight packed BF16 values per iteration.
+            for (uint k = lane * 8u; k < p.input_columns; k += 256u)
+            {
+                const vec4 x0 = input_data_v4[(row * p.input_columns + k) / 4u];
+                const vec4 x1 = input_data_v4[(row * p.input_columns + k) / 4u + 1u];
+                const uvec4 gate_word = weights_v4[(2u * base + gate_row * p.input_columns + k) / 8u];
+                const uvec4 up_word = weights_v4[(2u * base + up_row * p.input_columns + k) / 8u];
+                gate_sum += dot(bf16_first(gate_word), x0) + dot(bf16_second(gate_word), x1);
+                up_sum += dot(bf16_first(up_word), x0) + dot(bf16_second(up_word), x1);
+            }
+        }
+        else
+        {
+            for (uint k = lane; k < p.input_columns; k += 32u)
+            {
+                const float x = input_data[row * p.input_columns + k];
+                gate_sum += native_weight(base, gate_row * p.input_columns + k) * x;
+                up_sum += native_weight(base, up_row * p.input_columns + k) * x;
+            }
         }
     }
     float gate = 0.0;

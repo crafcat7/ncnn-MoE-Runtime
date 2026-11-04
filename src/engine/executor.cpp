@@ -265,14 +265,16 @@ static Result<void> forward_dense_layer(const CompiledModel& model,
     return {};
 }
 
-static ExpertDispatchOptions latent_router_options(const CompiledModel& model,
-                                                   const MoeBlockPlan& moe,
-                                                   std::span<const int32_t> input_ids,
-                                                   std::vector<uint32_t>& explicit_ids)
+static ExpertDispatchOptions router_options(const CompiledModel& model,
+                                            const MoeBlockPlan& moe,
+                                            std::span<const int32_t> input_ids,
+                                            std::vector<uint32_t>& explicit_ids)
 {
     ExpertDispatchOptions options;
     options.expert_count = static_cast<uint32_t>(moe.experts.size());
     options.top_k = moe.top_k;
+    options.group_count = moe.router_group_count;
+    options.top_k_groups = moe.router_top_k_groups;
     options.score_function = moe.score_function;
     options.normalization = moe.normalization;
     options.routed_scaling_factor = moe.routed_scaling_factor;
@@ -413,12 +415,15 @@ Result<void> forward_model(const CompiledModel& model,
     const ScopedResidentContinuation continuation_scope{pending_continuation, continuation_region};
     ExecutionNodeId continuation_target = invalid_execution_node_id;
     bool resident_chain_finished = false;
+    uint32_t resident_prefix_layers = 0;
     for (const ExecutionNodeId node_id : model.schedule.node_order)
     {
         if (node_id >= model.graph.nodes.size())
             return Error{ErrorCode::InternalError, "execution schedule references an invalid node"};
         const ExecutionNode* node = &model.graph.nodes[node_id];
         if (resident_chain_finished) continue;
+        if (resident_prefix_layers != 0 && node->layer_plan_index < resident_prefix_layers)
+            continue;
         if (node->type == ExecutionNodeType::TokenEmbedding)
         {
             if (node->weight_inputs.size() != 1)
@@ -438,30 +443,44 @@ Result<void> forward_model(const CompiledModel& model,
                 caches.clear();
                 auto& options = state.expert_scratch.bank_options;
                 auto& bank_ids = state.expert_scratch.bank_ids;
+                const size_t layer_count = model.graph.layer_plans.size();
+                const uint32_t bank_layers = model.resident_bank_layers == 0
+                                                 ? static_cast<uint32_t>(layer_count)
+                                                 : model.resident_bank_layers;
+                const bool partial = bank_layers < layer_count;
                 options.clear();
-                bank_ids.resize(model.graph.layer_plans.size());
-                options.resize(model.graph.layer_plans.size());
+                bank_ids.resize(layer_count);
+                options.resize(layer_count);
                 uint64_t assignments = 0;
-                for (size_t index = 0; index < model.graph.layer_plans.size(); ++index)
+                for (size_t index = 0; index < layer_count; ++index)
                 {
                     const auto& layer = model.graph.layer_plans[index];
                     if (layer.layer_id >= state.layers.size())
                         return Error{ErrorCode::InternalError, "resident graph layer cache is out of range"};
                     caches.insert(caches.end(), input_ids.size(), &state.layers[layer.layer_id]);
-                    if (!layer.moe.experts.empty())
+                    if (index < bank_layers && !layer.moe.experts.empty())
                     {
-                        options[index] = latent_router_options(model, layer.moe, input_ids, bank_ids[index]);
+                        options[index] = router_options(model, layer.moe, input_ids, bank_ids[index]);
                         assignments += input_ids.size() * layer.moe.top_k;
                     }
                 }
                 std::string error;
                 const bool completed = GpuSegment_vulkan::forward_resident(model, hidden, positions, caches, options,
-                                                                           logits_output != LogitsOutput::None, logits_output == LogitsOutput::Last,
-                                                                           state.logits, error, &state.gpu_segment);
+                                                                           !partial && logits_output != LogitsOutput::None,
+                                                                           !partial && logits_output == LogitsOutput::Last,
+                                                                           state.logits, error, &state.gpu_segment,
+                                                                           partial ? bank_layers : 0);
                 if (!completed)
                     return Error{ErrorCode::InternalError, "resident graph chain failed: " + error};
                 statistics.expert_assignments += assignments;
                 statistics.expert_gpu_routes += assignments;
+                if (partial)
+                {
+                    if (!GpuSegment_vulkan::materialize_hidden(state.gpu_segment, hidden, error))
+                        return Error{ErrorCode::InternalError, "resident graph prefix boundary failed: " + error};
+                    resident_prefix_layers = bank_layers;
+                    continue;
+                }
                 produced_logits = logits_output != LogitsOutput::None;
                 resident_chain_finished = true;
             }
@@ -730,7 +749,7 @@ Result<void> forward_model(const CompiledModel& model,
                     positions.resize(input_ids.size());
                     caches.assign(input_ids.size(), &state.layers[layer.layer_id]);
                     for (size_t row = 0; row < positions.size(); ++row) positions[row] = position_offset + row;
-                    auto options = latent_router_options(model, moe, input_ids, state.expert_scratch.explicit_expert_ids);
+                    auto options = router_options(model, moe, input_ids, state.expert_scratch.explicit_expert_ids);
                     if (!segment->forward(hidden, positions, caches, options, layer_state.dispatch_plan, state.gpu_segment, error))
                         return Error{ErrorCode::InternalError, "resident Vulkan segment at layer " + std::to_string(layer.layer_id) + " failed: " + error};
                 }
@@ -750,7 +769,7 @@ Result<void> forward_model(const CompiledModel& model,
             if (model.gated_residual_chain)
             {
                 const auto& fused = model.operators.at_weight(layer.attention.output_weight).gated_residual_layer;
-                auto options = latent_router_options(model, moe, input_ids, state.expert_scratch.explicit_expert_ids);
+                auto options = router_options(model, moe, input_ids, state.expert_scratch.explicit_expert_ids);
                 std::string device_error;
                 if (!fused || !fused->forward(hidden, input_ids, position_offset, state.layers[layer.layer_id], options, layer_state.dispatch_plan, state.gated_residual_layer, device_error))
                     return Error{ErrorCode::InternalError, "continuous gated residual Vulkan layer " + std::to_string(layer.layer_id) + " execution failed: " + device_error};
@@ -832,7 +851,7 @@ Result<void> forward_model(const CompiledModel& model,
                     caches.assign(input_ids.size(), &state.layers[layer.layer_id]);
                     for (size_t row = 0; row < positions.size(); ++row)
                         positions[row] = position_offset + row;
-                    auto options = latent_router_options(model, moe, input_ids, state.expert_scratch.explicit_expert_ids);
+                    auto options = router_options(model, moe, input_ids, state.expert_scratch.explicit_expert_ids);
                     if (fused->forward(hidden, positions, caches, options, layer_state.normalized,
                                        layer_state.dispatch_plan, layer_workspace))
                     {
@@ -1000,28 +1019,8 @@ Result<void> forward_model(const CompiledModel& model,
         }
         if (node->type == ExecutionNodeType::ExpertDispatch)
         {
-            ExpertDispatchOptions options;
-            options.expert_count = static_cast<uint32_t>(moe.experts.size());
-            options.top_k = moe.top_k;
-            options.score_function = moe.score_function;
-            options.normalization = moe.normalization;
-            options.routed_scaling_factor = moe.routed_scaling_factor;
-            options.jitter = moe.jitter;
-            if (moe.router_selection_bias != invalid_tensor_handle)
-                options.selection_bias = model.weights.at(moe.router_selection_bias).float32_values();
-            std::vector<uint32_t>& explicit_expert_ids = state.expert_scratch.explicit_expert_ids;
-            explicit_expert_ids.clear();
-            if (moe.token_experts != invalid_tensor_handle)
-            {
-                const std::span<const int64_t> table = model.weights.at(moe.token_experts).int64_values();
-                explicit_expert_ids.resize(input_ids.size() * moe.top_k);
-                for (size_t token_index = 0; token_index < input_ids.size(); ++token_index)
-                {
-                    for (uint32_t route = 0; route < moe.top_k; ++route)
-                        explicit_expert_ids[token_index * moe.top_k + route] = static_cast<uint32_t>(table[static_cast<size_t>(input_ids[token_index]) * moe.top_k + route]);
-                }
-                options.explicit_expert_ids = explicit_expert_ids;
-            }
+            ExpertDispatchOptions options = router_options(model, moe, input_ids,
+                                                           state.expert_scratch.explicit_expert_ids);
             if (!fused_router_ready)
             {
                 auto dispatched = forward_router(layer_state.router_logits.values(), static_cast<uint32_t>(layer_state.router_logits.rows()), options, layer_state.dispatch_plan);
@@ -1084,7 +1083,7 @@ Result<void> forward_model(const CompiledModel& model,
                         positions.resize(input_ids.size());
                         caches.assign(input_ids.size(), &state.layers[next_layer.layer_id]);
                         for (size_t row = 0; row < positions.size(); ++row) positions[row] = position_offset + row;
-                        auto options = latent_router_options(model, next_layer.moe, input_ids, state.expert_scratch.explicit_expert_ids);
+                        auto options = router_options(model, next_layer.moe, input_ids, state.expert_scratch.explicit_expert_ids);
                         pending_continuation = model.gpu_segments[target.layer_plan_index]->prepare_continuation(positions, caches, options,
                                                                                                                  state.gpu_segment, error);
                     }
@@ -1624,7 +1623,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                     }
                     if (!layer.moe.experts.empty())
                     {
-                        options[index] = latent_router_options(model, layer.moe, input_ids, bank_ids[index]);
+                        options[index] = router_options(model, layer.moe, input_ids, bank_ids[index]);
                         assignments += layer.moe.top_k;
                     }
                 }
@@ -1949,7 +1948,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                         positions[row] = entries[row].position_offset;
                         caches[row] = &entries[row].state->layers[layer.layer_id];
                     }
-                    auto options = latent_router_options(model, moe, workspace.staged_input_ids, batch_scratch.explicit_expert_ids);
+                    auto options = router_options(model, moe, workspace.staged_input_ids, batch_scratch.explicit_expert_ids);
                     if (!segment->forward(initial_hidden, positions, caches, options, fused_routes, workspace.gpu_segment, error))
                         return Error{ErrorCode::InternalError, "resident staged Vulkan segment at layer " + std::to_string(layer.layer_id) + " failed: " + error};
                 }
@@ -2030,7 +2029,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                         positions[row] = entries[row].position_offset;
                         caches[row] = &entries[row].state->layers[layer.layer_id];
                     }
-                    auto options = latent_router_options(model, moe, workspace.staged_input_ids, batch_scratch.explicit_expert_ids);
+                    auto options = router_options(model, moe, workspace.staged_input_ids, batch_scratch.explicit_expert_ids);
                     if (fused->forward(merged_hidden, positions, caches, options, workspace.staged_state.normalized,
                                        fused_routes, layer_workspace))
                     {
@@ -2429,7 +2428,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                             positions[row] = entries[row].position_offset;
                             caches[row] = &entries[row].state->layers[next_layer.layer_id];
                         }
-                        auto options = latent_router_options(model, next_layer.moe, workspace.staged_input_ids, batch_scratch.explicit_expert_ids);
+                        auto options = router_options(model, next_layer.moe, workspace.staged_input_ids, batch_scratch.explicit_expert_ids);
                         pending_continuation = model.gpu_segments[target.layer_plan_index]->prepare_continuation(positions, caches, options,
                                                                                                                  workspace.gpu_segment, error);
                     }

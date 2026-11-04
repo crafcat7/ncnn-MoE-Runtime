@@ -16,6 +16,7 @@ directories in `models/` and are not version-controlled.
 | DeepSeek-V4-Flash-DSpark | Hugging Face Safetensors; GGUF target-only | FP8/FP4, native INT4 or Qn_K | [DeepSeek V4 Flash DSpark](deepseek-v4/README.md#deepseek-v4-flash-dspark-matrix) |
 | Qwen3 dense (including 0.6B) | Hugging Face Safetensors (`qwen3`) | FP32/BF16; FP16 loaded as BF16 | [Native text interface](../README.md#unified-examples); CPU or Hybrid, original full-attention/unscaled-RoPE configuration |
 | Phi-mini-MoE-instruct | Hugging Face Safetensors (`phimoe`) | BF16 | [PhiMoE](phimoe/README.md); CPU or Hybrid with LayerNorm, attention bias, and sparse-mixer top-2 routing |
+| Ling-3.0-tiny | Hugging Face Safetensors (`bailing_hybrid`) | BF16 | [Ling](ling/README.md); CPU or Hybrid with Vulkan KDA/MLA, group-limited Top-8 routing, and routed Experts |
 | Qwen3.6-35B-A3B text backbone | Hugging Face Safetensors / native GGUF | BF16, native INT4/Qn_K, or optional compiled MXFP4 Artifact | [Execution and performance](qwen3.6/README.md) |
 | Qwen3.5 / Qwen3.6 / Qwen3.8-27B dense text architecture | Hugging Face Safetensors / native GGUF (`qwen3_5`) | BF16, native AWQ/GPTQ INT4, or GGUF Qn_K | [Dense admission and validation boundary](qwen3.6/README.md#dense-text-models) |
 | Qwen3.8-Flash-Next text backbone | Hugging Face Safetensors / native GGUF | BF16, native INT4/Qn_K, or optional compiled MXFP4 Artifact | [Admission and execution](qwen3.8/README.md) |

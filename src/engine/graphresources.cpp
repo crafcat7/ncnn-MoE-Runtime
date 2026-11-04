@@ -115,7 +115,7 @@ static bool bank_chain_supported(const CompiledModel& model)
         || model.gpu_segments.size() != layers || model.speculative.enabled()
         || !model.speculative.graph.nodes.empty() || has_flag(model.opt.flags, OptionRouterPrediction)
         || has_flag(model.opt.flags, OptionDisableGpuExpertExecution)) return false;
-    const auto context = model.gpu_head->context();
+    const auto context = model.gpu_head ? model.gpu_head->context() : nullptr;
     if (!context || std::any_of(model.gpu_segments.begin(), model.gpu_segments.end(), [&](const auto& segment) {
             return !segment || segment->context() != context;
         })) return false;
@@ -125,15 +125,23 @@ static bool bank_chain_supported(const CompiledModel& model)
     const auto next = [&](ExecutionNodeType type, size_t layer, bool gpu) {
         if (position >= model.schedule.node_order.size()) return false;
         const ExecutionNode& node = model.graph.nodes[model.schedule.node_order[position]];
-        if (node.type != type || (layer < layers && node.layer_plan_index != layer)
-            || (gpu && node.backend != ExecutionBackend::Vulkan)) return false;
+        const bool ok = node.type == type && (layer >= layers || node.layer_plan_index == layer)
+                        && (!gpu || node.backend == ExecutionBackend::Vulkan);
+        if (!ok) return false;
         ++position;
         return true;
     };
     if (!next(ExecutionNodeType::TokenEmbedding, layers, false)) return false;
     for (size_t layer = 0; layer < layers; ++layer)
     {
-        const MoeBlockPlan& moe = model.graph.layer_plans[layer].moe;
+        const CompiledLayerPlan& plan = model.graph.layer_plans[layer];
+        if (plan.dense_ffn.down_weight != invalid_tensor_handle)
+        {
+            if (!next(ExecutionNodeType::Attention, layer, true)
+                || !next(ExecutionNodeType::DenseFfn, layer, true)) return false;
+            continue;
+        }
+        const MoeBlockPlan& moe = plan.moe;
         if (moe.experts.empty() || moe.top_k == 0 || moe.top_k > 64 || moe.top_k > moe.experts.size()
             || !next(ExecutionNodeType::Attention, layer, true)
             || !next(ExecutionNodeType::Router, layer, true)
@@ -226,6 +234,11 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
         bool supported = true;
         for (const CompiledLayerPlan& layer : model.graph.layer_plans)
         {
+            if (layer.dense_ffn.down_weight != invalid_tensor_handle)
+            {
+                plans.emplace_back();
+                continue;
+            }
             std::vector<ExpertBankWeights_vulkan> experts;
             for (const ExpertPlan& expert : layer.moe.experts)
             {
@@ -268,7 +281,9 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
         }
         if (supported && (expert_budget == 0 || total <= expert_budget))
         {
-            model.gpu_expert_bank_plans = std::move(plans);
+            // Keep the full plan metadata visible to the resident memory plan;
+            // the selected prefix is truncated below.
+            model.gpu_expert_bank_plans = plans;
             model.resident_submission_rows = std::max(1u, prefill_rows);
             auto graph = plan_model_graph_memory(model, model.resident_submission_rows, std::max(1u, model.opt.num_concurrent_sessions));
             if (!graph) return graph.error();
@@ -277,6 +292,8 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
             const auto requests = graph_resource_requests(graph.value(), std::max(1u, model.opt.num_concurrent_sessions));
             const auto request = requests.find(device);
             bool fits = resource != candidate.end() && request != requests.end();
+            uint64_t bank_total = total;
+            size_t bank_layers = plans.size();
             if (fits)
             {
                 resource->expert_cache_reserve = 0;
@@ -289,19 +306,69 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
                 const auto live = bank_live_resources(model, device);
                 const uint64_t execution = std::max(gpu_resource_execution_reserve(*resource), resource->allocated_execution_size);
                 const uint64_t pending = execution - resource->allocated_execution_size;
-                fits = can_admit_gpu_resources(*resource, baseline, {total, 0, 0})
-                       && live.heap_usage <= live.heap_budget && pending <= live.heap_budget - live.heap_usage
-                       && total <= live.heap_budget - live.heap_usage - pending;
+                // Bank admission leaves headroom for the attention/FFN groups
+                // that are committed after the bank. A partial chain also keeps
+                // room for the streaming cache used by its tail layers.
+                constexpr uint64_t bank_headroom = UINT64_C(256) << 20;
+                constexpr uint64_t streaming_reserve = UINT64_C(1) << 30;
+                const bool free_heap = live.heap_usage <= live.heap_budget
+                                       && pending <= live.heap_budget - live.heap_usage;
+                const uint64_t available = free_heap ? live.heap_budget - live.heap_usage - pending : 0;
+                uint64_t maximum = free_heap && available > bank_headroom ? available - bank_headroom : 0;
+                if (expert_budget != 0)
+                    maximum = std::min(maximum, expert_budget);
+                const auto fit_prefix = [&](uint64_t budget, uint64_t& bytes, size_t& count) {
+                    bytes = 0;
+                    count = 0;
+                    for (size_t index = 0; index < plans.size(); ++index)
+                    {
+                        const uint64_t size = plans[index].physical_size;
+                        if (size != 0 && (size > budget || bytes > budget - size))
+                            break;
+                        bytes += size;
+                        count = index + 1;
+                    }
+                };
+                uint64_t prefix = 0;
+                size_t prefix_layers = 0;
+                fit_prefix(maximum, prefix, prefix_layers);
+                if (prefix_layers != plans.size())
+                {
+                    maximum = maximum > streaming_reserve ? maximum - streaming_reserve : 0;
+                    fit_prefix(maximum, prefix, prefix_layers);
+                    // The ordinary tail path owns dense FFNs. A bank can only
+                    // cover a prefix, so keep partial banks dense-free after it.
+                    for (size_t index = prefix_layers; index < plans.size(); ++index)
+                        if (model.graph.layer_plans[index].dense_ffn.down_weight != invalid_tensor_handle)
+                        {
+                            prefix = 0;
+                            prefix_layers = 0;
+                            break;
+                        }
+                }
+                if (prefix_layers != plans.size())
+                {
+                    for (size_t index = prefix_layers; index < plans.size(); ++index)
+                        plans[index] = ExpertBankPlan_vulkan{};
+                    bank_total = prefix;
+                    bank_layers = prefix_layers;
+                }
+                fits = prefix_layers != 0 && free_heap && available > bank_headroom
+                       && bank_total <= maximum
+                       && can_admit_gpu_resources(*resource, baseline, {bank_total, 0, 0});
+                if (fits)
+                    model.resident_bank_layers = static_cast<uint32_t>(bank_layers);
             }
             if (fits)
             {
                 // Selection ends here. All subsequent failures are terminal;
                 // no partially prepared bank is changed to streaming/CPU.
                 model.memory_plan.gpu_devices = std::move(candidate);
+                model.gpu_expert_bank_plans = plans;
                 auto prepared = prepare_model_graph_resources(model, model.resident_submission_rows, std::move(graph).value());
                 if (!prepared) return prepared.error();
                 const auto live = bank_live_resources(model, device);
-                if (live.heap_usage > live.heap_budget || total > live.heap_budget - live.heap_usage)
+                if (live.heap_usage > live.heap_budget || bank_total > live.heap_budget - live.heap_usage)
                     return Error{ErrorCode::InvalidArgument, "selected resident Expert banks exceed the live GPU budget after graph reservation"};
                 ExpertCache cache(lease_capacity, 1, {}, model.opt.expert_io_mode);
                 std::vector<std::shared_ptr<ExpertBank_vulkan>> banks;
@@ -309,6 +376,11 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
                 for (size_t index = 0; index < model.graph.layer_plans.size(); ++index)
                 {
                     const auto& layer = model.graph.layer_plans[index];
+                    if (index >= bank_layers || layer.dense_ffn.down_weight != invalid_tensor_handle)
+                    {
+                        banks.push_back({});
+                        continue;
+                    }
                     auto bank = ExpertBank_vulkan::create(model.gpu_expert_bank_plans[index], context, [&](uint32_t expert) {
                         return load_bank_expert(model, layer.moe.experts.at(expert), cache);
                     });
@@ -320,10 +392,11 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
                     physical += bank.value()->physical_size();
                     banks.push_back(std::move(bank).value());
                 }
-                if (physical != total)
+                if (physical != bank_total)
                     return Error{ErrorCode::InternalError, "selected resident Expert bank allocation does not match its admitted size"};
                 for (auto& item : model.memory_plan.gpu_devices)
                     if (item.initial.device_index == device) commit_gpu_resources(item, {physical, 0, 0});
+                model.gpu_expert_bank_plans = std::move(plans);
                 model.gpu_expert_banks = std::move(banks);
                 model.gpu_expert_bank_size = physical;
                 model.expert_backend.reset();
@@ -332,6 +405,8 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
                 return {};
             }
             model.gpu_expert_bank_plans.clear();
+            model.gpu_expert_banks.clear();
+            model.resident_bank_layers = 0;
             model.resident_submission_rows = 0;
         }
     }

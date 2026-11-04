@@ -36,6 +36,8 @@ struct ExpertDispatchOptions
 {
     uint32_t expert_count = 0;
     uint32_t top_k = 0;
+    uint32_t group_count = 0;
+    uint32_t top_k_groups = 0;
     RouterScoreFunction score_function = RouterScoreFunction::Softmax;
     RouterNormalization normalization = RouterNormalization::SelectedExperts;
     float routed_scaling_factor = 1.0f;

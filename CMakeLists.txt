@@ -116,6 +116,7 @@ set(NCNN_MOE_SOURCES
     src/models/modeladapter_qwen3_5.cpp
     src/models/modeladapter_qwen4exp.cpp
     src/models/modeladapter_phimoe.cpp
+    src/models/modeladapter_ling.cpp
     src/models/safetensors.cpp
     src/models/gguf.cpp
     src/models/ggufmodel.cpp

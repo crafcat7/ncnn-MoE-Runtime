@@ -42,10 +42,12 @@ layout(push_constant) uniform parameter
     uint token_count;
     float norm_epsilon;
     uint sigmoid_gate;
+    uint gate_channels;
+    float lower_bound;
 }
 p;
 
-#define KEY_LANES 4
+#define KEY_LANES   4
 #define VALUE_LANES 32
 
 float sigmoid(float value)
@@ -66,6 +68,16 @@ float softplus(float value)
 }
 
 shared float partial_sum[KEY_LANES * VALUE_LANES];
+
+// A scalar gate keeps the Qwen3-Next softplus decay. A per-channel gate uses
+// the bounded sigmoid form and indexes dt_bias by that channel.
+float delta_decay(float alpha, float a_log, uint value_head, uint key_column)
+{
+    if (p.gate_channels == 1)
+        return exp(-a_log * softplus(alpha + time_bias[value_head]));
+    const uint index = value_head * p.gate_channels + key_column;
+    return exp(p.lower_bound * sigmoid(a_log * (alpha + time_bias[index])));
+}
 
 void main()
 {
@@ -94,22 +106,24 @@ void main()
         const float beta = sigmoid(fused_input[input_row + p.convolution_size
                                                + p.value_size + value_head]);
         const uint alpha_base = input_row + p.convolution_size + p.value_size
-                                + p.head_count;
-        const float decay = exp(-exp(decay_log[value_head])
-                                * softplus(fused_input[alpha_base + value_head] + time_bias[value_head]));
+                                + p.head_count + value_head * p.gate_channels;
+        const float a_log = exp(decay_log[value_head]);
 
         float memory_value = 0.0;
         if (valid)
         {
             for (uint key_column = key_lane; key_column < p.head_dimension; key_column += KEY_LANES)
             {
+                const float decay = delta_decay(fused_input[alpha_base
+                                                            + (p.gate_channels == 1 ? 0 : key_column)],
+                                                a_log, value_head, key_column);
                 memory_value += recurrent_state[recurrent_base
                                                 + key_column * p.value_head_dimension
                                                 + value_column]
-                                * fused_input[key_base + key_column];
+                                * fused_input[key_base + key_column] * decay;
             }
         }
-        partial_sum[lane] = memory_value * decay;
+        partial_sum[lane] = memory_value;
         barrier();
         float memory = partial_sum[value_lane];
         for (uint offset = VALUE_LANES; offset < KEY_LANES * VALUE_LANES; offset += VALUE_LANES)
@@ -122,6 +136,9 @@ void main()
             const float delta = (value - memory) * beta;
             for (uint key_column = key_lane; key_column < p.head_dimension; key_column += KEY_LANES)
             {
+                const float decay = delta_decay(fused_input[alpha_base
+                                                            + (p.gate_channels == 1 ? 0 : key_column)],
+                                                a_log, value_head, key_column);
                 const uint state_index = recurrent_base + key_column * p.value_head_dimension + value_column;
                 recurrent_state[state_index] = recurrent_state[state_index] * decay
                                                + fused_input[key_base + key_column] * delta;

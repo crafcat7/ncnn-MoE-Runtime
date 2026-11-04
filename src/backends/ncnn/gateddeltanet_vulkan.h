@@ -104,6 +104,8 @@ public:
                                                                       uint32_t convolution_kernel_size,
                                                                       float norm_epsilon,
                                                                       bool sigmoid_gate,
+                                                                      uint32_t gate_channels,
+                                                                      float lower_bound,
                                                                       uint32_t vulkan_device_index,
                                                                       const VulkanRuntimePtr& vulkan_runtime,
                                                                       uint64_t optimization_flags);
@@ -120,6 +122,8 @@ public:
                                                                                 uint32_t convolution_kernel_size,
                                                                                 float norm_epsilon,
                                                                                 bool sigmoid_gate,
+                                                                                uint32_t gate_channels,
+                                                                                float lower_bound,
                                                                                 uint32_t vulkan_device_index,
                                                                                 const VulkanRuntimePtr& vulkan_runtime,
                                                                                 uint64_t optimization_flags);
@@ -138,6 +142,7 @@ public:
                                                                 uint32_t kv_head_count,
                                                                 uint32_t head_dimension,
                                                                 uint32_t value_head_dimension,
+                                                                uint32_t gate_channels,
                                                                 uint32_t rows);
 #if NCNN_MOE_WITH_VULKAN
     // The caller holds the context command lock and retains work through submit/wait.
@@ -168,6 +173,8 @@ private:
                                                                            uint32_t convolution_kernel_size,
                                                                            float norm_epsilon,
                                                                            bool sigmoid_gate,
+                                                                           uint32_t gate_channels,
+                                                                           float lower_bound,
                                                                            uint32_t vulkan_device_index,
                                                                            const VulkanRuntimePtr& vulkan_runtime,
                                                                            uint64_t optimization_flags);

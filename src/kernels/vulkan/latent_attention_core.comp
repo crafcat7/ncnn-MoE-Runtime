@@ -15,6 +15,8 @@ layout(binding = 5) readonly buffer rope_blob
 { float rope_data[]; };
 layout(binding = 6) writeonly buffer output_blob
 { float output_data[]; };
+layout(binding = 7) readonly buffer gate_blob
+{ float gate_data[]; };
 
 layout(push_constant) uniform parameter
 {
@@ -28,6 +30,8 @@ layout(push_constant) uniform parameter
     uint compressed_count;
     uint selected;
     float scale;
+    uint inverse_rope;
+    uint gate;
 }
 p;
 
@@ -36,15 +40,15 @@ shared float maximum;
 shared float denominator;
 shared float previous_scale;
 shared float current_weight;
-shared float accumulated[512];
+shared float accumulated[640];
 
 void main()
 {
     const uint lane = gl_LocalInvocationID.x;
     const uint head = gl_WorkGroupID.z;
     const uint base = (p.row * p.head_count + head) * p.dimension;
-    float numerator[4];
-    for (uint part = 0; part < 4; ++part)
+    float numerator[5];
+    for (uint part = 0; part < 5; ++part)
         numerator[part] = 0.0;
     if (lane == 0)
     {
@@ -60,7 +64,7 @@ void main()
                                   : (p.selected != 0 ? index_data[offset] : offset);
         const uint key_base = slot * p.dimension;
         float partial = 0.0;
-        for (uint part = 0; part < 4; ++part)
+        for (uint part = 0; part < 5; ++part)
         {
             const uint column = lane + part * 128;
             if (column < p.dimension)
@@ -87,7 +91,7 @@ void main()
             maximum = next_maximum;
         }
         barrier();
-        for (uint part = 0; part < 4; ++part)
+        for (uint part = 0; part < 5; ++part)
         {
             const uint column = lane + part * 128;
             if (column < p.dimension)
@@ -98,7 +102,10 @@ void main()
         }
         barrier();
     }
-    for (uint part = 0; part < 4; ++part)
+    float gate_scale = 1.0;
+    if (p.gate != 0)
+        gate_scale = 1.0 / (1.0 + exp(-gate_data[p.row * p.head_count + head]));
+    for (uint part = 0; part < 5; ++part)
     {
         const uint column = lane + part * 128;
         if (column < p.dimension)
@@ -109,7 +116,7 @@ void main()
     for (uint column = lane; column < p.dimension; column += 128)
     {
         float value = accumulated[column];
-        if (column >= rope_offset)
+        if (p.inverse_rope != 0 && column >= rope_offset)
         {
             const uint pair = (column - rope_offset) / 2;
             const float real = accumulated[rope_offset + pair * 2];
@@ -120,6 +127,6 @@ void main()
                         ? real * cosine + imaginary * sine
                         : imaginary * cosine - real * sine;
         }
-        output_data[base + column] = value;
+        output_data[base + column] = value * gate_scale;
     }
 }
