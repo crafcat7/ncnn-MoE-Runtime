@@ -2671,11 +2671,8 @@ static uint64_t graph_tensor_elements(const CompiledModel& model, const Executio
     const Layer& producer = graph.layers[tensor.producer];
     // Full-bank recording folds routed aggregation and the following Combine
     // into one output. The ExpertGroup tensor is not materialized there.
+    if (tensor.lifetime != TensorLifetime::Activation) return 0;
     if (producer.kind == LayerKind::ExpertGroup && graph_has_expert_banks(model, graph)) return 0;
-    // The cache output documents the state dependency; the cache has a
-    // Session lifetime and is not an activation in the reusable graph arena.
-    if (producer.kind == LayerKind::Attention && producer.outputs.size() > 1
-        && producer.outputs[1] == tensor.id) return 0;
     uint64_t elements = 1;
     for (size_t dimension = 0; dimension < tensor.shape.size(); ++dimension)
     {
@@ -3098,10 +3095,6 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
             const Layer& consumer = graph.layers[consumer_id];
             last = std::max(last, ends[consumer_id]);
             if (consumer.backend != ExecutionBackend::Vulkan) continue;
-            // Assignments are control edges. The Expert recorder uploads its
-            // own compact route buffers, accounted with its opaque operands.
-            if (consumer.kind == LayerKind::ExpertGroup && consumer.inputs.size() > 1
-                && consumer.inputs[1] == tensor.id) continue;
             const uint32_t device = graph_node_device(model, graph, consumer);
             const bool host_normalized = (consumer.kind == LayerKind::ExpertGroup || consumer.kind == LayerKind::SharedExpertGroup
                                           || consumer.kind == LayerKind::DenseFfn)

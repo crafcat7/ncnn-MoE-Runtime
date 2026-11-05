@@ -913,15 +913,27 @@ void test_prefill_decode_and_reset()
         check(layered_states[row].expert_scratch.backend_aggregated_output.allocated_bytes() == 0);
     }
 
-    // A dependency-valid schedule must still finish the live FFN workspace.
-    ExecutionGraph overlapping_graph = layered_model.graph;
-    for (Layer& node : overlapping_graph.layers)
-    {
-        if (node.kind == LayerKind::Router && node.plan_index == 1)
-            node.dependencies = {0};
-    }
-    ExecutionSchedule overlapping_schedule;
-    auto overlapping_status = schedule_graph(overlapping_graph, overlapping_schedule, ExecutionBackendCpu);
+    // A schedule must still finish the live FFN workspace before starting
+    // another layer's router.
+    ExecutionSchedule overlapping_schedule = layered_model.schedule;
+    const auto router = std::find_if(overlapping_schedule.node_order.begin(),
+                                     overlapping_schedule.node_order.end(),
+                                     [&](LayerId id) {
+                                         return layered_model.graph.layers[id].kind == LayerKind::Router
+                                                && layered_model.graph.layers[id].plan_index == 1;
+                                     });
+    check(router != overlapping_schedule.node_order.end());
+    const LayerId router_id = *router;
+    overlapping_schedule.node_order.erase(router);
+    const auto router_zero = std::find_if(overlapping_schedule.node_order.begin(),
+                                          overlapping_schedule.node_order.end(),
+                                          [&](LayerId id) {
+                                              return layered_model.graph.layers[id].kind == LayerKind::Router
+                                                     && layered_model.graph.layers[id].plan_index == 0;
+                                          });
+    check(router_zero != overlapping_schedule.node_order.end());
+    overlapping_schedule.node_order.insert(router_zero + 1, router_id);
+    auto overlapping_status = overlapping_schedule.validate(layered_model.graph);
     check(!overlapping_status);
     check(overlapping_status.error().message == "execution schedule overlaps an unfinished FFN layer");
 
@@ -11706,8 +11718,21 @@ void test_shared_expert_descriptor()
         check(std::find(schedule.node_order.begin(), schedule.node_order.end(), shared->id)
               < std::find(schedule.node_order.begin(), schedule.node_order.end(), routed->id));
         dispatch->flags &= ~LayerRequestExperts;
-        routed->dependencies = {dispatch->id};
-        shared->dependencies = {routed->id};
+        const auto retarget_control = [&](LayerId from, LayerId to, LayerId new_from, LayerId new_to) {
+            for (ExecutionTensor& tensor : graph.tensors)
+            {
+                if (tensor.lifetime == TensorLifetime::Control && tensor.producer == from
+                    && tensor.consumers.size() == 1 && tensor.consumers.front() == to)
+                {
+                    tensor.producer = new_from;
+                    tensor.consumers.front() = new_to;
+                    return true;
+                }
+            }
+            return false;
+        };
+        check(retarget_control(dispatch->id, shared->id, routed->id, shared->id));
+        check(retarget_control(shared->id, routed->id, dispatch->id, routed->id));
         check(static_cast<bool>(schedule_graph(graph, schedule, ExecutionBackendCpu)));
     };
     CompiledModel serial_shared_model = nonzero_shared_model;
@@ -12354,10 +12379,20 @@ void test_execution_graph_and_scheduler()
     }
     check(static_cast<bool>(graph.layers[3].flags == 0));
     check(static_cast<bool>(graph.layers[3].plan_index == 0));
-    check(static_cast<bool>(graph.layers[3].inputs.size() == 2));
-    check(static_cast<bool>(graph.layers[3].inputs[1] == graph.layers[2].outputs[0]));
-    check(static_cast<bool>(graph.layers[4].dependencies.size() == 1));
-    check(static_cast<bool>(graph.layers[4].dependencies[0] == 3));
+    const auto assignments = std::find_if(graph.tensors.begin(), graph.tensors.end(), [](const ExecutionTensor& tensor) {
+        return tensor.name.find("expert_dispatch.assignments") != std::string::npos;
+    });
+    check(assignments != graph.tensors.end());
+    check(assignments->lifetime == TensorLifetime::Control);
+    check(assignments->producer == 2);
+    check(assignments->consumers == std::vector<LayerId>{3});
+    const auto experts_output = std::find_if(graph.tensors.begin(), graph.tensors.end(), [](const ExecutionTensor& tensor) {
+        return tensor.name.find("experts.output") != std::string::npos;
+    });
+    check(experts_output != graph.tensors.end());
+    check(experts_output->producer == 3);
+    check(std::find(experts_output->consumers.begin(), experts_output->consumers.end(), LayerId{4})
+          != experts_output->consumers.end());
 
     const ExecutionSchedule& compiled_schedule = compiled.schedule;
     check(static_cast<bool>(compiled_schedule.validate(graph)));
@@ -12396,6 +12431,18 @@ void test_execution_graph_and_scheduler()
         }
     }
 
+    const auto add_test_edge = [](ExecutionGraph& graph, LayerId producer, LayerId consumer) {
+        ExecutionTensor tensor;
+        tensor.id = static_cast<ExecutionTensorId>(graph.tensors.size());
+        tensor.name = "test.edge." + std::to_string(tensor.id);
+        tensor.dtype = DType::Int32;
+        tensor.shape = {1};
+        tensor.lifetime = TensorLifetime::Control;
+        tensor.producer = producer;
+        tensor.consumers = {consumer};
+        graph.tensors.push_back(std::move(tensor));
+    };
+
     ExecutionGraph branch_graph;
     for (LayerId node_id = 0; node_id < 5; ++node_id)
     {
@@ -12404,24 +12451,24 @@ void test_execution_graph_and_scheduler()
         node.kind = LayerKind::FinalNorm;
         node.backend = ExecutionBackend::Cpu;
         node.backend_mask = ExecutionBackendCpu;
-        node.name = "branch." + std::to_string(node_id);
         node.weights = {node_id};
         branch_graph.layers.push_back(std::move(node));
     }
-    branch_graph.layers[0].dependencies = {3};
-    branch_graph.layers[2].dependencies = {1};
-    branch_graph.layers[4].dependencies = {0, 2};
+    add_test_edge(branch_graph, 3, 0);
+    add_test_edge(branch_graph, 1, 2);
+    add_test_edge(branch_graph, 0, 4);
+    add_test_edge(branch_graph, 2, 4);
     ExecutionSchedule branch_schedule;
     auto branch_status = schedule_graph(branch_graph, branch_schedule, ExecutionBackendCpu);
     check(static_cast<bool>(branch_status));
     check(static_cast<bool>(branch_schedule.node_order == std::vector<LayerId>{1, 3, 2, 0, 4}));
 
     ExecutionGraph duplicate_dependency_graph = branch_graph;
-    duplicate_dependency_graph.layers.back().dependencies = {0, 2, 0};
+    duplicate_dependency_graph.tensors.back().consumers.push_back(duplicate_dependency_graph.tensors.back().consumers.front());
     ExecutionSchedule duplicate_schedule;
     auto duplicate_schedule_status = schedule_graph(duplicate_dependency_graph, duplicate_schedule, ExecutionBackendCpu);
     check(!duplicate_schedule_status);
-    check(duplicate_schedule_status.error().message == "execution graph contains a duplicate dependency");
+    check(duplicate_schedule_status.error().message == "execution tensor contains a duplicate consumer");
 
     ExecutionGraph cpu_only_graph = graph;
     cpu_only_graph.layers.back().backend = ExecutionBackend::Vulkan;
@@ -12489,7 +12536,6 @@ void test_execution_graph_and_scheduler()
     vulkan_dense_node.kind = LayerKind::LmHead;
     vulkan_dense_node.backend = ExecutionBackend::Cpu;
     vulkan_dense_node.backend_mask = scheduling_backends;
-    vulkan_dense_node.name = "vulkan_only_lm_head";
     vulkan_dense_node.weights = {0};
     vulkan_only_graph.layers.push_back(std::move(vulkan_dense_node));
     ExecutionSchedule vulkan_only_schedule;
@@ -12506,11 +12552,13 @@ void test_execution_graph_and_scheduler()
     check(no_backend_status.error().message == "runtime scheduler requires at least one backend");
 
     ExecutionSchedule invalid_node_order_schedule = hybrid_schedule;
-    std::swap(invalid_node_order_schedule.node_order.front(), invalid_node_order_schedule.node_order[1]);
+    const LayerId delayed_token_node = invalid_node_order_schedule.node_order.front();
+    invalid_node_order_schedule.node_order.erase(invalid_node_order_schedule.node_order.begin());
+    invalid_node_order_schedule.node_order.push_back(delayed_token_node);
     auto invalid_node_order_status = invalid_node_order_schedule.validate(hybrid_graph);
     check(!invalid_node_order_status);
     check(static_cast<bool>(invalid_node_order_status.error().code == ErrorCode::InvalidModel));
-    check(static_cast<bool>(invalid_node_order_status.error().message == "execution schedule violates a node dependency"));
+    check(static_cast<bool>(invalid_node_order_status.error().message == "execution schedule violates a tensor dependency"));
 
     ExecutionGraph invalid_backend_graph = hybrid_graph;
     invalid_backend_graph.layers.back().backend_mask = ExecutionBackendCpu;
@@ -12520,12 +12568,12 @@ void test_execution_graph_and_scheduler()
     check(static_cast<bool>(invalid_backend_status.error().message == "execution schedule node backend is not allowed by its backend mask"));
 
     ExecutionGraph invalid_dependency_graph = hybrid_graph;
-    invalid_dependency_graph.layers.back().dependencies.push_back(invalid_layer_id);
+    invalid_dependency_graph.tensors.back().consumers.push_back(invalid_layer_id);
     ExecutionSchedule invalid_dependency_schedule;
     auto invalid_dependency_status = schedule_graph(invalid_dependency_graph, invalid_dependency_schedule, scheduling_backends);
     check(!invalid_dependency_status);
     check(static_cast<bool>(invalid_dependency_status.error().code == ErrorCode::InvalidModel));
-    check(static_cast<bool>(invalid_dependency_status.error().message == "execution graph dependency is out of range"));
+    check(static_cast<bool>(invalid_dependency_status.error().message == "execution tensor consumer is out of range"));
 
     for (LayerId invalid_id : {static_cast<LayerId>(graph.layers.size()), invalid_layer_id, LayerId{0}})
     {
@@ -12545,7 +12593,7 @@ void test_execution_graph_and_scheduler()
     auto unavailable_schedule_status = schedule_graph(unavailable_graph, unavailable_schedule, scheduling_backends);
     check(!unavailable_schedule_status);
     check(unavailable_schedule_status.error().code == ErrorCode::UnsupportedModel);
-    check(unavailable_schedule_status.error().message == "execution node has no available backend: " + graph.layers.front().name);
+    check(unavailable_schedule_status.error().message == "execution node has no available backend: TokenEmbedding #0");
 
     ExecutionGraph cyclic;
     Layer cyclic_router;
@@ -12554,21 +12602,19 @@ void test_execution_graph_and_scheduler()
     cyclic_router.backend = ExecutionBackend::Cpu;
     cyclic_router.backend_mask = ExecutionBackendCpu;
     cyclic_router.plan_index = 0;
-    cyclic_router.name = "router";
-    cyclic_router.dependencies = {1};
     Layer cyclic_combine;
     cyclic_combine.id = 1;
     cyclic_combine.kind = LayerKind::Combine;
     cyclic_combine.backend = ExecutionBackend::Cpu;
     cyclic_combine.backend_mask = ExecutionBackendCpu;
     cyclic_combine.plan_index = 0;
-    cyclic_combine.name = "combine";
-    cyclic_combine.dependencies = {0};
     cyclic.layers = {
         std::move(cyclic_router),
         std::move(cyclic_combine),
     };
     cyclic.layer_plans.resize(1);
+    add_test_edge(cyclic, 0, 1);
+    add_test_edge(cyclic, 1, 0);
     ExecutionSchedule invalid_schedule;
     auto invalid_schedule_status = schedule_graph(cyclic, invalid_schedule, ExecutionBackendCpu);
     check(static_cast<bool>(!invalid_schedule_status));

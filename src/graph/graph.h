@@ -61,8 +61,8 @@ enum LayerFlag : uint32_t
     LayerRequestExperts = UINT32_C(1) << NCNN_MOE_LAYER_REQUEST_EXPERTS_BIT
 };
 
-// One scheduled execution step. Planning-only fields (dependencies, tensor
-// edges and names) stay on Layer until P3 moves them into the Blob graph.
+// One scheduled execution step. All graph edges live in ExecutionTensor; the
+// layer only carries the runtime placement and compiled-plan binding.
 struct Layer
 {
     LayerId id = invalid_layer_id;
@@ -72,12 +72,15 @@ struct Layer
     uint32_t flags = 0;
     uint32_t plan_index = invalid_execution_layer_id;
     std::vector<TensorHandle> weights;
-    // Planning-only fields, retained on the layer until P3 moves the tensor
-    // edges fully into the Blob graph.
-    std::string name;
-    std::vector<LayerId> dependencies;
-    std::vector<ExecutionTensorId> inputs;
-    std::vector<ExecutionTensorId> outputs;
+};
+
+enum class TensorLifetime : uint8_t
+{
+    Activation,
+    // KV/session state is owned outside the reusable activation arena.
+    Session,
+    // Ordering-only edge; never materialized or copied.
+    Control,
 };
 
 struct ExecutionTensor
@@ -86,6 +89,7 @@ struct ExecutionTensor
     std::string name;
     DType dtype = DType::Float32;
     std::vector<uint32_t> shape;
+    TensorLifetime lifetime = TensorLifetime::Activation;
     LayerId producer = invalid_layer_id;
     std::vector<LayerId> consumers;
 };
