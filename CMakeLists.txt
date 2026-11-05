@@ -145,6 +145,11 @@ set(NCNN_MOE_SOURCES
     src/backends/ncnn/residentffn_vulkan.cpp
     src/backends/ncnn/latentattention_vulkan.cpp
     src/backends/ncnn/linear.cpp
+    src/backends/ncnn/linear_bf16.cpp
+    src/backends/ncnn/linear_expert.cpp
+    src/backends/ncnn/linear_float8.cpp
+    src/backends/ncnn/linear_mxfp4.cpp
+    src/backends/ncnn/linear_qnk.cpp
     src/backends/ncnn/modelpipeline.cpp
     src/backends/ncnn/vulkancontext.cpp
     # Execution
