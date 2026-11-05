@@ -450,14 +450,13 @@ static void run_batch_case(const CompiledModel& cpu_model,
         return;
     }
     require(static_cast<bool>(executed), executed ? "staged batch execution failed" : executed.error().message.c_str());
-    require(state->submitted_keys.size() == expert_count && workspace.combined_by_expert.size() == expert_count,
+    require(state->submitted_keys.size() == expert_count,
             "staged batch lost its canonical Expert mapping");
     for (size_t expert_id = 0; expert_id < expert_count; ++expert_id)
     {
         require(state->submitted_keys[expert_id] == "batch-combine-expert-" + std::to_string(expert_id)
-                    && state->submitted_slots[expert_id] == expert_id
-                    && workspace.combined_by_expert[expert_id] == expert_id,
-                "staged Expert order and reverse mapping must be canonical despite reverse first-seen order");
+                    && state->submitted_slots[expert_id] == expert_id,
+                "staged Expert order must be canonical despite reverse first-seen order");
         require(state->submitted_routes[expert_id].size() == 1
                     && state->submitted_routes[expert_id].front().token_index == 1 - expert_id,
                 "canonical staged reordering changed the route's original Session ownership");

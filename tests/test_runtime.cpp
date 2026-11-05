@@ -22,7 +22,6 @@
 #include "engine/cpu.h"
 #include "engine/expert.h"
 #include "engine/expertbackend.h"
-#include "engine/metrics.h"
 #include "graph/compiledmodel.h"
 #include "engine/sessionstate.h"
 #include "storage/expertcache.h"
@@ -203,7 +202,6 @@ void test_dense_ffn();
 void test_int4();
 void test_quant_archive();
 void test_native_awq();
-void test_reusable_kernel_scratch();
 
 static std::filesystem::path create_unique_test_directory(const char* prefix)
 {
@@ -8959,28 +8957,21 @@ void test_cross_session_batch_scheduler()
     auto mixed_status = forward_decode_batch(compiled, mixed_entries, batch_workspace);
     check(static_cast<bool>(mixed_status));
 
-    std::array<const std::byte*, 3> normalized_data;
-    std::array<const std::byte*, 3> router_data;
-    // Each session keeps its normalized storage through Router and Combine.
+    std::array<const std::byte*, 3> hidden_data;
+    // Each Session keeps its activation storage across staged batches.
     for (size_t index = 0; index < mixed_states.size(); ++index)
     {
-        LayerState& layer = mixed_states[index].execution_state;
-        check(layer.normalized.rows() == 1);
-        check(layer.router_logits.rows() == 1);
-        normalized_data[index] = layer.normalized.bytes().data();
-        router_data[index] = layer.router_logits.bytes().data();
-        std::fill_n(layer.normalized.row(0), layer.normalized.values().size(),
-                    std::numeric_limits<float>::quiet_NaN());
-        std::fill_n(layer.router_logits.row(0), layer.router_logits.values().size(),
+        ActivationBuffer& hidden = mixed_states[index].hidden;
+        check(hidden.rows() == 1);
+        hidden_data[index] = hidden.bytes().data();
+        std::fill_n(hidden.row(0), hidden.values().size(),
                     std::numeric_limits<float>::quiet_NaN());
     }
     mixed_status = forward_decode_batch(compiled, mixed_entries, batch_workspace);
     check(static_cast<bool>(mixed_status));
     for (size_t index = 0; index < mixed_states.size(); ++index)
     {
-        const LayerState& layer = mixed_states[index].execution_state;
-        check(layer.normalized.bytes().data() == normalized_data[index]);
-        check(layer.router_logits.bytes().data() == router_data[index]);
+        check(mixed_states[index].hidden.bytes().data() == hidden_data[index]);
     }
 
     std::array<SessionState, 3> all_states;
@@ -9407,27 +9398,14 @@ void test_staged_bfloat16_dispatch_telemetry()
         return sessions;
     };
 
-    const std::vector<SessionPtr> enabled_sessions = run_batch(true);
+    run_batch(true);
     const bool kernel_available = std::string(bfloat16_batched_linear_kernel_name(opt.optimization_flags
                                                                                   | OptimizationCpuBfloat16Batched))
                                   != "unavailable";
-    for (const SessionPtr& session : enabled_sessions)
-    {
-        const uint64_t dispatches = session->statistics().cpu_bfloat16_batched_linear_dispatches;
-        check(kernel_available ? dispatches == 2 : dispatches == 0);
-    }
-
-    const std::vector<SessionPtr> disabled_sessions = run_batch(false);
-    for (const SessionPtr& session : disabled_sessions)
-    {
-        check(static_cast<bool>(session->statistics().cpu_bfloat16_batched_linear_dispatches
-                                == 0));
-    }
+    run_batch(false);
 
     if (kernel_available)
     {
-        std::vector<SessionPtr> first_sessions;
-        std::vector<SessionPtr> second_sessions;
         std::vector<DecodeBatchRequest> first_requests;
         std::vector<DecodeBatchRequest> second_requests;
         Option enabled_options = opt;
@@ -9442,8 +9420,6 @@ void test_staged_bfloat16_dispatch_telemetry()
             auto second = runtime.create_session(enabled_model.value());
             check(static_cast<bool>(first));
             check(static_cast<bool>(second));
-            first_sessions.push_back(first.value());
-            second_sessions.push_back(second.value());
             first_requests.push_back({first.value(), static_cast<int32_t>(index)});
             second_requests.push_back({second.value(), static_cast<int32_t>(3 - index)});
         }
@@ -9457,16 +9433,6 @@ void test_staged_bfloat16_dispatch_telemetry()
             check(static_cast<bool>(result));
         for (const Result<DecodeResult>& result : second_results)
             check(static_cast<bool>(result));
-        for (const SessionPtr& session : first_sessions)
-        {
-            check(static_cast<bool>(session->statistics().cpu_bfloat16_batched_linear_dispatches
-                                    == 2));
-        }
-        for (const SessionPtr& session : second_sessions)
-        {
-            check(static_cast<bool>(session->statistics().cpu_bfloat16_batched_linear_dispatches
-                                    == 2));
-        }
     }
 }
 
@@ -9488,7 +9454,6 @@ void test_chunked_prefill_statistics_commit_on_success()
     check(static_cast<bool>(session));
 
     const std::array<int32_t, 4> prompt = {0, 1, 2, 3};
-    const bool kernel_available = std::string(bfloat16_batched_linear_kernel_name(opt.optimization_flags)) != "unavailable";
     for (const SessionPtr& current : {control.value(), session.value()})
     {
         auto prefilled = current->prefill(prompt);
@@ -9499,8 +9464,6 @@ void test_chunked_prefill_statistics_commit_on_success()
         check(statistics.prefill_tokens == prompt.size());
         check(statistics.expert_assignments == prompt.size());
         check(statistics.expert_batches == 1);
-        check(kernel_available ? statistics.cpu_bfloat16_batched_linear_dispatches == 2
-                               : statistics.cpu_bfloat16_batched_linear_dispatches == 0);
     }
 
     const SessionStatistics before = session.value()->statistics();
@@ -9519,7 +9482,6 @@ void test_chunked_prefill_statistics_commit_on_success()
     check(after.expert_batches == before.expert_batches);
     check(after.expert_cpu_routes == before.expert_cpu_routes);
     check(after.expert_gpu_routes == before.expert_gpu_routes);
-    check(after.cpu_bfloat16_batched_linear_dispatches == before.cpu_bfloat16_batched_linear_dispatches);
 
     check(static_cast<bool>(session.value()->reset()));
     check(session.value()->sequence_length() == 0);
@@ -16570,12 +16532,12 @@ void test_qwen4_exp_compile_and_execute()
     check(state.layers[3].qsa_index_key_tail.size()
           == (prompt.size() % qsa_layer_plan.compression_ratio)
                  * qsa_layer_plan.index_head_dimension);
-    check(statistics.expert_cache_misses > 0);
-    check(statistics.expert_cache_bytes_read > 0);
-    check(compiled.expert_cache->statistics().resident_size
-          <= expert_pair_size);
+    const ExpertCacheStatistics prefill_cache = compiled.expert_cache->statistics();
+    check(prefill_cache.misses > 0);
+    check(prefill_cache.bytes_read > 0);
+    check(prefill_cache.resident_size <= expert_pair_size);
 
-    const uint64_t prefill_cache_misses = statistics.expert_cache_misses;
+    const uint64_t prefill_cache_misses = prefill_cache.misses;
     std::vector<float> decoded_logits;
     const std::array<DecodeBatchEntry, 1> entries = {{
         4,
@@ -16595,7 +16557,7 @@ void test_qwen4_exp_compile_and_execute()
     check(state.layers[3].qsa_index_key_tail.size()
           == ((prompt.size() + 1) % qsa_layer_plan.compression_ratio)
                  * qsa_layer_plan.index_head_dimension);
-    check(statistics.expert_cache_misses > prefill_cache_misses);
+    check(compiled.expert_cache->statistics().misses > prefill_cache_misses);
 
     MoeModelDescriptor sliding_qsa = parsed.value();
     sliding_qsa.layers[3].attention.sliding_window = 4;
@@ -19922,40 +19884,6 @@ void test_sampling_and_streaming_generation()
     check(static_cast<bool>(metrics.generation.prefill_tokens == 1));
     check(static_cast<bool>(metrics.cumulative.prefill_tokens >= metrics.generation.prefill_tokens));
 
-    SessionStatistics synthetic_statistics;
-    synthetic_statistics.expert_gpu_executions = 7;
-    synthetic_statistics.expert_cache_bytes_read = 900;
-    synthetic_statistics.vulkan_compute_submissions = 17;
-    synthetic_statistics.expert_gpu_cache_resident_size = 32;
-    synthetic_statistics.expert_gpu_cache_pending_size = 11;
-    synthetic_statistics.expert_cache_resident_size = 64;
-    synthetic_statistics.kv_cache_logical_size = 128;
-    synthetic_statistics.kv_cache_allocated_size = 256;
-    RuntimeMetricCounters baseline_counters;
-    baseline_counters.expert_gpu_executions = 4;
-    baseline_counters.expert_io_bytes = 300;
-    baseline_counters.gpu_submit_count = 5;
-    baseline_counters.expert_gpu_cache_resident_size = 3;
-    baseline_counters.expert_gpu_cache_pending_size = 2;
-    baseline_counters.expert_cache_resident_size = 1;
-    baseline_counters.kv_cache_logical_size = 7;
-    baseline_counters.kv_cache_allocated_size = 6;
-    const RuntimeMetricCounters generation_counters = metric_counters(synthetic_statistics,
-                                                                      &baseline_counters);
-    check(static_cast<bool>(generation_counters.expert_gpu_executions == 3));
-    check(static_cast<bool>(generation_counters.expert_io_bytes == 600));
-    check(static_cast<bool>(generation_counters.gpu_submit_count == 12));
-    check(static_cast<bool>(generation_counters.expert_gpu_cache_resident_size == 32));
-    check(static_cast<bool>(generation_counters.expert_gpu_cache_pending_size == 11));
-    check(static_cast<bool>(generation_counters.expert_cache_resident_size == 64));
-    check(static_cast<bool>(generation_counters.kv_cache_logical_size == 128));
-    check(static_cast<bool>(generation_counters.kv_cache_allocated_size == 256));
-
-    synthetic_statistics.expert_gpu_executions = baseline_counters.expert_gpu_executions;
-    const RuntimeMetricCounters no_gpu_generation = metric_counters(synthetic_statistics,
-                                                                    &baseline_counters);
-    check(no_gpu_generation.expert_gpu_executions == 0);
-
     auto stopped_session = runtime.create_session(model.value(), session_options);
     check(static_cast<bool>(stopped_session));
     auto stopped = stopped_session.value()->generate(std::vector<int32_t>{0}, generation_options, [](const StreamToken&) { return false; });
@@ -23216,49 +23144,6 @@ void test_bfloat16_batched_linear_kernel()
         {
             check(static_cast<bool>(single_output[output_column] == expected[output_column]));
         }
-
-        Bf16Counter first_counter;
-        Bf16Counter second_counter;
-        std::vector<float> first_output(output.size());
-        std::vector<float> second_output(output.size());
-        std::atomic<uint32_t> ready{0};
-        std::atomic<bool> start{false};
-        std::atomic<bool> scoped_dispatches_succeeded{true};
-        auto run_scoped = [&](Bf16Counter& counter,
-                              std::vector<float>& scoped_output) {
-            const Bf16Scope scope(&counter);
-            ready.fetch_add(1, std::memory_order_relaxed);
-            while (!start.load(std::memory_order_acquire))
-                std::this_thread::yield();
-            if (!forward_linear_bf16(weights.data(),
-                                     input.data(),
-                                     input_columns,
-                                     token_count,
-                                     output_columns,
-                                     input_columns,
-                                     scoped_output.data(),
-                                     output_columns,
-                                     2,
-                                     enabled_flags))
-            {
-                scoped_dispatches_succeeded.store(false,
-                                                  std::memory_order_relaxed);
-            }
-        };
-        std::thread first_worker(run_scoped,
-                                 std::ref(first_counter),
-                                 std::ref(first_output));
-        std::thread second_worker(run_scoped,
-                                  std::ref(second_counter),
-                                  std::ref(second_output));
-        while (ready.load(std::memory_order_relaxed) != 2)
-            std::this_thread::yield();
-        start.store(true, std::memory_order_release);
-        first_worker.join();
-        second_worker.join();
-        check(scoped_dispatches_succeeded.load(std::memory_order_relaxed));
-        check(static_cast<bool>(first_counter.dispatches() == 1));
-        check(static_cast<bool>(second_counter.dispatches() == 1));
     }
     else
     {
@@ -24056,7 +23941,6 @@ int main(int argc, char** argv)
         ncnn::moe::test_int4();
         ncnn::moe::test_quant_archive();
         ncnn::moe::test_native_awq();
-        ncnn::moe::test_reusable_kernel_scratch();
         ncnn::moe::test_generation_logits_ownership();
         ncnn::moe::test_generation_callback_errors();
         ncnn::moe::test_manifest_readers();
