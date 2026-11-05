@@ -631,7 +631,17 @@ if(NCNN_MOE_BUILD_TESTS)
         tests/test_int4.cpp
         tests/test_quant_archive.cpp
         tests/test_native_awq.cpp
-        tests/test_runtime.cpp
+        tests/test_runtime_main.cpp
+        tests/test_runtime_continuation.cpp
+        tests/test_runtime_cpu_kernels.cpp
+        tests/test_runtime_deepseek.cpp
+        tests/test_runtime_generation.cpp
+        tests/test_runtime_graph_adapter.cpp
+        tests/test_runtime_linear_vulkan.cpp
+        tests/test_runtime_prefill_session.cpp
+        tests/test_runtime_quant_cpu.cpp
+        tests/test_runtime_qwen.cpp
+        tests/test_runtime_storage_cache.cpp
     )
     target_link_libraries(ncnn_moe_tests PRIVATE ncnn::moe)
     target_compile_features(ncnn_moe_tests PRIVATE cxx_std_20)

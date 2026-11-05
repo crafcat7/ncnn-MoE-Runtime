@@ -1,0 +1,115 @@
+#ifndef NCNN_MOE_TEST_RUNTIME_DECLS_H
+#define NCNN_MOE_TEST_RUNTIME_DECLS_H
+
+namespace ncnn {
+namespace moe {
+
+void test_batch_combine_backend();
+void test_dense_ffn();
+void test_int4();
+void test_quant_archive();
+void test_native_awq();
+void test_prefill_decode_and_reset();
+void test_linear_operator();
+void test_vulkan_device_tensor_residency();
+void test_dense_mxn_tiles();
+void test_released_dense_host_storage_guard();
+void test_ncnn_vulkan_float8_operator();
+void test_ncnn_vulkan_bfloat16_operator();
+void test_gguf_mxfp4_row_unpack();
+void test_mxfp4_weight_storage_padding();
+void test_weightstore_finalize();
+void test_mxfp4_cpu_kernel_and_fused_gate_up();
+void test_qnk_cpu_kernel();
+void test_qnk_graph_cpu_projections();
+void test_ncnn_vulkan_qnk_operator();
+void test_ncnn_vulkan_qnk_expert_operator();
+void test_adaptive_cache_wait_policy();
+void test_sharded_expert_victim_cache();
+void test_mapped_file_range_and_shared_buffer(bool low_fd = false);
+void test_safetensors_dense_mmap();
+void test_safetensors_packed_mxfp4_expert();
+void test_safetensors_qnk_source_binding();
+void test_file_backed_bfloat16_expert_cache();
+void test_expert_residency_coordinator();
+void test_file_backed_qnk_expert_cache();
+void test_file_backed_mxfp4_expert_cache();
+void test_cross_session_batch_scheduler();
+void test_batch_scheduler_submission_contract();
+void test_independent_batch_scheduler();
+void test_staged_bfloat16_dispatch_telemetry();
+void test_chunked_prefill_statistics_commit_on_success();
+void test_chunked_prefill_invalid_token_preserves_attention_state();
+void test_staged_invalid_token_preserves_attention_state();
+void test_session_execution_failure_requires_reset();
+void test_staged_execution_failure_requires_reset();
+void test_speculative_generation();
+void test_invalid_token_is_transactional();
+void test_chunked_prefill_matches_single_batch();
+void test_topk_selected_weight_normalization_and_combine();
+void test_int8_expert_linear();
+void test_invalid_int8_scale_is_rejected();
+void test_attention_kv_cache_and_reset();
+void test_bfloat16_ring_kv_cache();
+void test_generic_mtp_int4_cache_key();
+void test_attention_graph_without_bias_or_sink();
+void test_shared_expert_descriptor();
+void test_execution_graph_and_scheduler();
+void test_expert_dispatcher_groups_routes();
+void test_deepseek_router_and_hyper_connection_kernels();
+void test_deepseek_v4_descriptors();
+void test_latent_attention_scratch_reuse();
+void test_qwen3_5_moe_descriptors();
+void test_model_neutral_expert_storage();
+void test_qwen4_exp_descriptors();
+void test_qwen4_exp_compile_and_execute();
+void test_qwen4_exp_vulkan_projections();
+void test_gated_delta_vulkan_budget_admission();
+void test_gated_residual_kernels();
+void test_ple_prefill_decode_continuation();
+void test_quantized_attention_scratch_reuse();
+void test_attention_output_aliases();
+void test_qsa_prefill_decode_continuation();
+void test_gated_delta_net_continuation();
+void test_automatic_expert_memory_planning();
+void test_sampling_and_streaming_generation();
+void test_batch_workspace_reuse();
+void test_generation_logits_ownership();
+void test_generation_callback_errors();
+void test_manifest_readers();
+void test_model_adapter_scopes();
+void test_loader_reports_adapter_and_weight_errors();
+void test_backend_capabilities_and_hybrid_execution();
+void test_flag_defaults();
+void test_cpu_task_worker();
+void test_float_scaled_add();
+void test_float_scale_inplace_and_scaled_add();
+void test_float_scale_add();
+void test_float_dot();
+void test_dense_gemm_tails();
+void test_float_exp_inplace();
+void test_float_approximate_exp();
+void test_int8_float_dot();
+void test_weighted_scale();
+void test_rms_vector_kernels();
+void test_l2_vector_kernel();
+void test_hyper_connection_vector_kernels();
+void test_float_rope_kernel();
+void test_float_silu_mul();
+void test_float_sigmoid_mul();
+void test_dense_expert_thread_budget();
+void test_bfloat16_vector_kernels();
+void test_bfloat16_dot_reduction();
+void test_float_to_bfloat16_array();
+void test_activation_buffer_reset();
+void test_bfloat16_batched_linear_kernel();
+void benchmark_bfloat16_attention_kernels();
+void benchmark_qnk_gemm();
+void benchmark_vulkan_qnk();
+void benchmark_vulkan_qnk_expert();
+void test_cpu_resource_coordination();
+
+} // namespace moe
+} // namespace ncnn
+
+#endif // NCNN_MOE_TEST_RUNTIME_DECLS_H
