@@ -35,22 +35,20 @@ adapter with KDA/MLA hybrid attention and group-limited sparse routing.
 
 The table is a compact index of the current reference measurements and
 admission status. Published values are three-run medians on a Ryzen 7 9800X3D,
-31.14 GiB RAM, and an RTX 5070 Ti 16 GiB. Each benchmarked model report owns
-the complete cold/warm, short/long, multi-Session, memory, cache, and I/O
-matrix.
+31.14 GiB RAM, and an RTX 5070 Ti 16 GiB.
 
-| Model | Reference execution | Reference single Session, 32 tokens | Reference service, 32 tokens | Full report |
-| --- | --- | ---: | ---: | --- |
-| GPT-OSS-20B | Hybrid, eager Experts | **14.855 token/s** | n/a | [GPT-OSS performance](models/gpt-oss/README.md#reference-performance) |
-| GPT-OSS-120B | Hybrid, 16 GiB host ARC | **4.718 token/s** | **10.916 aggregate token/s** (2 Sessions) | [GPT-OSS performance](models/gpt-oss/README.md#reference-performance) |
-| DeepSeek-V4-Flash | Hybrid, 16 GiB host ARC | **1.254 token/s** | **3.809 aggregate token/s** (4 staged Sessions) | [Flash performance](models/deepseek-v4/README.md#deepseek-v4-flash-matrix) |
-| DeepSeek-V4-Flash-DSpark | Hybrid, DSpark enabled, 16 GiB host ARC | **1.254 token/s** | **3.594 aggregate token/s** (4 independent Sessions) | [DSpark performance](models/deepseek-v4/README.md#deepseek-v4-flash-dspark-matrix) |
-| Qwen3.6-35B-A3B | Hybrid, compiled MXFP4 Artifact, target only | **8.383 token/s** | **22.435 aggregate token/s** (4 independent Sessions) | [Qwen3.6 performance](models/qwen3.6/README.md#reference-performance) |
-| Qwen3.8-Flash-Next | Hybrid, on-demand Experts | Not yet published | Not yet published | [Qwen3.8 admission](models/qwen3.8/README.md) |
-| Qwen3.5 / Qwen3.6 dense text | CPU or mixed Attention/FFN | Not yet published | Not yet published | [Dense admission](models/qwen3.6/README.md#dense-text-models) |
-| Qwen3 dense (including 0.6B) | CPU or Hybrid, Safetensors | Not yet published | Not yet published | [Native text interface](#unified-examples) |
-| Phi-mini-MoE-instruct | CPU or Hybrid, BF16 Safetensors | Not yet published | Not yet published | [PhiMoE admission](models/phimoe/README.md) |
-| Ling-3.0-tiny | CPU or Hybrid, BF16 Safetensors | Not yet published | Not yet published | [Ling admission](models/ling/README.md) |
+| Model | Reference execution | Reference single Session, 32 tokens | Reference service, 32 tokens |
+| --- | --- | ---: | ---: |
+| GPT-OSS-20B | Hybrid, eager Experts | **14.855 token/s** | n/a |
+| GPT-OSS-120B | Hybrid, 16 GiB host ARC | **4.718 token/s** | **10.916 aggregate token/s** (2 Sessions) |
+| DeepSeek-V4-Flash | Hybrid, 16 GiB host ARC | **1.254 token/s** | **3.809 aggregate token/s** (4 staged Sessions) |
+| DeepSeek-V4-Flash-DSpark | Hybrid, DSpark enabled, 16 GiB host ARC | **1.254 token/s** | **3.594 aggregate token/s** (4 independent Sessions) |
+| Qwen3.6-35B-A3B | Hybrid, compiled MXFP4 Artifact, target only | **8.383 token/s** | **22.435 aggregate token/s** (4 independent Sessions) |
+| Qwen3.8-Flash-Next | Hybrid, on-demand Experts | Not yet published | Not yet published |
+| Qwen3.5 / Qwen3.6 dense text | CPU or mixed Attention/FFN | Not yet published | Not yet published |
+| Qwen3 dense (including 0.6B) | CPU or Hybrid, Safetensors | Not yet published | Not yet published |
+| Phi-mini-MoE-instruct | CPU or Hybrid, BF16 Safetensors | Not yet published | Not yet published |
+| Ling-3.0-tiny | CPU or Hybrid, BF16 Safetensors | Not yet published | Not yet published |
 
 Model-specific prompts, kernels, quantization formats, and service policies
 differ, so these rows are reference points rather than a cross-model ranking.
@@ -286,13 +284,11 @@ periodic metrics trace is disabled by default. Use `--no-stream`,
 Use `--no-thinking` to request the model's non-thinking template where supported.
 
 See [examples/README.md](examples/README.md) for the protocol boundary and
-common commands. The model guides document model-specific package preparation
-and adapter options.
+common commands. Model-specific package handling lives in `src/models/`.
 
 ## Qn_K CPU weights
 
-The [model catalog](models/README.md#quantized-package-import) documents the
-native AWQ/GPTQ INT4 execution across the built-in model families and the
+The native AWQ/GPTQ INT4 path supports the built-in model families and the
 GGUF, FP8, and ordinary Safetensors importer, including retained storage,
 CPU/Vulkan execution, and validation boundaries.
 
@@ -585,14 +581,6 @@ Qwen routed BF16 Expert banks share one file mapping per bank, with each Expert
 holding an owning slice. If the bank cannot be mapped or is not aligned, loading
 falls back to individual slices without making a temporary copy of the whole bank.
 
-Model execution guides live with their adapter definitions:
-
-- [Model catalog and capability matrix](models/README.md)
-- [GPT-OSS-20B/120B execution and performance](models/gpt-oss/README.md)
-- [DeepSeek V4 Flash and DSpark execution and performance](models/deepseek-v4/README.md)
-- [Qwen3.6-35B-A3B text admission and execution](models/qwen3.6/README.md)
-- [Qwen3.8-Flash-Next text admission and execution](models/qwen3.8/README.md)
-
 ## Project layout
 
 ```text
@@ -603,7 +591,6 @@ src/models/        Built-in model adapters, package loading, packed-sidecar sele
 src/storage/       Weight storage, mapped-file I/O, host ARC, and Vulkan victim cache
 src/kernels/       Portable CPU Attention/Linear, BF16 helpers, Qn_K pack/decode, and runtime-selected FP8/MXFP4 SIMD kernels
 src/backends/ncnn/ ncnn operator packaging, mixed Attention, Vulkan contexts, and native MXFP4 Experts
-models/            Model catalog and model-family execution guides
 examples/          Unified JSONL worker and shared telemetry helpers
 tools/             Unified CLI/client, Qwen artifact compiler, and quantized-package importer
 tests/             Deterministic, parity, cache, scheduling, concurrency, and error-path tests
