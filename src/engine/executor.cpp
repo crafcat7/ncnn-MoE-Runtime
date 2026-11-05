@@ -297,17 +297,17 @@ static void router_linear(const CompiledModel& model,
 {
     if (model.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
     {
-        auto mixed = forward_hyper_connection_pre(input,
-                                                  model.weights.at(layer.hyper_connection.ffn_function),
-                                                  model.weights.at(layer.hyper_connection.ffn_scale),
-                                                  model.weights.at(layer.hyper_connection.ffn_base),
-                                                  model.descriptor.hyper_connection_multiplier,
-                                                  model.descriptor.hyper_connection_iterations,
-                                                  model.descriptor.norm_epsilon,
-                                                  model.descriptor.hyper_connection_epsilon,
-                                                  mix,
-                                                  hyper,
-                                                  model.opt.optimization_flags);
+        auto mixed = hc_pre(input,
+                            model.weights.at(layer.hyper_connection.ffn_function),
+                            model.weights.at(layer.hyper_connection.ffn_scale),
+                            model.weights.at(layer.hyper_connection.ffn_base),
+                            model.descriptor.hyper_connection_multiplier,
+                            model.descriptor.hyper_connection_iterations,
+                            model.descriptor.norm_epsilon,
+                            model.descriptor.hyper_connection_epsilon,
+                            mix,
+                            hyper,
+                            model.opt.optimization_flags);
         if (!mixed)
             return mixed.error();
         forward_rms_norm(mix.reduced,
@@ -515,27 +515,27 @@ static void norm_fwd(const CompiledModel& model,
 {
     if (model.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
     {
-        return forward_hyper_connection_head(input,
-                                             model.weights.at(model.hyper_head_function),
-                                             model.weights.at(model.hyper_head_scale),
-                                             model.weights.at(model.hyper_head_base),
-                                             model.descriptor.hyper_connection_multiplier,
-                                             model.descriptor.norm_epsilon,
-                                             model.descriptor.hyper_connection_epsilon,
-                                             output,
-                                             scratch,
-                                             model.opt.optimization_flags);
+        return hc_head(input,
+                       model.weights.at(model.hyper_head_function),
+                       model.weights.at(model.hyper_head_scale),
+                       model.weights.at(model.hyper_head_base),
+                       model.descriptor.hyper_connection_multiplier,
+                       model.descriptor.norm_epsilon,
+                       model.descriptor.hyper_connection_epsilon,
+                       output,
+                       scratch,
+                       model.opt.optimization_flags);
     }
     if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
     {
-        return forward_gated_residual_head(input,
-                                           model.weights,
-                                           model.operators,
-                                           model.gated_residual_head,
-                                           model.descriptor,
-                                           output,
-                                           scratch,
-                                           model.opt.optimization_flags);
+        return gr_head(input,
+                       model.weights,
+                       model.operators,
+                       model.gated_residual_head,
+                       model.descriptor,
+                       output,
+                       scratch,
+                       model.opt.optimization_flags);
     }
     return {};
 }
@@ -694,7 +694,7 @@ Result<void> forward_model(const CompiledModel& model,
 
     if (input_ids.size() > std::numeric_limits<uint64_t>::max() - position_offset)
         return Error{ErrorCode::InvalidArgument, "execution position overflows"};
-    auto output_size = ensure_model_graph_resources(model, input_ids.size(), position_offset + input_ids.size());
+    auto output_size = ensure_graph(model, input_ids.size(), position_offset + input_ids.size());
     if (!output_size)
         return output_size.error();
     reset_state(model, state);
@@ -1024,14 +1024,14 @@ Result<void> forward_model(const CompiledModel& model,
         const ActivationBuffer* attn_input = &hidden;
         if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
         {
-            auto mixed = forward_gated_residual_pre(hidden,
-                                                    model.weights,
-                                                    model.operators,
-                                                    layer.attention_gated_residual,
-                                                    model.descriptor,
-                                                    attn_mix,
-                                                    state.hyper_connection_scratch,
-                                                    model.opt.optimization_flags);
+            auto mixed = gr_pre(hidden,
+                                model.weights,
+                                model.operators,
+                                layer.attention_gated_residual,
+                                model.descriptor,
+                                attn_mix,
+                                state.hyper_connection_scratch,
+                                model.opt.optimization_flags);
             if (!mixed)
                 return mixed.error();
             attn_input = &attn_mix.reduced;
@@ -1051,10 +1051,10 @@ Result<void> forward_model(const CompiledModel& model,
                 return gated_delta.error();
             if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
             {
-                auto connected = forward_gated_residual_post(state.gated_delta_scratch.output, hidden,
-                                                             attn_mix,
-                                                             model.descriptor.hyper_connection_multiplier,
-                                                             hidden);
+                auto connected = gr_post(state.gated_delta_scratch.output, hidden,
+                                         attn_mix,
+                                         model.descriptor.hyper_connection_multiplier,
+                                         hidden);
                 if (!connected)
                     return connected.error();
             }
@@ -1092,17 +1092,17 @@ Result<void> forward_model(const CompiledModel& model,
             const ActivationBuffer* attention_input = &hidden;
             if (model.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
             {
-                auto mixed = forward_hyper_connection_pre(hidden,
-                                                          model.weights.at(layer.hyper_connection.attention_function),
-                                                          model.weights.at(layer.hyper_connection.attention_scale),
-                                                          model.weights.at(layer.hyper_connection.attention_base),
-                                                          model.descriptor.hyper_connection_multiplier,
-                                                          model.descriptor.hyper_connection_iterations,
-                                                          model.descriptor.norm_epsilon,
-                                                          model.descriptor.hyper_connection_epsilon,
-                                                          hyper_mix,
-                                                          state.hyper_connection_scratch,
-                                                          model.opt.optimization_flags);
+                auto mixed = hc_pre(hidden,
+                                    model.weights.at(layer.hyper_connection.attention_function),
+                                    model.weights.at(layer.hyper_connection.attention_scale),
+                                    model.weights.at(layer.hyper_connection.attention_base),
+                                    model.descriptor.hyper_connection_multiplier,
+                                    model.descriptor.hyper_connection_iterations,
+                                    model.descriptor.norm_epsilon,
+                                    model.descriptor.hyper_connection_epsilon,
+                                    hyper_mix,
+                                    state.hyper_connection_scratch,
+                                    model.opt.optimization_flags);
                 if (!mixed)
                     return mixed.error();
                 attention_input = &hyper_mix.reduced;
@@ -1122,9 +1122,9 @@ Result<void> forward_model(const CompiledModel& model,
                 return output.error();
             if (model.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
             {
-                auto connected = forward_hyper_connection_post(attention_output, hidden, hyper_mix,
-                                                               model.descriptor.hyper_connection_multiplier,
-                                                               state.expert_scratch.staged_output);
+                auto connected = hc_post(attention_output, hidden, hyper_mix,
+                                         model.descriptor.hyper_connection_multiplier,
+                                         state.expert_scratch.staged_output);
                 if (!connected)
                     return connected.error();
                 hidden.swap(state.expert_scratch.staged_output);
@@ -1150,10 +1150,10 @@ Result<void> forward_model(const CompiledModel& model,
                 return attention.error();
             if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
             {
-                auto connected = forward_gated_residual_post(state.attention_scratch.output, hidden,
-                                                             attn_mix,
-                                                             model.descriptor.hyper_connection_multiplier,
-                                                             hidden);
+                auto connected = gr_post(state.attention_scratch.output, hidden,
+                                         attn_mix,
+                                         model.descriptor.hyper_connection_multiplier,
+                                         hidden);
                 if (!connected)
                     return connected.error();
             }
@@ -1180,14 +1180,14 @@ Result<void> forward_model(const CompiledModel& model,
             return completed_prediction.error();
         if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
         {
-            auto mixed = forward_gated_residual_pre(hidden,
-                                                    model.weights,
-                                                    model.operators,
-                                                    layer.ffn_gated_residual,
-                                                    model.descriptor,
-                                                    layer_state.ffn_hyper_mix,
-                                                    state.hyper_connection_scratch,
-                                                    model.opt.optimization_flags);
+            auto mixed = gr_pre(hidden,
+                                model.weights,
+                                model.operators,
+                                layer.ffn_gated_residual,
+                                model.descriptor,
+                                layer_state.ffn_hyper_mix,
+                                state.hyper_connection_scratch,
+                                model.opt.optimization_flags);
             if (!mixed)
                 return mixed.error();
             // GatedResidual post needs only the injection coefficients.
@@ -1393,17 +1393,17 @@ Result<void> forward_model(const CompiledModel& model,
             }
             else if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
             {
-                auto connected = forward_gated_residual_post(moe_output, hidden, layer_state.ffn_hyper_mix,
-                                                             model.descriptor.hyper_connection_multiplier,
-                                                             hidden);
+                auto connected = gr_post(moe_output, hidden, layer_state.ffn_hyper_mix,
+                                         model.descriptor.hyper_connection_multiplier,
+                                         hidden);
                 if (!connected)
                     return connected.error();
             }
             else if (model.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
             {
-                auto connected = forward_hyper_connection_post(moe_output, hidden, layer_state.ffn_hyper_mix,
-                                                               model.descriptor.hyper_connection_multiplier,
-                                                               state.expert_scratch.staged_output);
+                auto connected = hc_post(moe_output, hidden, layer_state.ffn_hyper_mix,
+                                         model.descriptor.hyper_connection_multiplier,
+                                         state.expert_scratch.staged_output);
                 if (!connected)
                     return connected.error();
                 hidden.swap(state.expert_scratch.staged_output);
@@ -1575,7 +1575,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
     }
     if (entries.size() > std::numeric_limits<uint32_t>::max())
         return Error{ErrorCode::InvalidArgument, "decode batch exceeds uint32 range"};
-    auto output_size = ensure_model_graph_resources(model, 1, context_tokens, static_cast<uint32_t>(entries.size()));
+    auto output_size = ensure_graph(model, 1, context_tokens, static_cast<uint32_t>(entries.size()));
     if (!output_size)
         return output_size.error();
     workspace.gpu_segment.reserve_host_output(output_size.value());
@@ -2082,17 +2082,17 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             const ActivationBuffer* attention_input = &merged_hidden;
             if (hyper_multiplier > 1)
             {
-                auto mixed = forward_hyper_connection_pre(merged_hidden,
-                                                          model.weights.at(layer.hyper_connection.attention_function),
-                                                          model.weights.at(layer.hyper_connection.attention_scale),
-                                                          model.weights.at(layer.hyper_connection.attention_base),
-                                                          hyper_multiplier,
-                                                          hyper_iterations,
-                                                          model.descriptor.norm_epsilon,
-                                                          hyper_epsilon,
-                                                          merged_mix,
-                                                          hyper_scratch,
-                                                          model.opt.optimization_flags);
+                auto mixed = hc_pre(merged_hidden,
+                                    model.weights.at(layer.hyper_connection.attention_function),
+                                    model.weights.at(layer.hyper_connection.attention_scale),
+                                    model.weights.at(layer.hyper_connection.attention_base),
+                                    hyper_multiplier,
+                                    hyper_iterations,
+                                    model.descriptor.norm_epsilon,
+                                    hyper_epsilon,
+                                    merged_mix,
+                                    hyper_scratch,
+                                    model.opt.optimization_flags);
                 if (!mixed)
                     return mixed.error();
                 attention_input = &merged_mix.reduced;
@@ -2102,17 +2102,17 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                 return filled.error();
             AttentionScratch& attention_scratch = workspace.attention;
             ActivationBuffer& attention_output = attention_scratch.output;
-            auto merged_output = forward_latent_attention_batch(model.weights, model.operators, layer.attention, node->backend, positions, caches,
-                                                                attention_scratch, *attention_input, attention_output, model.opt.optimization_flags);
+            auto merged_output = forward_latent_batch(model.weights, model.operators, layer.attention, node->backend, positions, caches,
+                                                      attention_scratch, *attention_input, attention_output, model.opt.optimization_flags);
             if (!merged_output)
                 return merged_output.error();
             if (hyper_multiplier > 1)
             {
-                auto connected = forward_hyper_connection_post(attention_output,
-                                                               merged_hidden,
-                                                               merged_mix,
-                                                               hyper_multiplier,
-                                                               batch_scratch.staged_output);
+                auto connected = hc_post(attention_output,
+                                         merged_hidden,
+                                         merged_mix,
+                                         hyper_multiplier,
+                                         batch_scratch.staged_output);
                 if (!connected)
                     return connected.error();
                 if (!split_hidden_rows(batch_scratch.staged_output))
@@ -2530,11 +2530,11 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             {
                 if (!merge_hidden_rows(batch_scratch.staged_merged))
                     return Error{ErrorCode::InternalError, "cannot merge staged FFN residual rows"};
-                auto connected = forward_hyper_connection_post(moe_output,
-                                                               batch_scratch.staged_merged,
-                                                               combined.ffn_hyper_mix,
-                                                               hyper_multiplier,
-                                                               batch_scratch.staged_output);
+                auto connected = hc_post(moe_output,
+                                         batch_scratch.staged_merged,
+                                         combined.ffn_hyper_mix,
+                                         hyper_multiplier,
+                                         batch_scratch.staged_output);
                 if (!connected)
                     return connected.error();
                 if (!split_hidden_rows(batch_scratch.staged_output))

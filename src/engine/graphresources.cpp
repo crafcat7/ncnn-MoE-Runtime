@@ -72,9 +72,9 @@ static Result<void> allocate_graph_resources(const CompiledModel& model,
     return {};
 }
 
-static Result<void> prepare_model_graph_resources(CompiledModel& model,
-                                                  uint32_t prefill_rows,
-                                                  ModelGraphMemoryPlan&& plan)
+static Result<void> prepare_graph(CompiledModel& model,
+                                  uint32_t prefill_rows,
+                                  ModelGraphMemoryPlan&& plan)
 {
     const uint32_t sessions = std::max(1u, model.opt.num_concurrent_sessions);
     if (prefill_rows == 0 || plan.prefill_rows != prefill_rows || plan.sequence_count != sessions)
@@ -98,14 +98,14 @@ static Result<void> prepare_model_graph_resources(CompiledModel& model,
     return {};
 }
 
-Result<void> prepare_model_graph_resources(CompiledModel& model, uint32_t prefill_rows)
+Result<void> prepare_graph(CompiledModel& model, uint32_t prefill_rows)
 {
     const uint32_t rows = std::max(1u, prefill_rows);
     const uint32_t sessions = std::max(1u, model.opt.num_concurrent_sessions);
     auto plan = plan_model_graph_memory(model, rows, sessions);
     if (!plan)
         return plan.error();
-    return prepare_model_graph_resources(model, rows, std::move(plan).value());
+    return prepare_graph(model, rows, std::move(plan).value());
 }
 
 #if NCNN_MOE_WITH_VULKAN
@@ -366,7 +366,7 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
                 // no partially prepared bank is changed to streaming/CPU.
                 model.memory_plan.gpu_devices = std::move(candidate);
                 model.gpu_expert_bank_plans = plans;
-                auto prepared = prepare_model_graph_resources(model, model.resident_submission_rows, std::move(graph).value());
+                auto prepared = prepare_graph(model, model.resident_submission_rows, std::move(graph).value());
                 if (!prepared) return prepared.error();
                 const auto live = bank_live_resources(model, device);
                 if (live.heap_usage > live.heap_budget || bank_total > live.heap_budget - live.heap_usage)
@@ -414,10 +414,10 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
 #else
     (void)expert_budget;
 #endif
-    return prepare_model_graph_resources(model, prefill_rows);
+    return prepare_graph(model, prefill_rows);
 }
 
-Result<uint64_t> ensure_model_graph_resources(const CompiledModel& model, uint64_t rows, uint64_t context_tokens, uint32_t sequence_count)
+Result<uint64_t> ensure_graph(const CompiledModel& model, uint64_t rows, uint64_t context_tokens, uint32_t sequence_count)
 {
     // Direct compiler clients may manage allocation themselves. Runtime loads
     // always initialize the shared graph resource domain before publishing.

@@ -1291,7 +1291,7 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
                                     q8_input);
             if (has_flag(optimization_flags, OptimizationCpuPackedWeights)
                 && output_columns >= 4
-                && mxfp4_q8_packed_kernel_available())
+                && mxfp4_q8_ready())
             {
                 const std::shared_ptr<const Mxfp4Q8PackedMatrix>
                     packed_weights = get_mxfp4_q8_packed_weights(matrix,
@@ -1881,9 +1881,9 @@ private:
     Mxfp4Scratch& buffers;
 };
 
-static bool forward_experts_mxfp4_decode(std::span<const Mxfp4Task> tasks,
-                                         Mxfp4Scratch* scratch,
-                                         uint64_t optimization_flags)
+static bool forward_mxfp4_decode(std::span<const Mxfp4Task> tasks,
+                                 Mxfp4Scratch* scratch,
+                                 uint64_t optimization_flags)
 {
     Mxfp4Scratch local_scratch;
     Mxfp4Scratch& buffers = scratch ? *scratch : local_scratch;
@@ -1940,7 +1940,7 @@ static bool forward_experts_mxfp4_decode(std::span<const Mxfp4Task> tasks,
             q8_down_enabled[task_index] = 1;
             if (has_flag(optimization_flags, OptimizationCpuPackedWeights)
                 && task.down->shape[0] >= 4
-                && mxfp4_q8_packed_kernel_available())
+                && mxfp4_q8_ready())
             {
                 q8_down_packed[task_index] = get_mxfp4_q8_packed_weights(*task.down,
                                                                          task.down_operator ? &task.down_operator->mxfp4_q8_packed : nullptr,
@@ -1965,7 +1965,7 @@ static bool forward_experts_mxfp4_decode(std::span<const Mxfp4Task> tasks,
             }
             if (has_flag(optimization_flags, OptimizationCpuPackedWeights)
                 && task.gate_up->shape[0] >= 4
-                && mxfp4_q8_packed_kernel_available())
+                && mxfp4_q8_ready())
             {
                 q8_gate_packed[task_index] = 1;
             }
@@ -2296,7 +2296,7 @@ bool forward_experts_mxfp4(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scrat
                 scratch->unique_row_maps[task_index].clear();
             }
         }
-        return forward_experts_mxfp4_decode(tasks, scratch, optimization_flags);
+        return forward_mxfp4_decode(tasks, scratch, optimization_flags);
     }
 
     Mxfp4Scratch local_scratch;

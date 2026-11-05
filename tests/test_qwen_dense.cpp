@@ -609,9 +609,9 @@ static bool test_dynamic_gpu_cache(const std::filesystem::path& root, const GpuI
     const DenseBudgetTrace expected = execute_budget_model(cpu);
     const ExpertPlan& first = cpu.graph.layer_plans.front().dense_ffn;
     const auto sizing_runtime = create_vulkan_runtime();
-    const uint64_t entry_size = native_quantized_expert_storage_bytes(cpu.weights.at(first.gate_weight),
-                                                                      &cpu.weights.at(first.up_weight), cpu.weights.at(first.down_weight), gpu.device_index,
-                                                                      sizing_runtime, OptimizationDefaultFlags);
+    const uint64_t entry_size = quant_expert_bytes(cpu.weights.at(first.gate_weight),
+                                                   &cpu.weights.at(first.up_weight), cpu.weights.at(first.down_weight), gpu.device_index,
+                                                   sizing_runtime, OptimizationDefaultFlags);
     if (entry_size == 0 || gpu.heap_available < entry_size * 4)
     {
         std::cout << "SKIP " << context << ": dense cache entry is unsupported or available heap is too small\n";

@@ -1041,16 +1041,16 @@ static Result<void> forward_latent_value_vulkan(const WeightStore& weights,
     return {};
 }
 
-Result<void> forward_latent_attention_batch(const WeightStore& weights,
-                                            const CompiledOperatorTable& operators,
-                                            const AttentionBlockPlan& plan,
-                                            ExecutionBackend backend,
-                                            std::span<const uint64_t> positions,
-                                            std::span<LayerCache* const> caches,
-                                            AttentionScratch& scratch,
-                                            const ActivationBuffer& input,
-                                            ActivationBuffer& output,
-                                            uint64_t optimization_flags)
+Result<void> forward_latent_batch(const WeightStore& weights,
+                                  const CompiledOperatorTable& operators,
+                                  const AttentionBlockPlan& plan,
+                                  ExecutionBackend backend,
+                                  std::span<const uint64_t> positions,
+                                  std::span<LayerCache* const> caches,
+                                  AttentionScratch& scratch,
+                                  const ActivationBuffer& input,
+                                  ActivationBuffer& output,
+                                  uint64_t optimization_flags)
 {
     if (plan.kind != AttentionKind::MultiHeadLatent
         || input.columns() != weights.at(plan.pre_attention_norm_weight).shape[0]
@@ -1124,9 +1124,9 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
         for (size_t row = 0; row < input.rows(); ++row)
         {
             std::copy_n(input.row(row), input.columns(), row_input.row(0));
-            const auto executed = forward_latent_attention_batch(weights, operators, plan, backend,
-                                                                 positions.subspan(row, 1), caches.subspan(row, 1),
-                                                                 scratch, row_input, row_output, optimization_flags);
+            const auto executed = forward_latent_batch(weights, operators, plan, backend,
+                                                       positions.subspan(row, 1), caches.subspan(row, 1),
+                                                       scratch, row_input, row_output, optimization_flags);
             if (!executed)
                 return executed.error();
             std::copy_n(row_output.row(0), completed.columns(), completed.row(row));
@@ -1778,16 +1778,16 @@ Result<void> forward_latent_attention(const WeightStore& weights,
     {
         const std::array<uint64_t, 1> positions = {position_offset};
         std::array<LayerCache*, 1> caches = {&cache};
-        return forward_latent_attention_batch(weights, operators, plan, backend, positions, caches,
-                                              scratch, input, output, optimization_flags);
+        return forward_latent_batch(weights, operators, plan, backend, positions, caches,
+                                    scratch, input, output, optimization_flags);
     }
     scratch.latent_positions.resize(input.rows());
     scratch.latent_caches.assign(input.rows(), &cache);
     for (size_t row = 0; row < input.rows(); ++row)
         scratch.latent_positions[row] = position_offset + row;
-    return forward_latent_attention_batch(weights, operators, plan, backend,
-                                          scratch.latent_positions, scratch.latent_caches,
-                                          scratch, input, output, optimization_flags);
+    return forward_latent_batch(weights, operators, plan, backend,
+                                scratch.latent_positions, scratch.latent_caches,
+                                scratch, input, output, optimization_flags);
 }
 
 Result<void> append_dspark_attention_context(const WeightStore& weights,

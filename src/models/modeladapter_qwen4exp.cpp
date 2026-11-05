@@ -35,27 +35,27 @@ static Result<void> validate_mxfp4_artifact(const ModelPackage& package,
     if (!opened)
         return opened.error();
     SafetensorsArchive archive = std::move(opened).value();
-    auto status = validate_mxfp4_artifact_identity(archive,
-                                                   package,
-                                                   "__ncnn_moe_qwen3_8_mxfp4__.identity.v1.",
-                                                   layer_count,
-                                                   mtp_layer_count,
-                                                   expert_count,
-                                                   hidden_size,
-                                                   intermediate_size,
-                                                   "Qwen4 Exp artifact identity source",
-                                                   "Qwen4 Exp MXFP4 artifact");
+    auto status = validate_artifact_id(archive,
+                                       package,
+                                       "__ncnn_moe_qwen3_8_mxfp4__.identity.v1.",
+                                       layer_count,
+                                       mtp_layer_count,
+                                       expert_count,
+                                       hidden_size,
+                                       intermediate_size,
+                                       "Qwen4 Exp artifact identity source",
+                                       "Qwen4 Exp MXFP4 artifact");
     if (!status)
         return status.error();
 
     for (uint32_t layer_id = 0; layer_id < layer_count; ++layer_id)
     {
-        status = validate_mxfp4_artifact_expert_bank(archive,
-                                                     mxfp4_expert_prefix(layer_id),
-                                                     expert_count,
-                                                     hidden_size,
-                                                     intermediate_size,
-                                                     "Qwen4 Exp MXFP4 artifact");
+        status = validate_artifact_bank(archive,
+                                        mxfp4_expert_prefix(layer_id),
+                                        expert_count,
+                                        hidden_size,
+                                        intermediate_size,
+                                        "Qwen4 Exp MXFP4 artifact");
         if (!status)
             return status.error();
     }
@@ -588,10 +588,10 @@ Result<WeightMapping> Qwen4ExpModelAdapter::map_weights(const ModelPackage& pack
             {
                 const std::string expert_source = source + "mlp.experts." + std::to_string(expert_id) + ".";
                 const std::string expert = expert_prefix(layer_id, expert_id);
-                auto gate_up = archive.load_interleaved_mxfp4_tensor(expert_source + "gate_proj.weight", {},
-                                                                     expert_source + "up_proj.weight", {},
-                                                                     moe.intermediate_size, descriptor.hidden_size,
-                                                                     expert_load_flags);
+                auto gate_up = archive.load_mxfp4(expert_source + "gate_proj.weight", {},
+                                                  expert_source + "up_proj.weight", {},
+                                                  moe.intermediate_size, descriptor.hidden_size,
+                                                  expert_load_flags);
                 if (!gate_up)
                     return gate_up.error();
                 mapping.emplace(expert + "gate_up.weight", std::move(gate_up).value());

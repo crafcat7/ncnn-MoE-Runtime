@@ -1373,14 +1373,14 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& input_descri
     {
         eager_capacity = plan.host_memory_budget - plan.estimated_dense_size - safety_reserve;
     }
-    const auto supports_file_backed_experts = [weights](const MoeDescriptor& moe) {
+    const auto file_experts = [weights](const MoeDescriptor& moe) {
         if (weights)
             return has_flag(moe.flags, MoeDescriptorFileBackedExperts);
         return moe.expert_weight_dtype == DType::MxFp4
                || (moe.expert_weight_dtype == DType::BFloat16
                    && has_flag(moe.flags, MoeDescriptorFileBackedExperts));
     };
-    if (!supports_file_backed_experts(moe))
+    if (!file_experts(moe))
     {
         plan.selected_mode = ExpertMemoryMode::Eager;
         if (opt.expert_memory_mode == ExpertMemoryMode::OnDemand || opt.expert_cache_size != 0)
@@ -1447,7 +1447,7 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& input_descri
     {
         if (layer.dense.enabled())
             continue;
-        if (!supports_file_backed_experts(layer.moe))
+        if (!file_experts(layer.moe))
         {
             return Error{ErrorCode::UnsupportedModel, "on-demand mode requires a file-backed Expert encoding"};
         }

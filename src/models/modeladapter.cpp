@@ -783,16 +783,16 @@ static Result<void> validate_u8_artifact_tensor(const SafetensorsArchive& archiv
     return {};
 }
 
-Result<void> validate_mxfp4_artifact_identity(const SafetensorsArchive& archive,
-                                              const ModelPackage& package,
-                                              const char* identity_prefix,
-                                              uint32_t layer_count,
-                                              uint32_t mtp_layer_count,
-                                              uint32_t expert_count,
-                                              uint32_t hidden_size,
-                                              uint32_t intermediate_size,
-                                              const char* identity_description,
-                                              const char* artifact_description)
+Result<void> validate_artifact_id(const SafetensorsArchive& archive,
+                                  const ModelPackage& package,
+                                  const char* identity_prefix,
+                                  uint32_t layer_count,
+                                  uint32_t mtp_layer_count,
+                                  uint32_t expert_count,
+                                  uint32_t hidden_size,
+                                  uint32_t intermediate_size,
+                                  const char* identity_description,
+                                  const char* artifact_description)
 {
     uint64_t config_hash = UINT64_C(14695981039346656037);
     for (unsigned char value : package.manifest.raw_json)
@@ -822,12 +822,12 @@ Result<void> validate_mxfp4_artifact_identity(const SafetensorsArchive& archive,
     return {};
 }
 
-Result<void> validate_mxfp4_artifact_expert_bank(const SafetensorsArchive& archive,
-                                                 const std::string& prefix,
-                                                 uint32_t expert_count,
-                                                 uint32_t hidden_size,
-                                                 uint32_t intermediate_size,
-                                                 const char* description)
+Result<void> validate_artifact_bank(const SafetensorsArchive& archive,
+                                    const std::string& prefix,
+                                    uint32_t expert_count,
+                                    uint32_t hidden_size,
+                                    uint32_t intermediate_size,
+                                    const char* description)
 {
     auto status = validate_u8_artifact_tensor(archive,
                                               prefix + "gate_up.blocks",

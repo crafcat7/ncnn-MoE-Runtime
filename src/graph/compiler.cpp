@@ -1090,7 +1090,7 @@ static Result<void> compile_shared_expert(const WeightStore& weights, const std:
     return {};
 }
 
-static bool is_mapped_bfloat16_expert_tensor(const TensorData& tensor) noexcept
+static bool is_mapped_expert(const TensorData& tensor) noexcept
 {
     if (tensor.dtype != DType::BFloat16
         || tensor.shape.size() != 2
@@ -1105,20 +1105,20 @@ static bool is_mapped_bfloat16_expert_tensor(const TensorData& tensor) noexcept
            && tensor.bfloat16_values().size() == elements;
 }
 
-static bool is_cache_file_backed_expert_tensor(const TensorData& tensor,
-                                               bool allow_bfloat16) noexcept
+static bool is_file_expert(const TensorData& tensor,
+                           bool allow_bfloat16) noexcept
 {
     return static_cast<bool>(tensor.mxfp4_file_storage)
            || (allow_bfloat16
-               && is_mapped_bfloat16_expert_tensor(tensor));
+               && is_mapped_expert(tensor));
 }
 
 static bool is_cache_file_backed_expert_pair(const TensorData& gate_up,
                                              const TensorData& down,
                                              bool allow_bfloat16) noexcept
 {
-    return is_cache_file_backed_expert_tensor(gate_up, allow_bfloat16)
-           && is_cache_file_backed_expert_tensor(down, allow_bfloat16);
+    return is_file_expert(gate_up, allow_bfloat16)
+           && is_file_expert(down, allow_bfloat16);
 }
 
 static Result<void> finalize_expert(WeightStore& weights,
@@ -1954,11 +1954,11 @@ static Result<void> compile_dense_layer(CompiledModel& compiled, const std::stri
         && support_vulkan_expert(ffn, compiled.weights.at(ffn.gate_weight), compiled.weights.at(ffn.down_weight),
                                  compiled.opt.optimization_flags, &compiled.weights.at(ffn.up_weight)))
     {
-        const uint64_t device_size = native_quantized_expert_storage_bytes(compiled.weights.at(ffn.gate_weight),
-                                                                           &compiled.weights.at(ffn.up_weight),
-                                                                           compiled.weights.at(ffn.down_weight),
-                                                                           layer_plan.vulkan_device_index, compiled.vulkan_runtime,
-                                                                           compiled.opt.optimization_flags);
+        const uint64_t device_size = quant_expert_bytes(compiled.weights.at(ffn.gate_weight),
+                                                        &compiled.weights.at(ffn.up_weight),
+                                                        compiled.weights.at(ffn.down_weight),
+                                                        layer_plan.vulkan_device_index, compiled.vulkan_runtime,
+                                                        compiled.opt.optimization_flags);
         if (device_size != 0)
         {
             ffn.cache_key = "dense:" + layer_name + "ffn";

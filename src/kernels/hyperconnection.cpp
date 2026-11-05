@@ -59,9 +59,9 @@ static Result<void> validate_hyper_tensors(const ActivationBuffer& input, const 
     return {};
 }
 
-Result<void> forward_hyper_connection_pre(const ActivationBuffer& input, const TensorData& function, const TensorData& scale, const TensorData& base,
-                                          uint32_t multiplier, uint32_t sinkhorn_iterations, float norm_epsilon, float hyper_epsilon,
-                                          HyperConnectionMix& result, HyperConnectionScratch& scratch, uint64_t optimization_flags)
+Result<void> hc_pre(const ActivationBuffer& input, const TensorData& function, const TensorData& scale, const TensorData& base,
+                    uint32_t multiplier, uint32_t sinkhorn_iterations, float norm_epsilon, float hyper_epsilon,
+                    HyperConnectionMix& result, HyperConnectionScratch& scratch, uint64_t optimization_flags)
 {
     const uint32_t mix_count = (2 + multiplier) * multiplier;
     auto valid = validate_hyper_tensors(input, function, scale, base, multiplier, mix_count);
@@ -185,7 +185,7 @@ Result<void> forward_hyper_connection_pre(const ActivationBuffer& input, const T
     return {};
 }
 
-Result<void> forward_hyper_connection_post(const ActivationBuffer& branch, const ActivationBuffer& residual, const HyperConnectionMix& mix, uint32_t multiplier, ActivationBuffer& output)
+Result<void> hc_post(const ActivationBuffer& branch, const ActivationBuffer& residual, const HyperConnectionMix& mix, uint32_t multiplier, ActivationBuffer& output)
 {
     if (multiplier == 0
         || branch.rows() != residual.rows()
@@ -226,9 +226,9 @@ Result<void> forward_hyper_connection_post(const ActivationBuffer& branch, const
     return {};
 }
 
-Result<void> forward_hyper_connection_head(const ActivationBuffer& input, const TensorData& function, const TensorData& scale, const TensorData& base, uint32_t multiplier,
-                                           float norm_epsilon, float hyper_epsilon, ActivationBuffer& output, HyperConnectionScratch& scratch,
-                                           uint64_t optimization_flags)
+Result<void> hc_head(const ActivationBuffer& input, const TensorData& function, const TensorData& scale, const TensorData& base, uint32_t multiplier,
+                     float norm_epsilon, float hyper_epsilon, ActivationBuffer& output, HyperConnectionScratch& scratch,
+                     uint64_t optimization_flags)
 {
     auto valid = validate_hyper_tensors(input, function, scale, base, multiplier, multiplier);
     if (!valid)

@@ -43,7 +43,7 @@ static bool support_cpu_packed_weights(const MoeModelDescriptor& descriptor,
         if (dtype == DType::MxFp4
             && has_flag(opt.optimization_flags,
                         OptimizationCpuMxfp4Q8)
-            && mxfp4_q8_packed_kernel_available())
+            && mxfp4_q8_ready())
         {
             return true;
         }
@@ -780,8 +780,8 @@ Result<void> ModelLoader::create_expert_backend(const std::vector<uint64_t>& gpu
 
     if (use_victim_source)
     {
-        model.expert_backend = create_key_sharded_expert_backend(std::move(backends),
-                                                                 cache_devices);
+        model.expert_backend = create_key_sharded(std::move(backends),
+                                                  cache_devices);
     }
     else
     {
@@ -792,9 +792,9 @@ Result<void> ModelLoader::create_expert_backend(const std::vector<uint64_t>& gpu
         for (const CompiledLayerPlan& layer : model.speculative.graph.layer_plans)
             group_device_indices.push_back(layer.vulkan_device_index);
 
-        model.expert_backend = create_multi_device_expert_backend(std::move(backends),
-                                                                  cache_devices,
-                                                                  std::move(group_device_indices));
+        model.expert_backend = create_multi_device(std::move(backends),
+                                                   cache_devices,
+                                                   std::move(group_device_indices));
     }
 
     if (!model.expert_backend)
@@ -858,7 +858,7 @@ Result<void> ModelLoader::configure_expert_cache()
     return {};
 }
 
-Result<void> ModelLoader::configure_resident_expert_backend()
+Result<void> ModelLoader::configure_resident()
 {
     if (opt.hybrid_mode != HybridMode::HybridExperts
         || has_flag(opt.flags, OptionDisableGpuExpertExecution)
@@ -921,16 +921,16 @@ Result<void> ModelLoader::configure_resident_expert_backend()
                     || ((quantized(gate_up) || quantized(down) || (up && quantized(*up)))
                         && support_vulkan_expert(expert, gate_up, down, model.opt.optimization_flags, up)))
                 {
-                    const uint64_t bytes = native_quantized_expert_storage_bytes(gate_up, up, down,
-                                                                                 device_indices[device],
-                                                                                 model.vulkan_runtime,
-                                                                                 model.opt.optimization_flags,
-                                                                                 (up ? expert.gate_bias : expert.gate_up_bias) == invalid_tensor_handle
-                                                                                     ? nullptr
-                                                                                     : &model.weights.at(up ? expert.gate_bias : expert.gate_up_bias),
-                                                                                 expert.up_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.up_bias),
-                                                                                 expert.down_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.down_bias),
-                                                                                 expert.activation, expert.activation_limit);
+                    const uint64_t bytes = quant_expert_bytes(gate_up, up, down,
+                                                              device_indices[device],
+                                                              model.vulkan_runtime,
+                                                              model.opt.optimization_flags,
+                                                              (up ? expert.gate_bias : expert.gate_up_bias) == invalid_tensor_handle
+                                                                  ? nullptr
+                                                                  : &model.weights.at(up ? expert.gate_bias : expert.gate_up_bias),
+                                                              expert.up_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.up_bias),
+                                                              expert.down_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.down_bias),
+                                                              expert.activation, expert.activation_limit);
                     // A storage size of zero also denotes an unsupported
                     // device/dtype combination. Keep its CPU implementation.
                     if (bytes == 0)
@@ -1016,8 +1016,8 @@ Result<void> ModelLoader::configure_resident_expert_backend()
                                                             gpu_infos, model);
             if (available.size() != 1)
                 continue;
-            cache_sizes[index] = native_quantized_gpu_cache_size(available.front(), total_sizes[device],
-                                                                 max_pair_sizes[device]);
+            cache_sizes[index] = quant_cache_size(available.front(), total_sizes[device],
+                                                  max_pair_sizes[device]);
         }
     }
 
@@ -1051,8 +1051,8 @@ Result<void> ModelLoader::configure_resident_expert_backend()
         group_device_indices.push_back(layer.vulkan_device_index);
     for (const CompiledLayerPlan& layer : model.speculative.graph.layer_plans)
         group_device_indices.push_back(layer.vulkan_device_index);
-    model.expert_backend = create_multi_device_expert_backend(std::move(backends), std::move(cache_devices),
-                                                              std::move(group_device_indices));
+    model.expert_backend = create_multi_device(std::move(backends), std::move(cache_devices),
+                                               std::move(group_device_indices));
     if (!model.expert_backend)
         return Error{ErrorCode::UnsupportedModel, "cannot create the Vulkan quantized Expert execution backend"};
     model.opt.expert_gpu_cache_size = total_cache_size;
@@ -1102,7 +1102,7 @@ Result<void> ModelLoader::load(const std::filesystem::path& model_path)
         ret = configure_expert_cache();
         if (!ret)
             return ret.error();
-        ret = configure_resident_expert_backend();
+        ret = configure_resident();
         if (!ret)
             return ret.error();
     }

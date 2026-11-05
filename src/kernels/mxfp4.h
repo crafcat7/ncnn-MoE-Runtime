@@ -139,7 +139,7 @@ struct Mxfp4Q8PackedMatrix
 // True only when the current ISA has a tuned implementation for the
 // interleaved layout.  Keeping this separate from the packer lets callers
 // cache the sidecar without accidentally selecting a slower fallback.
-[[nodiscard]] bool mxfp4_q8_packed_kernel_available() noexcept;
+[[nodiscard]] bool mxfp4_q8_ready() noexcept;
 
 // Reorders row-major MXFP4 weights (16 bytes and one E8M0 scale per 32-value
 // block) into persistent 4x4 or 8x8 interleaved blocks.  The source buffers

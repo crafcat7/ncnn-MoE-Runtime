@@ -74,17 +74,17 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
     const ActivationBuffer* attention_input = &hidden;
     if (multiplier > 1)
     {
-        auto mixed = forward_hyper_connection_pre(hidden,
-                                                  model.weights.at(layer.hyper_connection.attention_function),
-                                                  model.weights.at(layer.hyper_connection.attention_scale),
-                                                  model.weights.at(layer.hyper_connection.attention_base),
-                                                  multiplier,
-                                                  model.descriptor.hyper_connection_iterations,
-                                                  model.descriptor.norm_epsilon,
-                                                  model.descriptor.hyper_connection_epsilon,
-                                                  attention_mix,
-                                                  hyper_connection_scratch,
-                                                  model.opt.optimization_flags);
+        auto mixed = hc_pre(hidden,
+                            model.weights.at(layer.hyper_connection.attention_function),
+                            model.weights.at(layer.hyper_connection.attention_scale),
+                            model.weights.at(layer.hyper_connection.attention_base),
+                            multiplier,
+                            model.descriptor.hyper_connection_iterations,
+                            model.descriptor.norm_epsilon,
+                            model.descriptor.hyper_connection_epsilon,
+                            attention_mix,
+                            hyper_connection_scratch,
+                            model.opt.optimization_flags);
         if (!mixed)
             return mixed.error();
         attention_input = &attention_mix.reduced;
@@ -121,11 +121,11 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
             return attention.error();
         if (multiplier > 1)
         {
-            auto connected = forward_hyper_connection_post(attention_scratch.output,
-                                                           hidden,
-                                                           attention_mix,
-                                                           multiplier,
-                                                           scratch.staged_output);
+            auto connected = hc_post(attention_scratch.output,
+                                     hidden,
+                                     attention_mix,
+                                     multiplier,
+                                     scratch.staged_output);
             if (!connected)
                 return connected.error();
             hidden.swap(scratch.staged_output);
@@ -139,17 +139,17 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
     const MoeBlockPlan& moe = layer.moe;
     if (multiplier > 1)
     {
-        auto mixed = forward_hyper_connection_pre(hidden,
-                                                  model.weights.at(layer.hyper_connection.ffn_function),
-                                                  model.weights.at(layer.hyper_connection.ffn_scale),
-                                                  model.weights.at(layer.hyper_connection.ffn_base),
-                                                  multiplier,
-                                                  model.descriptor.hyper_connection_iterations,
-                                                  model.descriptor.norm_epsilon,
-                                                  model.descriptor.hyper_connection_epsilon,
-                                                  layer_state.ffn_hyper_mix,
-                                                  hyper_connection_scratch,
-                                                  model.opt.optimization_flags);
+        auto mixed = hc_pre(hidden,
+                            model.weights.at(layer.hyper_connection.ffn_function),
+                            model.weights.at(layer.hyper_connection.ffn_scale),
+                            model.weights.at(layer.hyper_connection.ffn_base),
+                            multiplier,
+                            model.descriptor.hyper_connection_iterations,
+                            model.descriptor.norm_epsilon,
+                            model.descriptor.hyper_connection_epsilon,
+                            layer_state.ffn_hyper_mix,
+                            hyper_connection_scratch,
+                            model.opt.optimization_flags);
         if (!mixed)
             return mixed.error();
         forward_rms_norm(layer_state.ffn_hyper_mix.reduced, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset);
@@ -256,11 +256,11 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
         add_batch_inplace(moe_output, layer_state.shared_expert_output);
     if (multiplier > 1)
     {
-        auto connected = forward_hyper_connection_post(moe_output,
-                                                       hidden,
-                                                       layer_state.ffn_hyper_mix,
-                                                       multiplier,
-                                                       scratch.staged_output);
+        auto connected = hc_post(moe_output,
+                                 hidden,
+                                 layer_state.ffn_hyper_mix,
+                                 multiplier,
+                                 scratch.staged_output);
         if (!connected)
             return connected.error();
         hidden.swap(scratch.staged_output);
@@ -764,16 +764,16 @@ Result<void> propose_speculative(const CompiledModel& model, int32_t input_id, S
             return executed.error();
     }
 
-    auto headed = forward_hyper_connection_head(hidden,
-                                                model.weights.at(model.speculative.hyper_head_function),
-                                                model.weights.at(model.speculative.hyper_head_scale),
-                                                model.weights.at(model.speculative.hyper_head_base),
-                                                model.descriptor.hyper_connection_multiplier,
-                                                model.descriptor.norm_epsilon,
-                                                model.descriptor.hyper_connection_epsilon,
-                                                state.expert_scratch.staged_output,
-                                                state.hyper_connection_scratch,
-                                                model.opt.optimization_flags);
+    auto headed = hc_head(hidden,
+                          model.weights.at(model.speculative.hyper_head_function),
+                          model.weights.at(model.speculative.hyper_head_scale),
+                          model.weights.at(model.speculative.hyper_head_base),
+                          model.descriptor.hyper_connection_multiplier,
+                          model.descriptor.norm_epsilon,
+                          model.descriptor.hyper_connection_epsilon,
+                          state.expert_scratch.staged_output,
+                          state.hyper_connection_scratch,
+                          model.opt.optimization_flags);
     if (!headed)
         return headed.error();
     forward_rms_norm(state.expert_scratch.staged_output,

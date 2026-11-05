@@ -36,23 +36,23 @@ float optional_manifest_float(const std::string& json, const std::string& key, f
 [[nodiscard]] Result<bool> optional_artifact_exists(const std::filesystem::path& path,
                                                     const char* description);
 
-[[nodiscard]] Result<void> validate_mxfp4_artifact_identity(const SafetensorsArchive& archive,
-                                                            const ModelPackage& package,
-                                                            const char* identity_prefix,
-                                                            uint32_t layer_count,
-                                                            uint32_t mtp_layer_count,
-                                                            uint32_t expert_count,
-                                                            uint32_t hidden_size,
-                                                            uint32_t intermediate_size,
-                                                            const char* identity_description,
-                                                            const char* artifact_description);
+[[nodiscard]] Result<void> validate_artifact_id(const SafetensorsArchive& archive,
+                                                const ModelPackage& package,
+                                                const char* identity_prefix,
+                                                uint32_t layer_count,
+                                                uint32_t mtp_layer_count,
+                                                uint32_t expert_count,
+                                                uint32_t hidden_size,
+                                                uint32_t intermediate_size,
+                                                const char* identity_description,
+                                                const char* artifact_description);
 
-[[nodiscard]] Result<void> validate_mxfp4_artifact_expert_bank(const SafetensorsArchive& archive,
-                                                               const std::string& prefix,
-                                                               uint32_t expert_count,
-                                                               uint32_t hidden_size,
-                                                               uint32_t intermediate_size,
-                                                               const char* description);
+[[nodiscard]] Result<void> validate_artifact_bank(const SafetensorsArchive& archive,
+                                                  const std::string& prefix,
+                                                  uint32_t expert_count,
+                                                  uint32_t hidden_size,
+                                                  uint32_t intermediate_size,
+                                                  const char* description);
 
 [[nodiscard]] Result<void> add_tensor(WeightMapping& mapping,
                                       const SafetensorsArchive& archive,

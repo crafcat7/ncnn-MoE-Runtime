@@ -1917,22 +1917,22 @@ static uint64_t minimum_gpu_expert_reserve(const CompiledModel& compiled, uint32
                                            ? &compiled.weights.at(expert.up_weight)
                                            : nullptr;
                 const TensorHandle gate_bias = up ? expert.gate_bias : expert.gate_up_bias;
-                const uint64_t bytes = native_quantized_expert_storage_bytes(compiled.weights.at(gate), up,
-                                                                             compiled.weights.at(expert.down_weight), device_index, compiled.vulkan_runtime, compiled.opt.optimization_flags,
-                                                                             gate_bias == invalid_tensor_handle ? nullptr : &compiled.weights.at(gate_bias),
-                                                                             expert.up_bias == invalid_tensor_handle ? nullptr : &compiled.weights.at(expert.up_bias),
-                                                                             expert.down_bias == invalid_tensor_handle ? nullptr : &compiled.weights.at(expert.down_bias),
-                                                                             expert.activation, expert.activation_limit);
+                const uint64_t bytes = quant_expert_bytes(compiled.weights.at(gate), up,
+                                                          compiled.weights.at(expert.down_weight), device_index, compiled.vulkan_runtime, compiled.opt.optimization_flags,
+                                                          gate_bias == invalid_tensor_handle ? nullptr : &compiled.weights.at(gate_bias),
+                                                          expert.up_bias == invalid_tensor_handle ? nullptr : &compiled.weights.at(expert.up_bias),
+                                                          expert.down_bias == invalid_tensor_handle ? nullptr : &compiled.weights.at(expert.down_bias),
+                                                          expert.activation, expert.activation_limit);
                 largest = std::max(largest, bytes);
             }
             required = std::max(required, saturating_multiply_u64(largest, layer.moe.top_k));
             if (layer.dense_ffn.use_gpu_cache)
             {
                 const ExpertPlan& ffn = layer.dense_ffn;
-                const uint64_t bytes = native_quantized_expert_storage_bytes(compiled.weights.at(ffn.gate_weight),
-                                                                             &compiled.weights.at(ffn.up_weight), compiled.weights.at(ffn.down_weight), device_index,
-                                                                             compiled.vulkan_runtime, compiled.opt.optimization_flags, nullptr, nullptr, nullptr,
-                                                                             ffn.activation, ffn.activation_limit);
+                const uint64_t bytes = quant_expert_bytes(compiled.weights.at(ffn.gate_weight),
+                                                          &compiled.weights.at(ffn.up_weight), compiled.weights.at(ffn.down_weight), device_index,
+                                                          compiled.vulkan_runtime, compiled.opt.optimization_flags, nullptr, nullptr, nullptr,
+                                                          ffn.activation, ffn.activation_limit);
                 required = std::max(required, bytes);
             }
         }
@@ -2038,11 +2038,11 @@ static uint64_t expert_wave_workspace_size(const CompiledModel& model, uint32_t 
                                            ? &model.weights.at(expert.up_weight)
                                            : nullptr;
                 const TensorHandle gate_bias = up ? expert.gate_bias : expert.gate_up_bias;
-                if (native_quantized_expert_storage_bytes(input, up, down, device, model.vulkan_runtime, model.opt.optimization_flags,
-                                                          gate_bias == invalid_tensor_handle ? nullptr : &model.weights.at(gate_bias),
-                                                          expert.up_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.up_bias),
-                                                          expert.down_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.down_bias),
-                                                          expert.activation, expert.activation_limit)
+                if (quant_expert_bytes(input, up, down, device, model.vulkan_runtime, model.opt.optimization_flags,
+                                       gate_bias == invalid_tensor_handle ? nullptr : &model.weights.at(gate_bias),
+                                       expert.up_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.up_bias),
+                                       expert.down_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.down_bias),
+                                       expert.activation, expert.activation_limit)
                     == 0) return;
                 const uint64_t tokens = SessionOptions{}.prefill_chunk_size;
                 const uint64_t routes = saturating_multiply_u64(tokens, std::max(1u, top_k));
@@ -2355,10 +2355,10 @@ static GpuResourceRequest ffn_resource_request(const CompiledModel& model, const
     {
         // Native FFNs own their complete projection chain; its physical
         // allocations can differ from three independently prepared linears.
-        size = native_quantized_expert_storage_bytes(model.weights.at(ffn.gate_weight),
-                                                     &model.weights.at(ffn.up_weight), model.weights.at(ffn.down_weight),
-                                                     device, model.vulkan_runtime, model.opt.optimization_flags,
-                                                     nullptr, nullptr, nullptr, ffn.activation, ffn.activation_limit);
+        size = quant_expert_bytes(model.weights.at(ffn.gate_weight),
+                                  &model.weights.at(ffn.up_weight), model.weights.at(ffn.down_weight),
+                                  device, model.vulkan_runtime, model.opt.optimization_flags,
+                                  nullptr, nullptr, nullptr, ffn.activation, ffn.activation_limit);
     }
     if (size == 0)
     {
@@ -2378,7 +2378,7 @@ static GpuResourceRequest ffn_resource_request(const CompiledModel& model, const
     return {size, 0, saturating_multiply_u64(saturating_multiply_u64(rows, columns), sizeof(float))};
 }
 
-static bool complete_ffn_kernel_supported(const CompiledModel& model, const CompiledLayerPlan& layer)
+static bool ffn_kernel_ready(const CompiledModel& model, const CompiledLayerPlan& layer)
 {
     const ExpertPlan& ffn = layer.dense_ffn;
     const TensorData& gate = model.weights.at(ffn.gate_weight);
@@ -2388,8 +2388,8 @@ static bool complete_ffn_kernel_supported(const CompiledModel& model, const Comp
         && (ffn.activation == ExpertActivation::Silu || ffn.activation == ExpertActivation::DeepSeekSwiGlu)
         && up.shape.size() == 2 && up.shape[0] % 128 == 0)
         return true;
-    if (native_quantized_expert_storage_bytes(gate, &up, down, layer.vulkan_device_index,
-                                              model.vulkan_runtime, model.opt.optimization_flags, nullptr, nullptr, nullptr, ffn.activation, ffn.activation_limit)
+    if (quant_expert_bytes(gate, &up, down, layer.vulkan_device_index,
+                           model.vulkan_runtime, model.opt.optimization_flags, nullptr, nullptr, nullptr, ffn.activation, ffn.activation_limit)
         != 0)
         return true;
     const uint64_t alignment = gpu_buffer_alignment(model, layer.vulkan_device_index);
@@ -2524,7 +2524,7 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
             ExpertPlan& ffn = layer.dense_ffn;
             if (ffn.down_weight == invalid_tensor_handle
                 || (ffn.use_gpu_cache && resources.explicit_cache_reserve(layer.vulkan_device_index))
-                || !complete_ffn_kernel_supported(compiled, layer)) continue;
+                || !ffn_kernel_ready(compiled, layer)) continue;
             const bool cached = ffn.use_gpu_cache;
             const GpuResourceRequest request = ffn_resource_request(compiled, layer, false);
             auto prepared = prepare_resource_group(compiled, resources, layer.vulkan_device_index, request, &layer, "dense FFN at layer " + std::to_string(layer.layer_id), [&] { return prepare_ffn_operators(compiled.weights, compiled.operators, layer.dense_ffn,

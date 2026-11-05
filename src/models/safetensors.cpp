@@ -29,7 +29,7 @@ struct SourceQuantizationConfig
     bool symmetric = true;
 };
 
-static std::string lowercase_quantization_string(std::string value)
+static std::string lower_quant(std::string value)
 {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
         return static_cast<char>(std::tolower(character));
@@ -37,7 +37,7 @@ static std::string lowercase_quantization_string(std::string value)
     return value;
 }
 
-static Result<SourceQuantizationConfig> parse_source_quantization_config(std::string_view json)
+static Result<SourceQuantizationConfig> parse_quant_config(std::string_view json)
 {
     if (json.empty() || json.front() != '{')
         return Error{ErrorCode::InvalidModel, "quantization_config must be an object"};
@@ -45,7 +45,7 @@ static Result<SourceQuantizationConfig> parse_source_quantization_config(std::st
     const auto method = json_string(json, "quant_method");
     if (!method)
         return config;
-    config.method = lowercase_quantization_string(*method);
+    config.method = lower_quant(*method);
     if (config.method != "awq" && config.method != "gptq")
     {
         config.method.clear();
@@ -84,7 +84,7 @@ static Result<SourceQuantizationConfig> parse_source_quantization_config(std::st
     }
     if (config.method == "awq")
     {
-        if ((find_manifest_member(json, "version") && (!json_string(json, "version") || lowercase_quantization_string(*json_string(json, "version")) != "gemm"))
+        if ((find_manifest_member(json, "version") && (!json_string(json, "version") || lower_quant(*json_string(json, "version")) != "gemm"))
             || (find_manifest_member(json, "zero_point") && json_boolean(json, "zero_point") != true))
         {
             return Error{ErrorCode::UnsupportedModel, "only asymmetric AWQ GEMM checkpoints are supported"};
@@ -93,7 +93,7 @@ static Result<SourceQuantizationConfig> parse_source_quantization_config(std::st
     else
     {
         if (find_manifest_member(json, "checkpoint_format")
-            && (!json_string(json, "checkpoint_format") || lowercase_quantization_string(*json_string(json, "checkpoint_format")) != "gptq"))
+            && (!json_string(json, "checkpoint_format") || lower_quant(*json_string(json, "checkpoint_format")) != "gptq"))
         {
             return Error{ErrorCode::UnsupportedModel, "only legacy GPTQ checkpoints are supported; GPTQ v2/Marlin are unsupported"};
         }
@@ -113,7 +113,7 @@ static Result<SourceQuantizationConfig> parse_source_quantization_config(std::st
     return config;
 }
 
-static Result<SourceQuantizationConfig> read_source_quantization_config(const std::filesystem::path& root, std::string_view manifest_json)
+static Result<SourceQuantizationConfig> read_quant_config(const std::filesystem::path& root, std::string_view manifest_json)
 {
     const std::filesystem::path path = root / "config.json";
     std::string owned_json;
@@ -147,12 +147,12 @@ static Result<SourceQuantizationConfig> read_source_quantization_config(const st
     const auto selected = outer && *outer != "null" ? outer : inner;
     if (!selected || *selected == "null")
         return SourceQuantizationConfig{};
-    auto config = parse_source_quantization_config(*selected);
+    auto config = parse_quant_config(*selected);
     if (!config)
         return config.error();
     if (outer && *outer != "null" && inner && *inner != "null")
     {
-        auto nested = parse_source_quantization_config(*inner);
+        auto nested = parse_quant_config(*inner);
         if (!nested)
             return nested.error();
         if (config.value().method != nested.value().method || config.value().group_size != nested.value().group_size
@@ -432,7 +432,7 @@ Result<SafetensorsArchive> SafetensorsArchive::open(const std::filesystem::path&
     }
     if (archive.tensors.empty())
         return Error{ErrorCode::InvalidModel, "model directory contains no safetensors tensors"};
-    auto config = read_source_quantization_config(root, manifest_json);
+    auto config = read_quant_config(root, manifest_json);
     if (!config)
         return config.error();
     archive.quant_method = config.value().method;
@@ -1937,9 +1937,9 @@ Result<TensorData> SafetensorsArchive::load_mxfp4_tensor(const std::string& bloc
     return tensor;
 }
 
-Result<TensorData> SafetensorsArchive::load_interleaved_mxfp4_tensor(const std::string& gate_blocks_name, const std::string& gate_scales_name,
-                                                                     const std::string& up_blocks_name, const std::string& up_scales_name,
-                                                                     uint32_t rows, uint32_t columns, uint32_t flags) const
+Result<TensorData> SafetensorsArchive::load_mxfp4(const std::string& gate_blocks_name, const std::string& gate_scales_name,
+                                                  const std::string& up_blocks_name, const std::string& up_scales_name,
+                                                  uint32_t rows, uint32_t columns, uint32_t flags) const
 {
     if (rows == 0 || columns == 0 || rows > std::numeric_limits<uint32_t>::max() / 2
         || columns % 32 != 0)

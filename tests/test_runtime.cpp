@@ -2876,7 +2876,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             check_near(packed_q8_projected.row(input_row)[matrix_row], unpacked_q8_projected.row(input_row)[matrix_row], 0.15f);
             check_near(owner_packed_q8_projected.row(input_row)[matrix_row], packed_q8_projected.row(input_row)[matrix_row], 0.15f);
         }
-    if (mxfp4_q8_packed_kernel_available())
+    if (mxfp4_q8_ready())
         check(static_cast<bool>(packed_owner.mxfp4_q8_packed));
     const std::shared_ptr<const Mxfp4Q8PackedMatrix> packed_owner_sidecar = packed_owner.mxfp4_q8_packed;
     ActivationBuffer owner_packed_q8_projected_again;
@@ -3008,7 +3008,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             check_near(biased_owner_output.row(input_row)[matrix_row],
                        biased_reference.row(input_row)[matrix_row],
                        0.15f);
-    if (mxfp4_q8_packed_kernel_available())
+    if (mxfp4_q8_ready())
         check(static_cast<bool>(biased_owner.mxfp4_q8_packed));
     const std::shared_ptr<const Mxfp4Q8PackedMatrix> biased_owner_sidecar = biased_owner.mxfp4_q8_packed;
     ActivationBuffer biased_owner_output_again;
@@ -4301,11 +4301,11 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
         {
             // A scan in one layer must evict an unused Recent entry in
             // another layer before evicting that layer's reused Experts.
-            const uint64_t pair_size = native_quantized_expert_storage_bytes(*backend_gate_up, nullptr, *backend_down,
-                                                                             automatic_vulkan_device_index,
-                                                                             vulkan_runtime, backend_optimization_flags,
-                                                                             &expert_gate_up_bias, nullptr, &expert_down_bias,
-                                                                             ExpertActivation::GptOssSwiGlu, expert_activation_limit);
+            const uint64_t pair_size = quant_expert_bytes(*backend_gate_up, nullptr, *backend_down,
+                                                          automatic_vulkan_device_index,
+                                                          vulkan_runtime, backend_optimization_flags,
+                                                          &expert_gate_up_bias, nullptr, &expert_down_bias,
+                                                          ExpertActivation::GptOssSwiGlu, expert_activation_limit);
             check(pair_size != 0);
             auto arc_backend = create_vulkan_expert_backend(pair_size * 3,
                                                             automatic_vulkan_device_index,
@@ -5597,7 +5597,7 @@ void test_ncnn_vulkan_qnk_expert_operator()
     const auto check_batch = [&vulkan_runtime](const TensorData& gate, const TensorData* up, const TensorData& down,
                                                const ActivationBuffer& batch_input, const ActivationBuffer& expected, uint64_t flags,
                                                uint64_t dispatches, uint64_t int4_dispatches, float tolerance) {
-        const uint64_t size = native_quantized_expert_storage_bytes(gate, up, down, automatic_vulkan_device_index, vulkan_runtime, flags);
+        const uint64_t size = quant_expert_bytes(gate, up, down, automatic_vulkan_device_index, vulkan_runtime, flags);
         check(size != 0);
         auto backend = create_vulkan_expert_backend(size + 4096, automatic_vulkan_device_index, nullptr, vulkan_runtime, flags);
         check(static_cast<bool>(backend));
@@ -5739,13 +5739,13 @@ void test_ncnn_vulkan_qnk_expert_operator()
           == QnkLinear_vulkan::storage_bytes(gate_up, alignment));
     check(QnkLinear_vulkan::storage_bytes(metadata_down, alignment)
           == QnkLinear_vulkan::storage_bytes(down, alignment));
-    const uint64_t metadata_size = native_quantized_expert_storage_bytes(metadata_gate_up,
-                                                                         nullptr,
-                                                                         metadata_down,
-                                                                         automatic_vulkan_device_index,
-                                                                         vulkan_runtime,
-                                                                         g_test_optimization_flags | OptimizationVulkanQnK);
-    check(metadata_size == native_quantized_expert_storage_bytes(gate_up, nullptr, down, automatic_vulkan_device_index, vulkan_runtime, g_test_optimization_flags | OptimizationVulkanQnK));
+    const uint64_t metadata_size = quant_expert_bytes(metadata_gate_up,
+                                                      nullptr,
+                                                      metadata_down,
+                                                      automatic_vulkan_device_index,
+                                                      vulkan_runtime,
+                                                      g_test_optimization_flags | OptimizationVulkanQnK);
+    check(metadata_size == quant_expert_bytes(gate_up, nullptr, down, automatic_vulkan_device_index, vulkan_runtime, g_test_optimization_flags | OptimizationVulkanQnK));
     check(static_cast<bool>(!QnkExpert_vulkan::create(metadata_gate_up,
                                                       nullptr,
                                                       metadata_down,
@@ -5760,12 +5760,12 @@ void test_ncnn_vulkan_qnk_expert_operator()
     --invalid_storage->blocks_size;
     invalid_metadata.mxfp4_file_storage = std::move(invalid_storage);
     check(QnkLinear_vulkan::storage_bytes(invalid_metadata, alignment) == 0);
-    check(native_quantized_expert_storage_bytes(invalid_metadata,
-                                                nullptr,
-                                                metadata_down,
-                                                automatic_vulkan_device_index,
-                                                vulkan_runtime,
-                                                g_test_optimization_flags | OptimizationVulkanQnK)
+    check(quant_expert_bytes(invalid_metadata,
+                             nullptr,
+                             metadata_down,
+                             automatic_vulkan_device_index,
+                             vulkan_runtime,
+                             g_test_optimization_flags | OptimizationVulkanQnK)
           == 0);
 
     const auto metadata_backend = create_vulkan_expert_backend(metadata_size + 4096,
@@ -6812,13 +6812,13 @@ void test_safetensors_packed_mxfp4_expert()
     {
         auto tensor = matrix_archive.value().load_mxfp4_tensor("blocks", "scales", 1, 32, flags);
         check(static_cast<bool>(tensor));
-        auto interleaved = matrix_archive.value().load_interleaved_mxfp4_tensor("blocks", "scales", "blocks", "scales", 1, 32, flags);
+        auto interleaved = matrix_archive.value().load_mxfp4("blocks", "scales", "blocks", "scales", 1, 32, flags);
         check(static_cast<bool>(interleaved));
         check(interleaved.value().shape == std::vector<uint32_t>({2, 32}));
         check_invalid(matrix_archive.value().load_mxfp4_tensor("blocks", "scales", 2, 32, flags));
-        check_invalid(matrix_archive.value().load_interleaved_mxfp4_tensor("blocks", "scales", "blocks", "scales", 2, 32, flags));
+        check_invalid(matrix_archive.value().load_mxfp4("blocks", "scales", "blocks", "scales", 2, 32, flags));
         check_invalid(matrix_archive.value().load_mxfp4_expert("expert_blocks", "expert_scales", 2, 1, 32, flags));
-        check_invalid(matrix_archive.value().load_interleaved_mxfp4_tensor("blocks", "scales", "blocks", "scales", std::numeric_limits<uint32_t>::max() / 2 + 1, 32, flags));
+        check_invalid(matrix_archive.value().load_mxfp4("blocks", "scales", "blocks", "scales", std::numeric_limits<uint32_t>::max() / 2 + 1, 32, flags));
     }
 
     std::error_code ignored;
@@ -13206,17 +13206,17 @@ void test_deepseek_router_and_hyper_connection_kernels()
     scale.float32_data.resize(3, 0.0f);
     HyperConnectionMix mixed;
     HyperConnectionScratch hyper_scratch;
-    auto mixed_result = forward_hyper_connection_pre(hyper_input,
-                                                     function,
-                                                     scale,
-                                                     base,
-                                                     2,
-                                                     2,
-                                                     1e-6f,
-                                                     1e-6f,
-                                                     mixed,
-                                                     hyper_scratch,
-                                                     g_test_optimization_flags);
+    auto mixed_result = hc_pre(hyper_input,
+                               function,
+                               scale,
+                               base,
+                               2,
+                               2,
+                               1e-6f,
+                               1e-6f,
+                               mixed,
+                               hyper_scratch,
+                               g_test_optimization_flags);
     check(static_cast<bool>(mixed_result));
     check_near(mixed.reduced.row(0)[0], 3.000006f, 1e-4f);
 
@@ -13228,32 +13228,32 @@ void test_deepseek_router_and_hyper_connection_kernels()
     float8_function.quantization_scales = {1.0f};
     HyperConnectionMix float8_mix;
     HyperConnectionScratch float8_scratch;
-    auto float8_pre = forward_hyper_connection_pre(hyper_input,
-                                                   float8_function,
-                                                   scale,
-                                                   base,
-                                                   2,
-                                                   2,
-                                                   1e-6f,
-                                                   1e-6f,
-                                                   float8_mix,
-                                                   float8_scratch,
-                                                   g_test_optimization_flags);
+    auto float8_pre = hc_pre(hyper_input,
+                             float8_function,
+                             scale,
+                             base,
+                             2,
+                             2,
+                             1e-6f,
+                             1e-6f,
+                             float8_mix,
+                             float8_scratch,
+                             g_test_optimization_flags);
     check(static_cast<bool>(float8_pre));
     const std::byte* auxiliary_storage = float8_scratch.auxiliary.bytes().data();
     const uint64_t auxiliary_capacity = float8_scratch.auxiliary.allocated_bytes();
     check(auxiliary_capacity >= 2 * sizeof(float));
-    float8_pre = forward_hyper_connection_pre(hyper_input,
-                                              float8_function,
-                                              scale,
-                                              base,
-                                              2,
-                                              2,
-                                              1e-6f,
-                                              1e-6f,
-                                              float8_mix,
-                                              float8_scratch,
-                                              g_test_optimization_flags);
+    float8_pre = hc_pre(hyper_input,
+                        float8_function,
+                        scale,
+                        base,
+                        2,
+                        2,
+                        1e-6f,
+                        1e-6f,
+                        float8_mix,
+                        float8_scratch,
+                        g_test_optimization_flags);
     check(static_cast<bool>(float8_pre));
     check(float8_scratch.auxiliary.bytes().data() == auxiliary_storage);
     check(float8_scratch.auxiliary.allocated_bytes() == auxiliary_capacity);
@@ -13267,17 +13267,17 @@ void test_deepseek_router_and_hyper_connection_kernels()
     int8_function.quantization_scales.assign(8, 1.0f);
     HyperConnectionMix int8_mix;
     HyperConnectionScratch int8_scratch;
-    auto int8_pre = forward_hyper_connection_pre(hyper_input,
-                                                 int8_function,
-                                                 scale,
-                                                 base,
-                                                 2,
-                                                 2,
-                                                 1e-6f,
-                                                 1e-6f,
-                                                 int8_mix,
-                                                 int8_scratch,
-                                                 g_test_optimization_flags);
+    auto int8_pre = hc_pre(hyper_input,
+                           int8_function,
+                           scale,
+                           base,
+                           2,
+                           2,
+                           1e-6f,
+                           1e-6f,
+                           int8_mix,
+                           int8_scratch,
+                           g_test_optimization_flags);
     check(static_cast<bool>(int8_pre));
     for (size_t index = 0; index < mixed.reduced.values().size(); ++index)
         check_near(int8_mix.reduced.values()[index], mixed.reduced.values()[index], 1e-5f);
@@ -13286,23 +13286,23 @@ void test_deepseek_router_and_hyper_connection_kernels()
 
     TensorData malformed_function = function;
     malformed_function.shape.clear();
-    auto invalid_function = forward_hyper_connection_pre(hyper_input, malformed_function, scale, base,
-                                                         2, 2, 1e-6f, 1e-6f, mixed, hyper_scratch, g_test_optimization_flags);
+    auto invalid_function = hc_pre(hyper_input, malformed_function, scale, base,
+                                   2, 2, 1e-6f, 1e-6f, mixed, hyper_scratch, g_test_optimization_flags);
     check(!invalid_function);
     check(invalid_function.error().code == ErrorCode::InvalidModel);
     check(invalid_function.error().message == "invalid hyper-connection function tensor");
 
     malformed_function.shape = {4, 4};
-    auto invalid_function_dimensions = forward_hyper_connection_pre(hyper_input, malformed_function, scale, base,
-                                                                    2, 2, 1e-6f, 1e-6f, mixed, hyper_scratch, g_test_optimization_flags);
+    auto invalid_function_dimensions = hc_pre(hyper_input, malformed_function, scale, base,
+                                              2, 2, 1e-6f, 1e-6f, mixed, hyper_scratch, g_test_optimization_flags);
     check(!invalid_function_dimensions);
     check(invalid_function_dimensions.error().code == ErrorCode::InvalidModel);
     check(invalid_function_dimensions.error().message == "invalid hyper-connection function tensor");
 
     TensorData malformed_base = base;
     malformed_base.shape = {8, 1};
-    auto invalid_base = forward_hyper_connection_pre(hyper_input, function, scale, malformed_base,
-                                                     2, 2, 1e-6f, 1e-6f, mixed, hyper_scratch, g_test_optimization_flags);
+    auto invalid_base = hc_pre(hyper_input, function, scale, malformed_base,
+                               2, 2, 1e-6f, 1e-6f, mixed, hyper_scratch, g_test_optimization_flags);
     check(!invalid_base);
     check(invalid_base.error().code == ErrorCode::InvalidModel);
     check(invalid_base.error().message == "invalid hyper-connection base tensor");
@@ -13310,7 +13310,7 @@ void test_deepseek_router_and_hyper_connection_kernels()
     ActivationBuffer branch(1, 1);
     branch.row(0)[0] = 10.0f;
     ActivationBuffer connected_output;
-    auto connected = forward_hyper_connection_post(branch, hyper_input, mixed, 2, connected_output);
+    auto connected = hc_post(branch, hyper_input, mixed, 2, connected_output);
     check(static_cast<bool>(connected));
     check_near(connected_output.row(0)[0], 13.0f, 1e-3f);
     check_near(connected_output.row(0)[1], 13.0f, 1e-3f);
@@ -13318,7 +13318,7 @@ void test_deepseek_router_and_hyper_connection_kernels()
     directed_mix.post = {0.0f, 0.0f};
     directed_mix.combine = {1.0f, 2.0f, 3.0f, 4.0f};
     branch.row(0)[0] = 0.0f;
-    connected = forward_hyper_connection_post(branch, hyper_input, directed_mix, 2, connected_output);
+    connected = hc_post(branch, hyper_input, directed_mix, 2, connected_output);
     check(static_cast<bool>(connected));
     check_near(connected_output.row(0)[0], 14.0f, 1e-5f);
     check_near(connected_output.row(0)[1], 20.0f, 1e-5f);
@@ -13336,17 +13336,17 @@ void test_deepseek_router_and_hyper_connection_kernels()
         5.0f, 6.0f, 7.0f, 8.0f,
         9.0f, 10.0f, 11.0f, 12.0f,
         13.0f, 14.0f, 15.0f, 16.0f};
-    connected = forward_hyper_connection_post(four_way_branch, four_way_residual, four_way_mix, 4, connected_output);
+    connected = hc_post(four_way_branch, four_way_residual, four_way_mix, 4, connected_output);
     check(static_cast<bool>(connected));
     const std::array<float, 8> four_way_expected = {162.0f, 200.0f, 188.0f, 240.0f, 214.0f, 280.0f, 240.0f, 320.0f};
     for (size_t index = 0; index < four_way_expected.size(); ++index)
         check_near(connected_output.row(0)[index], four_way_expected[index], 1e-4f);
 
-    auto aliased_branch = forward_hyper_connection_post(branch, hyper_input, directed_mix, 2, branch);
+    auto aliased_branch = hc_post(branch, hyper_input, directed_mix, 2, branch);
     check(!aliased_branch);
     check(aliased_branch.error().code == ErrorCode::InvalidArgument);
     check_near(branch.row(0)[0], 0.0f, 1e-6f);
-    auto aliased_residual = forward_hyper_connection_post(branch, hyper_input, directed_mix, 2, hyper_input);
+    auto aliased_residual = hc_post(branch, hyper_input, directed_mix, 2, hyper_input);
     check(!aliased_residual);
     check(aliased_residual.error().code == ErrorCode::InvalidArgument);
     check_near(hyper_input.row(0)[0], 2.0f, 1e-6f);
@@ -13358,33 +13358,33 @@ void test_deepseek_router_and_hyper_connection_kernels()
     TensorData larger_function = function;
     larger_function.shape = {8, 4};
     larger_function.float32_data.resize(32, 0.0f);
-    auto enlarged = forward_hyper_connection_pre(larger_hyper_input,
-                                                 larger_function,
-                                                 scale,
-                                                 base,
-                                                 2,
-                                                 2,
-                                                 1e-6f,
-                                                 1e-6f,
-                                                 mixed,
-                                                 hyper_scratch,
-                                                 g_test_optimization_flags);
+    auto enlarged = hc_pre(larger_hyper_input,
+                           larger_function,
+                           scale,
+                           base,
+                           2,
+                           2,
+                           1e-6f,
+                           1e-6f,
+                           mixed,
+                           hyper_scratch,
+                           g_test_optimization_flags);
     check(static_cast<bool>(enlarged));
     const uint64_t grown_reduced_capacity = mixed.reduced.allocated_bytes();
     const uint64_t grown_normalized_capacity = hyper_scratch.normalized.allocated_bytes();
     const std::byte* grown_reduced_data = mixed.reduced.bytes().data();
     const std::byte* grown_normalized_data = hyper_scratch.normalized.bytes().data();
-    auto shrunk = forward_hyper_connection_pre(hyper_input,
-                                               function,
-                                               scale,
-                                               base,
-                                               2,
-                                               2,
-                                               1e-6f,
-                                               1e-6f,
-                                               mixed,
-                                               hyper_scratch,
-                                               g_test_optimization_flags);
+    auto shrunk = hc_pre(hyper_input,
+                         function,
+                         scale,
+                         base,
+                         2,
+                         2,
+                         1e-6f,
+                         1e-6f,
+                         mixed,
+                         hyper_scratch,
+                         g_test_optimization_flags);
     check(static_cast<bool>(shrunk));
     check(mixed.reduced.allocated_bytes() == grown_reduced_capacity);
     check(hyper_scratch.normalized.allocated_bytes() == grown_normalized_capacity);
@@ -13406,31 +13406,31 @@ void test_deepseek_router_and_hyper_connection_kernels()
     head_scale.float32_data = {0.0f};
     ActivationBuffer head_output(1, 1);
     head_output.row(0)[0] = 99.0f;
-    auto headed = forward_hyper_connection_head(hyper_input,
-                                                head_function,
-                                                head_scale,
-                                                head_base,
-                                                2,
-                                                1e-6f,
-                                                1e-6f,
-                                                head_output,
-                                                hyper_scratch,
-                                                g_test_optimization_flags);
+    auto headed = hc_head(hyper_input,
+                          head_function,
+                          head_scale,
+                          head_base,
+                          2,
+                          1e-6f,
+                          1e-6f,
+                          head_output,
+                          hyper_scratch,
+                          g_test_optimization_flags);
     check(static_cast<bool>(headed));
     check(head_output.rows() == 1);
     check(head_output.columns() == 1);
     check_near(head_output.row(0)[0], 3.000006f, 1e-4f);
     std::fill_n(head_output.row(0), head_output.columns(), 77.0f);
-    headed = forward_hyper_connection_head(hyper_input,
-                                           head_function,
-                                           head_scale,
-                                           head_base,
-                                           2,
-                                           1e-6f,
-                                           1e-6f,
-                                           head_output,
-                                           hyper_scratch,
-                                           g_test_optimization_flags);
+    headed = hc_head(hyper_input,
+                     head_function,
+                     head_scale,
+                     head_base,
+                     2,
+                     1e-6f,
+                     1e-6f,
+                     head_output,
+                     hyper_scratch,
+                     g_test_optimization_flags);
     check(static_cast<bool>(headed));
     check_near(head_output.row(0)[0], 3.000006f, 1e-4f);
 
@@ -13440,16 +13440,16 @@ void test_deepseek_router_and_hyper_connection_kernels()
     float8_head_function.quantized_data.assign(4, 0);
     float8_head_function.quantization_scales = {1.0f};
     ActivationBuffer float8_head_output;
-    auto float8_head = forward_hyper_connection_head(hyper_input,
-                                                     float8_head_function,
-                                                     head_scale,
-                                                     head_base,
-                                                     2,
-                                                     1e-6f,
-                                                     1e-6f,
-                                                     float8_head_output,
-                                                     float8_scratch,
-                                                     g_test_optimization_flags);
+    auto float8_head = hc_head(hyper_input,
+                               float8_head_function,
+                               head_scale,
+                               head_base,
+                               2,
+                               1e-6f,
+                               1e-6f,
+                               float8_head_output,
+                               float8_scratch,
+                               g_test_optimization_flags);
     check(static_cast<bool>(float8_head));
     check_near(float8_head_output.row(0)[0], 3.000006f, 1e-4f);
     check(float8_scratch.auxiliary.bytes().data() == auxiliary_storage);
@@ -13461,16 +13461,16 @@ void test_deepseek_router_and_hyper_connection_kernels()
     int8_head_function.int8_data.assign(4, 0);
     int8_head_function.quantization_scales.assign(2, 1.0f);
     ActivationBuffer int8_head_output;
-    auto int8_head = forward_hyper_connection_head(hyper_input,
-                                                   int8_head_function,
-                                                   head_scale,
-                                                   head_base,
-                                                   2,
-                                                   1e-6f,
-                                                   1e-6f,
-                                                   int8_head_output,
-                                                   int8_scratch,
-                                                   g_test_optimization_flags);
+    auto int8_head = hc_head(hyper_input,
+                             int8_head_function,
+                             head_scale,
+                             head_base,
+                             2,
+                             1e-6f,
+                             1e-6f,
+                             int8_head_output,
+                             int8_scratch,
+                             g_test_optimization_flags);
     check(static_cast<bool>(int8_head));
     check_near(int8_head_output.row(0)[0], 3.000006f, 1e-4f);
 
@@ -13483,30 +13483,30 @@ void test_deepseek_router_and_hyper_connection_kernels()
     head4_base.shape = {4};
     head4_base.float32_data.resize(4, 0.0f);
     ActivationBuffer head4_output;
-    auto headed4 = forward_hyper_connection_head(four_way_residual,
-                                                 head4_function,
-                                                 head_scale,
-                                                 head4_base,
-                                                 4,
-                                                 1e-6f,
-                                                 1e-6f,
-                                                 head4_output,
-                                                 hyper_scratch,
-                                                 g_test_optimization_flags);
+    auto headed4 = hc_head(four_way_residual,
+                           head4_function,
+                           head_scale,
+                           head4_base,
+                           4,
+                           1e-6f,
+                           1e-6f,
+                           head4_output,
+                           hyper_scratch,
+                           g_test_optimization_flags);
     check(static_cast<bool>(headed4));
     const float head4_scale = 0.500001f;
     check_near(head4_output.row(0)[0], 16.0f * head4_scale, 1e-4f);
     check_near(head4_output.row(0)[1], 20.0f * head4_scale, 1e-4f);
-    auto aliased_head = forward_hyper_connection_head(hyper_input,
-                                                      head_function,
-                                                      head_scale,
-                                                      head_base,
-                                                      2,
-                                                      1e-6f,
-                                                      1e-6f,
-                                                      hyper_input,
-                                                      hyper_scratch,
-                                                      g_test_optimization_flags);
+    auto aliased_head = hc_head(hyper_input,
+                                head_function,
+                                head_scale,
+                                head_base,
+                                2,
+                                1e-6f,
+                                1e-6f,
+                                hyper_input,
+                                hyper_scratch,
+                                g_test_optimization_flags);
     check(!aliased_head);
     check(aliased_head.error().code == ErrorCode::InvalidArgument);
     check_near(hyper_input.row(0)[0], 2.0f, 1e-6f);
@@ -15204,10 +15204,10 @@ void test_latent_attention_scratch_reuse()
     const std::array<uint64_t, 2> batch_positions{8, 8};
     const std::array<LayerCache*, 2> batch_caches{&batch_first_cache, &batch_second_cache};
     ActivationBuffer batch_output;
-    auto batch_result = forward_latent_attention_batch(weights, operators, compressed_plan,
-                                                       ExecutionBackend::Cpu, batch_positions,
-                                                       batch_caches, pair_scratch, batch_input,
-                                                       batch_output, g_test_optimization_flags);
+    auto batch_result = forward_latent_batch(weights, operators, compressed_plan,
+                                             ExecutionBackend::Cpu, batch_positions,
+                                             batch_caches, pair_scratch, batch_input,
+                                             batch_output, g_test_optimization_flags);
     check(static_cast<bool>(batch_result));
     ActivationBuffer first_batch_input(1, 2);
     ActivationBuffer second_batch_input(1, 2);
@@ -17123,14 +17123,14 @@ void test_gated_residual_kernels()
     constexpr float epsilon = 1e-6f;
     HyperConnectionMix mixed;
     HyperConnectionScratch gated_scratch;
-    auto mixed_result = forward_gated_residual_pre(input,
-                                                   weights,
-                                                   operators,
-                                                   plan,
-                                                   descriptor,
-                                                   mixed,
-                                                   gated_scratch,
-                                                   0);
+    auto mixed_result = gr_pre(input,
+                               weights,
+                               operators,
+                               plan,
+                               descriptor,
+                               mixed,
+                               gated_scratch,
+                               0);
     check(static_cast<bool>(mixed_result));
     const float first_scale = 1.0f / std::sqrt(2.5f + epsilon);
     const float second_scale = 1.0f / std::sqrt(12.5f + epsilon);
@@ -17147,27 +17147,27 @@ void test_gated_residual_kernels()
     ActivationBuffer larger_input(3, 4);
     for (size_t row = 0; row < larger_input.rows(); ++row)
         std::copy_n(input.row(0), input.columns(), larger_input.row(row));
-    auto enlarged = forward_gated_residual_pre(larger_input,
-                                               weights,
-                                               operators,
-                                               plan,
-                                               descriptor,
-                                               mixed,
-                                               gated_scratch,
-                                               0);
+    auto enlarged = gr_pre(larger_input,
+                           weights,
+                           operators,
+                           plan,
+                           descriptor,
+                           mixed,
+                           gated_scratch,
+                           0);
     check(static_cast<bool>(enlarged));
     const uint64_t grown_reduced_capacity = mixed.reduced.allocated_bytes();
     const uint64_t grown_normalized_capacity = gated_scratch.normalized.allocated_bytes();
     const std::byte* grown_reduced_data = mixed.reduced.bytes().data();
     const std::byte* grown_normalized_data = gated_scratch.normalized.bytes().data();
-    auto restored = forward_gated_residual_pre(input,
-                                               weights,
-                                               operators,
-                                               plan,
-                                               descriptor,
-                                               mixed,
-                                               gated_scratch,
-                                               0);
+    auto restored = gr_pre(input,
+                           weights,
+                           operators,
+                           plan,
+                           descriptor,
+                           mixed,
+                           gated_scratch,
+                           0);
     check(static_cast<bool>(restored));
     check(mixed.reduced.allocated_bytes() == grown_reduced_capacity);
     check(gated_scratch.normalized.allocated_bytes() == grown_normalized_capacity);
@@ -17200,14 +17200,14 @@ void test_gated_residual_kernels()
     int8_plan.inject_weight = add_zero_quantized_projection("gr_int8_inject", {2, 4}, DType::Int8);
     HyperConnectionMix int8_mixed;
     HyperConnectionScratch int8_scratch;
-    auto int8_pre = forward_gated_residual_pre(input,
-                                               weights,
-                                               operators,
-                                               int8_plan,
-                                               descriptor,
-                                               int8_mixed,
-                                               int8_scratch,
-                                               0);
+    auto int8_pre = gr_pre(input,
+                           weights,
+                           operators,
+                           int8_plan,
+                           descriptor,
+                           int8_mixed,
+                           int8_scratch,
+                           0);
     check(static_cast<bool>(int8_pre));
     for (size_t index = 0; index < mixed.reduced.values().size(); ++index)
         check_near(int8_mixed.reduced.values()[index], mixed.reduced.values()[index], 1e-6f);
@@ -17220,28 +17220,28 @@ void test_gated_residual_kernels()
     float8_plan.inject_weight = add_zero_quantized_projection("gr_float8_inject", {2, 4}, DType::Float8E4M3);
     HyperConnectionMix float8_mixed;
     HyperConnectionScratch float8_scratch;
-    auto float8_pre = forward_gated_residual_pre(input,
-                                                 weights,
-                                                 operators,
-                                                 float8_plan,
-                                                 descriptor,
-                                                 float8_mixed,
-                                                 float8_scratch,
-                                                 0);
+    auto float8_pre = gr_pre(input,
+                             weights,
+                             operators,
+                             float8_plan,
+                             descriptor,
+                             float8_mixed,
+                             float8_scratch,
+                             0);
     check(static_cast<bool>(float8_pre));
     const std::byte* auxiliary_storage = float8_scratch.auxiliary.bytes().data();
     const uint64_t auxiliary_capacity = float8_scratch.auxiliary.allocated_bytes();
     const std::byte* reduced_storage = float8_mixed.reduced.bytes().data();
     const uint64_t reduced_capacity = float8_mixed.reduced.allocated_bytes();
     check(reduced_capacity >= 4 * sizeof(float));
-    float8_pre = forward_gated_residual_pre(input,
-                                            weights,
-                                            operators,
-                                            float8_plan,
-                                            descriptor,
-                                            float8_mixed,
-                                            float8_scratch,
-                                            0);
+    float8_pre = gr_pre(input,
+                        weights,
+                        operators,
+                        float8_plan,
+                        descriptor,
+                        float8_mixed,
+                        float8_scratch,
+                        0);
     check(static_cast<bool>(float8_pre));
     check(float8_scratch.auxiliary.bytes().data() == auxiliary_storage);
     check(float8_scratch.auxiliary.allocated_bytes() == auxiliary_capacity);
@@ -17258,27 +17258,27 @@ void test_gated_residual_kernels()
     check(static_cast<bool>(malformed_norm_added));
     GatedResidualPlan malformed_norm_plan = plan;
     malformed_norm_plan.norm_weight = malformed_norm_added.value();
-    auto invalid_norm = forward_gated_residual_pre(input,
-                                                   weights,
-                                                   operators,
-                                                   malformed_norm_plan,
-                                                   descriptor,
-                                                   mixed,
-                                                   gated_scratch,
-                                                   0);
+    auto invalid_norm = gr_pre(input,
+                               weights,
+                               operators,
+                               malformed_norm_plan,
+                               descriptor,
+                               mixed,
+                               gated_scratch,
+                               0);
     check(!invalid_norm);
     check(invalid_norm.error().code == ErrorCode::InvalidModel);
     check(invalid_norm.error().message == "invalid gated-residual normalization tensor");
 
     weights.at_mutable(malformed_norm_added.value()).shape = {2, 2};
-    auto invalid_norm_rank = forward_gated_residual_pre(input,
-                                                        weights,
-                                                        operators,
-                                                        malformed_norm_plan,
-                                                        descriptor,
-                                                        mixed,
-                                                        gated_scratch,
-                                                        0);
+    auto invalid_norm_rank = gr_pre(input,
+                                    weights,
+                                    operators,
+                                    malformed_norm_plan,
+                                    descriptor,
+                                    mixed,
+                                    gated_scratch,
+                                    0);
     check(!invalid_norm_rank);
     check(invalid_norm_rank.error().code == ErrorCode::InvalidModel);
     check(invalid_norm_rank.error().message == "invalid gated-residual normalization tensor");
@@ -17289,14 +17289,14 @@ void test_gated_residual_kernels()
     check(static_cast<bool>(malformed_mix_up_added));
     GatedResidualPlan malformed_mix_up_plan = plan;
     malformed_mix_up_plan.mix_up_weight = malformed_mix_up_added.value();
-    auto invalid_mix_up = forward_gated_residual_pre(input,
-                                                     weights,
-                                                     operators,
-                                                     malformed_mix_up_plan,
-                                                     descriptor,
-                                                     mixed,
-                                                     gated_scratch,
-                                                     0);
+    auto invalid_mix_up = gr_pre(input,
+                                 weights,
+                                 operators,
+                                 malformed_mix_up_plan,
+                                 descriptor,
+                                 mixed,
+                                 gated_scratch,
+                                 0);
     check(!invalid_mix_up);
     check(invalid_mix_up.error().code == ErrorCode::InvalidModel);
     check(invalid_mix_up.error().message == "invalid gated-residual up projection");
@@ -17306,18 +17306,18 @@ void test_gated_residual_kernels()
     branch.row(0)[1] = 20.0f;
     ActivationBuffer residual = input;
     ActivationBuffer posted_output;
-    auto posted = forward_gated_residual_post(branch, residual, mixed, 2, posted_output);
+    auto posted = gr_post(branch, residual, mixed, 2, posted_output);
     check(static_cast<bool>(posted));
     check_near(posted_output.row(0)[0], 11.0f, 1e-6f);
     check_near(posted_output.row(0)[1], 22.0f, 1e-6f);
     check_near(posted_output.row(0)[2], 13.0f, 1e-6f);
     check_near(posted_output.row(0)[3], 24.0f, 1e-6f);
 
-    auto aliased_branch = forward_gated_residual_post(branch, residual, mixed, 2, branch);
+    auto aliased_branch = gr_post(branch, residual, mixed, 2, branch);
     check(!aliased_branch);
     check(aliased_branch.error().code == ErrorCode::InvalidArgument);
     check_near(branch.row(0)[0], 10.0f, 1e-6f);
-    auto in_place = forward_gated_residual_post(branch, residual, mixed, 2, residual);
+    auto in_place = gr_post(branch, residual, mixed, 2, residual);
     check(static_cast<bool>(in_place));
     check_near(residual.row(0)[0], 11.0f, 1e-6f);
     check_near(residual.row(0)[1], 22.0f, 1e-6f);
@@ -17328,39 +17328,39 @@ void test_gated_residual_kernels()
         mixed.reduced.row(0)[0], mixed.reduced.row(0)[1]};
     ActivationBuffer head_output(1, 1);
     head_output.row(0)[0] = 123.0f;
-    auto head = forward_gated_residual_head(input,
-                                            weights,
-                                            operators,
-                                            plan,
-                                            descriptor,
-                                            head_output,
-                                            gated_scratch,
-                                            0);
+    auto head = gr_head(input,
+                        weights,
+                        operators,
+                        plan,
+                        descriptor,
+                        head_output,
+                        gated_scratch,
+                        0);
     check(static_cast<bool>(head));
     check_near(head_output.row(0)[0], expected_head[0], 1e-6f);
     check_near(head_output.row(0)[1], expected_head[1], 1e-6f);
     std::fill_n(head_output.row(0), head_output.columns(), 456.0f);
     GatedResidualPlan head_plan = plan;
     head_plan.inject_weight = invalid_tensor_handle;
-    head = forward_gated_residual_head(input,
-                                       weights,
-                                       operators,
-                                       head_plan,
-                                       descriptor,
-                                       head_output,
-                                       gated_scratch,
-                                       0);
+    head = gr_head(input,
+                   weights,
+                   operators,
+                   head_plan,
+                   descriptor,
+                   head_output,
+                   gated_scratch,
+                   0);
     check(static_cast<bool>(head));
     check_near(head_output.row(0)[0], expected_head[0], 1e-6f);
     check_near(head_output.row(0)[1], expected_head[1], 1e-6f);
-    auto aliased_head = forward_gated_residual_head(input,
-                                                    weights,
-                                                    operators,
-                                                    plan,
-                                                    descriptor,
-                                                    input,
-                                                    gated_scratch,
-                                                    0);
+    auto aliased_head = gr_head(input,
+                                weights,
+                                operators,
+                                plan,
+                                descriptor,
+                                input,
+                                gated_scratch,
+                                0);
     check(!aliased_head);
     check(aliased_head.error().code == ErrorCode::InvalidArgument);
     check_near(input.row(0)[0], 1.0f, 1e-6f);

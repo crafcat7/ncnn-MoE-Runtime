@@ -475,18 +475,18 @@ private:
 // Native projections include aligned bias/metadata; packed BF16 and MXFP4
 // preserve their existing payload and explicit-bias residency accounting.
 // Returns zero when any matrix cannot be admitted or dispatched on this device.
-[[nodiscard]] uint64_t native_quantized_expert_storage_bytes(const TensorData& gate_up, const TensorData* up,
-                                                             const TensorData& down, uint32_t device_index,
-                                                             const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags);
-[[nodiscard]] uint64_t native_quantized_expert_storage_bytes(const TensorData& gate_up, const TensorData* up,
-                                                             const TensorData& down, uint32_t device_index,
-                                                             const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags,
-                                                             const TensorData* gate_up_bias, const TensorData* up_bias,
-                                                             const TensorData* down_bias, ExpertActivation activation,
-                                                             float activation_limit);
+[[nodiscard]] uint64_t quant_expert_bytes(const TensorData& gate_up, const TensorData* up,
+                                          const TensorData& down, uint32_t device_index,
+                                          const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags);
+[[nodiscard]] uint64_t quant_expert_bytes(const TensorData& gate_up, const TensorData* up,
+                                          const TensorData& down, uint32_t device_index,
+                                          const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags,
+                                          const TensorData* gate_up_bias, const TensorData* up_bias,
+                                          const TensorData* down_bias, ExpertActivation activation,
+                                          float activation_limit);
 
-[[nodiscard]] uint64_t native_quantized_gpu_cache_size(uint64_t available_size, uint64_t total_size,
-                                                       uint64_t largest_expert_size) noexcept;
+[[nodiscard]] uint64_t quant_cache_size(uint64_t available_size, uint64_t total_size,
+                                        uint64_t largest_expert_size) noexcept;
 
 [[nodiscard]] std::shared_ptr<ExpertBackend> create_vulkan_expert_backend(uint64_t cache_size, uint32_t device_index,
                                                                           std::shared_ptr<ExpertVictimCache> device_weight_source,

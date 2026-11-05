@@ -268,9 +268,9 @@ private:
     std::shared_ptr<ExpertBackend> backend;
 };
 
-[[nodiscard]] std::shared_ptr<ExpertBackend> create_multi_device_expert_backend(std::vector<std::shared_ptr<ExpertBackend>> backends, std::vector<uint32_t> device_indices, std::vector<uint32_t> residency_group_devices);
+[[nodiscard]] std::shared_ptr<ExpertBackend> create_multi_device(std::vector<std::shared_ptr<ExpertBackend>> backends, std::vector<uint32_t> device_indices, std::vector<uint32_t> residency_group_devices);
 
-[[nodiscard]] std::shared_ptr<ExpertBackend> create_key_sharded_expert_backend(std::vector<std::shared_ptr<ExpertBackend>> backends, std::vector<uint32_t> device_indices);
+[[nodiscard]] std::shared_ptr<ExpertBackend> create_key_sharded(std::vector<std::shared_ptr<ExpertBackend>> backends, std::vector<uint32_t> device_indices);
 
 } // namespace moe
 } // namespace ncnn

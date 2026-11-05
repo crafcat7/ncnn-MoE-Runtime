@@ -774,7 +774,7 @@ void forward_shared_expert(const CompiledModel& model,
     }
 }
 
-static bool expert_cache_wait_timing_enabled(const CompiledModel& model) noexcept
+static bool wait_timing(const CompiledModel& model) noexcept
 {
     // Queue latency drives rank-adaptive router prefetch.
     return has_flag(model.opt.flags, OptionRouterPrediction)
@@ -783,8 +783,8 @@ static bool expert_cache_wait_timing_enabled(const CompiledModel& model) noexcep
 
 static std::chrono::steady_clock::time_point expert_cache_wait_start(const CompiledModel& model)
 {
-    return expert_cache_wait_timing_enabled(model) ? std::chrono::steady_clock::now()
-                                                   : std::chrono::steady_clock::time_point{};
+    return wait_timing(model) ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
 }
 
 static uint64_t expert_cache_wait_elapsed(std::chrono::steady_clock::time_point start)
@@ -2366,7 +2366,7 @@ try
         for (size_t index = 0; index < backend_status.size(); ++index)
             if (backend_status[index] == ExpertStatus::Executed)
                 stats->expert_gpu_routes += layer_state.active_experts()[index].batch.routes.size();
-        if (expert_cache_wait_timing_enabled(model))
+        if (wait_timing(model))
         {
             for (const ExpertState& active : layer_state.active_experts())
             {

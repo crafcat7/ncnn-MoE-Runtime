@@ -181,14 +181,14 @@ static Result<void> forward_gated_residual(const ActivationBuffer& input,
     return {};
 }
 
-Result<void> forward_gated_residual_pre(const ActivationBuffer& input,
-                                        const WeightStore& weights,
-                                        const CompiledOperatorTable& operators,
-                                        const GatedResidualPlan& plan,
-                                        const MoeModelDescriptor& descriptor,
-                                        HyperConnectionMix& result,
-                                        HyperConnectionScratch& scratch,
-                                        uint64_t optimization_flags)
+Result<void> gr_pre(const ActivationBuffer& input,
+                    const WeightStore& weights,
+                    const CompiledOperatorTable& operators,
+                    const GatedResidualPlan& plan,
+                    const MoeModelDescriptor& descriptor,
+                    HyperConnectionMix& result,
+                    HyperConnectionScratch& scratch,
+                    uint64_t optimization_flags)
 {
     result.combine.resize(0);
     return forward_gated_residual(input,
@@ -202,11 +202,11 @@ Result<void> forward_gated_residual_pre(const ActivationBuffer& input,
                                   optimization_flags);
 }
 
-Result<void> forward_gated_residual_post(const ActivationBuffer& branch,
-                                         const ActivationBuffer& residual,
-                                         const HyperConnectionMix& mix,
-                                         uint32_t multiplier,
-                                         ActivationBuffer& output)
+Result<void> gr_post(const ActivationBuffer& branch,
+                     const ActivationBuffer& residual,
+                     const HyperConnectionMix& mix,
+                     uint32_t multiplier,
+                     ActivationBuffer& output)
 {
     if (multiplier == 0 || branch.rows() != residual.rows()
         || residual.columns() != branch.columns() * multiplier
@@ -233,14 +233,14 @@ Result<void> forward_gated_residual_post(const ActivationBuffer& branch,
     return {};
 }
 
-Result<void> forward_gated_residual_head(const ActivationBuffer& input,
-                                         const WeightStore& weights,
-                                         const CompiledOperatorTable& operators,
-                                         const GatedResidualPlan& plan,
-                                         const MoeModelDescriptor& descriptor,
-                                         ActivationBuffer& output,
-                                         HyperConnectionScratch& scratch,
-                                         uint64_t optimization_flags)
+Result<void> gr_head(const ActivationBuffer& input,
+                     const WeightStore& weights,
+                     const CompiledOperatorTable& operators,
+                     const GatedResidualPlan& plan,
+                     const MoeModelDescriptor& descriptor,
+                     ActivationBuffer& output,
+                     HyperConnectionScratch& scratch,
+                     uint64_t optimization_flags)
 {
     if (&output == &input)
         return Error{ErrorCode::InvalidArgument, "gated-residual head output must not alias input"};
