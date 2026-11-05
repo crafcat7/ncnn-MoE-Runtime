@@ -53,7 +53,7 @@ using LibraryHandle = HMODULE;
 using LibraryHandle = void*;
 #endif
 
-void* load_symbol(LibraryHandle library, const char* name)
+static void* load_symbol(LibraryHandle library, const char* name)
 {
 #if defined(_WIN32)
     return library == nullptr ? nullptr : reinterpret_cast<void*>(GetProcAddress(library, name));
@@ -66,7 +66,7 @@ void* load_symbol(LibraryHandle library, const char* name)
 #endif
 }
 
-LibraryHandle load_library()
+static LibraryHandle load_library()
 {
 #if defined(_WIN32)
     return LoadLibraryA("nvml.dll");
@@ -82,7 +82,7 @@ LibraryHandle load_library()
 #endif
 }
 
-void unload_library(LibraryHandle library)
+static void unload_library(LibraryHandle library)
 {
     if (library == nullptr)
         return;
@@ -95,7 +95,7 @@ void unload_library(LibraryHandle library)
 #endif
 }
 
-std::string lower_copy(std::string value)
+static std::string lower_copy(std::string value)
 {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
         return static_cast<char>(std::tolower(character));
@@ -116,6 +116,7 @@ struct GpuTelemetrySampler::Impl
     NvmlGetNameFn get_name = nullptr;
     NvmlErrorStringFn error_string = nullptr;
     NvmlDevice device = nullptr;
+    unsigned int device_count = 0;
     bool initialized = false;
 
     Impl(const RuntimeInfo& info, const EffectiveOption& opt)
@@ -157,8 +158,13 @@ struct GpuTelemetrySampler::Impl
             base.reason = "nvml_library_not_found";
             return;
         }
-        base.provider = "nvml";
+        if (load_symbols() && initialize() && select_device(*device_index))
+            base.reason.clear();
+    }
 
+    [[nodiscard]] bool load_symbols()
+    {
+        base.provider = "nvml";
         init = reinterpret_cast<NvmlInitFn>(load_symbol(library, "nvmlInit_v2"));
         if (init == nullptr)
             init = reinterpret_cast<NvmlInitFn>(load_symbol(library, "nvmlInit"));
@@ -178,25 +184,32 @@ struct GpuTelemetrySampler::Impl
             || get_utilization == nullptr || get_memory_info == nullptr || get_name == nullptr)
         {
             base.reason = "nvml_symbol_missing";
-            return;
+            return false;
         }
+        return true;
+    }
 
+    [[nodiscard]] bool initialize()
+    {
         const NvmlReturn init_result = init();
         if (init_result != nvml_success)
         {
             base.reason = error_reason("nvml_init", init_result);
-            return;
+            return false;
         }
         initialized = true;
 
-        unsigned int device_count = 0;
         const NvmlReturn count_result = get_count(&device_count);
         if (count_result != nvml_success)
         {
             base.reason = error_reason("nvml_device_count", count_result);
-            return;
+            return false;
         }
+        return true;
+    }
 
+    [[nodiscard]] bool select_device(uint32_t device_index)
+    {
         const std::string target_name = lower_copy(base.device_name);
         for (unsigned int index = 0; index < device_count; ++index)
         {
@@ -208,7 +221,10 @@ struct GpuTelemetrySampler::Impl
             if (get_name(candidate, name, sizeof(name)) != nvml_success)
                 continue;
             const std::string candidate_name = lower_copy(name);
-            if (!target_name.empty() && (candidate_name == target_name || candidate_name.find(target_name) != std::string::npos || target_name.find(candidate_name) != std::string::npos))
+            const bool name_match = candidate_name == target_name
+                                    || candidate_name.find(target_name) != std::string::npos
+                                    || target_name.find(candidate_name) != std::string::npos;
+            if (!target_name.empty() && name_match)
             {
                 device = candidate;
                 break;
@@ -218,19 +234,19 @@ struct GpuTelemetrySampler::Impl
         // Vulkan and NVML usually enumerate NVIDIA devices in the same order.
         // Use the index as a conservative fallback when the driver changes the
         // reported device name format.
-        if (device == nullptr && *device_index < device_count)
+        if (device == nullptr && device_index < device_count)
         {
             NvmlDevice candidate = nullptr;
-            if (get_handle_by_index(*device_index, &candidate) == nvml_success)
+            if (get_handle_by_index(device_index, &candidate) == nvml_success)
                 device = candidate;
         }
 
         if (device == nullptr)
         {
             base.reason = "nvml_device_not_found";
-            return;
+            return false;
         }
-        base.reason.clear();
+        return true;
     }
 
     ~Impl()
