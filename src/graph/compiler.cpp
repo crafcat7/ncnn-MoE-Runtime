@@ -1982,11 +1982,16 @@ Result<void> compile_model(MoeModelDescriptor descriptor, WeightMapping mapping,
 
 Result<void> compile_model(MoeModelDescriptor descriptor, WeightMapping mapping, CompiledModel& compiled, HybridMode hybrid_mode, const CompilerOption& opt)
 {
-    if (!has_flag(opt.flags, BackendCpuExecution))
-        return Error{ErrorCode::UnsupportedModel, "compiler requires a CPU execution backend"};
     auto valid = validate_model_descriptor(descriptor);
     if (!valid)
         return valid.error();
+    return compile_model_validated(std::move(descriptor), std::move(mapping), compiled, hybrid_mode, opt);
+}
+
+Result<void> compile_model_validated(MoeModelDescriptor descriptor, WeightMapping mapping, CompiledModel& compiled, HybridMode hybrid_mode, const CompilerOption& opt)
+{
+    if (!has_flag(opt.flags, BackendCpuExecution))
+        return Error{ErrorCode::UnsupportedModel, "compiler requires a CPU execution backend"};
     const uint32_t layer_count = static_cast<uint32_t>(descriptor.layers.size());
     if (descriptor.activation_dtype != DType::Float32 && descriptor.activation_dtype != DType::BFloat16)
         return Error{ErrorCode::UnsupportedModel, "dense weights must use float32 or bfloat16"};

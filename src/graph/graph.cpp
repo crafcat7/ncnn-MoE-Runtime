@@ -193,30 +193,14 @@ static Result<void> validate_graph(const Net& graph, std::vector<LayerId>& order
     return {};
 }
 
-Result<void> Net::validate_order() const
+// Generated order must not overlap FFN workspaces. This is the only schedule
+// constraint not guaranteed by the Blob topological order.
+static Result<void> validate_ffn_grouping(const Net& graph)
 {
-    if (layers.empty())
-        return Error{ErrorCode::InvalidModel, "execution schedule cannot reference an empty graph"};
-    if (order.size() != layers.size())
-        return Error{ErrorCode::InvalidModel, "execution schedule node order is incomplete"};
-
-    std::vector<uint32_t> positions(layers.size(), invalid_plan_index);
     uint32_t active_ffn = invalid_plan_index;
-    for (size_t order_index = 0; order_index < order.size(); ++order_index)
+    for (const LayerId node_id : graph.order)
     {
-        const LayerId node_id = order[order_index];
-        if (node_id >= layers.size())
-            return Error{ErrorCode::InvalidModel, "execution schedule node order is out of range"};
-        if (positions[node_id] != invalid_plan_index)
-            return Error{ErrorCode::InvalidModel, "execution schedule contains a duplicate node"};
-        positions[node_id] = static_cast<uint32_t>(order_index);
-        // Execution reuses one FFN workspace from Router through Combine.
-        const Layer& node = layers[node_id];
-        const uint32_t selected_backend = node.backend == ExecutionBackend::Cpu ? ExecutionBackendCpu : ExecutionBackendVulkan;
-        if (!has_flag(node.backend_mask, selected_backend))
-        {
-            return Error{ErrorCode::InvalidModel, "execution schedule node backend is not allowed by its backend mask"};
-        }
+        const Layer& node = graph.layers[node_id];
         if (active_ffn != invalid_plan_index && node.plan_index != active_ffn)
             return Error{ErrorCode::InvalidModel, "execution schedule overlaps an unfinished FFN layer"};
         if (node.kind == LayerKind::Router)
@@ -232,9 +216,38 @@ Result<void> Net::validate_order() const
             active_ffn = invalid_plan_index;
         }
     }
-
     if (active_ffn != invalid_plan_index)
         return Error{ErrorCode::InvalidModel, "execution schedule leaves an unfinished FFN layer"};
+    return {};
+}
+
+Result<void> Net::validate_order() const
+{
+    if (layers.empty())
+        return Error{ErrorCode::InvalidModel, "execution schedule cannot reference an empty graph"};
+    if (order.size() != layers.size())
+        return Error{ErrorCode::InvalidModel, "execution schedule node order is incomplete"};
+
+    std::vector<uint32_t> positions(layers.size(), invalid_plan_index);
+    for (size_t order_index = 0; order_index < order.size(); ++order_index)
+    {
+        const LayerId node_id = order[order_index];
+        if (node_id >= layers.size())
+            return Error{ErrorCode::InvalidModel, "execution schedule node order is out of range"};
+        if (positions[node_id] != invalid_plan_index)
+            return Error{ErrorCode::InvalidModel, "execution schedule contains a duplicate node"};
+        positions[node_id] = static_cast<uint32_t>(order_index);
+        const Layer& node = layers[node_id];
+        const uint32_t selected_backend = node.backend == ExecutionBackend::Cpu ? ExecutionBackendCpu : ExecutionBackendVulkan;
+        if (!has_flag(node.backend_mask, selected_backend))
+        {
+            return Error{ErrorCode::InvalidModel, "execution schedule node backend is not allowed by its backend mask"};
+        }
+    }
+
+    auto ffn_valid = validate_ffn_grouping(*this);
+    if (!ffn_valid)
+        return ffn_valid.error();
 
     for (const Blob& tensor : blobs)
     {
@@ -280,7 +293,7 @@ Result<void> schedule_graph(Net& graph, uint32_t available_backends)
     if (!ret)
         return ret.error();
 
-    ret = graph.validate_order();
+    ret = validate_ffn_grouping(graph);
     if (!ret)
         return ret.error();
     return {};

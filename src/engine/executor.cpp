@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cmath>
 #include <exception>
 #include <future>
@@ -238,11 +239,8 @@ static Result<void> fwd_shared(const CompiledModel& model,
                                ExecutionBackend backend)
 {
     if (shared_done(state)) return {};
-    if (state.normalized.rows() != rows
-        || state.normalized.columns() != model.descriptor.hidden_size)
-    {
-        return Error{ErrorCode::InternalError, "Shared Expert input has an invalid shape"};
-    }
+    assert(state.normalized.rows() == rows);
+    assert(state.normalized.columns() == model.descriptor.hidden_size);
     try
     {
         forward_shared_expert(model, moe, state.normalized, state.shared_expert_output,
@@ -1457,8 +1455,7 @@ Result<void> forward_model(const CompiledModel& model,
     };
     for (const LayerId node_id : model.net.order)
     {
-        if (node_id >= model.net.layers.size())
-            return Error{ErrorCode::InternalError, "execution schedule references an invalid node"};
+        assert(node_id < model.net.layers.size());
         const Layer* node = &model.net.layers[node_id];
         if (resident_chain_finished) continue;
         if (resident_prefix_layers != 0 && node->plan_index < resident_prefix_layers)
@@ -1481,12 +1478,9 @@ Result<void> forward_model(const CompiledModel& model,
             if (!stepped) return stepped;
             continue;
         }
-        if (node->plan_index >= model.net.layer_plans.size())
-            return Error{ErrorCode::InternalError, "execution node layer is out of range"};
-
+        assert(node->plan_index < model.net.layer_plans.size());
         const CompiledLayerPlan& layer = model.net.layer_plans[node->plan_index];
-        if (layer.layer_id >= state.layers.size())
-            return Error{ErrorCode::InternalError, "execution layer id is out of range"};
+        assert(layer.layer_id < state.layers.size());
         LayerState& layer_state = state.execution_state;
         const MoeBlockPlan& moe = layer.moe;
 
@@ -2596,10 +2590,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
     };
     for (const LayerId node_id : model.net.order)
     {
-        if (node_id >= model.net.layers.size())
-        {
-            return Error{ErrorCode::InternalError, "execution schedule references an invalid node"};
-        }
+        assert(node_id < model.net.layers.size());
         const Layer* node = &model.net.layers[node_id];
         if (resident_chain_finished) continue;
         if (node->kind == LayerKind::TokenEmbedding)
@@ -2620,11 +2611,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             if (!stepped) return stepped;
             continue;
         }
-        if (node->plan_index >= model.net.layer_plans.size())
-        {
-            return Error{ErrorCode::InternalError, "execution node layer is out of range"};
-        }
-
+        assert(node->plan_index < model.net.layer_plans.size());
         const CompiledLayerPlan& layer = model.net.layer_plans[node->plan_index];
         const MoeBlockPlan& moe = layer.moe;
 

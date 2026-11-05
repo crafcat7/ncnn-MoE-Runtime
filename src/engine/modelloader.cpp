@@ -597,11 +597,11 @@ Result<void> ModelLoader::compile_model()
     if (use_file_backed_experts)
         compiler_opt.flags |= BackendFileBackedExperts;
 
-    auto ret = ncnn::moe::compile_model(std::move(descriptor),
-                                        std::move(weights).value(),
-                                        model,
-                                        opt.hybrid_mode,
-                                        compiler_opt);
+    auto ret = ncnn::moe::compile_model_validated(std::move(descriptor),
+                                                  std::move(weights).value(),
+                                                  model,
+                                                  opt.hybrid_mode,
+                                                  compiler_opt);
     if (!ret)
         return ret.error();
 
