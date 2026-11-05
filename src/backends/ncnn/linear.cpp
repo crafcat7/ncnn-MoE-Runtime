@@ -2656,8 +2656,8 @@ bool Bfloat16Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
 #endif
 }
 
-static bool bfloat16_swiglu_scratch_shape(uint32_t intermediate_columns, bool router_gate,
-                                          uint64_t rows, uint64_t& fused_columns) noexcept
+static bool swiglu_shape(uint32_t intermediate_columns, bool router_gate,
+                         uint64_t rows, uint64_t& fused_columns) noexcept
 {
     if (intermediate_columns == 0 || rows == 0)
         return false;
@@ -2670,7 +2670,7 @@ std::vector<uint64_t> Bfloat16Linear_vulkan::swiglu_scratch_elements(uint32_t in
                                                                      bool router_gate, uint64_t rows)
 {
     uint64_t fused_columns = 0;
-    if (!bfloat16_swiglu_scratch_shape(intermediate_columns, router_gate, rows, fused_columns))
+    if (!swiglu_shape(intermediate_columns, router_gate, rows, fused_columns))
         return intermediate_columns == 0 || rows == 0 ? std::vector<uint64_t>{}
                                                       : std::vector<uint64_t>{UINT64_MAX};
     return {saturating_multiply_u64(fused_columns, rows)};
@@ -2695,8 +2695,8 @@ bool Bfloat16Linear_vulkan::record_swiglu_chain(const ncnn::VkMat& input,
         || !input.allocator || input.allocator->vkdev != first.vulkan_context->device()
         || static_cast<uint32_t>(input.h) > first.vulkan_context->device()->info.max_workgroup_count_y()
         || activation_variant(first.option) != 0 || activation_variant(down.option) != 0
-        || !bfloat16_swiglu_scratch_shape(intermediate_columns, apply_router_gate,
-                                          static_cast<uint64_t>(input.h), fused_columns)
+        || !swiglu_shape(intermediate_columns, apply_router_gate,
+                         static_cast<uint64_t>(input.h), fused_columns)
         || first.output_columns != fused_columns || down.input_columns != intermediate_columns
         || intermediate_columns % 128 != 0 || down.packed.empty() || down.bias.empty())
         return false;
@@ -2993,8 +2993,8 @@ bool Bfloat16Expert_vulkan::forward(const ActivationBuffer& input,
 #endif
 }
 
-static bool bfloat16_expert_scratch_shape(uint32_t gate_output_columns, uint64_t rows,
-                                          uint32_t& fused_columns) noexcept
+static bool expert_shape(uint32_t gate_output_columns, uint64_t rows,
+                         uint32_t& fused_columns) noexcept
 {
     fused_columns = gate_output_columns;
     return gate_output_columns != 0 && rows != 0
@@ -3005,7 +3005,7 @@ std::vector<uint64_t> Bfloat16Expert_vulkan::scratch_elements(uint32_t gate_outp
                                                               uint64_t rows)
 {
     uint32_t fused_columns = 0;
-    if (!bfloat16_expert_scratch_shape(gate_output_columns, rows, fused_columns))
+    if (!expert_shape(gate_output_columns, rows, fused_columns))
         return gate_output_columns == 0 || rows == 0 ? std::vector<uint64_t>{}
                                                      : std::vector<uint64_t>{UINT64_MAX};
     return {saturating_multiply_u64(fused_columns, rows)};
@@ -3024,7 +3024,7 @@ bool Bfloat16Expert_vulkan::record(const ncnn::VkMat& input, ncnn::VkMat& output
     if (input.empty() || input.dims != 2 || input.elempack != 1 || input.elemsize != sizeof(float)
         || input.w != static_cast<int>(expert.input_columns) || input.h <= 0
         || !gate.swiglu_down_pipeline || activation_variant(gate.option) != 0
-        || !bfloat16_expert_scratch_shape(gate.output_columns, static_cast<uint64_t>(input.h), fused_columns))
+        || !expert_shape(gate.output_columns, static_cast<uint64_t>(input.h), fused_columns))
         return false;
     ncnn::VkMat fused;
     fused.create(static_cast<int>(fused_columns), input.h, sizeof(float), expert.vulkan_context->blob_allocator());
@@ -3915,9 +3915,9 @@ std::vector<uint64_t> Float8Linear_vulkan::scratch_elements(uint32_t input_colum
     return {saturating_multiply_u64(scratch_columns, rows)};
 }
 
-static size_t float8_swiglu_scratch_shapes(uint32_t input_columns, uint32_t intermediate_columns,
-                                           uint64_t rows, bool device_input,
-                                           uint64_t columns[3]) noexcept
+static size_t fp8_swiglu_shapes(uint32_t input_columns, uint32_t intermediate_columns,
+                                uint64_t rows, bool device_input,
+                                uint64_t columns[3]) noexcept
 {
     if (intermediate_columns == 0 || rows == 0)
         return 0;
@@ -3944,8 +3944,8 @@ std::vector<uint64_t> Float8Linear_vulkan::swiglu_scratch_elements(uint32_t inpu
     if (input_columns == 0 || intermediate_columns == 0 || rows == 0)
         return {};
     uint64_t columns[3]{};
-    const size_t count = float8_swiglu_scratch_shapes(input_columns, intermediate_columns,
-                                                      rows, device_input, columns);
+    const size_t count = fp8_swiglu_shapes(input_columns, intermediate_columns,
+                                           rows, device_input, columns);
     if (count != (device_input ? 3u : 2u))
         return {UINT64_MAX};
     std::vector<uint64_t> result;
@@ -5090,11 +5090,11 @@ bool Float8Linear_vulkan::record_swiglu_chain(const ncnn::VkMat& input,
     const auto& up = *up_operator.d;
     const auto& down = *down_operator.d;
     uint64_t scratch_columns[3]{};
-    const size_t scratch_count = float8_swiglu_scratch_shapes(gate.logical_input_columns,
-                                                              gate.output_columns,
-                                                              input.h > 0 ? static_cast<uint64_t>(input.h) : 0,
-                                                              true,
-                                                              scratch_columns);
+    const size_t scratch_count = fp8_swiglu_shapes(gate.logical_input_columns,
+                                                   gate.output_columns,
+                                                   input.h > 0 ? static_cast<uint64_t>(input.h) : 0,
+                                                   true,
+                                                   scratch_columns);
     if (&input == &output || activation != ExpertActivation::DeepSeekSwiGlu
         || !gate.vulkan_context || gate.vulkan_context != up.vulkan_context || gate.vulkan_context != down.vulkan_context
         || !gate.pipeline || !gate.quantize_pipeline || !up.pipeline || !down.pipeline || !gate.swiglu_quantize_pipeline
@@ -8569,11 +8569,11 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertRequest> requests,
     std::vector<uint32_t> route_rows;
     std::vector<float> route_weights;
     if (use_route_aggregation
-        && !build_route_aggregation_metadata(requests,
-                                             selected,
-                                             route_offsets,
-                                             route_rows,
-                                             route_weights))
+        && !build_ra_meta(requests,
+                          selected,
+                          route_offsets,
+                          route_rows,
+                          route_weights))
     {
         return false;
     }

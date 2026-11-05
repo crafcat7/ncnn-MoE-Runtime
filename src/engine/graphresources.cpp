@@ -305,7 +305,7 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
                 // actual usage is never compared with an artificial budget.
                 const GpuResourceSnapshot baseline{device, resource->initial.heap_budget, resource->initial.heap_usage};
                 const auto live = bank_live_resources(model, device);
-                const uint64_t execution = std::max(gpu_resource_execution_reserve(*resource), resource->allocated_execution_size);
+                const uint64_t execution = std::max(gpu_exec_reserve(*resource), resource->allocated_execution_size);
                 const uint64_t pending = execution - resource->allocated_execution_size;
                 // Bank admission leaves headroom for the attention/FFN groups
                 // that are committed after the bank. A partial chain also keeps

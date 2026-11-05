@@ -1842,15 +1842,15 @@ void test_ncnn_vulkan_float8_operator()
         check(static_cast<bool>(embedding) && static_cast<bool>(head));
         accounting_model.operators.bind_weight_count(accounting_model.weights.size());
         accounting_model.operators.at_weight_mutable(head.value()).float8 = vulkan;
-        release_vulkan_dense_host_copies(accounting_model);
+        release_host_copies(accounting_model);
         check(accounting_model.released_dense_host_size == matrix.quantization_scales.size() * sizeof(float));
         check(accounting_model.weights.at(head.value()).float8_values().empty());
         check(!accounting_model.weights.at(embedding.value()).float8_values().empty());
         accounting_model.operators.at_weight_mutable(embedding.value()).float8 = vulkan;
-        release_vulkan_dense_host_copies(accounting_model);
+        release_host_copies(accounting_model);
         check(accounting_model.released_dense_host_size == matrix.mapped_size + matrix.quantization_scales.size() * sizeof(float) * 2);
         const uint64_t released_size = accounting_model.released_dense_host_size;
-        release_vulkan_dense_host_copies(accounting_model);
+        release_host_copies(accounting_model);
         check(accounting_model.released_dense_host_size == released_size);
     }
     {
@@ -1863,7 +1863,7 @@ void test_ncnn_vulkan_float8_operator()
         check(static_cast<bool>(head));
         accounting_model.operators.bind_weight_count(accounting_model.weights.size());
         accounting_model.operators.at_weight_mutable(head.value()).float8 = vulkan;
-        release_vulkan_dense_host_copies(accounting_model);
+        release_host_copies(accounting_model);
         check(accounting_model.weights.at(head.value()).quantized_data.empty());
         check(accounting_model.released_dense_host_size == matrix.mapped_size + matrix.quantization_scales.size() * sizeof(float));
     }
@@ -2073,7 +2073,7 @@ void test_ncnn_vulkan_float8_operator()
     check(check_finite_nonzero(shared_before_release));
     check(check_finite_nonzero(routed_shared_before_release));
 
-    release_vulkan_dense_host_copies(shared_model);
+    release_host_copies(shared_model);
     for (TensorHandle handle : shared_handles)
     {
         const TensorData& tensor = shared_model.weights.at(handle);
@@ -10013,7 +10013,7 @@ void test_speculative_generation()
             compiled.opt.hybrid_mode = HybridMode::HybridExperts;
             check(static_cast<bool>(build_graph(compiled, false)));
             check_head_backend(ExecutionBackend::Vulkan);
-            release_vulkan_dense_host_copies(compiled);
+            release_host_copies(compiled);
             check(compiled.weights.at(compiled.lm_head_weight).float32_values().empty());
             check(compiled.weights.at(compiled.lm_head_weight).bfloat16_values().empty());
 
@@ -16852,7 +16852,7 @@ void test_gated_delta_vulkan_budget_admission()
                 return plan.initial.device_index == opt.device_index;
             });
             check(resource_plan != model.memory_plan.gpu_devices.end());
-            check(execution_reserve == gpu_resource_execution_reserve(*resource_plan));
+            check(execution_reserve == gpu_exec_reserve(*resource_plan));
             uint32_t gated_delta_layers = 0;
             uint32_t qsa_layers = 0;
             for (const CompiledLayerPlan& layer : model.graph.layer_plans)
@@ -19012,7 +19012,7 @@ void test_gated_delta_net_continuation()
     cpu_gdn_layer.attention.delta_beta_weight = cpu_gdn_input_weights[2];
     cpu_gdn_layer.attention.delta_alpha_weight = cpu_gdn_input_weights[3];
     cpu_gdn_release_model.graph.layer_plans.push_back(std::move(cpu_gdn_layer));
-    release_vulkan_dense_host_copies(cpu_gdn_release_model);
+    release_host_copies(cpu_gdn_release_model);
     for (TensorHandle handle : cpu_gdn_input_weights)
         check(!cpu_gdn_release_model.weights.at(handle).float32_data.empty());
 
@@ -21492,11 +21492,11 @@ void test_float_scale_inplace_and_scaled_add()
         expected_output[index] = output[index]
                                  + output_scale * expected_values[index];
     }
-    float_scale_inplace_and_scaled_add(values.data(),
-                                       value_scale,
-                                       output.data(),
-                                       output_scale,
-                                       static_cast<uint32_t>(values.size()));
+    scale_add(values.data(),
+              value_scale,
+              output.data(),
+              output_scale,
+              static_cast<uint32_t>(values.size()));
     for (size_t index = 0; index < values.size(); ++index)
     {
         check_near(values[index], expected_values[index], 1e-6f);
@@ -21523,12 +21523,12 @@ void test_float_scale_inplace_and_scaled_add()
         expected_accumulated[index] = accumulated[index]
                                       + accumulate_scale * expected_recurrent[index];
     }
-    float_scaled_add_and_accumulate(recurrent.data(),
-                                    delta.data(),
-                                    input_scale,
-                                    accumulated.data(),
-                                    accumulate_scale,
-                                    static_cast<uint32_t>(recurrent.size()));
+    scaled_acc(recurrent.data(),
+               delta.data(),
+               input_scale,
+               accumulated.data(),
+               accumulate_scale,
+               static_cast<uint32_t>(recurrent.size()));
     for (size_t index = 0; index < recurrent.size(); ++index)
     {
         check_near(recurrent[index], expected_recurrent[index], 1e-6f);
@@ -21540,12 +21540,12 @@ void test_float_scale_inplace_and_scaled_add()
     recurrent.fill(-0x1.000004p0f);
     delta.fill(0x1.000002p0f);
     accumulated.fill(0.0f);
-    float_scaled_add_and_accumulate(recurrent.data(),
-                                    delta.data(),
-                                    0x1.000002p0f,
-                                    accumulated.data(),
-                                    1.0f,
-                                    static_cast<uint32_t>(recurrent.size()));
+    scaled_acc(recurrent.data(),
+               delta.data(),
+               0x1.000002p0f,
+               accumulated.data(),
+               1.0f,
+               static_cast<uint32_t>(recurrent.size()));
     for (size_t index = 0; index < recurrent.size(); ++index)
     {
         check(recurrent[index] == 0.0f);
@@ -21569,12 +21569,12 @@ void test_float_scale_inplace_and_scaled_add()
         std::numeric_limits<float>::denorm_min(),
         -0.5f};
     std::array<float, 7> special_output = {0.0f, -0.0f, 0.0f, 0.0f, 0.0f, 0.0f, -0.75f};
-    float_scaled_add_and_accumulate(special_recurrent.data(),
-                                    special_delta.data(),
-                                    0.5f,
-                                    special_output.data(),
-                                    1.0f,
-                                    static_cast<uint32_t>(special_recurrent.size()));
+    scaled_acc(special_recurrent.data(),
+               special_delta.data(),
+               0.5f,
+               special_output.data(),
+               1.0f,
+               static_cast<uint32_t>(special_recurrent.size()));
     check(special_recurrent[0] == 0.0f && !std::signbit(special_recurrent[0]));
     check(special_recurrent[1] == 0.0f && std::signbit(special_recurrent[1]));
     check(std::isinf(special_recurrent[2]) && !std::signbit(special_recurrent[2]));

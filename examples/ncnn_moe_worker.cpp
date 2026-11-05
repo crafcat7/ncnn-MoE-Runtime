@@ -250,7 +250,7 @@ static std::string gpu_resource_plan_json(const CompiledModel& model)
         device.add_uint("session_state_bytes", plan.admitted.session_state_size);
         device.add_uint("peak_workspace_bytes", plan.admitted.workspace_size);
         device.add_uint("expected_concurrency", plan.num_concurrent_sessions);
-        device.add_uint("execution_reserve_bytes", gpu_resource_execution_reserve(plan));
+        device.add_uint("execution_reserve_bytes", gpu_exec_reserve(plan));
         device.add_uint("allocated_execution_bytes", plan.allocated_execution_size);
         const auto physical = query_vulkan_graph_compute(model.vulkan_runtime, plan.initial.device_index, model.opt.optimization_flags);
         device.add_uint("arena_preparation_physical_bytes", physical.preparation_physical_size);

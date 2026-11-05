@@ -1493,7 +1493,7 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
         created_states.push_back(created_device_state);
     }
 
-    const auto mark_nontransaction_existing_states_unknown = [&]() noexcept {
+    const auto mark_states_unknown = [&]() noexcept {
         for (size_t index = 0; index < states.size(); ++index)
         {
             if (!created_states[index]
@@ -1637,14 +1637,14 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
     if (submit_compute_and_wait(cmd, implementation.vulkan_context->device()) != 0)
     {
         transaction_recording.mark_submit_failed();
-        mark_nontransaction_existing_states_unknown();
+        mark_states_unknown();
         return GatedDeltaBatchResult_vulkan::Failed;
     }
     transaction_recording.mark_submitted();
     if (!copy_staging_to_cpu_batch(transfer_slot.download,
                                    combined_projected))
     {
-        mark_nontransaction_existing_states_unknown();
+        mark_states_unknown();
         return GatedDeltaBatchResult_vulkan::Failed;
     }
     transaction_recording.commit_rows();

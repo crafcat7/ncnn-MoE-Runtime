@@ -357,11 +357,11 @@ static bool attention_decode_window_is_visible(const LayerCache& cache,
     return query_position == cache.start_position + cache.token_count;
 }
 
-static bool fill_attention_cache_promotion_staging(ncnn::VkMat& key_staging,
-                                                   ncnn::VkMat& value_staging,
-                                                   const LayerCache& cache,
-                                                   const AttentionConfig_vulkan& config,
-                                                   ncnn::VkAllocator* allocator)
+static bool fill_promotion_stage(ncnn::VkMat& key_staging,
+                                 ncnn::VkMat& value_staging,
+                                 const LayerCache& cache,
+                                 const AttentionConfig_vulkan& config,
+                                 ncnn::VkAllocator* allocator)
 {
     const uint32_t columns = config.kv_head_count * config.head_dimension;
     if (cache.token_count == 0
@@ -2154,11 +2154,11 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
             && !fill_attention_mask_staging(ticket.attention_mask, token_count, destination_count, position_offset, cache, config, implementation.sinks,
                                             bfloat16_storage, implementation.vulkan_context->staging_allocator()))
         || (promote_host_cache
-            && !fill_attention_cache_promotion_staging(ticket.attention_cache_key,
-                                                       ticket.attention_cache_value,
-                                                       cache,
-                                                       config,
-                                                       implementation.vulkan_context->staging_allocator())))
+            && !fill_promotion_stage(ticket.attention_cache_key,
+                                     ticket.attention_cache_value,
+                                     cache,
+                                     config,
+                                     implementation.vulkan_context->staging_allocator())))
     {
         return false;
     }

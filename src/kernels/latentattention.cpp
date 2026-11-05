@@ -212,19 +212,19 @@ static void apply_rope(float* values, uint32_t dimension, uint64_t position, con
     }
 }
 
-static bool prepared_latent_rope_enabled(uint64_t optimization_flags) noexcept
+static bool latent_rope_on(uint64_t optimization_flags) noexcept
 {
     return has_flag(optimization_flags,
                     OptimizationCpuLatentPreparedRope);
 }
 
-static bool online_latent_softmax_enabled(uint64_t optimization_flags) noexcept
+static bool latent_softmax_vecline(uint64_t optimization_flags) noexcept
 {
     return has_flag(optimization_flags,
                     OptimizationCpuLatentOnlineSoftmax);
 }
 
-static bool vector_latent_softmax_enabled(uint64_t optimization_flags) noexcept
+static bool latent_softmax_vec(uint64_t optimization_flags) noexcept
 {
     return has_flag(optimization_flags,
                     OptimizationCpuLatentVectorSoftmax)
@@ -324,12 +324,12 @@ static void normalize_vector(float* values, uint32_t count, const TensorData& we
         float_rms_norm(values, values, weight.float32_values().data(), epsilon, 0.0f, count);
 }
 
-static void normalize_unit_prepared_rope(float* values,
-                                         uint32_t count,
-                                         uint32_t rope_dimension,
-                                         float epsilon,
-                                         std::span<const float> cosines,
-                                         std::span<const float> sines)
+static void norm_rope(float* values,
+                      uint32_t count,
+                      uint32_t rope_dimension,
+                      float epsilon,
+                      std::span<const float> cosines,
+                      std::span<const float> sines)
 {
     float_rms_scale_inplace(values, epsilon, count);
     const uint32_t rope_offset = count - rope_dimension;
@@ -668,10 +668,10 @@ static void matrix_rows_dot(const TensorData& matrix,
     }
 }
 
-static int latent_output_group_team_size(size_t row_count,
-                                         uint32_t group_count,
-                                         uint32_t group_columns,
-                                         uint32_t rank) noexcept
+static int latent_team_size(size_t row_count,
+                            uint32_t group_count,
+                            uint32_t group_columns,
+                            uint32_t rank) noexcept
 {
 #if defined(_OPENMP)
     const uint64_t operations = static_cast<uint64_t>(row_count) * group_count * group_columns
@@ -737,8 +737,8 @@ static Result<void> forward_output(const WeightStore& weights,
                                                  group_columns, 128, true, optimization_flags);
         }
 #if defined(_OPENMP)
-        const int output_team_size = latent_output_group_team_size(attention_output.rows(), plan.output_group_count, group_columns,
-                                                                   plan.output_lora_rank);
+        const int output_team_size = latent_team_size(attention_output.rows(), plan.output_group_count, group_columns,
+                                                      plan.output_lora_rank);
         const int64_t output_tasks = static_cast<int64_t>(attention_output.rows())
                                      * plan.output_group_count;
 #pragma omp parallel for schedule(static) num_threads(output_team_size) if (output_team_size > 1)
@@ -813,16 +813,16 @@ static int latent_task_team_size(size_t tasks) noexcept
 #endif
 }
 
-static Result<void> forward_latent_value_attention_batch(const WeightStore& weights,
-                                                         const CompiledOperatorTable& operators,
-                                                         const AttentionBlockPlan& plan,
-                                                         ExecutionBackend backend,
-                                                         std::span<const uint64_t> positions,
-                                                         std::span<LayerCache* const> caches,
-                                                         AttentionScratch& scratch,
-                                                         const ActivationBuffer& input,
-                                                         ActivationBuffer& output,
-                                                         uint64_t optimization_flags)
+static Result<void> latent_value_batch(const WeightStore& weights,
+                                       const CompiledOperatorTable& operators,
+                                       const AttentionBlockPlan& plan,
+                                       ExecutionBackend backend,
+                                       std::span<const uint64_t> positions,
+                                       std::span<LayerCache* const> caches,
+                                       AttentionScratch& scratch,
+                                       const ActivationBuffer& input,
+                                       ActivationBuffer& output,
+                                       uint64_t optimization_flags)
 {
     if (backend != ExecutionBackend::Cpu)
         return Error{ErrorCode::InternalError, "expanded-value latent attention requires the CPU backend"};
@@ -1066,9 +1066,9 @@ Result<void> forward_latent_batch(const WeightStore& weights,
             return forward_latent_value_vulkan(weights, operators, plan, positions, caches,
                                                scratch, input, output, optimization_flags);
         }
-        return forward_latent_value_attention_batch(weights, operators, plan, ExecutionBackend::Cpu,
-                                                    positions, caches, scratch, input, output,
-                                                    optimization_flags);
+        return latent_value_batch(weights, operators, plan, ExecutionBackend::Cpu,
+                                  positions, caches, scratch, input, output,
+                                  optimization_flags);
     }
     for (const LayerCache* cache : caches)
     {
@@ -1435,8 +1435,8 @@ Result<void> forward_latent_batch(const WeightStore& weights,
 
     const std::span<const float> sinks = weights.at(plan.sinks).float32_values();
     const float softmax_scale = 1.0f / std::sqrt(static_cast<float>(plan.head_dimension));
-    const bool use_online_latent_softmax = online_latent_softmax_enabled(optimization_flags);
-    const bool use_vector_latent_softmax = vector_latent_softmax_enabled(optimization_flags);
+    const bool use_online_latent_softmax = latent_softmax_vecline(optimization_flags);
+    const bool use_vector_latent_softmax = latent_softmax_vec(optimization_flags);
 
     std::vector<LatentAttentionRowContext>& row_contexts = scratch.latent_row_contexts;
     row_contexts.resize(input.rows());
@@ -1455,7 +1455,7 @@ Result<void> forward_latent_batch(const WeightStore& weights,
             record_latent_cache_transaction_row(cache, plan, position);
             cache.latent_token_count = position + 1;
             float* key = key_value.row(row_index);
-            if (use_vulkan_core || prepared_latent_rope_enabled(optimization_flags))
+            if (use_vulkan_core || latent_rope_on(optimization_flags))
             {
                 prepare_rope_coefficients(plan.rope_head_dimension,
                                           position,
@@ -1571,14 +1571,14 @@ Result<void> forward_latent_batch(const WeightStore& weights,
         const uint32_t selected_count = context.selected_compressed_indices ? static_cast<uint32_t>(context.compressed_indices.size()) : context.compressed_count;
         const uint32_t candidate_count = context.window_count + selected_count;
         float* query_head = query.row(row_index) + static_cast<size_t>(head) * plan.head_dimension;
-        if (prepared_latent_rope_enabled(optimization_flags))
+        if (latent_rope_on(optimization_flags))
         {
-            normalize_unit_prepared_rope(query_head,
-                                         plan.head_dimension,
-                                         plan.rope_head_dimension,
-                                         plan.norm_epsilon,
-                                         cache.latent_rope_cosines,
-                                         cache.latent_rope_sines);
+            norm_rope(query_head,
+                      plan.head_dimension,
+                      plan.rope_head_dimension,
+                      plan.norm_epsilon,
+                      cache.latent_rope_cosines,
+                      cache.latent_rope_sines);
         }
         else
         {
@@ -1638,7 +1638,7 @@ Result<void> forward_latent_batch(const WeightStore& weights,
                                  plan.head_dimension);
             }
             float_scale_inplace(output_head, 1.0f / denominator, plan.head_dimension);
-            if (prepared_latent_rope_enabled(optimization_flags))
+            if (latent_rope_on(optimization_flags))
             {
                 apply_prepared_rope(output_head + plan.head_dimension
                                         - plan.rope_head_dimension,
@@ -1708,7 +1708,7 @@ Result<void> forward_latent_batch(const WeightStore& weights,
             const float probability = logits[candidate] / denominator;
             float_scaled_add(output_head, candidate_key, probability, plan.head_dimension);
         }
-        if (prepared_latent_rope_enabled(optimization_flags))
+        if (latent_rope_on(optimization_flags))
         {
             apply_prepared_rope(output_head + plan.head_dimension - plan.rope_head_dimension,
                                 plan.rope_head_dimension,
@@ -1977,7 +1977,7 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
     const uint32_t window_count = static_cast<uint32_t>(std::min<uint64_t>(cache.latent_token_count, plan.sliding_window));
     const uint64_t window_begin = cache.latent_token_count - window_count;
     const uint32_t candidate_count = window_count + static_cast<uint32_t>(input.rows());
-    const bool use_vector_softmax = vector_latent_softmax_enabled(optimization_flags)
+    const bool use_vector_softmax = latent_softmax_vec(optimization_flags)
                                     && candidate_count >= vector_latent_softmax_min_candidates;
     scratch.logits.resize(candidate_count);
     std::span<float> logits(scratch.logits);

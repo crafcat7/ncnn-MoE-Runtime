@@ -58,11 +58,11 @@ static void configure_gated_delta_cache(LayerCache& cache, const AttentionBlockP
     cache.gated_delta_token_count = 0;
 }
 
-static void execute_depthwise_convolution_row(const TensorData& weight,
-                                              uint32_t kernel_size,
-                                              std::vector<float>& state,
-                                              float* values,
-                                              uint32_t columns)
+static void conv_row(const TensorData& weight,
+                     uint32_t kernel_size,
+                     std::vector<float>& state,
+                     float* values,
+                     uint32_t columns)
 {
     assert(weight.shape.size() == 3);
     assert(weight.shape[0] == columns);
@@ -126,13 +126,13 @@ static void execute_depthwise_convolution_row(const TensorData& weight,
     float_silu_inplace(values, columns);
 }
 
-static void forward_gated_delta_recurrence(const WeightStore& weights,
-                                           const AttentionBlockPlan& plan,
-                                           LayerCache& cache,
-                                           GatedDeltaScratch& scratch,
-                                           bool fused_input,
-                                           size_t first_row,
-                                           size_t row_count)
+static void gdn_recurrence(const WeightStore& weights,
+                           const AttentionBlockPlan& plan,
+                           LayerCache& cache,
+                           GatedDeltaScratch& scratch,
+                           bool fused_input,
+                           size_t first_row,
+                           size_t row_count)
 {
     const uint32_t key_size = plan.kv_head_count * plan.head_dimension;
     const uint32_t value_size = plan.head_count * plan.value_head_dimension;
@@ -243,13 +243,13 @@ static void forward_gated_delta_recurrence(const WeightStore& weights,
                                         ? float_approximate_exp(plan.delta_lower_bound
                                                                 * gated_delta_sigmoid(gate_scale * (token_alpha[key_column] + gated_delta_tensor_value(time_bias, gate_offset + key_column))))
                                         : scalar_decay;
-                float_scale_inplace_and_scaled_add(recurrent
-                                                       + static_cast<size_t>(key_column)
-                                                             * plan.value_head_dimension,
-                                                   decay,
-                                                   memory_values,
-                                                   key[key_column],
-                                                   plan.value_head_dimension);
+                scale_add(recurrent
+                              + static_cast<size_t>(key_column)
+                                    * plan.value_head_dimension,
+                          decay,
+                          memory_values,
+                          key[key_column],
+                          plan.value_head_dimension);
             }
             for (uint32_t value_column = 0;
                  value_column < plan.value_head_dimension;
@@ -264,14 +264,14 @@ static void forward_gated_delta_recurrence(const WeightStore& weights,
                  key_column < plan.head_dimension;
                  ++key_column)
             {
-                float_scaled_add_and_accumulate(recurrent
-                                                    + static_cast<size_t>(key_column)
-                                                          * plan.value_head_dimension,
-                                                delta_values,
-                                                key[key_column],
-                                                head_output,
-                                                query[key_column],
-                                                plan.value_head_dimension);
+                scaled_acc(recurrent
+                               + static_cast<size_t>(key_column)
+                                     * plan.value_head_dimension,
+                           delta_values,
+                           key[key_column],
+                           head_output,
+                           query[key_column],
+                           plan.value_head_dimension);
             }
             float_scale_inplace(head_output,
                                 query_scale,
@@ -485,19 +485,19 @@ Result<void> forward_gated_delta(const WeightStore& weights,
             float* qkv = fused_input
                              ? scratch.fused_input.row(token_index)
                              : scratch.qkv.row(token_index);
-            execute_depthwise_convolution_row(weights.at(plan.delta_convolution_weight),
-                                              plan.convolution_kernel_size,
-                                              cache.gated_delta_convolution,
-                                              qkv,
-                                              convolution_size);
+            conv_row(weights.at(plan.delta_convolution_weight),
+                     plan.convolution_kernel_size,
+                     cache.gated_delta_convolution,
+                     qkv,
+                     convolution_size);
         }
-        forward_gated_delta_recurrence(weights,
-                                       plan,
-                                       cache,
-                                       scratch,
-                                       fused_input,
-                                       first,
-                                       rows);
+        gdn_recurrence(weights,
+                       plan,
+                       cache,
+                       scratch,
+                       fused_input,
+                       first,
+                       rows);
         record_gated_delta_cache_transaction_row(cache);
     }
     ActivationBuffer& projected = (&output == &hidden || &output == &scratch.recurrent_output)

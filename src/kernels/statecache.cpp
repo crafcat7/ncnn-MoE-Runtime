@@ -7,7 +7,7 @@
 namespace ncnn {
 namespace moe {
 
-static void refresh_gated_delta_device_size(LayerCache& cache) noexcept
+static void refresh_gdn_size(LayerCache& cache) noexcept
 {
     cache.device_allocated_size = cache.gated_delta_device_state ? cache.gated_delta_device_state->allocated_bytes() : 0;
     if (cache.qsa_device_state)
@@ -16,15 +16,15 @@ static void refresh_gated_delta_device_size(LayerCache& cache) noexcept
         cache.device_allocated_size += cache.ple_device_state->allocated_bytes();
 }
 
-static void capture_gated_delta_snapshot(const LayerCache& cache,
-                                         GatedDeltaSnapshot& snapshot)
+static void capture_gdn(const LayerCache& cache,
+                        GatedDeltaSnapshot& snapshot)
 {
     snapshot.gated_delta_convolution = cache.gated_delta_convolution;
     snapshot.gated_delta_recurrent = cache.gated_delta_recurrent;
 }
 
-static void restore_gated_delta_snapshot(LayerCache& cache,
-                                         GatedDeltaSnapshot& snapshot) noexcept
+static void restore_gdn(LayerCache& cache,
+                        GatedDeltaSnapshot& snapshot) noexcept
 {
     cache.gated_delta_convolution.swap(snapshot.gated_delta_convolution);
     cache.gated_delta_recurrent.swap(snapshot.gated_delta_recurrent);
@@ -89,7 +89,7 @@ Result<void> begin_state_cache_transaction(std::span<LayerCache> caches,
                 {
                     if (cleanup_cache.gated_delta_device_state)
                     {
-                        refresh_gated_delta_device_size(cleanup_cache);
+                        refresh_gdn_size(cleanup_cache);
                     }
                 }
                 return Error{
@@ -97,7 +97,7 @@ Result<void> begin_state_cache_transaction(std::span<LayerCache> caches,
                     "failed to begin Vulkan Gated DeltaNet transaction"};
             }
             device_transactions.push_back(cache.gated_delta_device_state.get());
-            refresh_gated_delta_device_size(cache);
+            refresh_gdn_size(cache);
         }
     }
 
@@ -118,8 +118,8 @@ Result<void> begin_state_cache_transaction(std::span<LayerCache> caches,
             if (!cache.gated_delta_convolution.empty()
                 || !cache.gated_delta_recurrent.empty())
             {
-                capture_gated_delta_snapshot(cache,
-                                             transaction.initial);
+                capture_gdn(cache,
+                            transaction.initial);
                 transaction.rows.resize(expected_rows > 0 ? expected_rows - 1 : 0);
             }
             transaction.active = true;
@@ -143,7 +143,7 @@ Result<void> begin_state_cache_transaction(std::span<LayerCache> caches,
         {
             if (cleanup_cache.gated_delta_device_state)
             {
-                refresh_gated_delta_device_size(cleanup_cache);
+                refresh_gdn_size(cleanup_cache);
             }
         }
         return Error{
@@ -174,7 +174,7 @@ void record_gated_delta_cache_transaction_row(LayerCache& cache)
         const size_t index = transaction.recorded_rows - 1;
         if (transaction.rows.size() <= index)
             transaction.rows.resize(index + 1);
-        capture_gated_delta_snapshot(cache, transaction.rows[index]);
+        capture_gdn(cache, transaction.rows[index]);
     }
 }
 
@@ -256,21 +256,21 @@ Result<void> finish_state_cache_transaction(std::span<LayerCache> caches,
             if (committed_rows == 0)
             {
                 if (!cache.gated_delta_device_state)
-                    restore_gated_delta_snapshot(cache, transaction.initial);
+                    restore_gdn(cache, transaction.initial);
             }
             else if (committed_rows < transaction.recorded_rows)
             {
                 if (!cache.gated_delta_device_state)
                 {
-                    restore_gated_delta_snapshot(cache,
-                                                 transaction.rows[committed_rows - 1]);
+                    restore_gdn(cache,
+                                transaction.rows[committed_rows - 1]);
                 }
             }
             cache.gated_delta_token_count = transaction.initial_gated_delta_token_count
                                             + committed_rows;
             if (cache.gated_delta_device_state)
             {
-                refresh_gated_delta_device_size(cache);
+                refresh_gdn_size(cache);
             }
         }
         else

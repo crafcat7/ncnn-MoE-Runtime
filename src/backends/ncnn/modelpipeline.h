@@ -33,7 +33,7 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled,
                                                                    uint32_t sequence_count = 1,
                                                                    uint32_t context_tokens = 0);
 
-void release_vulkan_dense_host_copies(CompiledModel& compiled);
+void release_host_copies(CompiledModel& compiled);
 
 [[nodiscard]] bool support_vulkan_experts(const WeightStore& weights,
                                           const MoeBlockPlan& moe,
@@ -48,19 +48,19 @@ void release_vulkan_dense_host_copies(CompiledModel& compiled);
 [[nodiscard]] bool support_vulkan_dense_ffn(const CompiledOperatorTable& operators,
                                             const ExpertPlan& ffn) noexcept;
 
-[[nodiscard]] uint64_t dense_vulkan_attention_storage_size(const CompiledModel& compiled,
-                                                           const CompiledLayerPlan& layer,
-                                                           uint64_t alignment,
-                                                           uint32_t device_index = automatic_vulkan_device_index) noexcept;
+[[nodiscard]] uint64_t attn_vk_size(const CompiledModel& compiled,
+                                    const CompiledLayerPlan& layer,
+                                    uint64_t alignment,
+                                    uint32_t device_index = automatic_vulkan_device_index) noexcept;
 
-[[nodiscard]] uint64_t dense_vulkan_weight_storage_size(const CompiledModel& compiled,
-                                                        const TensorData& matrix,
-                                                        uint64_t alignment,
-                                                        uint32_t device_index = automatic_vulkan_device_index,
-                                                        bool has_bias = false) noexcept;
+[[nodiscard]] uint64_t dense_weight_size(const CompiledModel& compiled,
+                                         const TensorData& matrix,
+                                         uint64_t alignment,
+                                         uint32_t device_index = automatic_vulkan_device_index,
+                                         bool has_bias = false) noexcept;
 
-[[nodiscard]] uint64_t dense_vulkan_pending_state_size(const CompiledModel& compiled,
-                                                       uint32_t device_index) noexcept;
+[[nodiscard]] uint64_t dense_pending_size(const CompiledModel& compiled,
+                                          uint32_t device_index) noexcept;
 
 // The common resource plan's unallocated per-Session state and peak execution
 // workspace for this device. Shape estimates use the default prefill chunk;

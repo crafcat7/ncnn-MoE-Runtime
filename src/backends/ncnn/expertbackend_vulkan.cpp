@@ -2033,11 +2033,11 @@ bool VulkanExpertBackend::route_aggregation_enabled(std::span<const ExpertReques
     return true;
 }
 
-bool VulkanExpertBackend::build_route_aggregation_metadata(std::span<const ExpertRequest> requests,
-                                                           std::span<const Selection> selected,
-                                                           std::vector<uint32_t>& offsets,
-                                                           std::vector<uint32_t>& rows,
-                                                           std::vector<float>& weights)
+bool VulkanExpertBackend::build_ra_meta(std::span<const ExpertRequest> requests,
+                                        std::span<const Selection> selected,
+                                        std::vector<uint32_t>& offsets,
+                                        std::vector<uint32_t>& rows,
+                                        std::vector<float>& weights)
 {
     if (selected.empty())
         return false;

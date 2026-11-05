@@ -787,7 +787,7 @@ int wait_submitted_compute(ncnn::VkCompute& command, const ncnn::VulkanDevice* p
         [](void* context) noexcept {
             const VkQueue borrowed = static_cast<WaitContext*>(context)->queue;
             if (borrowed)
-                return classify_vulkan_completion_probe(vkQueueWaitIdle(borrowed), VK_ERROR_DEVICE_LOST);
+                return classify_probe(vkQueueWaitIdle(borrowed), VK_ERROR_DEVICE_LOST);
             const ncnn::VulkanDevice* device = static_cast<WaitContext*>(context)->device;
             if (!device)
                 return VulkanCompletionProbeResult::Retry;
@@ -800,10 +800,10 @@ int wait_submitted_compute(ncnn::VkCompute& command, const ncnn::VulkanDevice* p
                 return VulkanCompletionProbeResult::Retry;
             const VkResult probe_result = vkQueueWaitIdle(queue);
             device->reclaim_queue(family, queue);
-            return classify_vulkan_completion_probe(probe_result, VK_ERROR_DEVICE_LOST);
+            return classify_probe(probe_result, VK_ERROR_DEVICE_LOST);
         },
         [](void*) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }};
-    return wait_for_vulkan_submission_completion(callbacks);
+    return wait_submit(callbacks);
 }
 
 VulkanComputeBatch::VulkanComputeBatch(VulkanContext& owner) : context(owner)

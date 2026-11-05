@@ -345,11 +345,11 @@ private:
                                           uint32_t& token_count,
                                           uint64_t optimization_flags);
 
-    static bool build_route_aggregation_metadata(std::span<const ExpertRequest> requests,
-                                                 std::span<const Selection> selected,
-                                                 std::vector<uint32_t>& offsets,
-                                                 std::vector<uint32_t>& rows,
-                                                 std::vector<float>& weights);
+    static bool build_ra_meta(std::span<const ExpertRequest> requests,
+                              std::span<const Selection> selected,
+                              std::vector<uint32_t>& offsets,
+                              std::vector<uint32_t>& rows,
+                              std::vector<float>& weights);
 
     static uint64_t mxfp4_bytes(const TensorData& tensor);
 

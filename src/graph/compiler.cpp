@@ -2284,7 +2284,7 @@ Result<void> compile_model(MoeModelDescriptor descriptor, WeightMapping mapping,
     if (!graph)
         return graph.error();
     if (use_vulkan_dense)
-        release_vulkan_dense_host_copies(compiled);
+        release_host_copies(compiled);
     compiled.weights.finalize();
     return {};
 }

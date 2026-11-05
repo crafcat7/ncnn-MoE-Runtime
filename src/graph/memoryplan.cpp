@@ -309,7 +309,7 @@ static Result<uint64_t> latent_dense_size(const MoeModelDescriptor& descriptor)
     return total;
 }
 
-static Result<uint64_t> latent_vulkan_releasable_dense_size(const MoeModelDescriptor& descriptor)
+static Result<uint64_t> latent_release_size(const MoeModelDescriptor& descriptor)
 {
     if (descriptor.layers.empty()
         || descriptor.hyper_connection_multiplier <= 1
@@ -935,8 +935,8 @@ static bool mapped_ple_embedding_shard(const std::string& name, const TensorData
     return ple.embedding_dimension % heads == 0 && tensor.shape[1] == ple.embedding_dimension / heads;
 }
 
-static Result<uint64_t> gated_residual_vulkan_releasable_dense_size(const MoeModelDescriptor& descriptor,
-                                                                    const Option& opt, const WeightMapping& weights)
+static Result<uint64_t> gr_release_size(const MoeModelDescriptor& descriptor,
+                                        const Option& opt, const WeightMapping& weights)
 {
     const uint64_t required_flags = OptimizationVulkanAttention | OptimizationVulkanQnK
                                     | OptimizationVulkanExpertGpuPriority | OptimizationVulkanCommandGraph;
@@ -1459,10 +1459,10 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& input_descri
         if (weights && descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
         {
             if (use_vulkan_attention)
-                releasable = gated_residual_vulkan_releasable_dense_size(descriptor, opt, *weights);
+                releasable = gr_release_size(descriptor, opt, *weights);
         }
         else
-            releasable = latent_vulkan_releasable_dense_size(descriptor);
+            releasable = latent_release_size(descriptor);
         if (!releasable)
             return releasable.error();
         plan.estimated_vulkan_dense_host_release_size = std::min(releasable.value(), plan.estimated_dense_size);

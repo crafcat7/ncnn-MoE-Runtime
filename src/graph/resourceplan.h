@@ -46,7 +46,7 @@ struct GpuResourcePlan
 // Commit only after an entire operator group has been created successfully.
 void commit_gpu_resources(GpuResourcePlan& plan, GpuResourceRequest request) noexcept;
 
-[[nodiscard]] uint64_t gpu_resource_execution_reserve(const GpuResourcePlan& plan) noexcept;
+[[nodiscard]] uint64_t gpu_exec_reserve(const GpuResourcePlan& plan) noexcept;
 
 // Called after persistent operators are allocated. Explicit cache reservations
 // are released into this capacity, rather than subtracted a second time.

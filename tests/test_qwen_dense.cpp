@@ -339,17 +339,17 @@ static bool test_partial_gpu_budget(const std::filesystem::path& root, const Gpu
     TensorData oversized_head;
     oversized_head.dtype = DType::Float32;
     oversized_head.shape = {248320, 5120};
-    check(dense_vulkan_weight_storage_size(cpu, oversized_head, alignment, device_index) == 0,
+    check(dense_weight_size(cpu, oversized_head, alignment, device_index) == 0,
           "FP32 head exceeding Vulkan's single-buffer range was admitted");
     TensorData biased_projection;
     biased_projection.dtype = DType::BFloat16;
     biased_projection.shape = {4, 6};
-    const uint64_t bias_free_storage = dense_vulkan_weight_storage_size(cpu, biased_projection, alignment, device_index);
+    const uint64_t bias_free_storage = dense_weight_size(cpu, biased_projection, alignment, device_index);
     check(bias_free_storage > 0
-              && dense_vulkan_weight_storage_size(cpu, biased_projection, alignment, device_index, true) > bias_free_storage,
+              && dense_weight_size(cpu, biased_projection, alignment, device_index, true) > bias_free_storage,
           "generic FP32 projection budget omitted its bias allocation");
-    const uint64_t projection_storage = dense_vulkan_weight_storage_size(cpu, cpu.weights.at(cpu.graph.layer_plans.front().dense_ffn.gate_weight),
-                                                                         alignment, device_index);
+    const uint64_t projection_storage = dense_weight_size(cpu, cpu.weights.at(cpu.graph.layer_plans.front().dense_ffn.gate_weight),
+                                                          alignment, device_index);
     if (projection_storage == 0)
     {
         std::cout << "SKIP dense GPU budget " << device << ": no supported FFN projection\n";
@@ -375,8 +375,8 @@ static bool test_partial_gpu_budget(const std::filesystem::path& root, const Gpu
 
     uint64_t attention_storage = 0;
     for (const CompiledLayerPlan& layer : cpu.graph.layer_plans)
-        attention_storage += dense_vulkan_attention_storage_size(cpu, layer, alignment, device_index);
-    const uint64_t head_storage = dense_vulkan_weight_storage_size(cpu, cpu.weights.at(cpu.lm_head_weight), alignment, device_index);
+        attention_storage += attn_vk_size(cpu, layer, alignment, device_index);
+    const uint64_t head_storage = dense_weight_size(cpu, cpu.weights.at(cpu.lm_head_weight), alignment, device_index);
     if (gpu.heap_available < attention_storage + head_storage + projection_storage * 6)
     {
         std::cout << "SKIP complete dense GPU budget " << device << ": fixture exceeds available heap\n";
@@ -404,7 +404,7 @@ static bool test_partial_gpu_budget(const std::filesystem::path& root, const Gpu
           "admitted dense operators did not execute on GPU");
     check(actual.counters.attention_cpu_fallbacks == 0,
           "a selected GPU attention operator retried through CPU");
-    check(dense_vulkan_pending_state_size(model, device_index) >= actual.gated_delta_state_bytes,
+    check(dense_pending_size(model, device_index) >= actual.gated_delta_state_bytes,
           "published resource plan omitted allocated GatedDelta state");
     check(model.released_dense_host_size > 0,
           "resident dense GPU operators retained all host payloads");
