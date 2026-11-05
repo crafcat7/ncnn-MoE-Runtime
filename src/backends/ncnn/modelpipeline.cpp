@@ -15,6 +15,7 @@
 #include "gatedresiduallayer_vulkan.h"
 #include "gpusegment_vulkan.h"
 #include "expertbackend_vulkan.h"
+#include "expertbank_vulkan.h"
 #include "graph/compiler.h"
 #include "engine/expert.h"
 #include "graph/compiledmodel.h"
@@ -40,16 +41,16 @@
 namespace ncnn {
 namespace moe {
 
-static Result<void> prepare_vulkan_linear_operator(WeightStore& weights,
-                                                   CompiledOperatorTable& operators,
-                                                   TensorHandle matrix_handle,
-                                                   TensorHandle bias_handle,
-                                                   uint32_t vulkan_device_index,
-                                                   const VulkanRuntimePtr& vulkan_runtime,
-                                                   uint64_t optimization_flags,
-                                                   uint32_t input_group_count = 1,
-                                                   bool prefer_bfloat16_vulkan = true,
-                                                   bool allow_float32_fallback = true)
+static Result<void> prepare_linear_vk(WeightStore& weights,
+                                      CompiledOperatorTable& operators,
+                                      TensorHandle matrix_handle,
+                                      TensorHandle bias_handle,
+                                      uint32_t vulkan_device_index,
+                                      const VulkanRuntimePtr& vulkan_runtime,
+                                      uint64_t optimization_flags,
+                                      uint32_t input_group_count = 1,
+                                      bool prefer_bfloat16_vulkan = true,
+                                      bool allow_float32_fallback = true)
 {
     TensorData& matrix = weights.at_mutable(matrix_handle);
     CompiledOperator& compiled_operator = operators.at_weight_mutable(matrix_handle);
@@ -110,9 +111,9 @@ static Result<void> prepare_vulkan_linear_operator(WeightStore& weights,
 static Result<void> prepare_lm_head_operator(CompiledModel& compiled, bool allow_float32_fallback = true,
                                              bool prefer_bfloat16_vulkan = true)
 {
-    auto prepared = prepare_vulkan_linear_operator(compiled.weights, compiled.operators, compiled.lm_head_weight, compiled.lm_head_bias,
-                                                   compiled.opt.vulkan_device_index, compiled.vulkan_runtime,
-                                                   compiled.opt.optimization_flags, 1, prefer_bfloat16_vulkan, allow_float32_fallback);
+    auto prepared = prepare_linear_vk(compiled.weights, compiled.operators, compiled.lm_head_weight, compiled.lm_head_bias,
+                                      compiled.opt.vulkan_device_index, compiled.vulkan_runtime,
+                                      compiled.opt.optimization_flags, 1, prefer_bfloat16_vulkan, allow_float32_fallback);
     if (!prepared)
         return prepared.error();
     const CompiledOperator& lm_head_operator = compiled.operators.at_weight(compiled.lm_head_weight);
@@ -552,8 +553,8 @@ static Result<void> prepare_ffn_operators(WeightStore& weights,
     {
         for (TensorHandle handle : {ffn.gate_weight, ffn.up_weight, ffn.down_weight})
         {
-            auto prepared = prepare_vulkan_linear_operator(weights, operators, handle, invalid_tensor_handle,
-                                                           vulkan_device_index, vulkan_runtime, optimization_flags);
+            auto prepared = prepare_linear_vk(weights, operators, handle, invalid_tensor_handle,
+                                              vulkan_device_index, vulkan_runtime, optimization_flags);
             if (!prepared) return prepared.error();
         }
         ffn.vulkan_operator = operators.handle_for_weight(ffn.gate_weight);
@@ -572,16 +573,16 @@ static Result<void> prepare_ffn_operators(WeightStore& weights,
         {
             ffn.vulkan_operator = operators.allocate();
             operators.at_mutable(ffn.vulkan_operator).bfloat16 = std::move(fused);
-            return prepare_vulkan_linear_operator(weights, operators, ffn.down_weight, invalid_tensor_handle,
-                                                  vulkan_device_index, vulkan_runtime, optimization_flags, 1, true, allow_float32_fallback);
+            return prepare_linear_vk(weights, operators, ffn.down_weight, invalid_tensor_handle,
+                                     vulkan_device_index, vulkan_runtime, optimization_flags, 1, true, allow_float32_fallback);
         }
     }
     if (!allow_float32_fallback)
         return Error{ErrorCode::InternalError, "failed to create fused Vulkan BF16 FFN operator"};
     for (TensorHandle handle : {ffn.gate_weight, ffn.up_weight, ffn.down_weight})
     {
-        auto prepared = prepare_vulkan_linear_operator(weights, operators, handle, invalid_tensor_handle,
-                                                       vulkan_device_index, vulkan_runtime, optimization_flags, 1, true, allow_float32_fallback);
+        auto prepared = prepare_linear_vk(weights, operators, handle, invalid_tensor_handle,
+                                          vulkan_device_index, vulkan_runtime, optimization_flags, 1, true, allow_float32_fallback);
         if (!prepared)
             return prepared.error();
     }
@@ -622,8 +623,8 @@ static Result<void> prepare_shared_expert_operators(WeightStore& weights,
                 return Error{ErrorCode::InternalError, "failed to prepare the selected Vulkan Shared Expert router gate"};
             return {};
         }
-        return prepare_vulkan_linear_operator(weights, operators, moe.shared_expert_gate_weight, invalid_tensor_handle,
-                                              vulkan_device_index, vulkan_runtime, optimization_flags);
+        return prepare_linear_vk(weights, operators, moe.shared_expert_gate_weight, invalid_tensor_handle,
+                                 vulkan_device_index, vulkan_runtime, optimization_flags);
     }
     if (!has_router_gate && shared.activation == ExpertActivation::DeepSeekSwiGlu
         && gate.dtype == DType::Float8E4M3 && up.dtype == DType::Float8E4M3
@@ -675,13 +676,13 @@ static Result<void> prepare_shared_expert_operators(WeightStore& weights,
     const CompiledOperatorHandle fused_handle = operators.allocate();
     operators.at_mutable(fused_handle).bfloat16 = std::move(fused_operator);
     moe.fused_shared_input_bfloat16_operator = fused_handle;
-    return prepare_vulkan_linear_operator(weights,
-                                          operators,
-                                          shared.down_weight,
-                                          invalid_tensor_handle,
-                                          vulkan_device_index,
-                                          vulkan_runtime,
-                                          optimization_flags);
+    return prepare_linear_vk(weights,
+                             operators,
+                             shared.down_weight,
+                             invalid_tensor_handle,
+                             vulkan_device_index,
+                             vulkan_runtime,
+                             optimization_flags);
 }
 
 static Result<void> prepare_vulkan_qkv_operator(CompiledModel& compiled,
@@ -712,10 +713,10 @@ static Result<void> prepare_vulkan_qkv_operator(CompiledModel& compiled,
         const TensorHandle biases[] = {plan.query_bias, plan.key_bias, plan.value_bias};
         for (size_t index = 0; index < 3; ++index)
         {
-            auto prepared = prepare_vulkan_linear_operator(compiled.weights, compiled.operators,
-                                                           handles[index], biases[index],
-                                                           layer_plan.vulkan_device_index, compiled.vulkan_runtime,
-                                                           compiled.opt.optimization_flags);
+            auto prepared = prepare_linear_vk(compiled.weights, compiled.operators,
+                                              handles[index], biases[index],
+                                              layer_plan.vulkan_device_index, compiled.vulkan_runtime,
+                                              compiled.opt.optimization_flags);
             if (!prepared)
                 return prepared.error();
         }
@@ -801,11 +802,11 @@ static Result<void> prepare_latent_attention_operators(CompiledModel& compiled,
     {
         if (handle == invalid_tensor_handle)
             continue;
-        prepared = prepare_vulkan_linear_operator(compiled.weights, compiled.operators, handle,
-                                                  invalid_tensor_handle,
-                                                  layer_plan.vulkan_device_index,
-                                                  compiled.vulkan_runtime,
-                                                  compiled.opt.optimization_flags);
+        prepared = prepare_linear_vk(compiled.weights, compiled.operators, handle,
+                                     invalid_tensor_handle,
+                                     layer_plan.vulkan_device_index,
+                                     compiled.vulkan_runtime,
+                                     compiled.opt.optimization_flags);
         if (!prepared)
             return prepared.error();
     }
@@ -823,21 +824,21 @@ static Result<void> prepare_latent_attention_operators(CompiledModel& compiled,
         {
             if (handle == invalid_tensor_handle)
                 continue;
-            prepared = prepare_vulkan_linear_operator(compiled.weights, compiled.operators, handle,
-                                                      invalid_tensor_handle,
-                                                      layer_plan.vulkan_device_index,
-                                                      compiled.vulkan_runtime,
-                                                      compiled.opt.optimization_flags);
+            prepared = prepare_linear_vk(compiled.weights, compiled.operators, handle,
+                                         invalid_tensor_handle,
+                                         layer_plan.vulkan_device_index,
+                                         compiled.vulkan_runtime,
+                                         compiled.opt.optimization_flags);
             if (!prepared)
                 return prepared.error();
         }
     }
-    prepared = prepare_vulkan_linear_operator(compiled.weights, compiled.operators, plan.output_a_weight,
-                                              invalid_tensor_handle,
-                                              layer_plan.vulkan_device_index,
-                                              compiled.vulkan_runtime,
-                                              compiled.opt.optimization_flags,
-                                              plan.output_group_count);
+    prepared = prepare_linear_vk(compiled.weights, compiled.operators, plan.output_a_weight,
+                                 invalid_tensor_handle,
+                                 layer_plan.vulkan_device_index,
+                                 compiled.vulkan_runtime,
+                                 compiled.opt.optimization_flags,
+                                 plan.output_group_count);
     if (!prepared)
         return prepared.error();
     const CompiledOperator& query_a = compiled.operators.at_weight(plan.query_a_weight);
@@ -1251,25 +1252,25 @@ static Result<void> prepare_standard_attention_operators(CompiledModel& compiled
                                            "failed to create fused Vulkan QKV operator", !use_bfloat16_fusion && allow_float32_fallback);
     if (!prepared)
         return prepared.error();
-    prepared = prepare_vulkan_linear_operator(compiled.weights, compiled.operators, plan.output_weight,
-                                              plan.output_bias,
-                                              layer_plan.vulkan_device_index,
-                                              compiled.vulkan_runtime,
-                                              compiled.opt.optimization_flags,
-                                              1,
-                                              use_bfloat16_fusion,
-                                              !use_bfloat16_fusion && allow_float32_fallback);
+    prepared = prepare_linear_vk(compiled.weights, compiled.operators, plan.output_weight,
+                                 plan.output_bias,
+                                 layer_plan.vulkan_device_index,
+                                 compiled.vulkan_runtime,
+                                 compiled.opt.optimization_flags,
+                                 1,
+                                 use_bfloat16_fusion,
+                                 !use_bfloat16_fusion && allow_float32_fallback);
     if (!prepared)
         return prepared.error();
     if (plan.output_gate_weight != invalid_tensor_handle)
     {
         if (plan.fused_qkv_gate_bfloat16_operator == invalid_compiled_operator_handle)
         {
-            prepared = prepare_vulkan_linear_operator(compiled.weights, compiled.operators, plan.output_gate_weight,
-                                                      invalid_tensor_handle,
-                                                      layer_plan.vulkan_device_index,
-                                                      compiled.vulkan_runtime,
-                                                      compiled.opt.optimization_flags, 1, true, allow_float32_fallback);
+            prepared = prepare_linear_vk(compiled.weights, compiled.operators, plan.output_gate_weight,
+                                         invalid_tensor_handle,
+                                         layer_plan.vulkan_device_index,
+                                         compiled.vulkan_runtime,
+                                         compiled.opt.optimization_flags, 1, true, allow_float32_fallback);
             if (!prepared)
                 return prepared.error();
         }

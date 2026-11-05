@@ -2,6 +2,7 @@
 
 #include "backends/ncnn/modelpipeline.h"
 #include "backends/ncnn/gpusegment_vulkan.h"
+#include "backends/ncnn/expertbank_vulkan.h"
 #include "backends/ncnn/vulkan.h"
 #include "backends/ncnn/vulkancontext.h"
 #include "graph/compiledmodel.h"
@@ -309,8 +310,8 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
                 // Bank admission leaves headroom for the attention/FFN groups
                 // that are committed after the bank. A partial chain also keeps
                 // room for the streaming cache used by its tail layers.
-                constexpr uint64_t bank_headroom = UINT64_C(256) << 20;
-                constexpr uint64_t streaming_reserve = UINT64_C(1) << 30;
+                constexpr uint64_t bank_headroom = UINT64_C(256) * 1024 * 1024;
+                constexpr uint64_t streaming_reserve = UINT64_C(1024) * 1024 * 1024;
                 const bool free_heap = live.heap_usage <= live.heap_budget
                                        && pending <= live.heap_budget - live.heap_usage;
                 const uint64_t available = free_heap ? live.heap_budget - live.heap_usage - pending : 0;

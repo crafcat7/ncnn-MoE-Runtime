@@ -10,14 +10,11 @@
 #include "ncnn/moe/option.h"
 #include "ncnn/moe/types.h"
 #include "backends/ncnn/vulkan.h"
-#include "backends/ncnn/expertbank_vulkan.h"
+#include "backends/ncnn/expertbankplan_vulkan.h"
 #include "storage/weightstore.h"
 
 #include <cstdint>
-#include <limits>
 #include <memory>
-#include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace ncnn {
@@ -29,6 +26,7 @@ class ExpertBackend;
 class Tokenizer;
 class GatedResidualLayer_vulkan;
 class GpuSegment_vulkan;
+class ExpertBank_vulkan;
 class GraphResources;
 
 // Runtime settings after hardware/resource Auto values have been resolved;
