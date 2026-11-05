@@ -13,9 +13,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "NCNN_MOE_BUILD_TESTS": "OFF",
-        "NCNN_MOE_BUILD_EXAMPLES": "ON",
-        "NCNN_MOE_BUILD_REFERENCE_RUNNERS": "OFF",
-        "NCNN_MOE_BUILD_MXFP4_BENCHMARK": "OFF"
+        "NCNN_MOE_BUILD_EXAMPLES": "ON"
       }
     },
     {
@@ -34,8 +32,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "NCNN_MOE_BUILD_TESTS": "ON",
-        "NCNN_MOE_BUILD_EXAMPLES": "ON",
-        "NCNN_MOE_BUILD_REFERENCE_RUNNERS": "OFF"
+        "NCNN_MOE_BUILD_EXAMPLES": "ON"
       }
     },
     {
@@ -45,8 +42,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "NCNN_MOE_BUILD_TESTS": "OFF",
-        "NCNN_MOE_BUILD_EXAMPLES": "OFF",
-        "NCNN_MOE_BUILD_REFERENCE_RUNNERS": "OFF"
+        "NCNN_MOE_BUILD_EXAMPLES": "OFF"
       }
     }
   ],

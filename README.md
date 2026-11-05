@@ -155,15 +155,12 @@ is `python -m pip install -e .`. The `ncnn-moe` console script is equivalent to
 git clone --recurse-submodules https://github.com/crafcat7/ncnn-MoE-Runtime.git
 cd ncnn-MoE-Runtime
 cmake -S . -B build-ncnn `
-  -DNCNN_MOE_BUILD_TESTS=OFF `
-  -DNCNN_MOE_BUILD_REFERENCE_RUNNERS=OFF `
-  -DNCNN_MOE_BUILD_MXFP4_BENCHMARK=OFF
+  -DNCNN_MOE_BUILD_TESTS=OFF
 cmake --build build-ncnn --config Release --target ncnn_moe_worker --parallel
 ```
 
-The worker build is the fast default for the unified CLI. CMake does not build
-the model-specific reference runners or the MXFP4 microbenchmark unless they
-are explicitly enabled. MSVC builds use multiprocessor compilation by default;
+The worker build is the fast default for the unified CLI. MSVC builds use
+multiprocessor compilation by default;
 set `-DNCNN_MOE_ENABLE_MSVC_MP=OFF` only when a toolchain does not support it.
 Release builds enable per-function sections and linker dead-code elimination.
 Set `-DNCNN_MOE_ENABLE_LTO=ON` for the smallest worker; the tradeoff is a much
@@ -606,7 +603,7 @@ src/storage/       Weight storage, mapped-file I/O, host ARC, and Vulkan victim 
 src/kernels/       Portable CPU Attention/Linear, BF16 helpers, Qn_K pack/decode, and runtime-selected FP8/MXFP4 SIMD kernels
 src/backends/ncnn/ ncnn operator packaging, mixed Attention, Vulkan contexts, and native MXFP4 Experts
 models/            Model catalog and model-family execution guides
-examples/          Unified worker and model-specific reference runners
+examples/          Unified JSONL worker and shared telemetry helpers
 tools/             Unified CLI/client, Qwen artifact compiler, and quantized-package importer
 tests/             Deterministic, parity, cache, scheduling, concurrency, and error-path tests
 third_party/ncnn/  Pinned upstream ncnn source submodule

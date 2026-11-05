@@ -145,25 +145,6 @@ The Runtime does not currently expose the checkpoint's recommended presence
 penalty. Applications that require exact sampling-policy parity should account
 for that difference.
 
-## Run token IDs with the reference runner
-
-Applications that already own tokenization can use the model-named native
-reference target:
-
-```powershell
-cmake -S . -B build-ncnn -DNCNN_MOE_BUILD_REFERENCE_RUNNERS=ON
-cmake --build build-ncnn --config Release --target ncnn_moe_qwen3_6 --parallel
-.\build-ncnn\Release\ncnn_moe_qwen3_6.exe `
-  .\models\qwen3.6\Qwen3.6-35B-A3B 248044 `
-  --max-new-tokens 16 --no-speculative --hybrid --report-throughput
-```
-
-Use `--prompt-token-file PATH` for a whitespace-separated token sequence and
-`--stream-token-ids` for incremental machine-readable IDs. The runner stops on
-both published stop tokens: `<|im_end|>` (`248046`) and `<|endoftext|>`
-(`248044`). These reference targets are retained for the benchmark harness and
-CTest fixture; normal text and chat usage should use `ncnn_moe.py`.
-
 ## Execution and memory
 
 | Option | Execution |

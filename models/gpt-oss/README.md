@@ -70,25 +70,6 @@ The CLI locates `ncnn_moe_worker` in common build directories, or accepts an
 explicit path with `--worker`. Scripted runs can add `--no-metrics` to suppress
 periodic metrics events while retaining final statistics.
 
-## Run token IDs with the reference runner
-
-Applications that already own tokenization can use the model-named native
-reference target. It accepts a model directory followed by one or more prompt
-token IDs:
-
-```powershell
-cmake -S . -B build-ncnn -DNCNN_MOE_BUILD_REFERENCE_RUNNERS=ON
-cmake --build build-ncnn --config Release --target ncnn_moe_gpt_oss --parallel
-.\build-ncnn\Release\ncnn_moe_gpt_oss.exe `
-  .\models\gpt-oss\gpt-oss-20b 0 `
-  --max-new-tokens 64 --hybrid --report-throughput
-```
-
-Use `--stream-token-ids` to print generated IDs as they become available. For
-long whitespace-separated sequences, use `--prompt-token-file PATH`. These
-reference targets are retained for the benchmark harness and CTest fixture;
-normal text and chat usage should use `ncnn_moe.py`.
-
 ## Sampling
 
 | Option | Meaning |

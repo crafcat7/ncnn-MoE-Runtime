@@ -10,16 +10,6 @@ option(NCNN_BUILD_MOE_RUNTIME "Build the ncnn MoE transformer runtime" ON)
 option(NCNN_MOE_BUILD_TESTS "Build ncnn_moe tests" ON)
 option(NCNN_MOE_BUILD_EXAMPLES "Build ncnn_moe examples" ON)
 option(
-    NCNN_MOE_BUILD_REFERENCE_RUNNERS
-    "Build model-specific token-ID reference runners used by benchmarks and CTest"
-    OFF
-)
-option(
-    NCNN_MOE_BUILD_MXFP4_BENCHMARK
-    "Build the standalone MXFP4 microbenchmark"
-    OFF
-)
-option(
     NCNN_MOE_ENABLE_MSVC_MP
     "Enable MSVC multiprocessor compilation"
     ON
@@ -699,62 +689,6 @@ endif()
 # ==============================================================================
 
 if(NCNN_MOE_BUILD_EXAMPLES)
-    if(NCNN_MOE_BUILD_REFERENCE_RUNNERS)
-        add_library(
-            ncnn_moe_reference_runner
-            STATIC
-            examples/internal/modelrunner.cpp)
-        target_link_libraries(
-            ncnn_moe_reference_runner
-            PUBLIC ncnn::moe)
-        target_compile_features(
-            ncnn_moe_reference_runner
-            PRIVATE cxx_std_20)
-        target_include_directories(
-            ncnn_moe_reference_runner
-            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        ncnn_moe_optimize_target(ncnn_moe_reference_runner)
-
-        add_executable(
-            ncnn_moe_gpt_oss
-            examples/run_gpt_oss.cpp)
-        target_link_libraries(
-            ncnn_moe_gpt_oss
-            PRIVATE ncnn_moe_reference_runner)
-        target_compile_features(
-            ncnn_moe_gpt_oss
-            PRIVATE cxx_std_20)
-
-        add_executable(
-            ncnn_moe_deepseek_v4
-            examples/run_deepseek_v4.cpp)
-        target_link_libraries(
-            ncnn_moe_deepseek_v4
-            PRIVATE ncnn_moe_reference_runner)
-        target_compile_features(
-            ncnn_moe_deepseek_v4
-            PRIVATE cxx_std_20)
-
-        add_executable(
-            ncnn_moe_qwen3_6
-            examples/run_qwen3_6.cpp)
-        target_link_libraries(
-            ncnn_moe_qwen3_6
-            PRIVATE ncnn_moe_reference_runner)
-        target_compile_features(
-            ncnn_moe_qwen3_6
-            PRIVATE cxx_std_20)
-
-        add_executable(
-            ncnn_moe_qwen3_8
-            examples/run_qwen3_8.cpp)
-        target_link_libraries(
-            ncnn_moe_qwen3_8
-            PRIVATE ncnn_moe_reference_runner)
-        target_compile_features(
-            ncnn_moe_qwen3_8
-            PRIVATE cxx_std_20)
-    endif()
     add_executable(
         ncnn_moe_worker
         examples/ncnn_moe_worker.cpp
@@ -779,36 +713,11 @@ if(NCNN_MOE_BUILD_EXAMPLES)
     ncnn_moe_optimize_target(ncnn_moe_worker)
     install(TARGETS ncnn_moe_worker
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-    if(NCNN_MOE_BUILD_MXFP4_BENCHMARK)
-        add_executable(
-            ncnn_moe_mxfp4_bench
-            examples/benchmark_mxfp4.cpp)
-        target_link_libraries(
-            ncnn_moe_mxfp4_bench
-            PRIVATE ncnn::moe)
-        target_compile_features(
-            ncnn_moe_mxfp4_bench
-            PRIVATE cxx_std_20)
-        target_include_directories(
-            ncnn_moe_mxfp4_bench
-            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    endif()
 endif()
 
-if(APPLE)
-    foreach(NCNN_MOE_EXECUTABLE IN ITEMS
-        ncnn_moe_worker
-        ncnn_moe_gpt_oss
-        ncnn_moe_deepseek_v4
-        ncnn_moe_qwen3_6
-        ncnn_moe_qwen3_8
-        ncnn_moe_mxfp4_bench
-    )
-        if(TARGET ${NCNN_MOE_EXECUTABLE})
-            target_link_options(${NCNN_MOE_EXECUTABLE} PRIVATE
-                "$<$<CONFIG:Release>:LINKER:-dead_strip>")
-        endif()
-    endforeach()
+if(APPLE AND TARGET ncnn_moe_worker)
+    target_link_options(ncnn_moe_worker PRIVATE
+        "$<$<CONFIG:Release>:LINKER:-dead_strip>")
 endif()
 
 # ==============================================================================

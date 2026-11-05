@@ -13,9 +13,7 @@ Build the long-lived native worker with the examples target:
 
 ```powershell
 cmake -S . -B build-ncnn `
-  -DNCNN_MOE_BUILD_TESTS=OFF `
-  -DNCNN_MOE_BUILD_REFERENCE_RUNNERS=OFF `
-  -DNCNN_MOE_BUILD_MXFP4_BENCHMARK=OFF
+  -DNCNN_MOE_BUILD_TESTS=OFF
 cmake --build build-ncnn --config Release --target ncnn_moe_worker --parallel
 ```
 
@@ -69,20 +67,7 @@ Normal generation automatically uses a model-provided speculative plan when
 supported. These policies do not require separate CLI switches.
 
 The CLI is the interactive text entry point; C++ consumers can use
-`Model::encode`, `Model::decode`, and `Model::stop_tokens`. The four
-model-named native executables (`ncnn_moe_gpt_oss`,
-`ncnn_moe_deepseek_v4`, `ncnn_moe_qwen3_6`, and `ncnn_moe_qwen3_8`) remain
-reference/benchmark
-targets because the benchmark harness and CTest fixture use their positional
-token-ID, prompt-file, and multi-session controls. They are not built by the
-fast default configuration and are not required for normal text or chat usage.
-Enable them at configure time when needed:
-
-```powershell
-cmake -S . -B build-reference -DNCNN_MOE_BUILD_REFERENCE_RUNNERS=ON
-cmake --build build-reference --config Release `
-  --target ncnn_moe_gpt_oss ncnn_moe_deepseek_v4 ncnn_moe_qwen3_6 ncnn_moe_qwen3_8 --parallel
-```
+`Model::encode`, `Model::decode`, and `Model::stop_tokens`.
 
 ## Metrics trace
 
