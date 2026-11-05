@@ -938,25 +938,12 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
         std::cout << "Vulkan batch boundary requests: " << statistics.vulkan_batch_uploads << " host->device, " << statistics.vulkan_batch_downloads << " device->host\n";
         std::cout << "Vulkan attention fusion: " << statistics.vulkan_attention_qkv_rope_fusions << " QKV+RoPE block(s), " << statistics.vulkan_attention_device_rope_fusions << " device-RoPE block(s), " << statistics.vulkan_attention_qkv_ring_fusions << " QKV->ring block(s), "
                   << statistics.vulkan_attention_decode_sdpa_fusions << " Decode-SDPA block(s)\n";
-        std::cout << "Vulkan shared Expert SwiGLU fusions: " << statistics.vulkan_shared_expert_swiglu_fusions << '\n';
-        std::cout << "Vulkan BF16 cooperative matrix dispatches: "
-                  << statistics.vulkan_bfloat16_cooperative_matrix_dispatches
-                  << '\n';
-        std::cout << "CPU BF16 batched Linear dispatches: "
-                  << statistics.cpu_bfloat16_batched_linear_dispatches
-                  << '\n';
-        std::cout << "Vulkan Gated DeltaNet fusions: " << statistics.vulkan_gated_delta_fusions << ", submissions: " << statistics.vulkan_gated_delta_submissions << '\n';
-        std::cout << "Vulkan RMSNorm+Linear fusions: " << statistics.vulkan_rms_norm_linear_fusions << '\n';
-        std::cout << "Vulkan KV ring: " << statistics.vulkan_kv_ring_appends << " append(s)\n";
+        std::cout << "Vulkan Gated DeltaNet submissions: " << statistics.vulkan_gated_delta_submissions << '\n';
+        std::cout << "Vulkan KV ring: " << statistics.vulkan_kv_ring_appends << " append(s), " << statistics.vulkan_kv_ring_resizes << " resize(s), " << statistics.vulkan_kv_ring_wrapped_views << " wrapped view(s)\n";
         std::cout << "Expert weight demand: " << statistics.expert_batch_weight_bytes << " batched bytes, " << statistics.expert_route_weight_bytes << " route bytes\n";
         std::cout << "Speculative decoding: " << speculative_proposals << " proposal(s), "
                   << speculative_draft_tokens << " draft token(s), "
                   << speculative_accepted_tokens << " accepted token(s)\n";
-        std::cout << "Expert route prediction: " << statistics.expert_route_predictions << " prediction(s), " << statistics.expert_route_prediction_matches << " match(es), " << statistics.expert_route_prediction_cache_hits
-                  << " cache-ready, " << statistics.expert_route_prediction_cache_misses << " not-ready, "
-                  << statistics.expert_route_prediction_async_submissions << " async submission(s), "
-                  << statistics.expert_route_prediction_async_completions << " completion(s), "
-                  << statistics.expert_route_prediction_async_fallbacks << " fallback(s)\n";
         std::cout << "Expert route ranks:";
         for (uint32_t rank = 0; rank < ncnn::moe::maximum_expert_route_ranks; ++rank)
         {
@@ -972,42 +959,11 @@ int ncnn::moe::run_model_example(int argc, char** argv, const ncnn::moe::Example
         }
         std::cout << '\n';
         std::cout << "Expert cache: " << statistics.expert_cache_hits << " hit(s), " << statistics.expert_cache_misses << " miss(es), " << statistics.expert_cache_evictions << " eviction(s), " << statistics.expert_cache_bytes_read
-                  << " bytes read, " << statistics.expert_cache_resident_size << " bytes resident, " << statistics.expert_cache_queued_reads << " queued read(s), " << statistics.expert_cache_speculative_reads << " speculative read(s), "
-                  << statistics.expert_cache_cancelled_speculative_reads << " cancelled speculative read(s), " << statistics.expert_cache_dropped_speculative_admissions << " dropped speculative admission(s), "
-                  << statistics.expert_cache_unused_speculative_reads << " unused speculative read(s), " << statistics.expert_cache_short_term_reloads << " short-term reload(s)\n";
-        std::cout << "Expert ARC: T1 " << statistics.expert_cache_arc_recent_size << " bytes, T2 " << statistics.expert_cache_arc_frequent_size << " bytes, target T1 " << statistics.expert_cache_arc_recent_target_size << " bytes, B1 "
-                  << statistics.expert_cache_arc_recent_ghost_size << " bytes, B2 " << statistics.expert_cache_arc_frequent_ghost_size << " bytes, B1 " << statistics.expert_cache_arc_recent_ghost_hits << " hit(s), B2 "
-                  << statistics.expert_cache_arc_frequent_ghost_hits << " hit(s)\n";
-        std::cout << "Expert mmap: " << statistics.expert_cache_mapped_ranges << " range(s), " << statistics.expert_cache_mapped_bytes << " bytes\n";
-        const char* expert_read_policy = "sampling";
-        if (statistics.expert_cache_read_policy == 1)
-            expert_read_policy = "buffered";
-        else if (statistics.expert_cache_read_policy == 2)
-            expert_read_policy = "direct";
-        else if (statistics.expert_cache_read_policy == 3)
-            expert_read_policy = "mmap";
-        std::cout << "Expert I/O policy: " << expert_read_policy << ", " << statistics.expert_cache_direct_read_ranges << " direct range(s), " << statistics.expert_cache_direct_read_bytes << " direct byte(s), "
-                  << statistics.expert_cache_direct_read_fallbacks << " fallback(s), " << statistics.expert_cache_buffered_read_ranges << " buffered range(s), " << statistics.expert_cache_buffered_read_bytes << " buffered byte(s), "
-                  << statistics.expert_cache_coalesced_read_batches << " coalesced batch(es), " << statistics.expert_cache_coalesced_experts << " coalesced Expert(s), "
-                  << statistics.expert_cache_coalesced_read_ranges_saved << " physical range(s) saved, io workers: "
-                  << statistics.expert_cache_num_io_threads << '\n';
-        std::cout << "Expert GPU execution cache: " << statistics.expert_gpu_cache_hits << " hit(s), " << statistics.expert_gpu_cache_misses << " miss(es), " << statistics.expert_gpu_cache_admissions << " admission(s), "
-                  << statistics.expert_gpu_cache_stores << " store(s), " << statistics.expert_gpu_cache_evictions << " eviction(s), " << statistics.expert_gpu_cache_dropped_admissions << " dropped admission(s), "
-                  << statistics.expert_gpu_cache_bytes_uploaded << " bytes uploaded, " << statistics.expert_gpu_cache_resident_size << " bytes resident, " << statistics.expert_gpu_cache_pending_size << " bytes pending\n";
-        std::cout << "Expert GPU victim cache: " << statistics.expert_gpu_victim_cache_hits << " hit(s), " << statistics.expert_gpu_victim_cache_misses << " miss(es), " << statistics.expert_gpu_victim_cache_admissions << " admission(s), "
-                  << statistics.expert_gpu_victim_cache_filtered_admissions << " filtered admission(s), " << statistics.expert_gpu_victim_cache_reused_admissions << " reused admission(s), "
-                  << statistics.expert_gpu_victim_cache_probe_admissions << " probe admission(s), " << statistics.expert_gpu_victim_cache_stores << " store(s), " << statistics.expert_gpu_victim_cache_evictions << " eviction(s), "
-                  << statistics.expert_gpu_victim_cache_dropped_admissions << " dropped admission(s), " << statistics.expert_gpu_victim_cache_restore_failures << " restore failure(s), " << statistics.expert_gpu_victim_cache_bytes_uploaded
-                  << " bytes uploaded, " << statistics.expert_gpu_victim_cache_bytes_downloaded << " bytes downloaded, "
-                  << statistics.expert_gpu_victim_cache_mapped_stores << " mapped store(s), " << statistics.expert_gpu_victim_cache_mapped_restores << " mapped restore(s), " << statistics.expert_gpu_victim_cache_resident_size
-                  << " bytes resident, " << statistics.expert_gpu_victim_cache_pending_size << " bytes pending\n";
+                  << " bytes read, " << statistics.expert_cache_resident_size << " bytes resident\n";
+        std::cout << "Expert GPU execution cache: " << statistics.expert_gpu_cache_hits << " hit(s), " << statistics.expert_gpu_cache_misses << " miss(es), "
+                  << statistics.expert_gpu_cache_stores << " store(s), " << statistics.expert_gpu_cache_evictions << " eviction(s), "
+                  << statistics.expert_gpu_cache_resident_size << " bytes resident, " << statistics.expert_gpu_cache_pending_size << " bytes pending\n";
         std::cout << "Expert GPU execution: " << statistics.expert_gpu_executions << " execution(s), " << statistics.expert_gpu_execution_failures << " failure(s)\n";
-        std::cout << "Expert GPU route aggregation: " << statistics.expert_gpu_route_aggregation_batches << " batch(es), " << statistics.expert_gpu_route_aggregation_routes << " route(s), "
-                  << statistics.expert_gpu_route_aggregation_bytes_saved << " CPU aggregation byte(s) saved\n";
-        std::cout << "Expert GPU device source: " << statistics.expert_gpu_device_source_hits << " hit(s), " << statistics.expert_gpu_device_source_misses << " miss(es), " << statistics.expert_gpu_device_source_executions
-                  << " execution(s), " << statistics.expert_gpu_device_source_execution_failures << " failure(s)\n";
-        std::cout << "Expert GPU ARC: " << statistics.expert_gpu_arc_recent_size << " recent byte(s), " << statistics.expert_gpu_arc_frequent_size << " frequent byte(s), " << statistics.expert_gpu_arc_recent_target_size
-                  << " recent target byte(s), " << statistics.expert_gpu_arc_recent_ghost_size << " recent ghost byte(s), " << statistics.expert_gpu_arc_frequent_ghost_size << " frequent ghost byte(s)\n";
         std::cout << "Parallel CPU experts: " << (ncnn::moe::has_flag(runtime.info().flags, ncnn::moe::RuntimeOpenmp) ? "OpenMP enabled" : "single-thread fallback") << '\n';
         std::cout << "CPU topology: " << runtime.info().physical_cpu_count << " physical core(s), " << runtime.info().cpu_count << " logical processor(s), " << runtime.info().num_threads
                   << " OpenMP thread(s)\n";

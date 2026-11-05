@@ -1121,7 +1121,6 @@ static void forward_experts(const CompiledModel& model,
     }
 #endif
     const int64_t count = static_cast<int64_t>(active_indices.size());
-    Bf16Counter* const bf16_counter = current_bf16_counter();
     const size_t workspace_count = parallelize_experts
                                        ? static_cast<size_t>(expert_team_size)
                                        : 1;
@@ -1141,7 +1140,6 @@ static void forward_experts(const CompiledModel& model,
     };
     if (!parallelize_experts)
     {
-        const Bf16Scope bf16_scope(bf16_counter);
         for (int64_t task_index = 0; task_index < count; ++task_index)
             forward(task_index, 0);
         return;
@@ -1149,7 +1147,6 @@ static void forward_experts(const CompiledModel& model,
 #pragma omp parallel for schedule(dynamic, 1) num_threads(expert_team_size)
     for (int64_t task_index = 0; task_index < count; ++task_index)
     {
-        const Bf16Scope bf16_scope(bf16_counter);
         size_t workspace_index = 0;
 #if defined(_OPENMP)
         workspace_index = static_cast<size_t>(omp_get_thread_num());
@@ -1274,28 +1271,32 @@ ExpertVictimExecutionMetadata victim_metadata(const CompiledModel& model,
 
 void prepare_experts(const MoeBlockPlan& moe,
                      LayerState& layer_state,
-                     SessionStatistics& stats)
+                     SessionStatistics* stats)
 {
     ExpertDispatchPlan& plan = layer_state.dispatch_plan;
-    stats.expert_assignments += plan.assignment_count;
+    if (stats)
+        stats->expert_assignments += plan.assignment_count;
     layer_state.resize_experts(plan.batches.size());
     for (size_t batch_index = 0; batch_index < plan.batches.size(); ++batch_index)
     {
         ExpertBatch& batch = plan.batches[batch_index];
-        const uint64_t weight_size = moe.experts[batch.expert_id].weight_size;
-        if (stats.expert_batch_weight_bytes > std::numeric_limits<uint64_t>::max() - weight_size)
-            stats.expert_batch_weight_bytes = std::numeric_limits<uint64_t>::max();
-        else
-            stats.expert_batch_weight_bytes += weight_size;
-        const uint64_t route_count = static_cast<uint64_t>(batch.routes.size());
-        const uint64_t route_weight_size = weight_size != 0
-                                                   && batch.routes.size() > std::numeric_limits<uint64_t>::max() / weight_size
-                                               ? std::numeric_limits<uint64_t>::max()
-                                               : weight_size * route_count;
-        if (stats.expert_route_weight_bytes > std::numeric_limits<uint64_t>::max() - route_weight_size)
-            stats.expert_route_weight_bytes = std::numeric_limits<uint64_t>::max();
-        else
-            stats.expert_route_weight_bytes += route_weight_size;
+        if (stats)
+        {
+            const uint64_t weight_size = moe.experts[batch.expert_id].weight_size;
+            if (stats->expert_batch_weight_bytes > std::numeric_limits<uint64_t>::max() - weight_size)
+                stats->expert_batch_weight_bytes = std::numeric_limits<uint64_t>::max();
+            else
+                stats->expert_batch_weight_bytes += weight_size;
+            const uint64_t route_count = static_cast<uint64_t>(batch.routes.size());
+            const uint64_t route_weight_size = weight_size != 0
+                                                       && batch.routes.size() > std::numeric_limits<uint64_t>::max() / weight_size
+                                                   ? std::numeric_limits<uint64_t>::max()
+                                                   : weight_size * route_count;
+            if (stats->expert_route_weight_bytes > std::numeric_limits<uint64_t>::max() - route_weight_size)
+                stats->expert_route_weight_bytes = std::numeric_limits<uint64_t>::max();
+            else
+                stats->expert_route_weight_bytes += route_weight_size;
+        }
         layer_state.active_experts()[batch_index].prepare(batch);
     }
 }

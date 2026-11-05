@@ -1,13 +1,11 @@
 #include "executor.h"
 
 #include "sessionstate.h"
-#include "metrics.h"
 #include "expertbackend.h"
 #include "expert.h"
 #include "graph/router.h"
 #include "graph/compiledmodel.h"
 #include "kernels/attention.h"
-#include "kernels/bfloat16.h"
 #include "kernels/hyperconnection.h"
 #include "kernels/latentattention.h"
 #include "kernels/ops.h"
@@ -181,7 +179,7 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
                                      layer_state.dispatch_plan);
     if (!dispatched)
         return dispatched.error();
-    prepare_experts(moe, layer_state, statistics);
+    prepare_experts(moe, layer_state, &statistics);
     const auto execute_shared = [&]() -> Result<void> {
         if (execution.shared_expert_group >= graph.nodes.size())
             return Error{ErrorCode::InternalError, "speculative execution graph has no shared Expert binding"};
@@ -508,8 +506,6 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
     if (!model.speculative.enabled()
         || !state.use_speculative_context)
         return {};
-    Bf16Counter bf16;
-    const Bf16Scope bf16_scope(&bf16);
     VulkanStatistics vulkan_before;
     if (model.vulkan_runtime)
         vulkan_before = get_vulkan_statistics(model.vulkan_runtime);
@@ -524,7 +520,6 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
             const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
             record_vulkan_delta(statistics, vulkan_before, vulkan_after);
         }
-        statistics.cpu_bfloat16_batched_linear_dispatches += bf16.dispatches();
         return {};
     }
     const uint32_t expected_columns = model.descriptor.hidden_size
@@ -587,7 +582,6 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
         const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
         record_vulkan_delta(statistics, vulkan_before, vulkan_after);
     }
-    statistics.cpu_bfloat16_batched_linear_dispatches += bf16.dispatches();
     return {};
 }
 
@@ -624,12 +618,6 @@ static Result<void> propose_mtp(const CompiledModel& model,
     VulkanStatistics vulkan_before;
     if (model.vulkan_runtime)
         vulkan_before = get_vulkan_statistics(model.vulkan_runtime);
-    ExpertCacheStatistics cache_before;
-    if (model.expert_cache)
-        cache_before = model.expert_cache->statistics();
-    ExpertBackendStatistics backend_before;
-    if (model.expert_backend)
-        backend_before = model.expert_backend->statistics();
     const std::vector<SpeculativeModelPlan::LayerNodes>& layer_nodes = model.speculative.layer_nodes;
     if (layer_nodes.size() != model.speculative.graph.layer_plans.size())
     {
@@ -683,7 +671,6 @@ static Result<void> propose_mtp(const CompiledModel& model,
     }
     state.mtp_pending_target_hidden.clear();
 
-    record_resource_delta(model, statistics, cache_before, backend_before);
     if (model.vulkan_runtime)
     {
         const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
@@ -706,8 +693,6 @@ Result<void> propose_speculative(const CompiledModel& model, int32_t input_id, S
             ErrorCode::UnsupportedModel,
             "the model does not provide a speculative execution plan"};
     }
-    Bf16Counter bf16;
-    const Bf16Scope bf16_scope(&bf16);
     if (model.speculative.kind == SpeculativeModelKind::Mtp)
     {
         auto proposed = propose_mtp(model,
@@ -717,10 +702,6 @@ Result<void> propose_speculative(const CompiledModel& model, int32_t input_id, S
                                     position_offset,
                                     proposal,
                                     sampler);
-        if (proposed)
-        {
-            statistics.cpu_bfloat16_batched_linear_dispatches += bf16.dispatches();
-        }
         return proposed;
     }
     if (!sampler)
@@ -759,12 +740,6 @@ Result<void> propose_speculative(const CompiledModel& model, int32_t input_id, S
     VulkanStatistics vulkan_before;
     if (model.vulkan_runtime)
         vulkan_before = get_vulkan_statistics(model.vulkan_runtime);
-    ExpertCacheStatistics cache_before;
-    if (model.expert_cache)
-        cache_before = model.expert_cache->statistics();
-    ExpertBackendStatistics backend_before;
-    if (model.expert_backend)
-        backend_before = model.expert_backend->statistics();
 
     std::vector<int32_t> draft_input_ids(model.speculative.block_size, static_cast<int32_t>(model.speculative.noise_token_id));
     draft_input_ids.front() = input_id;
@@ -862,13 +837,11 @@ Result<void> propose_speculative(const CompiledModel& model, int32_t input_id, S
         proposal.confidence_logits.push_back(confidence_output.row(0)[0]);
     }
 
-    record_resource_delta(model, statistics, cache_before, backend_before);
     if (model.vulkan_runtime)
     {
         const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
         record_vulkan_delta(statistics, vulkan_before, vulkan_after);
     }
-    statistics.cpu_bfloat16_batched_linear_dispatches += bf16.dispatches();
     ++statistics.speculative_proposals;
     statistics.speculative_draft_tokens += proposal.token_ids.size();
     return {};

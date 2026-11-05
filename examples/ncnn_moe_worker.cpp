@@ -159,10 +159,8 @@ static std::string expert_metrics_json(const RuntimeMetricCounters& counters)
     result.add_uint("cache_resident_bytes", counters.expert_cache_resident_size);
     result.add_uint("gpu_cache_hit", counters.expert_gpu_cache_hits);
     result.add_uint("gpu_cache_miss", counters.expert_gpu_cache_misses);
-    result.add_uint("gpu_cache_admissions", counters.expert_gpu_cache_admissions);
     result.add_uint("gpu_cache_stores", counters.expert_gpu_cache_stores);
     result.add_uint("gpu_cache_evictions", counters.expert_gpu_cache_evictions);
-    result.add_uint("gpu_cache_dropped_admissions", counters.expert_gpu_cache_dropped_admissions);
     result.add_uint("gpu_cache_resident_bytes", counters.expert_gpu_cache_resident_size);
     result.add_uint("gpu_cache_pending_bytes", counters.expert_gpu_cache_pending_size);
     result.add_uint("gpu_executions", counters.expert_gpu_executions);
@@ -170,9 +168,6 @@ static std::string expert_metrics_json(const RuntimeMetricCounters& counters)
     result.add_uint("speculative_proposals", counters.speculative_proposals);
     result.add_uint("speculative_draft_tokens", counters.speculative_draft_tokens);
     result.add_uint("speculative_accepted_tokens", counters.speculative_accepted_tokens);
-    result.add_uint("gpu_route_aggregation_batches", counters.expert_gpu_route_aggregation_batches);
-    result.add_uint("gpu_route_aggregation_routes", counters.expert_gpu_route_aggregation_routes);
-    result.add_uint("gpu_route_aggregation_bytes_saved", counters.expert_gpu_route_aggregation_bytes_saved);
     const uint64_t cache_requests = counters.expert_cache_hits + counters.expert_cache_misses;
     if (cache_requests == 0)
         result.add_null("cache_hit_rate");
@@ -192,26 +187,12 @@ static std::string gpu_metrics_json(const RuntimeMetricCounters& counters, bool 
     result.add_uint("linear_dispatches", counters.vulkan_linear_dispatches);
     result.add_uint("int4_dispatches", counters.vulkan_int4_dispatches);
     result.add_uint("attention_blocks", counters.vulkan_attention_blocks);
-    result.add_uint("gated_delta_fusions", counters.vulkan_gated_delta_fusions);
     result.add_uint("gated_delta_submissions", counters.vulkan_gated_delta_submissions);
-    result.add_uint("qwen_layers", counters.vulkan_qwen_layers);
-    result.add_uint("gated_residual_blocks", counters.vulkan_gated_residual_blocks);
-    result.add_uint("ple_blocks", counters.vulkan_ple_blocks);
     result.add_uint("batch_uploads", counters.vulkan_batch_uploads);
     result.add_uint("batch_downloads", counters.vulkan_batch_downloads);
-    result.add_uint("weight_upload_bytes", counters.vulkan_weight_upload_bytes);
-    result.add_uint("weight_transfer_submissions", counters.vulkan_weight_transfer_submissions);
-    result.add_uint("weight_visibility_submissions", counters.vulkan_weight_visibility_submissions);
-    result.add_uint("weight_transfer_fence_waits", counters.vulkan_weight_transfer_fence_waits);
-    result.add_uint("weight_transfer_wait_microseconds", counters.vulkan_weight_transfer_wait_microseconds);
-    result.add_uint("resident_graph_submissions", counters.vulkan_resident_graph_submissions);
-    result.add_uint("resident_graph_activation_upload_bytes", counters.vulkan_resident_graph_activation_upload_bytes);
-    result.add_uint("resident_graph_activation_download_bytes", counters.vulkan_resident_graph_activation_download_bytes);
-    result.add_uint("resident_graph_route_download_bytes", counters.vulkan_resident_graph_route_download_bytes);
     result.add_uint("attention_qkv_rope_fusions", counters.vulkan_attention_qkv_rope_fusions);
     result.add_uint("attention_device_rope_fusions", counters.vulkan_attention_device_rope_fusions);
     result.add_uint("attention_qkv_ring_fusions", counters.vulkan_attention_qkv_ring_fusions);
-    result.add_uint("attention_cache_materializations", counters.vulkan_attention_cache_materializations);
     result.add_uint("attention_cpu_fallbacks", counters.vulkan_attention_cpu_fallbacks);
     return result.finish();
 }

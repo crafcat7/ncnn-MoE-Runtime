@@ -56,7 +56,7 @@ ExpertVictimExecutionMetadata victim_metadata(const CompiledModel& model,
 // Transfer dispatched routes into reusable execution slots and record demand.
 void prepare_experts(const MoeBlockPlan& moe,
                      LayerState& layer_state,
-                     SessionStatistics& stats);
+                     SessionStatistics* stats);
 
 // Submit exact reads without waiting or acquiring compute-time leases.
 [[nodiscard]] Result<void> request_experts(const CompiledModel& model,
