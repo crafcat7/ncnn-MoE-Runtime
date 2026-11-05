@@ -1,6 +1,8 @@
 # CMake build trees and generated files
 /build/
 /build-*/
+/build32/
+build32-*.cmd
 /cmake-build-*/
 /out/
 /install/
