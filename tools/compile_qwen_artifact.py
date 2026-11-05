@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile Qwen3.8 routed BF16 Experts into an optional MXFP4 sidecar."""
+"""Compile Qwen routed BF16 Experts into an optional MXFP4 sidecar."""
 
 from __future__ import annotations
 
@@ -19,9 +19,32 @@ from typing import BinaryIO
 import numpy as np
 
 
-ARTIFACT_NAME = "ncnn-moe-qwen3.8-mxfp4.safetensors"
-ARTIFACT_PREFIX = "__ncnn_moe_qwen3_8_mxfp4__"
-ARTIFACT_FORMAT = "ncnn-moe-qwen3.8-mxfp4-v1"
+FAMILIES = {
+    "qwen3_5_moe": {
+        "label": "Qwen3.6",
+        "name": "ncnn-moe-qwen3.6-mxfp4.safetensors",
+        "prefix": "__ncnn_moe_qwen3_6_mxfp4__",
+        "format": "ncnn-moe-qwen3.6-mxfp4-v3",
+        "identity": "v3",
+        "scope": "main-and-mtp-routed-experts",
+        "mtp": True,
+    },
+    "qwen4_exp": {
+        "label": "Qwen3.8",
+        "name": "ncnn-moe-qwen3.8-mxfp4.safetensors",
+        "prefix": "__ncnn_moe_qwen3_8_mxfp4__",
+        "format": "ncnn-moe-qwen3.8-mxfp4-v1",
+        "identity": "v1",
+        "scope": "main-routed-experts",
+        "mtp": False,
+    },
+}
+ARTIFACT_NAME = FAMILIES["qwen3_5_moe"]["name"]
+ARTIFACT_PREFIX = FAMILIES["qwen3_5_moe"]["prefix"]
+ARTIFACT_FORMAT = FAMILIES["qwen3_5_moe"]["format"]
+ARTIFACT_IDENTITY = FAMILIES["qwen3_5_moe"]["identity"]
+ARTIFACT_SCOPE = FAMILIES["qwen3_5_moe"]["scope"]
+ARTIFACT_MODEL_TYPE = "qwen3_5_moe"
 MAX_HEADER_BYTES = 128 * 1024 * 1024
 FNV1A64_OFFSET = 14695981039346656037
 FNV1A64_PRIME = 1099511628211
@@ -51,8 +74,8 @@ class ArtifactTensor:
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compile the routed Experts from an official Qwen3.8-Flash-Next "
-            "BF16 checkpoint into an optional OCP MXFP4 Safetensors sidecar."
+            "Compile the routed Experts from an official Qwen BF16 "
+            "checkpoint into an optional OCP MXFP4 Safetensors sidecar."
         )
     )
     parser.add_argument("model", type=Path, help="Official model directory")
@@ -161,7 +184,7 @@ def artifact_tensor_plan(
     index_fnv1a64: int,
 ) -> list[ArtifactTensor]:
     identity = (
-        f"{ARTIFACT_PREFIX}.identity.v1."
+        f"{ARTIFACT_PREFIX}.identity.{ARTIFACT_IDENTITY}."
         f"{layer_count}.{mtp_layer_count}.{expert_count}."
         f"{hidden_size}.{intermediate_size}."
         f"{config_fnv1a64:016x}.{index_fnv1a64:016x}"
@@ -197,6 +220,10 @@ def artifact_tensor_plan(
             )
     for layer_id in range(layer_count):
         append_bank(f"{ARTIFACT_PREFIX}.layers.{layer_id}.experts.")
+    for layer_id in range(mtp_layer_count):
+        append_bank(
+            f"{ARTIFACT_PREFIX}.mtp.layers.{layer_id}.experts."
+        )
     return plan
 
 
@@ -210,8 +237,8 @@ def encode_header(
     header: dict[str, object] = {
         "__metadata__": {
             "format": ARTIFACT_FORMAT,
-            "model_type": "qwen4_exp",
-            "scope": "main-routed-experts",
+            "model_type": ARTIFACT_MODEL_TYPE,
+            "scope": ARTIFACT_SCOPE,
             "quantization": "ocp-e2m1-e8m0-block32-maxabs",
             "source_config_sha256": config_sha256,
             "source_index_sha256": index_sha256,
@@ -344,6 +371,7 @@ def compile_artifact(
     tensors: dict[str, TensorRange],
     header: bytes,
     layer_count: int,
+    mtp_layer_count: int,
     expert_count: int,
     hidden_size: int,
     intermediate_size: int,
@@ -357,7 +385,7 @@ def compile_artifact(
     temporary = output.with_name(output.name + ".tmp")
     if temporary.exists():
         temporary.unlink()
-    expected_data_bytes = layer_count * expert_count * (
+    expected_data_bytes = (layer_count + mtp_layer_count) * expert_count * (
         intermediate_size * 2 * hidden_size * 17 // 32
         + hidden_size * intermediate_size * 17 // 32
     )
@@ -419,6 +447,54 @@ def compile_artifact(
                     f"compiled layer {layer_id + 1}/{layer_count} down",
                     flush=True,
                 )
+            for layer_id in range(mtp_layer_count):
+                source_prefix = f"mtp.layers.{layer_id}.mlp.experts."
+                gate_up = required_source(
+                    tensors,
+                    source_prefix + "gate_up_proj",
+                    (
+                        expert_count,
+                        intermediate_size * 2,
+                        hidden_size,
+                    ),
+                )
+                compile_bank(
+                    destination,
+                    gate_up,
+                    expert_count,
+                    intermediate_size * 2,
+                    hidden_size,
+                    workers,
+                    True,
+                )
+                print(
+                    f"compiled MTP layer {layer_id + 1}/"
+                    f"{mtp_layer_count} gate/up",
+                    flush=True,
+                )
+                down = required_source(
+                    tensors,
+                    source_prefix + "down_proj",
+                    (
+                        expert_count,
+                        hidden_size,
+                        intermediate_size,
+                    ),
+                )
+                compile_bank(
+                    destination,
+                    down,
+                    expert_count,
+                    hidden_size,
+                    intermediate_size,
+                    workers,
+                    False,
+                )
+                print(
+                    f"compiled MTP layer {layer_id + 1}/"
+                    f"{mtp_layer_count} down",
+                    flush=True,
+                )
             destination.flush()
             os.fsync(destination.fileno())
         actual_bytes = temporary.stat().st_size
@@ -444,10 +520,20 @@ def main() -> int:
         index_path = model / "model.safetensors.index.json"
         with config_path.open("r", encoding="utf-8") as stream:
             config = json.load(stream)
-        if config.get("model_type") != "qwen4_exp":
+        global ARTIFACT_NAME, ARTIFACT_PREFIX, ARTIFACT_FORMAT
+        global ARTIFACT_IDENTITY, ARTIFACT_SCOPE, ARTIFACT_MODEL_TYPE
+        model_type = config.get("model_type")
+        family = FAMILIES.get(model_type)
+        if family is None:
             raise ValueError(
-                "the compiler requires the official qwen4_exp package"
+                "the compiler requires an official Qwen routed-Expert package"
             )
+        ARTIFACT_NAME = family["name"]
+        ARTIFACT_PREFIX = family["prefix"]
+        ARTIFACT_FORMAT = family["format"]
+        ARTIFACT_IDENTITY = family["identity"]
+        ARTIFACT_SCOPE = family["scope"]
+        ARTIFACT_MODEL_TYPE = model_type
         text_config = config.get("text_config")
         if not isinstance(text_config, dict):
             raise ValueError("config.json is missing text_config")
@@ -456,9 +542,16 @@ def main() -> int:
         expert_count = int(text_config["num_experts"])
         hidden_size = int(text_config["hidden_size"])
         intermediate_size = int(text_config["moe_intermediate_size"])
+        if family["mtp"]:
+            if (
+                mtp_layer_count != 1
+                or bool(text_config.get("mtp_use_dedicated_embeddings", True))
+            ):
+                raise ValueError("unsupported Qwen MTP routed Expert layout")
+        else:
+            mtp_layer_count = 0
         if (
             layer_count <= 0
-            or mtp_layer_count < 0
             or expert_count <= 0
             or hidden_size <= 0
             or intermediate_size <= 0
@@ -491,7 +584,8 @@ def main() -> int:
             tensor.byte_count for tensor in plan
         )
         print(
-            f"compiling {layer_count * expert_count} main routed Experts "
+            f"compiling {(layer_count + mtp_layer_count) * expert_count} "
+            f"main/MTP routed Experts "
             f"into {artifact_bytes / (1024 ** 3):.2f} GiB at {output}",
             flush=True,
         )
@@ -501,13 +595,14 @@ def main() -> int:
             tensors,
             header,
             layer_count,
+            mtp_layer_count,
             expert_count,
             hidden_size,
             intermediate_size,
             arguments.workers,
             arguments.overwrite,
         )
-        print(f"compiled Qwen3.8 MXFP4 artifact: {output}", flush=True)
+        print(f"compiled {family['label']} MXFP4 artifact: {output}", flush=True)
         return 0
     except (
         FileExistsError,

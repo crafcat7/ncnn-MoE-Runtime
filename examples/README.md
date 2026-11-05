@@ -168,6 +168,6 @@ Use `--config-dir PATH` or `NCNN_MOE_CONFIG_DIR` to select another location.
 runtime Expert/GPU caches remain process-local and are not written to disk.
 
 For the JSONL operation schema, see
-`tools/ncnn_moe_protocol.py` and the native implementation in
+`tools/ncnn_moe.py` and the native implementation in
 `examples/ncnn_moe_worker.cpp`. Private tokenizer and template handling live
 in `src/models/tokenizer.cpp` and are loaded with the Model.

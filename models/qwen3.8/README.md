@@ -66,7 +66,7 @@ Compile the routed BF16 Expert banks when lower Expert storage and bounded GPU
 residency are desired:
 
 ```powershell
-python tools\compile_qwen3_8_artifact.py `
+python tools\compile_qwen_artifact.py `
   D:\Models\Qwen3.8-Flash-Next
 ```
 
