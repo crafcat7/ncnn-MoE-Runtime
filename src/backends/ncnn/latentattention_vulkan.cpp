@@ -706,8 +706,8 @@ bool LatentAttention_vulkan::forward_batch(std::span<const uint64_t> positions,
     if (!record_projection(implementation.output_a, attention, output_rank, cmd, projection_storage)
         || !record_projection(implementation.output_b, output_rank, final_output, cmd, projection_storage)
         || !prepare_staging_batch(transfer_slot.download, rows, output_columns, transfer_slot.staging_allocator, output.element_size())
-        || !record_prepared_activation_staging_download(final_output, rows, output_columns, transfer_slot.download, cmd,
-                                                        implementation.context->device(), implementation.opt, output_dtype))
+        || !record_staging_download(final_output, rows, output_columns, transfer_slot.download, cmd,
+                                    implementation.context->device(), implementation.opt, output_dtype))
         return false;
     if (submit_compute_and_wait(cmd, implementation.context->device()) != 0)
         return false;
@@ -1258,8 +1258,8 @@ bool LatentAttention_vulkan::forward_value_batch(std::span<const uint64_t> posit
     if (!record_projection(implementation.output_a, attention, output_rank, cmd, projection_storage)
         || !record_projection(implementation.output_b, output_rank, final_output, cmd, projection_storage)
         || !prepare_staging_batch(transfer_slot.download, rows, output_columns, transfer_slot.staging_allocator, output.element_size())
-        || !record_prepared_activation_staging_download(final_output, rows, output_columns, transfer_slot.download, cmd,
-                                                        implementation.context->device(), implementation.opt, output_dtype))
+        || !record_staging_download(final_output, rows, output_columns, transfer_slot.download, cmd,
+                                    implementation.context->device(), implementation.opt, output_dtype))
         return false;
     if (submit_compute_and_wait(cmd, implementation.context->device()) != 0)
         return false;
@@ -1307,11 +1307,11 @@ bool LatentAttention_vulkan::forward_projected_batch(const ActivationBuffer& inp
     LatentAttentionWork_vulkan work;
     VulkanRuntimeState& state = d->context->runtime_state();
     if (!fill_staging_upload(input, input_staging, d->context->staging_allocator())
-        || !record_mapped_activation_upload(input_staging, device_input, cmd, d->context->device(), d->opt, input.dtype())
+        || !record_mapped_act_upload(input_staging, device_input, cmd, d->context->device(), d->opt, input.dtype())
         || !record_batch(device_input, positions, caches, device_output, cmd, work)
         || !prepare_staging_batch(output_staging, input.rows(), static_cast<uint32_t>(device_output.w), d->context->staging_allocator(), output.element_size())
-        || !record_prepared_activation_staging_download(device_output, input.rows(), static_cast<uint32_t>(device_output.w), output_staging,
-                                                        cmd, d->context->device(), d->opt, output.dtype()))
+        || !record_staging_download(device_output, input.rows(), static_cast<uint32_t>(device_output.w), output_staging,
+                                    cmd, d->context->device(), d->opt, output.dtype()))
         return false;
     if (submit_compute_and_wait(cmd, d->context->device()) != 0)
         return false;
@@ -2221,9 +2221,9 @@ bool LatentAttention_vulkan::record_batch(const ncnn::VkMat& input,
         if (!record_latent_copy(implementation.append_pipeline.get(), *view.value, packed_shadow, view.count, view.offset, cmd))
             return false;
     if (!prepare_staging_batch(recording.shadow_staging, 1, static_cast<uint32_t>(shadow_count), implementation.context->staging_allocator())
-        || !record_prepared_activation_staging_download(latent_flat_view(packed_shadow, 0, static_cast<uint32_t>(shadow_count)),
-                                                        1, static_cast<uint32_t>(shadow_count), recording.shadow_staging, cmd,
-                                                        implementation.context->device(), implementation.opt))
+        || !record_staging_download(latent_flat_view(packed_shadow, 0, static_cast<uint32_t>(shadow_count)),
+                                    1, static_cast<uint32_t>(shadow_count), recording.shadow_staging, cmd,
+                                    implementation.context->device(), implementation.opt))
         return false;
     for (const ShadowView& view : shadow_views)
         *view.value = latent_flat_view(recording.shadow_staging, view.offset, view.count);

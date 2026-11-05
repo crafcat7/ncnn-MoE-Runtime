@@ -1075,7 +1075,7 @@ Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name, uint
                         return Error{ErrorCode::InvalidModel, "MXFP4 input-column index is out of range: " + name};
                     tensor.value().input_column_indices[column] = static_cast<uint32_t>(index);
                 }
-                auto valid_columns = validate_input_column_indices(tensor.value());
+                auto valid_columns = check_input_columns(tensor.value());
                 if (!valid_columns)
                     return valid_columns.error();
             }
@@ -1426,7 +1426,7 @@ Result<TensorData> SafetensorsArchive::load_gguf_tensor(const SafetensorInfo& in
             }
         }
         result.input_column_indices = transform.input_column_indices;
-        auto valid_columns = validate_input_column_indices(result);
+        auto valid_columns = check_input_columns(result);
         if (!valid_columns)
             return Error{ErrorCode::InvalidModel, valid_columns.error().message};
         return result;
@@ -1563,7 +1563,7 @@ static Result<TensorData> defer_gguf_qnk(const SafetensorInfo& info,
     tensor.dtype = dtype;
     tensor.shape = {rows, columns};
     tensor.input_column_indices = transform.input_column_indices;
-    auto valid_columns = validate_input_column_indices(tensor);
+    auto valid_columns = check_input_columns(tensor);
     if (!valid_columns)
         return Error{ErrorCode::InvalidModel, valid_columns.error().message};
 
@@ -1684,7 +1684,7 @@ Result<TensorData> SafetensorsArchive::load_qnk_tensor(const std::string& name,
                 return Error{ErrorCode::InvalidModel, "Qn_K input-column index is out of range: " + name};
             tensor.input_column_indices[column] = static_cast<uint32_t>(index);
         }
-        auto status = validate_input_column_indices(tensor);
+        auto status = check_input_columns(tensor);
         if (!status)
             return Error{ErrorCode::InvalidModel, status.error().message + ": " + name};
     }

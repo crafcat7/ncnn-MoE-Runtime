@@ -435,7 +435,7 @@ std::unique_ptr<CommandGraph_vulkan> CommandGraph_vulkan::create(const Linear& s
     implementation->context = seed.vulkan_context();
     implementation->option = seed.option();
     implementation->state = std::make_shared<CommandGraphState_vulkan>();
-    implementation->state->storage_variant = vulkan_activation_storage_variant(implementation->option);
+    implementation->state->storage_variant = activation_variant(implementation->option);
     implementation->transfer_lease = std::make_unique<VulkanTransferLease>(implementation->context->acquire_transfer_slot());
 
     VulkanTransferSlot& transfer_slot = implementation->transfer_lease->slot();
@@ -519,7 +519,7 @@ bool CommandGraph_vulkan::linear(const Linear& op,
     }
     const std::shared_ptr<CommandGraphState_vulkan>& input_graph = input.d->graph;
     if (input.d->context.get() != d->context.get()
-        || !input.d->readable_from(d->state, vulkan_activation_storage_variant(d->option)))
+        || !input.d->readable_from(d->state, activation_variant(d->option)))
     {
         return false;
     }
@@ -530,8 +530,8 @@ bool CommandGraph_vulkan::linear(const Linear& op,
         || context.get()
                != d->context.get()
         || op.input_columns() != input.columns()
-        || vulkan_activation_storage_variant(opt)
-               != vulkan_activation_storage_variant(d->option))
+        || activation_variant(opt)
+               != activation_variant(d->option))
     {
         return false;
     }
@@ -591,7 +591,7 @@ bool CommandGraph_vulkan::download(const DeviceTensor_vulkan& input,
     }
     const std::shared_ptr<CommandGraphState_vulkan>& input_graph = input.d->graph;
     if (input.d->context.get() != d->context.get()
-        || !input.d->readable_from(d->state, vulkan_activation_storage_variant(d->option)))
+        || !input.d->readable_from(d->state, activation_variant(d->option)))
     {
         return false;
     }
@@ -611,14 +611,14 @@ bool CommandGraph_vulkan::download(const DeviceTensor_vulkan& input,
         const std::lock_guard<std::mutex> lock(d->context->command_mutex());
         if (input_graph.get() != d->state.get())
             input.prepare_read();
-        if (!record_prepared_activation_staging_download(input.d->value,
-                                                         input.rows(),
-                                                         input.columns(),
-                                                         pending.staging,
-                                                         *d->transfer_lease->slot().command,
-                                                         d->context->device(),
-                                                         d->option,
-                                                         output_dtype))
+        if (!record_staging_download(input.d->value,
+                                     input.rows(),
+                                     input.columns(),
+                                     pending.staging,
+                                     *d->transfer_lease->slot().command,
+                                     d->context->device(),
+                                     d->option,
+                                     output_dtype))
         {
             return false;
         }
@@ -942,14 +942,14 @@ bool Linear::forward(const ActivationBuffer& input, ActivationBuffer& output) co
         vkdev->convert_packing(top_gpu, unpacked, 1, command, implementation.option);
         download_gpu = unpacked;
     }
-    if (!record_prepared_activation_staging_download(download_gpu,
-                                                     input.rows(),
-                                                     implementation.output_columns,
-                                                     transfer_slot.download,
-                                                     command,
-                                                     vkdev,
-                                                     implementation.option,
-                                                     output_dtype))
+    if (!record_staging_download(download_gpu,
+                                 input.rows(),
+                                 implementation.output_columns,
+                                 transfer_slot.download,
+                                 command,
+                                 vkdev,
+                                 implementation.option,
+                                 output_dtype))
         return false;
     if (submit_compute_and_wait(command, implementation.vulkan_context->device()) != 0 || !copy_staging_to_cpu_batch(transfer_slot.download, output))
         return false;
@@ -1067,7 +1067,7 @@ static bool create_bfloat16_projection_pipeline(const std::shared_ptr<VulkanCont
                                                 std::shared_ptr<ncnn::Pipeline>& destination)
 {
     const size_t shader_variant = (option.use_subgroup_ops ? 1u : 0u) * 3
-                                  + vulkan_activation_storage_variant(option);
+                                  + activation_variant(option);
     ncnn::Option compile_option = option;
     compile_option.use_fp16_packed = false;
     compile_option.use_fp16_arithmetic = false;
@@ -1126,7 +1126,7 @@ static bool create_bfloat16_cooperative_projection_pipeline(const std::shared_pt
     // The cooperative shader uses the BF16 storage macro family for its
     // matrix tiles. Activation storage must use the scalar/subgroup path until
     // activation and weight storage types are independently parameterized.
-    if (vulkan_activation_storage_variant(option) != 0)
+    if (activation_variant(option) != 0)
         return false;
     if (!device->info.support_VK_KHR_cooperative_matrix()
         || !device->info.support_bf16_cooperative_matrix()
@@ -1241,7 +1241,7 @@ static bool create_bfloat16_rms_norm_projection_pipeline(const std::shared_ptr<V
                                                          uint32_t& output_subgroups)
 {
     const size_t shader_variant = (option.use_subgroup_ops ? 1u : 0u) * 3
-                                  + vulkan_activation_storage_variant(option);
+                                  + activation_variant(option);
     const std::shared_ptr<const std::vector<uint32_t>> spirv = context->shader_binary(bfloat16_rms_norm_projection_shader,
                                                                                       static_cast<int>(sizeof(bfloat16_rms_norm_projection_shader) - 1),
                                                                                       option,
@@ -1292,7 +1292,7 @@ static bool create_bfloat16_swiglu_down_pipeline(const std::shared_ptr<VulkanCon
                                                  std::shared_ptr<ncnn::Pipeline>& destination)
 {
     const size_t shader_variant = (option.use_subgroup_ops ? 1u : 0u) * 3
-                                  + vulkan_activation_storage_variant(option);
+                                  + activation_variant(option);
     ncnn::Option compile_option = option;
     compile_option.use_fp16_packed = false;
     compile_option.use_fp16_arithmetic = false;
@@ -1532,7 +1532,7 @@ bool Bfloat16Linear_vulkan::record_rms_norm_chain(const ncnn::VkMat& input,
         || input.empty() || input.dims != 2 || input.w != static_cast<int>(implementation.input_columns)
         || input.h <= 0 || input.elempack != 1 || input.elemsize != sizeof(float)
         || !input.allocator || input.allocator->vkdev != implementation.vulkan_context->device()
-        || vulkan_activation_storage_variant(implementation.option) != 0)
+        || activation_variant(implementation.option) != 0)
         return false;
     const uint64_t dispatch_width = ((static_cast<uint64_t>(implementation.output_columns)
                                       + implementation.rms_norm_output_subgroups - 1)
@@ -1568,9 +1568,9 @@ bool Bfloat16Linear_vulkan::record_rms_norm_chain_parallel(const ncnn::VkMat& in
 {
     if (!d->output_rms_norm || d->vulkan_context != next.d->vulkan_context
         || d->vulkan_context != parallel.d->vulkan_context
-        || vulkan_activation_storage_variant(d->option) != 0
-        || vulkan_activation_storage_variant(next.d->option) != 0
-        || vulkan_activation_storage_variant(parallel.d->option) != 0)
+        || activation_variant(d->option) != 0
+        || activation_variant(next.d->option) != 0
+        || activation_variant(parallel.d->option) != 0)
         return false;
     ncnn::VkMat intermediate;
     if (forward(input, intermediate, cmd, d->option) != 0
@@ -1604,11 +1604,11 @@ bool Bfloat16Linear_vulkan::forward_rms_norm_chain(const ActivationBuffer& input
 
     VulkanTransferLease transfer_lease = implementation.vulkan_context->acquire_transfer_slot();
     VulkanTransferSlot& transfer_slot = transfer_lease.slot();
-    const bool direct_host_input = vulkan_activation_storage_variant(implementation.option) == 0
+    const bool direct_host_input = activation_variant(implementation.option) == 0
                                    && implementation.vulkan_context->support_direct_host_buffer(static_cast<size_t>(input.rows())
                                                                                                     * implementation.input_columns * sizeof(float),
                                                                                                 input.dtype());
-    const bool direct_host_output = vulkan_activation_storage_variant(implementation.option) == 0
+    const bool direct_host_output = activation_variant(implementation.option) == 0
                                     && implementation.vulkan_context->support_direct_host_buffer(static_cast<size_t>(input.rows())
                                                                                                      * implementation.output_columns * sizeof(float),
                                                                                                  output.dtype());
@@ -1637,12 +1637,12 @@ bool Bfloat16Linear_vulkan::forward_rms_norm_chain(const ActivationBuffer& input
     ncnn::VkMat input_gpu;
     if (direct_host_input)
         input_gpu = bind_direct_host_input(transfer_slot.upload);
-    else if (!record_mapped_activation_upload(transfer_slot.upload,
-                                              input_gpu,
-                                              command,
-                                              implementation.vulkan_context->device(),
-                                              implementation.option,
-                                              input.dtype()))
+    else if (!record_mapped_act_upload(transfer_slot.upload,
+                                       input_gpu,
+                                       command,
+                                       implementation.vulkan_context->device(),
+                                       implementation.option,
+                                       input.dtype()))
     {
         return false;
     }
@@ -1653,7 +1653,7 @@ bool Bfloat16Linear_vulkan::forward_rms_norm_chain(const ActivationBuffer& input
     else
         output_gpu.create(static_cast<int>(implementation.output_columns),
                           static_cast<int>(input.rows()),
-                          vulkan_activation_element_size(implementation.option),
+                          act_element_size(implementation.option),
                           implementation.vulkan_context->blob_allocator());
     if (output_gpu.empty())
         return false;
@@ -1685,14 +1685,14 @@ bool Bfloat16Linear_vulkan::forward_rms_norm_chain(const ActivationBuffer& input
                             constants,
                             dispatcher);
     if ((!direct_host_output
-         && !record_prepared_activation_staging_download(output_gpu,
-                                                         input.rows(),
-                                                         implementation.output_columns,
-                                                         transfer_slot.download,
-                                                         command,
-                                                         implementation.vulkan_context->device(),
-                                                         implementation.option,
-                                                         output.dtype()))
+         && !record_staging_download(output_gpu,
+                                     input.rows(),
+                                     implementation.output_columns,
+                                     transfer_slot.download,
+                                     command,
+                                     implementation.vulkan_context->device(),
+                                     implementation.option,
+                                     output.dtype()))
         || submit_compute_and_wait(command, implementation.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batch(transfer_slot.download, output))
     {
@@ -2246,11 +2246,11 @@ bool Bfloat16Linear_vulkan::forward(const ActivationBuffer& input,
     VulkanRuntimeState& runtime_state = implementation.vulkan_context->runtime_state();
     VulkanTransferLease transfer_lease = implementation.vulkan_context->acquire_transfer_slot();
     VulkanTransferSlot& transfer_slot = transfer_lease.slot();
-    const bool direct_host_input = vulkan_activation_storage_variant(implementation.option) == 0
+    const bool direct_host_input = activation_variant(implementation.option) == 0
                                    && implementation.vulkan_context->support_direct_host_buffer(static_cast<size_t>(input.rows())
                                                                                                     * implementation.input_columns * sizeof(float),
                                                                                                 input.dtype());
-    const bool direct_host_output = vulkan_activation_storage_variant(implementation.option) == 0
+    const bool direct_host_output = activation_variant(implementation.option) == 0
                                     && implementation.vulkan_context->support_direct_host_buffer(static_cast<size_t>(input.rows())
                                                                                                      * implementation.output_columns * sizeof(float),
                                                                                                  output.dtype());
@@ -2279,12 +2279,12 @@ bool Bfloat16Linear_vulkan::forward(const ActivationBuffer& input,
     ncnn::VkMat input_gpu;
     if (direct_host_input)
         input_gpu = bind_direct_host_input(transfer_slot.upload);
-    else if (!record_mapped_activation_upload(transfer_slot.upload,
-                                              input_gpu,
-                                              command,
-                                              implementation.vulkan_context->device(),
-                                              implementation.option,
-                                              input.dtype()))
+    else if (!record_mapped_act_upload(transfer_slot.upload,
+                                       input_gpu,
+                                       command,
+                                       implementation.vulkan_context->device(),
+                                       implementation.option,
+                                       input.dtype()))
     {
         return false;
     }
@@ -2294,7 +2294,7 @@ bool Bfloat16Linear_vulkan::forward(const ActivationBuffer& input,
     else
         output_gpu.create(static_cast<int>(implementation.output_columns),
                           static_cast<int>(input.rows()),
-                          vulkan_activation_element_size(implementation.option),
+                          act_element_size(implementation.option),
                           implementation.vulkan_context->blob_allocator());
     if (output_gpu.empty())
         return false;
@@ -2308,14 +2308,14 @@ bool Bfloat16Linear_vulkan::forward(const ActivationBuffer& input,
                                                                           bindings,
                                                                           constants);
     if ((!direct_host_output
-         && !record_prepared_activation_staging_download(output_gpu,
-                                                         input.rows(),
-                                                         implementation.output_columns,
-                                                         transfer_slot.download,
-                                                         command,
-                                                         implementation.vulkan_context->device(),
-                                                         implementation.option,
-                                                         output.dtype()))
+         && !record_staging_download(output_gpu,
+                                     input.rows(),
+                                     implementation.output_columns,
+                                     transfer_slot.download,
+                                     command,
+                                     implementation.vulkan_context->device(),
+                                     implementation.option,
+                                     output.dtype()))
         || submit_compute_and_wait(command, implementation.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batch(transfer_slot.download,
                                       output))
@@ -2351,8 +2351,8 @@ bool Bfloat16Linear_vulkan::forward_parallel(const ActivationBuffer& input,
         || first.vulkan_context.get() != parallel.vulkan_context.get()
         || !first.pipeline
         || !parallel.pipeline
-        || vulkan_activation_storage_variant(first.option)
-               != vulkan_activation_storage_variant(parallel.option)
+        || activation_variant(first.option)
+               != activation_variant(parallel.option)
         || input.rows() == 0
         || input.columns() != first.input_columns
         || input.columns() != parallel.input_columns
@@ -2366,15 +2366,15 @@ bool Bfloat16Linear_vulkan::forward_parallel(const ActivationBuffer& input,
     VulkanTransferLease transfer_lease = first.vulkan_context->acquire_transfer_slot();
     VulkanTransferSlot& transfer_slot = transfer_lease.slot();
     ncnn::VkMat parallel_download;
-    const bool direct_host_input = vulkan_activation_storage_variant(first.option) == 0
+    const bool direct_host_input = activation_variant(first.option) == 0
                                    && first.vulkan_context->support_direct_host_buffer(static_cast<size_t>(input.rows()) * first.input_columns
                                                                                            * sizeof(float),
                                                                                        input.dtype());
-    const bool direct_host_output = vulkan_activation_storage_variant(first.option) == 0
+    const bool direct_host_output = activation_variant(first.option) == 0
                                     && first.vulkan_context->support_direct_host_buffer(static_cast<size_t>(input.rows()) * first.output_columns
                                                                                             * sizeof(float),
                                                                                         output.dtype());
-    const bool parallel_direct_host_output = vulkan_activation_storage_variant(parallel.option) == 0
+    const bool parallel_direct_host_output = activation_variant(parallel.option) == 0
                                              && parallel.vulkan_context->support_direct_host_buffer(static_cast<size_t>(input.rows()) * parallel.output_columns
                                                                                                         * sizeof(float),
                                                                                                     parallel_output.dtype());
@@ -2406,12 +2406,12 @@ bool Bfloat16Linear_vulkan::forward_parallel(const ActivationBuffer& input,
     ncnn::VkMat input_gpu;
     if (direct_host_input)
         input_gpu = bind_direct_host_input(transfer_slot.upload);
-    else if (!record_mapped_activation_upload(transfer_slot.upload,
-                                              input_gpu,
-                                              command,
-                                              first.vulkan_context->device(),
-                                              first.option,
-                                              input.dtype()))
+    else if (!record_mapped_act_upload(transfer_slot.upload,
+                                       input_gpu,
+                                       command,
+                                       first.vulkan_context->device(),
+                                       first.option,
+                                       input.dtype()))
     {
         return false;
     }
@@ -2422,7 +2422,7 @@ bool Bfloat16Linear_vulkan::forward_parallel(const ActivationBuffer& input,
     else
         output_gpu.create(static_cast<int>(first.output_columns),
                           static_cast<int>(input.rows()),
-                          vulkan_activation_element_size(first.option),
+                          act_element_size(first.option),
                           first.vulkan_context->blob_allocator());
     ncnn::VkMat parallel_output_gpu;
     if (parallel_direct_host_output)
@@ -2430,7 +2430,7 @@ bool Bfloat16Linear_vulkan::forward_parallel(const ActivationBuffer& input,
     else
         parallel_output_gpu.create(static_cast<int>(parallel.output_columns),
                                    static_cast<int>(input.rows()),
-                                   vulkan_activation_element_size(parallel.option),
+                                   act_element_size(parallel.option),
                                    parallel.vulkan_context->blob_allocator());
     if (output_gpu.empty() || parallel_output_gpu.empty())
         return false;
@@ -2450,23 +2450,23 @@ bool Bfloat16Linear_vulkan::forward_parallel(const ActivationBuffer& input,
                                                                              bindings,
                                                                              constants);
     if ((!direct_host_output
-         && !record_prepared_activation_staging_download(output_gpu,
-                                                         input.rows(),
-                                                         first.output_columns,
-                                                         transfer_slot.download,
-                                                         command,
-                                                         first.vulkan_context->device(),
-                                                         first.option,
-                                                         output.dtype()))
+         && !record_staging_download(output_gpu,
+                                     input.rows(),
+                                     first.output_columns,
+                                     transfer_slot.download,
+                                     command,
+                                     first.vulkan_context->device(),
+                                     first.option,
+                                     output.dtype()))
         || (!parallel_direct_host_output
-            && !record_prepared_activation_staging_download(parallel_output_gpu,
-                                                            input.rows(),
-                                                            parallel.output_columns,
-                                                            parallel_download,
-                                                            command,
-                                                            parallel.vulkan_context->device(),
-                                                            parallel.option,
-                                                            parallel_output.dtype()))
+            && !record_staging_download(parallel_output_gpu,
+                                        input.rows(),
+                                        parallel.output_columns,
+                                        parallel_download,
+                                        command,
+                                        parallel.vulkan_context->device(),
+                                        parallel.option,
+                                        parallel_output.dtype()))
         || submit_compute_and_wait(command, first.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batch(transfer_slot.download, output)
         || !copy_staging_to_cpu_batch(parallel_download, parallel_output))
@@ -2508,8 +2508,8 @@ bool Bfloat16Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
         || !first.vulkan_context
         || !down.vulkan_context
         || first.vulkan_context.get() != down.vulkan_context.get()
-        || vulkan_activation_storage_variant(first.option)
-               != vulkan_activation_storage_variant(down.option)
+        || activation_variant(first.option)
+               != activation_variant(down.option)
         || !first.pipeline
         || first.output_columns != expected_fused_columns
         || down.input_columns != intermediate_columns
@@ -2527,11 +2527,11 @@ bool Bfloat16Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
     VulkanRuntimeState& runtime_state = first.vulkan_context->runtime_state();
     VulkanTransferLease transfer_lease = first.vulkan_context->acquire_transfer_slot();
     VulkanTransferSlot& transfer_slot = transfer_lease.slot();
-    const bool direct_host_input = vulkan_activation_storage_variant(first.option) == 0
+    const bool direct_host_input = activation_variant(first.option) == 0
                                    && first.vulkan_context->support_direct_host_buffer(static_cast<size_t>(input.rows()) * first.input_columns
                                                                                            * sizeof(float),
                                                                                        input.dtype());
-    const bool direct_host_output = vulkan_activation_storage_variant(first.option) == 0
+    const bool direct_host_output = activation_variant(first.option) == 0
                                     && first.vulkan_context->support_direct_host_buffer(static_cast<size_t>(input.rows()) * down.output_columns
                                                                                             * sizeof(float),
                                                                                         output.dtype());
@@ -2565,19 +2565,19 @@ bool Bfloat16Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
     ncnn::VkMat input_gpu;
     if (direct_host_input)
         input_gpu = bind_direct_host_input(transfer_slot.upload);
-    else if (!record_mapped_activation_upload(transfer_slot.upload,
-                                              input_gpu,
-                                              command,
-                                              first.vulkan_context->device(),
-                                              first.option,
-                                              input.dtype()))
+    else if (!record_mapped_act_upload(transfer_slot.upload,
+                                       input_gpu,
+                                       command,
+                                       first.vulkan_context->device(),
+                                       first.option,
+                                       input.dtype()))
     {
         return false;
     }
     ncnn::VkMat fused_gpu;
     fused_gpu.create(static_cast<int>(first.output_columns),
                      static_cast<int>(input.rows()),
-                     vulkan_activation_element_size(first.option),
+                     act_element_size(first.option),
                      first.vulkan_context->blob_allocator());
     ncnn::VkMat output_gpu;
     if (direct_host_output)
@@ -2585,7 +2585,7 @@ bool Bfloat16Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
     else
         output_gpu.create(static_cast<int>(down.output_columns),
                           static_cast<int>(input.rows()),
-                          vulkan_activation_element_size(first.option),
+                          act_element_size(first.option),
                           first.vulkan_context->blob_allocator());
     if (fused_gpu.empty() || output_gpu.empty())
         return false;
@@ -2621,14 +2621,14 @@ bool Bfloat16Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
                             swiglu_dispatcher);
 
     if ((!direct_host_output
-         && !record_prepared_activation_staging_download(output_gpu,
-                                                         input.rows(),
-                                                         down.output_columns,
-                                                         transfer_slot.download,
-                                                         command,
-                                                         first.vulkan_context->device(),
-                                                         first.option,
-                                                         output.dtype()))
+         && !record_staging_download(output_gpu,
+                                     input.rows(),
+                                     down.output_columns,
+                                     transfer_slot.download,
+                                     command,
+                                     first.vulkan_context->device(),
+                                     first.option,
+                                     output.dtype()))
         || submit_compute_and_wait(command, first.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batch(transfer_slot.download, output))
     {
@@ -2694,7 +2694,7 @@ bool Bfloat16Linear_vulkan::record_swiglu_chain(const ncnn::VkMat& input,
         || input.h <= 0 || input.w != static_cast<int>(first.input_columns)
         || !input.allocator || input.allocator->vkdev != first.vulkan_context->device()
         || static_cast<uint32_t>(input.h) > first.vulkan_context->device()->info.max_workgroup_count_y()
-        || vulkan_activation_storage_variant(first.option) != 0 || vulkan_activation_storage_variant(down.option) != 0
+        || activation_variant(first.option) != 0 || activation_variant(down.option) != 0
         || !bfloat16_swiglu_scratch_shape(intermediate_columns, apply_router_gate,
                                           static_cast<uint64_t>(input.h), fused_columns)
         || first.output_columns != fused_columns || down.input_columns != intermediate_columns
@@ -2815,8 +2815,8 @@ bool Bfloat16Linear_vulkan::materialize(const DeviceTensor_vulkan& input, Activa
     if (slot.command_used && slot.command->reset() != 0)
         return false;
     slot.command_used = true;
-    if (!record_prepared_activation_staging_download(*value, input.rows(), input.columns(), slot.download,
-                                                     *slot.command, d->vulkan_context->device(), d->option, dtype)
+    if (!record_staging_download(*value, input.rows(), input.columns(), slot.download,
+                                 *slot.command, d->vulkan_context->device(), d->option, dtype)
         || submit_compute_and_wait(*slot.command, d->vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batch(slot.download, output))
         return false;
@@ -3023,7 +3023,7 @@ bool Bfloat16Expert_vulkan::record(const ncnn::VkMat& input, ncnn::VkMat& output
     uint32_t fused_columns = 0;
     if (input.empty() || input.dims != 2 || input.elempack != 1 || input.elemsize != sizeof(float)
         || input.w != static_cast<int>(expert.input_columns) || input.h <= 0
-        || !gate.swiglu_down_pipeline || vulkan_activation_storage_variant(gate.option) != 0
+        || !gate.swiglu_down_pipeline || activation_variant(gate.option) != 0
         || !bfloat16_expert_scratch_shape(gate.output_columns, static_cast<uint64_t>(input.h), fused_columns))
         return false;
     ncnn::VkMat fused;
@@ -3146,8 +3146,8 @@ bool Bfloat16Expert_vulkan::forward_batch(std::span<const Bfloat16Expert_vulkan*
             || gate.output_columns != first_gate.output_columns
             || down.input_columns != first_down.input_columns
             || down.output_columns != output_columns
-            || vulkan_activation_storage_variant(gate.option)
-                   != vulkan_activation_storage_variant(first_gate.option))
+            || activation_variant(gate.option)
+                   != activation_variant(first_gate.option))
         {
             return false;
         }
@@ -3223,19 +3223,19 @@ bool Bfloat16Expert_vulkan::forward_batch(std::span<const Bfloat16Expert_vulkan*
     transfer_slot.command_used = true;
 
     ncnn::VkMat input_gpu;
-    if (!record_mapped_activation_upload(transfer_slot.upload,
-                                         input_gpu,
-                                         command,
-                                         first_expert.vulkan_context->device(),
-                                         first_gate.option,
-                                         DType::Float32))
+    if (!record_mapped_act_upload(transfer_slot.upload,
+                                  input_gpu,
+                                  command,
+                                  first_expert.vulkan_context->device(),
+                                  first_gate.option,
+                                  DType::Float32))
     {
         return false;
     }
     ncnn::VkMat output_gpu;
     output_gpu.create(static_cast<int>(output_columns),
                       static_cast<int>(total_rows),
-                      vulkan_activation_element_size(first_gate.option),
+                      act_element_size(first_gate.option),
                       first_expert.vulkan_context->blob_allocator());
     if (input_gpu.empty() || output_gpu.empty())
         return false;
@@ -3272,7 +3272,7 @@ bool Bfloat16Expert_vulkan::forward_batch(std::span<const Bfloat16Expert_vulkan*
         ncnn::VkMat& fused_gpu = intermediates.emplace_back();
         fused_gpu.create(static_cast<int>(gate.output_columns),
                          static_cast<int>(rows),
-                         vulkan_activation_element_size(first_gate.option),
+                         act_element_size(first_gate.option),
                          first_expert.vulkan_context->blob_allocator());
         if (fused_gpu.empty())
             return false;
@@ -3313,14 +3313,14 @@ bool Bfloat16Expert_vulkan::forward_batch(std::span<const Bfloat16Expert_vulkan*
         row_offset += rows;
     }
 
-    if (!record_prepared_activation_staging_download(output_gpu,
-                                                     total_rows,
-                                                     output_columns,
-                                                     transfer_slot.download,
-                                                     command,
-                                                     first_expert.vulkan_context->device(),
-                                                     first_down.option,
-                                                     DType::Float32)
+    if (!record_staging_download(output_gpu,
+                                 total_rows,
+                                 output_columns,
+                                 transfer_slot.download,
+                                 command,
+                                 first_expert.vulkan_context->device(),
+                                 first_down.option,
+                                 DType::Float32)
         || submit_compute_and_wait(command, first_expert.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batches(transfer_slot.download,
                                         inputs,
@@ -4088,9 +4088,9 @@ bool Float8Linear_vulkan::materialize(const DeviceTensor_vulkan& input, Activati
     if (slot.command_used && slot.command->reset() != 0)
         return false;
     slot.command_used = true;
-    if (!record_prepared_activation_staging_download(*value, input.rows(), input.columns(),
-                                                     slot.download, *slot.command,
-                                                     d->vulkan_context->device(), d->option, dtype)
+    if (!record_staging_download(*value, input.rows(), input.columns(),
+                                 slot.download, *slot.command,
+                                 d->vulkan_context->device(), d->option, dtype)
         || submit_compute_and_wait(*slot.command, d->vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batch(slot.download, output))
         return false;
@@ -4165,14 +4165,14 @@ bool Float8Linear_vulkan::forward(const ActivationBuffer& input, ActivationBuffe
                                      static_cast<uint32_t>(input.rows()),
                                      command);
     if ((!direct_host_output
-         && !record_prepared_activation_staging_download(output_gpu,
-                                                         input.rows(),
-                                                         implementation.output_columns,
-                                                         transfer_slot.download,
-                                                         command,
-                                                         implementation.vulkan_context->device(),
-                                                         implementation.option,
-                                                         output_dtype))
+         && !record_staging_download(output_gpu,
+                                     input.rows(),
+                                     implementation.output_columns,
+                                     transfer_slot.download,
+                                     command,
+                                     implementation.vulkan_context->device(),
+                                     implementation.option,
+                                     output_dtype))
         || submit_compute_and_wait(command, implementation.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batch(transfer_slot.download, output))
     {
@@ -4271,14 +4271,14 @@ bool Float8Linear_vulkan::forward_chain(const ActivationBuffer& input, const Flo
                              command);
 
     if ((!direct_host_output
-         && !record_prepared_activation_staging_download(output_gpu,
-                                                         input.rows(),
-                                                         second.output_columns,
-                                                         transfer_slot.download,
-                                                         command,
-                                                         first.vulkan_context->device(),
-                                                         first.option,
-                                                         output_dtype))
+         && !record_staging_download(output_gpu,
+                                     input.rows(),
+                                     second.output_columns,
+                                     transfer_slot.download,
+                                     command,
+                                     first.vulkan_context->device(),
+                                     first.option,
+                                     output_dtype))
         || submit_compute_and_wait(command, first.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batch(transfer_slot.download, output))
     {
@@ -4386,14 +4386,14 @@ bool Float8Linear_vulkan::forward_rms_norm_chain(const ActivationBuffer& input,
                              command);
 
     if ((!direct_host_output
-         && !record_prepared_activation_staging_download(output_gpu,
-                                                         input.rows(),
-                                                         second.output_columns,
-                                                         transfer_slot.download,
-                                                         command,
-                                                         first.vulkan_context->device(),
-                                                         first.option,
-                                                         output_dtype))
+         && !record_staging_download(output_gpu,
+                                     input.rows(),
+                                     second.output_columns,
+                                     transfer_slot.download,
+                                     command,
+                                     first.vulkan_context->device(),
+                                     first.option,
+                                     output_dtype))
         || submit_compute_and_wait(command, first.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batch(transfer_slot.download, output))
     {
@@ -4557,23 +4557,23 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_impl(const ActivationB
                                static_cast<uint32_t>(input.rows()),
                                command);
     if ((!retained_output && !direct_host_output
-         && !record_prepared_activation_staging_download(output_gpu,
-                                                         input.rows(),
-                                                         second.output_columns,
-                                                         transfer_slot.download,
-                                                         command,
-                                                         first.vulkan_context->device(),
-                                                         first.option,
-                                                         output_dtype))
+         && !record_staging_download(output_gpu,
+                                     input.rows(),
+                                     second.output_columns,
+                                     transfer_slot.download,
+                                     command,
+                                     first.vulkan_context->device(),
+                                     first.option,
+                                     output_dtype))
         || (!parallel_direct_host_output
-            && !record_prepared_activation_staging_download(parallel_gpu,
-                                                            input.rows(),
-                                                            parallel.output_columns,
-                                                            parallel_download,
-                                                            command,
-                                                            first.vulkan_context->device(),
-                                                            first.option,
-                                                            parallel_output_dtype))
+            && !record_staging_download(parallel_gpu,
+                                        input.rows(),
+                                        parallel.output_columns,
+                                        parallel_download,
+                                        command,
+                                        first.vulkan_context->device(),
+                                        first.option,
+                                        parallel_output_dtype))
         || submit_compute_and_wait(command, first.vulkan_context->device()) != 0
         || (!retained_output && !copy_staging_to_cpu_batch(transfer_slot.download, output))
         || !copy_staging_to_cpu_batch(parallel_download, parallel_output))
@@ -4688,13 +4688,13 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const Activat
         {
             return false;
         }
-        const size_t variant = vulkan_activation_storage_variant(extra.option);
+        const size_t variant = activation_variant(extra.option);
         if (index == 0)
             extra_storage_variant = variant;
         else if (variant != extra_storage_variant)
             return false;
     }
-    if (extra_storage_variant != vulkan_activation_storage_variant(first.option)
+    if (extra_storage_variant != activation_variant(first.option)
         || extra_storage_variant != 0)
     {
         return false;
@@ -4812,7 +4812,7 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const Activat
         else
             extra_gpu[index].create(static_cast<int>(extra.output_columns),
                                     static_cast<int>(input.rows()),
-                                    vulkan_activation_element_size(extra.option),
+                                    act_element_size(extra.option),
                                     first.vulkan_context->blob_allocator());
         if (extra_gpu[index].empty())
             return false;
@@ -4863,23 +4863,23 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const Activat
     }
 
     if ((!retained_output && !direct_host_output
-         && !record_prepared_activation_staging_download(output_gpu,
-                                                         input.rows(),
-                                                         second.output_columns,
-                                                         transfer_slot.download,
-                                                         command,
-                                                         first.vulkan_context->device(),
-                                                         first.option,
-                                                         output_dtype))
+         && !record_staging_download(output_gpu,
+                                     input.rows(),
+                                     second.output_columns,
+                                     transfer_slot.download,
+                                     command,
+                                     first.vulkan_context->device(),
+                                     first.option,
+                                     output_dtype))
         || (!parallel_direct_host_output
-            && !record_prepared_activation_staging_download(parallel_gpu,
-                                                            input.rows(),
-                                                            parallel.output_columns,
-                                                            parallel_download,
-                                                            command,
-                                                            first.vulkan_context->device(),
-                                                            first.option,
-                                                            parallel_output_dtype)))
+            && !record_staging_download(parallel_gpu,
+                                        input.rows(),
+                                        parallel.output_columns,
+                                        parallel_download,
+                                        command,
+                                        first.vulkan_context->device(),
+                                        first.option,
+                                        parallel_output_dtype)))
     {
         return false;
     }
@@ -4887,14 +4887,14 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const Activat
     {
         const auto& extra = *extra_operators[index]->d;
         if (!extra_direct_host_outputs[index]
-            && !record_prepared_activation_staging_download(extra_gpu[index],
-                                                            input.rows(),
-                                                            extra.output_columns,
-                                                            extra_downloads[index],
-                                                            command,
-                                                            extra.vulkan_context->device(),
-                                                            extra.option,
-                                                            extra_outputs[index]->dtype()))
+            && !record_staging_download(extra_gpu[index],
+                                        input.rows(),
+                                        extra.output_columns,
+                                        extra_downloads[index],
+                                        command,
+                                        extra.vulkan_context->device(),
+                                        extra.option,
+                                        extra_outputs[index]->dtype()))
         {
             return false;
         }
@@ -5047,14 +5047,14 @@ bool Float8Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
                            static_cast<uint32_t>(input.rows()),
                            command);
     if ((!direct_host_output
-         && !record_prepared_activation_staging_download(output_gpu,
-                                                         input.rows(),
-                                                         down.output_columns,
-                                                         transfer_slot.download,
-                                                         command,
-                                                         gate.vulkan_context->device(),
-                                                         gate.option,
-                                                         output_dtype))
+         && !record_staging_download(output_gpu,
+                                     input.rows(),
+                                     down.output_columns,
+                                     transfer_slot.download,
+                                     command,
+                                     gate.vulkan_context->device(),
+                                     gate.option,
+                                     output_dtype))
         || submit_compute_and_wait(command, gate.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batch(transfer_slot.download, output))
     {
@@ -5583,14 +5583,14 @@ bool Mxfp4Linear_vulkan::forward(const ActivationBuffer& input, ActivationBuffer
     dispatcher.c = 1;
     command.record_pipeline(implementation.pipeline.get(), bindings, constants, dispatcher);
     if ((!direct_host_output
-         && !record_prepared_activation_staging_download(output_gpu,
-                                                         input.rows(),
-                                                         implementation.output_columns,
-                                                         transfer_slot.download,
-                                                         command,
-                                                         implementation.vulkan_context->device(),
-                                                         implementation.option,
-                                                         output_dtype))
+         && !record_staging_download(output_gpu,
+                                     input.rows(),
+                                     implementation.output_columns,
+                                     transfer_slot.download,
+                                     command,
+                                     implementation.vulkan_context->device(),
+                                     implementation.option,
+                                     output_dtype))
         || submit_compute_and_wait(command, implementation.vulkan_context->device()) != 0 || !copy_staging_to_cpu_batch(transfer_slot.download, output))
     {
         return false;
@@ -5958,7 +5958,7 @@ bool QnkLinear_vulkan::can_fuse(std::span<const TensorData* const> matrices,
     if (matrices.empty() || !matrices.front()) return false;
     const TensorData& first = *matrices.front();
     if (first.shape.size() != 2 || !is_qnk_dtype(first.dtype)
-        || !validate_input_column_indices(first)) return false;
+        || !check_input_columns(first)) return false;
     uint64_t rows = 0;
     uint64_t bytes = 0;
     for (const TensorData* matrix : matrices)
@@ -6094,7 +6094,7 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
         || (int4 && !validate_int4_tensor(matrix))
         || (mxfp4 && mxfp4_size == 0)
         || (!int4 && !dense && !mxfp4 && !qnk_shape_supported(matrix.dtype, matrix.shape[0], matrix.shape[1]))
-        || (!int4 && !validate_input_column_indices(matrix)))
+        || (!int4 && !check_input_columns(matrix)))
     {
         return {};
     }
@@ -6394,7 +6394,7 @@ bool QnkLinear_vulkan::record_forward(const ncnn::VkMat& input, ncnn::VkMat& out
     (void)workspace;
     if (!d->vulkan_context || !d->pipeline || input.empty() || input.dims != 2
         || input.elempack != 1 || input.elemsize != sizeof(float) || input.h <= 0
-        || input.w != static_cast<int>(d->input_columns * d->input_group_count) || vulkan_activation_storage_variant(d->option) != 0)
+        || input.w != static_cast<int>(d->input_columns * d->input_group_count) || activation_variant(d->option) != 0)
         return false;
     output.create(static_cast<int>(d->output_columns), input.h, sizeof(float), d->vulkan_context->blob_allocator());
     if (output.empty())
@@ -6538,14 +6538,14 @@ bool QnkLinear_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& 
 
     record(input_gpu, output_gpu, command);
     if ((!direct_host_output
-         && !record_prepared_activation_staging_download(output_gpu,
-                                                         input.rows(),
-                                                         implementation.output_columns,
-                                                         transfer_slot.download,
-                                                         command,
-                                                         implementation.vulkan_context->device(),
-                                                         implementation.option,
-                                                         output_dtype))
+         && !record_staging_download(output_gpu,
+                                     input.rows(),
+                                     implementation.output_columns,
+                                     transfer_slot.download,
+                                     command,
+                                     implementation.vulkan_context->device(),
+                                     implementation.option,
+                                     output_dtype))
         || submit_compute_and_wait(command, implementation.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batch(transfer_slot.download, output))
     {
@@ -7269,14 +7269,14 @@ bool QnkExpert_vulkan::forward_batch(std::span<const QnkExpert_vulkan*> experts,
         row_offset += rows;
     }
 
-    if (!record_prepared_activation_staging_download(output_gpu,
-                                                     total_rows,
-                                                     output_columns,
-                                                     transfer_slot.download,
-                                                     command,
-                                                     first_expert.vulkan_context->device(),
-                                                     first_down.option,
-                                                     output_dtype)
+    if (!record_staging_download(output_gpu,
+                                 total_rows,
+                                 output_columns,
+                                 transfer_slot.download,
+                                 command,
+                                 first_expert.vulkan_context->device(),
+                                 first_down.option,
+                                 output_dtype)
         || submit_compute_and_wait(command, first_expert.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batches(transfer_slot.download,
                                         inputs,
@@ -7386,14 +7386,14 @@ bool QnkExpert_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& 
         return false;
 
     if ((!direct_host_output
-         && !record_prepared_activation_staging_download(output_gpu,
-                                                         input.rows(),
-                                                         down.output_columns,
-                                                         transfer_slot.download,
-                                                         command,
-                                                         implementation.vulkan_context->device(),
-                                                         down.option,
-                                                         output_dtype))
+         && !record_staging_download(output_gpu,
+                                     input.rows(),
+                                     down.output_columns,
+                                     transfer_slot.download,
+                                     command,
+                                     implementation.vulkan_context->device(),
+                                     down.option,
+                                     output_dtype))
         || submit_compute_and_wait(command, implementation.vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batch(transfer_slot.download, output))
     {
@@ -7429,7 +7429,7 @@ bool QnkExpert_vulkan::forward_device(const DeviceTensor_vulkan& input, DeviceTe
         || input.vulkan_context() != implementation.vulkan_context
         || input.rows() == 0 || input.columns() != implementation.gate_up->input_columns()
         || input.rows() > implementation.vulkan_context->device()->info.max_workgroup_count_y()
-        || vulkan_activation_storage_variant(implementation.option) != 0)
+        || activation_variant(implementation.option) != 0)
         return false;
     const ncnn::VkMat retained_input = *source;
     auto lease = implementation.vulkan_context->acquire_transfer_slot();
@@ -7492,8 +7492,8 @@ bool QnkExpert_vulkan::materialize(const DeviceTensor_vulkan& input, ActivationB
     if (slot.command_used && slot.command->reset() != 0)
         return false;
     slot.command_used = true;
-    if (!record_prepared_activation_staging_download(*value, input.rows(), input.columns(), slot.download,
-                                                     *slot.command, d->vulkan_context->device(), d->option, dtype)
+    if (!record_staging_download(*value, input.rows(), input.columns(), slot.download,
+                                 *slot.command, d->vulkan_context->device(), d->option, dtype)
         || submit_compute_and_wait(*slot.command, d->vulkan_context->device()) != 0
         || !copy_staging_to_cpu_batch(slot.download, output))
         return false;
@@ -7645,7 +7645,7 @@ bool VulkanExpertBackend::forward_device_batch(std::span<const ExpertRequest> re
     const auto& option = first.qnk_operation        ? first.qnk_operation->d->option
                          : first.bfloat16_operation ? first.bfloat16_operation->d->option
                                                     : first.operation->d->gate_up->d->option;
-    if (!context || vulkan_activation_storage_variant(option) != 0) return false;
+    if (!context || activation_variant(option) != 0) return false;
     const uint32_t input_columns = first.qnk_operation        ? first.qnk_operation->d->gate_up->input_columns()
                                    : first.bfloat16_operation ? first.bfloat16_operation->d->input_columns
                                                               : first.operation->d->gate_up->d->input_columns;
@@ -8281,14 +8281,14 @@ bool Mxfp4Expert_vulkan::forward(const ActivationBuffer& input, ActivationBuffer
     std::vector<ncnn::vk_constant_type> constants(7);
     record(input_gpu, intermediate_gpu, output_gpu, command, bindings, constants);
 
-    if (!record_prepared_activation_staging_download(output_gpu,
-                                                     input.rows(),
-                                                     down.output_columns,
-                                                     transfer_slot.download,
-                                                     command,
-                                                     gate.vulkan_context->device(),
-                                                     down.option,
-                                                     output_dtype)
+    if (!record_staging_download(output_gpu,
+                                 input.rows(),
+                                 down.output_columns,
+                                 transfer_slot.download,
+                                 command,
+                                 gate.vulkan_context->device(),
+                                 down.option,
+                                 output_dtype)
         || submit_compute_and_wait(command, gate.vulkan_context->device()) != 0 || !copy_staging_to_cpu_batch(transfer_slot.download, output))
     {
         return false;
@@ -8429,7 +8429,7 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertRequest> requests,
     if (region)
     {
         if (region->columns() != input_columns || region->rows() == 0
-            || vulkan_activation_storage_variant(first_gate.option) != 0)
+            || activation_variant(first_gate.option) != 0)
             return false;
         if (!resident_combiner) resident_combiner = MoeCombine_vulkan::create(first_gate.vulkan_context);
         if (!region->bind_context(first_gate.vulkan_context, resident_combiner)) return false;
@@ -9073,14 +9073,14 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertRequest> requests,
                                 aggregation_bindings,
                                 aggregation_constants,
                                 aggregation_dispatcher);
-        if (!record_prepared_activation_staging_download(aggregated_output_gpu,
-                                                         aggregated_token_count,
-                                                         output_columns,
-                                                         transfer_slot.download,
-                                                         command,
-                                                         first_down.vulkan_context->device(),
-                                                         first_down.option,
-                                                         aggregated_output->dtype())
+        if (!record_staging_download(aggregated_output_gpu,
+                                     aggregated_token_count,
+                                     output_columns,
+                                     transfer_slot.download,
+                                     command,
+                                     first_down.vulkan_context->device(),
+                                     first_down.option,
+                                     aggregated_output->dtype())
             || submit_compute_and_wait(command, first_gate.vulkan_context->device()) != 0
             || !copy_staging_to_cpu_batch(transfer_slot.download, *aggregated_output))
         {
@@ -9090,14 +9090,14 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertRequest> requests,
     else
     {
         if (download_output && !direct_host_output
-            && !record_prepared_activation_staging_download(output_gpu,
-                                                            total_rows,
-                                                            output_columns,
-                                                            transfer_slot.download,
-                                                            command,
-                                                            first_down.vulkan_context->device(),
-                                                            first_down.option,
-                                                            host_output.dtype()))
+            && !record_staging_download(output_gpu,
+                                        total_rows,
+                                        output_columns,
+                                        transfer_slot.download,
+                                        command,
+                                        first_down.vulkan_context->device(),
+                                        first_down.option,
+                                        host_output.dtype()))
         {
             return false;
         }

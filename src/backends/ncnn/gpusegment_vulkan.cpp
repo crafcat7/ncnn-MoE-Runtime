@@ -243,7 +243,7 @@ bool GpuSegment_vulkan::supports(const CompiledModel& model, const CompiledLayer
     if (layer.attention.kind == AttentionKind::GatedDeltaNet)
     {
         const auto& operation = model.operators.at(layer.attention.gated_delta_vulkan_operator).gated_delta;
-        return operation && vulkan_activation_storage_variant(operation->option()) == 0;
+        return operation && activation_variant(operation->option()) == 0;
     }
     if (layer.attention.kind == AttentionKind::MultiHeadLatent)
     {
@@ -251,14 +251,14 @@ bool GpuSegment_vulkan::supports(const CompiledModel& model, const CompiledLayer
             return false;
         const auto& operation = model.operators.at_weight(layer.attention.query_a_weight).latent_attention;
         const bool supported = operation && operation->can_record()
-                               && vulkan_activation_storage_variant(operation->option()) == 0;
+                               && activation_variant(operation->option()) == 0;
         return supported;
     }
     if (layer.attention.kind != AttentionKind::Standard) return false;
     const auto& operation = model.operators.at(layer.attention.vulkan_attention_operator);
     return has_flag(layer.attention.flags, AttentionBlockQsa)
-               ? operation.qsa_attention && vulkan_activation_storage_variant(operation.qsa_attention->option()) == 0
-               : operation.attention && vulkan_activation_storage_variant(operation.attention->option()) == 0;
+               ? operation.qsa_attention && activation_variant(operation.qsa_attention->option()) == 0
+               : operation.attention && activation_variant(operation.attention->option()) == 0;
 #else
     (void)model;
     (void)layer;
@@ -275,10 +275,10 @@ bool GpuSegment_vulkan::supports_head(const CompiledModel& model) noexcept
         || !segment_norm_supported(model, model.final_norm_weight, model.final_norm_bias,
                                    model.descriptor.hidden_size)) return false;
     const auto& operation = model.operators.at_weight(model.lm_head_weight);
-    if (operation.qnk) return operation.qnk->vulkan_context() && vulkan_activation_storage_variant(operation.qnk->option()) == 0;
-    if (operation.float8) return operation.float8->vulkan_context() && vulkan_activation_storage_variant(operation.float8->option()) == 0;
-    if (operation.bfloat16) return operation.bfloat16->vulkan_context() && vulkan_activation_storage_variant(operation.bfloat16->option()) == 0;
-    return operation.linear && operation.linear->vulkan_context() && vulkan_activation_storage_variant(operation.linear->option()) == 0;
+    if (operation.qnk) return operation.qnk->vulkan_context() && activation_variant(operation.qnk->option()) == 0;
+    if (operation.float8) return operation.float8->vulkan_context() && activation_variant(operation.float8->option()) == 0;
+    if (operation.bfloat16) return operation.bfloat16->vulkan_context() && activation_variant(operation.bfloat16->option()) == 0;
+    return operation.linear && operation.linear->vulkan_context() && activation_variant(operation.linear->option()) == 0;
 #else
     (void)model;
     return false;
@@ -722,8 +722,8 @@ public:
         selected_columns = Router_vulkan::selected_columns(options.top_k);
         if (!download_routes) return true;
         if (!prepare_staging_batch(selected_staging, positions.size(), selected_columns, d->context->staging_allocator())
-            || !record_prepared_activation_staging_download(router_work.selected, positions.size(), selected_columns,
-                                                            selected_staging, command, d->context->device(), d->option)) return fail("cannot record compact Vulkan routes download");
+            || !record_staging_download(router_work.selected, positions.size(), selected_columns,
+                                        selected_staging, command, d->context->device(), d->option)) return fail("cannot record compact Vulkan routes download");
 
         return true;
     }
@@ -821,7 +821,7 @@ public:
                 host_output_slot_size = std::max(planned.value(), host_output->planned_capacity());
             }
             if (!host_output->prepare(d->context, output_rows, output.w, host_output_slot_size, selected_staging, pending_logits)
-                || !record_prepared_activation_staging_download(output, output_rows, output.w, selected_staging, command, d->context->device(), d->option))
+                || !record_staging_download(output, output_rows, output.w, selected_staging, command, d->context->device(), d->option))
             {
                 error = "cannot record Vulkan logits download";
                 return false;
@@ -1008,7 +1008,7 @@ void GpuSegmentContinuation_vulkan::abort() noexcept
 bool GpuSegmentContinuation_vulkan::record(const ncnn::VkMat& combined, ncnn::VkCompute& command, const ncnn::Option& option)
 {
     if (!d->previous.context || d->previous.combined || combined.empty()
-        || vulkan_activation_storage_variant(option) != 0) return false;
+        || activation_variant(option) != 0) return false;
     return d->record_work(&combined, command);
 }
 #endif
@@ -1409,7 +1409,7 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
             if (produce_logits) budget.record(head_work);
         }
         auto& command = *recording;
-        if (routed && (!prepare_staging_batch(validation_download, 1, 1, context->staging_allocator()) || !record_prepared_activation_staging_download(validation, 1, 1, validation_download, command, context->device(), option)))
+        if (routed && (!prepare_staging_batch(validation_download, 1, 1, context->staging_allocator()) || !record_staging_download(validation, 1, 1, validation_download, command, context->device(), option)))
             return fail("cannot record resident Expert bank validation download");
         submitted = chunk_attempted = true;
         if (batches.submit() != 0)
@@ -1607,7 +1607,7 @@ bool GpuSegment_vulkan::materialize_hidden(GpuSegmentWorkspace_vulkan& workspace
         output = *current.normalized->value();
     if ((!current.dense_ready && !current.record_hidden(output, command, storage, statistics))
         || !prepare_staging_batch(slot.download, rows, columns, slot.staging_allocator)
-        || !record_prepared_activation_staging_download(output, rows, columns, slot.download, command, context->device(), current.option)
+        || !record_staging_download(output, rows, columns, slot.download, command, context->device(), current.option)
         || submit_compute_and_wait(command, context->device()) != 0)
     {
         error = "Vulkan hidden materialization failed";

@@ -48,7 +48,7 @@ std::shared_ptr<RmsNorm_vulkan> RmsNorm_vulkan::create(const TensorData& weight,
 #if NCNN_MOE_WITH_VULKAN
     if (!context || epsilon <= 0.0f || weight.shape.size() != 1
         || weight.shape[0] == 0 || weight.shape[0] > 0x7fffffff
-        || vulkan_activation_storage_variant(opt) != 0)
+        || activation_variant(opt) != 0)
         return {};
     const auto& limits = context->device()->info.physicalDeviceProperties().limits;
     const uint32_t workgroup_size = limits.maxComputeWorkGroupInvocations >= 256

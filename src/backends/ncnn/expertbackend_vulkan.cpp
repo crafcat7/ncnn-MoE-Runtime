@@ -707,7 +707,7 @@ static uint64_t native_expert_storage_bytes(const TensorData& gate_up, const Ten
         else if (matrix->dtype == DType::MxFp4)
         {
             if (!has_flag(optimization_flags, OptimizationVulkanQnK)
-                || !validate_input_column_indices(*matrix))
+                || !check_input_columns(*matrix))
                 return 0;
         }
         else if (!has_flag(optimization_flags, OptimizationVulkanQnK)
@@ -715,7 +715,7 @@ static uint64_t native_expert_storage_bytes(const TensorData& gate_up, const Ten
                  || !qnk_shape_supported(matrix->dtype, matrix->shape[0], matrix->shape[1])
                  || (!matrix->mxfp4_file_storage
                      && matrix->qnk_values().size() != qnk_storage_bytes(matrix->dtype, matrix->shape[0], matrix->shape[1]))
-                 || !validate_input_column_indices(*matrix))
+                 || !check_input_columns(*matrix))
         {
             return 0;
         }

@@ -388,7 +388,7 @@ static void test_quantized_column_map()
         TensorData matrix = int4 ? int4_test_matrix(3, columns, 3, true) : qnk_test_matrix(DType::Q8K, 3, columns);
         for (uint32_t column = 0; column < columns; ++column)
             matrix.input_column_indices.push_back((column * (int4 ? 3 : 5) + 1) % columns);
-        int4_check(static_cast<bool>(validate_input_column_indices(matrix)), "valid input-column permutation rejected");
+        int4_check(static_cast<bool>(check_input_columns(matrix)), "valid input-column permutation rejected");
         if (int4)
             int4_check(static_cast<bool>(validate_int4_tensor(matrix)), "permuted INT4 validation failed");
         ActivationBuffer input(5, columns);
@@ -436,16 +436,16 @@ static void test_quantized_column_map()
         }
         TensorData invalid = matrix;
         invalid.input_column_indices.pop_back();
-        int4_check(!validate_input_column_indices(invalid), "short column map accepted");
+        int4_check(!check_input_columns(invalid), "short column map accepted");
         invalid = matrix;
         invalid.input_column_indices[0] = columns;
-        int4_check(!validate_input_column_indices(invalid), "out-of-range column map accepted");
+        int4_check(!check_input_columns(invalid), "out-of-range column map accepted");
         invalid = matrix;
         invalid.input_column_indices[0] = invalid.input_column_indices[1];
-        int4_check(!validate_input_column_indices(invalid), "duplicate column map accepted");
+        int4_check(!check_input_columns(invalid), "duplicate column map accepted");
         invalid = matrix;
         invalid.dtype = DType::BFloat16;
-        int4_check(!validate_input_column_indices(invalid), "column map accepted on dense weights");
+        int4_check(!check_input_columns(invalid), "column map accepted on dense weights");
     }
 }
 
@@ -459,40 +459,40 @@ static void test_input_column_map_boundaries()
         matrix.input_column_indices.resize(columns);
         for (uint32_t column = 0; column < columns; ++column)
             matrix.input_column_indices[column] = column;
-        int4_check(static_cast<bool>(validate_input_column_indices(matrix)), "valid column map at boundary rejected");
+        int4_check(static_cast<bool>(check_input_columns(matrix)), "valid column map at boundary rejected");
 
         TensorData invalid = matrix;
         invalid.input_column_indices.back() = invalid.input_column_indices.front();
-        int4_check(!validate_input_column_indices(invalid), "duplicate final column accepted");
+        int4_check(!check_input_columns(invalid), "duplicate final column accepted");
 
         invalid = matrix;
         invalid.input_column_indices.back() = columns;
-        int4_check(!validate_input_column_indices(invalid), "out-of-range final column accepted");
+        int4_check(!check_input_columns(invalid), "out-of-range final column accepted");
 
         invalid = matrix;
         invalid.input_column_indices.pop_back();
-        int4_check(!validate_input_column_indices(invalid), "short column map accepted");
+        int4_check(!check_input_columns(invalid), "short column map accepted");
 
         invalid = matrix;
         invalid.shape = {columns};
-        int4_check(!validate_input_column_indices(invalid), "non-matrix column map accepted");
+        int4_check(!check_input_columns(invalid), "non-matrix column map accepted");
 
         invalid = matrix;
         invalid.dtype = DType::Float32;
-        int4_check(!validate_input_column_indices(invalid), "dense column map accepted");
+        int4_check(!check_input_columns(invalid), "dense column map accepted");
 
         if (columns > 64)
         {
             invalid = matrix;
             invalid.input_column_indices[64] = invalid.input_column_indices[63];
-            int4_check(!validate_input_column_indices(invalid), "duplicate across columns 63 and 64 accepted");
+            int4_check(!check_input_columns(invalid), "duplicate across columns 63 and 64 accepted");
         }
     }
 
     TensorData empty_map;
     empty_map.dtype = DType::Float32;
     empty_map.shape = {1};
-    int4_check(static_cast<bool>(validate_input_column_indices(empty_map)), "empty column map did not bypass validation");
+    int4_check(static_cast<bool>(check_input_columns(empty_map)), "empty column map did not bypass validation");
 }
 
 static void test_quantized_embeddings()
@@ -509,7 +509,7 @@ static void test_quantized_embeddings()
                 for (uint32_t column = 0; column < columns; ++column)
                     matrix.input_column_indices.push_back((column * (dtype == DType::Int4 ? 3 : 5) + 1) % columns);
             }
-            int4_check(static_cast<bool>(validate_input_column_indices(matrix)), "embedding column map rejected");
+            int4_check(static_cast<bool>(check_input_columns(matrix)), "embedding column map rejected");
             if (dtype == DType::Int4)
                 int4_check(static_cast<bool>(validate_int4_tensor(matrix)), "INT4 embedding validation failed");
             const uint8_t* storage = matrix.quantized_data.data();

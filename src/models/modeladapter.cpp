@@ -894,7 +894,7 @@ Result<TensorData> select_tensor_rows(const TensorData& source,
             || source.mxfp4_blocks.size() != static_cast<uint64_t>(source.shape[0]) * columns / 2
             || source.mxfp4_scales.size() != static_cast<uint64_t>(source.shape[0]) * columns / 32)
             return Error{ErrorCode::InvalidModel, "invalid MXFP4 matrix row storage"};
-        auto valid_columns = validate_input_column_indices(source);
+        auto valid_columns = check_input_columns(source);
         if (!valid_columns)
             return valid_columns.error();
         TensorData result;
@@ -1002,7 +1002,7 @@ Result<TensorData> select_tensor_rows(const TensorData& source,
     {
         if (!qnk_shape_supported(source.dtype, source.shape[0], columns))
             return Error{ErrorCode::InvalidModel, "invalid Qn_K matrix row shape"};
-        auto status = validate_input_column_indices(source);
+        auto status = check_input_columns(source);
         if (!status)
             return status.error();
         result.input_column_indices = source.input_column_indices;

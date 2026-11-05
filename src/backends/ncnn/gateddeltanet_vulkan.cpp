@@ -1295,7 +1295,7 @@ bool GatedDeltaNet_vulkan::forward_impl(const ActivationBuffer& input,
         return false;
     VulkanTransferLease transfer_lease = implementation.vulkan_context->acquire_transfer_slot();
     VulkanTransferSlot& transfer_slot = transfer_lease.slot();
-    const bool direct_host_input = vulkan_activation_storage_variant(implementation.opt) == 0
+    const bool direct_host_input = activation_variant(implementation.opt) == 0
                                    && implementation.vulkan_context->support_direct_host_buffer(input.rows() * input.columns() * sizeof(float), input.dtype());
     if (!fill_staging_upload(input, transfer_slot.upload, transfer_slot.staging_allocator)
         || !prepare_staging_batch(transfer_slot.download, input.rows(), implementation.output_columns, transfer_slot.staging_allocator))
@@ -1315,9 +1315,9 @@ bool GatedDeltaNet_vulkan::forward_impl(const ActivationBuffer& input,
         return false;
     ncnn::VkMat output_gpu;
     if (!record_forward(input_gpu, cache, input.rows(), output_gpu, command, work, apply_input_rms_norm)
-        || !record_prepared_activation_staging_download(output_gpu, input.rows(), implementation.output_columns,
-                                                        transfer_slot.download, command, implementation.vulkan_context->device(),
-                                                        implementation.opt, projected_dtype))
+        || !record_staging_download(output_gpu, input.rows(), implementation.output_columns,
+                                    transfer_slot.download, command, implementation.vulkan_context->device(),
+                                    implementation.opt, projected_dtype))
         return false;
     if (submit_compute_and_wait(command, implementation.vulkan_context->device()) != 0)
     {
@@ -1506,7 +1506,7 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
 
     VulkanTransferLease transfer_lease = implementation.vulkan_context->acquire_transfer_slot();
     VulkanTransferSlot& transfer_slot = transfer_lease.slot();
-    const bool direct_host_input = vulkan_activation_storage_variant(implementation.opt) == 0
+    const bool direct_host_input = activation_variant(implementation.opt) == 0
                                    && implementation.vulkan_context->support_direct_host_buffer(total_rows
                                                                                                     * input_columns
                                                                                                     * sizeof(float),
@@ -1623,14 +1623,14 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
 
     record_output_projection(recurrent_output_gpu, output_gpu, cmd);
 
-    if (!record_prepared_activation_staging_download(output_gpu,
-                                                     total_rows,
-                                                     output_columns,
-                                                     transfer_slot.download,
-                                                     cmd,
-                                                     implementation.vulkan_context->device(),
-                                                     implementation.opt,
-                                                     combined_projected.dtype()))
+    if (!record_staging_download(output_gpu,
+                                 total_rows,
+                                 output_columns,
+                                 transfer_slot.download,
+                                 cmd,
+                                 implementation.vulkan_context->device(),
+                                 implementation.opt,
+                                 combined_projected.dtype()))
     {
         return GatedDeltaBatchResult_vulkan::Failed;
     }

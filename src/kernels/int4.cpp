@@ -16,7 +16,7 @@
 namespace ncnn {
 namespace moe {
 
-Result<void> validate_input_column_indices(const TensorData& tensor)
+Result<void> check_input_columns(const TensorData& tensor)
 {
     if (tensor.input_column_indices.empty())
         return {};
@@ -105,7 +105,7 @@ Result<void> validate_int4_tensor(const TensorData& tensor)
                 return Error{ErrorCode::InvalidModel, "INT4 group index is outside its scale groups"};
         }
     }
-    return validate_input_column_indices(tensor);
+    return check_input_columns(tensor);
 }
 
 uint64_t int4_storage_bytes(const TensorData& tensor) noexcept

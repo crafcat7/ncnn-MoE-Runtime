@@ -253,7 +253,7 @@ std::shared_ptr<QsaAttention_vulkan> QsaAttention_vulkan::create(const WeightSto
         return {};
     impl.context = impl.query->vulkan_context();
     impl.opt = impl.query->option();
-    if (!impl.context || vulkan_activation_storage_variant(impl.opt) != 0)
+    if (!impl.context || activation_variant(impl.opt) != 0)
         return {};
     if (plan.pre_attention_norm_weight != invalid_tensor_handle)
     {

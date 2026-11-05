@@ -247,7 +247,7 @@ std::shared_ptr<HyperConnection_vulkan> HyperConnection_vulkan::create(const Ten
         implementation.native_projection = QnkLinear_vulkan::create(function, nullptr, vulkan_device_index,
                                                                     vulkan_runtime, optimization_flags);
         if (!implementation.native_projection || implementation.native_projection->vulkan_context() != context
-            || vulkan_activation_storage_variant(implementation.native_projection->option()) != 0)
+            || activation_variant(implementation.native_projection->option()) != 0)
             return {};
         TensorData norm_weight;
         norm_weight.dtype = DType::Float32;
