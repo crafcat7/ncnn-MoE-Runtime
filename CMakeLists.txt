@@ -9,47 +9,34 @@ project(ncnn_moe_runtime VERSION 0.1.0 LANGUAGES CXX)
 option(NCNN_BUILD_MOE_RUNTIME "Build the ncnn MoE transformer runtime" ON)
 option(NCNN_MOE_BUILD_TESTS "Build ncnn_moe tests" ON)
 option(NCNN_MOE_BUILD_EXAMPLES "Build ncnn_moe examples" ON)
-option(
-    NCNN_MOE_ENABLE_MSVC_MP
-    "Enable MSVC multiprocessor compilation"
-    ON
-)
-option(
-    NCNN_MOE_ENABLE_LTO
-    "Enable Release LTO (smaller worker, much larger static .lib)"
-    OFF
-)
-option(
-    NCNN_MOE_SIZE_OPTIMIZE_COLD_PATHS
-    "Compile load/import/tokenizer paths for size in Release"
-    ON
-)
-option(
-    NCNN_MOE_ENABLE_O3
-    "Use O3 / aggressive inlining for Release execution paths"
-    ON
-)
+option(NCNN_MOE_ENABLE_MSVC_MP "Enable MSVC multiprocessor compilation" ON)
+option(NCNN_MOE_ENABLE_LTO "Enable Release LTO (smaller worker, much larger static .lib)" OFF)
+option(NCNN_MOE_SIZE_OPTIMIZE_COLD_PATHS "Compile load/import/tokenizer paths for size in Release" ON)
+set(NCNN_MOE_OPT_LEVEL "O3" CACHE STRING "Release optimization level: O0, O1, O2, O3, or Os")
 # Optional CPU ISA extensions. Disable these for portable/minimal builds; the
 # runtime selector falls back to scalar kernels when they are off.
-option(
-    NCNN_MOE_ENABLE_X86_SIMD
-    "Build optional AVX2/AVX512 x86 kernels"
-    ON
-)
-option(
-    NCNN_MOE_ENABLE_ARM_SVE2
-    "Build optional ARM SVE2 MXFP4 kernels"
-    ON
-)
-option(
-    NCNN_MOE_ENABLE_OPENMP
-    "Enable OpenMP CPU parallelism when the toolchain provides it"
-    ON
-)
+option(NCNN_MOE_ENABLE_X86_SIMD "Build optional AVX2/AVX512 x86 kernels" ON)
+option(NCNN_MOE_ENABLE_ARM_SVE2 "Build optional ARM SVE2 MXFP4 kernels" ON)
+option(NCNN_MOE_ENABLE_OPENMP "Enable OpenMP CPU parallelism when the toolchain provides it" ON)
 set(NCNN_MOE_USE_NCNN_DEFAULT ON)
 option(NCNN_MOE_USE_NCNN "Use ncnn optimized CPU operators when available" ${NCNN_MOE_USE_NCNN_DEFAULT})
 set(NCNN_MOE_USE_VULKAN_DEFAULT ON)
 option(NCNN_MOE_USE_VULKAN "Build ncnn with Vulkan support" ${NCNN_MOE_USE_VULKAN_DEFAULT})
+
+string(TOUPPER "${NCNN_MOE_OPT_LEVEL}" _NCNN_MOE_OPT_LEVEL)
+if(_NCNN_MOE_OPT_LEVEL MATCHES "^[0123]$")
+    set(NCNN_MOE_OPT_LEVEL "O${_NCNN_MOE_OPT_LEVEL}")
+elseif(_NCNN_MOE_OPT_LEVEL STREQUAL "S")
+    set(NCNN_MOE_OPT_LEVEL "Os")
+elseif(_NCNN_MOE_OPT_LEVEL MATCHES "^O[0123]$")
+    set(NCNN_MOE_OPT_LEVEL "${_NCNN_MOE_OPT_LEVEL}")
+elseif(_NCNN_MOE_OPT_LEVEL STREQUAL "OS")
+    set(NCNN_MOE_OPT_LEVEL "Os")
+else()
+    message(FATAL_ERROR "NCNN_MOE_OPT_LEVEL must be O0, O1, O2, O3, or Os (got: ${NCNN_MOE_OPT_LEVEL})")
+endif()
+set(NCNN_MOE_OPT_LEVEL "${NCNN_MOE_OPT_LEVEL}" CACHE STRING "Release optimization level: O0, O1, O2, O3, or Os" FORCE)
+set_property(CACHE NCNN_MOE_OPT_LEVEL PROPERTY STRINGS O0 O1 O2 O3 Os)
 
 include(GNUInstallDirs)
 
@@ -60,27 +47,38 @@ function(ncnn_moe_optimize_target target)
         return()
     endif()
     if(MSVC)
-        # /O2 is MSVC's "maximize speed". /Ob3 and /Ot are the closest
-        # equivalent of GCC/Clang -O3 for inlining and speed preference.
-        target_compile_options(${target} PRIVATE
-            $<$<CONFIG:Release>:/O2>
-            $<$<CONFIG:Release>:/Gy>
-            $<$<CONFIG:Release>:/Gw>)
-        if(NCNN_MOE_ENABLE_O3)
+        if(NCNN_MOE_OPT_LEVEL STREQUAL "O0")
+            target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/Od>)
+        elseif(NCNN_MOE_OPT_LEVEL STREQUAL "O1")
+            target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/O1>)
+        elseif(NCNN_MOE_OPT_LEVEL STREQUAL "O2")
+            target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/O2>)
+        elseif(NCNN_MOE_OPT_LEVEL STREQUAL "O3")
+            # /Ob3 and /Ot are the closest MSVC equivalent of -O3.
             target_compile_options(${target} PRIVATE
+                $<$<CONFIG:Release>:/O2>
                 $<$<CONFIG:Release>:/Ob3>
                 $<$<CONFIG:Release>:/Ot>)
+        else()
+            target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/O1>)
         endif()
+        target_compile_options(${target} PRIVATE
+            $<$<CONFIG:Release>:/Gy>
+            $<$<CONFIG:Release>:/Gw>)
         target_link_options(${target} PRIVATE
             $<$<CONFIG:Release>:/OPT:REF>
             $<$<CONFIG:Release>:/OPT:ICF>)
     else()
-        if(NCNN_MOE_ENABLE_O3)
-            target_compile_options(${target} PRIVATE
-                $<$<CONFIG:Release>:-O3>)
+        if(NCNN_MOE_OPT_LEVEL STREQUAL "O0")
+            target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-O0>)
+        elseif(NCNN_MOE_OPT_LEVEL STREQUAL "O1")
+            target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-O1>)
+        elseif(NCNN_MOE_OPT_LEVEL STREQUAL "O2")
+            target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-O2>)
+        elseif(NCNN_MOE_OPT_LEVEL STREQUAL "O3")
+            target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-O3>)
         else()
-            target_compile_options(${target} PRIVATE
-                $<$<CONFIG:Release>:-O2>)
+            target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-Os>)
         endif()
         target_compile_options(${target} PRIVATE
             $<$<CONFIG:Release>:-ffunction-sections>
@@ -209,7 +207,7 @@ ncnn_moe_optimize_target(ncnn_moe)
 
 # Loading, importing and tokenization are cold paths. Optimize them for size
 # while keeping kernels and execution at the target's Release optimization.
-if(NCNN_MOE_SIZE_OPTIMIZE_COLD_PATHS)
+if(NCNN_MOE_SIZE_OPTIMIZE_COLD_PATHS AND NOT NCNN_MOE_OPT_LEVEL STREQUAL "O0")
     set(NCNN_MOE_COLD_SOURCES
         src/engine/modelloader.cpp
         src/engine/runtime.cpp

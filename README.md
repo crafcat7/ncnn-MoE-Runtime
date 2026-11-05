@@ -167,9 +167,10 @@ Set `-DNCNN_MOE_ENABLE_LTO=ON` for the smallest worker; the tradeoff is a much
 larger static `.lib`, so leave it OFF when shipping the SDK library.
 
 Release builds also compile loader/import/tokenizer sources for size
-(`NCNN_MOE_SIZE_OPTIMIZE_COLD_PATHS`, default ON) while keeping kernels and
-execution at O3 (`-O3`, or MSVC `/O2 /Ob3 /Ot`) by default; set
-`-DNCNN_MOE_ENABLE_O3=OFF` to fall back to O2. Portable presets are available
+(`NCNN_MOE_SIZE_OPTIMIZE_COLD_PATHS`, default ON) while kernels and execution
+use `NCNN_MOE_OPT_LEVEL` (default `O3`; accepts `O0`, `O1`, `O2`, `O3`, `Os`).
+At `O3`, MSVC uses `/O2 /Ob3 /Ot`. Cold-path size optimization is skipped at
+`O0`. Portable presets are available
 in `CMakePresets.json`:
 
 ```powershell
