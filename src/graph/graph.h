@@ -61,6 +61,21 @@ enum ExecutionNodeFlag : uint32_t
     ExecutionNodeRequestExperts = UINT32_C(1) << NCNN_MOE_NODE_REQUEST_EXPERTS_BIT
 };
 
+// Runtime view of one scheduled step. Planning-only fields (dependencies,
+// tensor edges and names) stay in ExecutionNode until the P2 migration.
+using LayerKind = ExecutionNodeType;
+
+struct Layer
+{
+    ExecutionNodeId id = invalid_execution_node_id;
+    LayerKind kind = LayerKind::TokenEmbedding;
+    ExecutionBackend backend = ExecutionBackend::Cpu;
+    uint32_t backend_mask = ExecutionBackendCpu;
+    uint32_t flags = 0;
+    uint32_t plan_index = invalid_execution_layer_id;
+    std::vector<TensorHandle> weights;
+};
+
 struct ExecutionTensor
 {
     ExecutionTensorId id = invalid_execution_tensor_id;
@@ -95,7 +110,14 @@ struct ExecutionGraph
     std::vector<ExecutionTensor> tensors;
     std::vector<ExecutionNode> nodes;
     std::vector<CompiledLayerPlan> layer_plans;
+    // Runtime layer view built from nodes after scheduling. P2 removes the
+    // parallel ExecutionNode storage once modelpipeline also consumes layers.
+    std::vector<Layer> layers;
 };
+
+// Rebuild the runtime Layer view from the planning nodes. Called by
+// schedule_graph, and by tests that mutate nodes after scheduling.
+void refresh_layers(ExecutionGraph& graph);
 
 struct ExecutionSchedule
 {

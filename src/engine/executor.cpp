@@ -562,7 +562,7 @@ static void norm_fwd(const CompiledModel& model,
 }
 
 [[nodiscard]] static Result<void> lm_head_linear(const CompiledModel& model,
-                                                 const ExecutionNode& node,
+                                                 const Layer& node,
                                                  TensorHandle weight,
                                                  const ActivationBuffer& input,
                                                  ActivationBuffer& logits)
@@ -662,7 +662,7 @@ static void norm_fwd(const CompiledModel& model,
 }
 
 [[nodiscard]] static Result<void> fwd_lm_head(const CompiledModel& model,
-                                              const ExecutionNode& node,
+                                              const Layer& node,
                                               const CompiledOperator& lm_head_operator,
                                               const ActivationBuffer& input,
                                               ActivationBuffer& norm_output,
@@ -680,13 +680,13 @@ static void norm_fwd(const CompiledModel& model,
     if (norm_deferred)
     {
         forward_rms_norm(input,
-                         model.weights.at(node.weight_inputs[1]),
+                         model.weights.at(node.weights[1]),
                          model.descriptor.norm_epsilon,
                          norm_output,
                          model.descriptor.norm_weight_offset);
         project_input = &norm_output;
     }
-    return lm_head_linear(model, node, node.weight_inputs[0], *project_input, logits);
+    return lm_head_linear(model, node, node.weights[0], *project_input, logits);
 }
 
 Result<void> forward_model(const CompiledModel& model,
@@ -774,10 +774,10 @@ Result<void> forward_model(const CompiledModel& model,
     bool resident_chain_finished = false;
     uint32_t resident_prefix_layers = 0;
 
-    const auto fwd_embedding = [&](const ExecutionNode* node) -> Result<void> {
-        if (node->weight_inputs.size() != 1)
+    const auto fwd_embedding = [&](const Layer* node) -> Result<void> {
+        if (node->weights.size() != 1)
             return Error{ErrorCode::InternalError, "token embedding node has an invalid weight binding"};
-        forward_embedding(model.weights.at(node->weight_inputs[0]),
+        forward_embedding(model.weights.at(node->weights[0]),
                           input_ids,
                           hidden);
         hyper_connection_expand(hidden, model.descriptor.hyper_connection_multiplier, state.expert_scratch.staged_output);
@@ -835,7 +835,7 @@ Result<void> forward_model(const CompiledModel& model,
         }
         return {};
     };
-    const auto fwd_norm = [&](const ExecutionNode* node) -> Result<void> {
+    const auto fwd_norm = [&](const Layer* node) -> Result<void> {
         auto published = publish_pending_head(pending_continuation, continuation_target, node->id,
                                               state.logits, state.gpu_segment, continuation_region,
                                               "resident Vulkan head continuation failed: ");
@@ -874,7 +874,7 @@ Result<void> forward_model(const CompiledModel& model,
             return {};
         }
         const size_t weight_count = model.descriptor.final_norm == NormType::None ? 1 : 2;
-        if (node->weight_inputs.size() != weight_count)
+        if (node->weights.size() != weight_count)
             return Error{ErrorCode::InternalError, "final norm node has an invalid weight binding"};
         if (model.descriptor.final_norm == NormType::RmsNorm
             && model.descriptor.hyper_connection_multiplier == 1
@@ -888,7 +888,7 @@ Result<void> forward_model(const CompiledModel& model,
                             && hidden.rows() > 1;
             if (!norm_deferred && model.vulkan_runtime)
             {
-                const CompiledOperator& lm_head_operator = model.operators.at_weight(node->weight_inputs.back());
+                const CompiledOperator& lm_head_operator = model.operators.at_weight(node->weights.back());
                 norm_deferred = lm_head_operator.bfloat16
                                 && lm_head_operator.bfloat16->has_rms_norm_chain();
             }
@@ -915,7 +915,7 @@ Result<void> forward_model(const CompiledModel& model,
         }
         if (model.descriptor.final_norm != NormType::None)
         {
-            norm_fwd(model, node->weight_inputs[0], hidden,
+            norm_fwd(model, node->weights[0], hidden,
                      state.expert_scratch.staged_output);
             hidden.swap(state.expert_scratch.staged_output);
         }
@@ -930,11 +930,11 @@ Result<void> forward_model(const CompiledModel& model,
         }
         return {};
     };
-    const auto fwd_head = [&](const ExecutionNode* node) -> Result<void> {
+    const auto fwd_head = [&](const Layer* node) -> Result<void> {
         if (resident_head_finished) return {};
         if (model.gated_residual_chain) return {};
         const size_t weight_count = model.descriptor.final_norm == NormType::None ? 1 : 2;
-        if (node->weight_inputs.size() != weight_count)
+        if (node->weights.size() != weight_count)
             return Error{ErrorCode::InternalError, "LM head node has an invalid weight binding"};
         if (head_deferred)
         {
@@ -947,7 +947,7 @@ Result<void> forward_model(const CompiledModel& model,
         }
         if (logits_output == LogitsOutput::None)
             return {};
-        const CompiledOperator& lm_head_operator = model.operators.at_weight(node->weight_inputs[0]);
+        const CompiledOperator& lm_head_operator = model.operators.at_weight(node->weights[0]);
         const ActivationBuffer* lm_head_input = &hidden;
         if (logits_output == LogitsOutput::Last)
         {
@@ -971,12 +971,12 @@ Result<void> forward_model(const CompiledModel& model,
         logits_done = true;
         return {};
     };
-    const auto fwd_ffn = [&](const ExecutionNode* node, const CompiledLayerPlan& layer, LayerState& layer_state) -> Result<void> {
+    const auto fwd_ffn = [&](const Layer* node, const CompiledLayerPlan& layer, LayerState& layer_state) -> Result<void> {
         return fwd_dense_layer(model, layer, hidden, layer_state, state.gpu_segment,
                                layer_workspace, node->backend);
     };
-    const auto fwd_attn = [&](const ExecutionNode* node, const CompiledLayerPlan& layer, LayerState& layer_state, const MoeBlockPlan& moe) -> Result<void> {
-        const auto segment = node->layer_plan_index < model.gpu_segments.size() ? model.gpu_segments[node->layer_plan_index] : nullptr;
+    const auto fwd_attn = [&](const Layer* node, const CompiledLayerPlan& layer, LayerState& layer_state, const MoeBlockPlan& moe) -> Result<void> {
+        const auto segment = node->plan_index < model.gpu_segments.size() ? model.gpu_segments[node->plan_index] : nullptr;
         if (segment)
         {
             if (node->backend != ExecutionBackend::Vulkan)
@@ -1234,7 +1234,7 @@ Result<void> forward_model(const CompiledModel& model,
             return predicted.error();
         return {};
     };
-    const auto fwd_dispatch = [&](const ExecutionNode* node, const CompiledLayerPlan& layer, LayerState& layer_state, const MoeBlockPlan& moe) -> Result<void> {
+    const auto fwd_dispatch = [&](const Layer* node, const CompiledLayerPlan& layer, LayerState& layer_state, const MoeBlockPlan& moe) -> Result<void> {
         ExpertDispatchOptions options = route_opt(model, moe, input_ids,
                                                   state.expert_scratch.explicit_expert_ids);
         if (!router_fused)
@@ -1258,7 +1258,7 @@ Result<void> forward_model(const CompiledModel& model,
         }
         return {};
     };
-    const auto fwd_experts = [&](const ExecutionNode* node, const CompiledLayerPlan& layer, LayerState& layer_state, const MoeBlockPlan& moe) -> Result<void> {
+    const auto fwd_experts = [&](const Layer* node, const CompiledLayerPlan& layer, LayerState& layer_state, const MoeBlockPlan& moe) -> Result<void> {
         if (layer_state.experts_executed)
             return {};
         auto resident = open_region(model, layer_state, node->backend);
@@ -1279,18 +1279,18 @@ Result<void> forward_model(const CompiledModel& model,
                 target_id = resolved.value();
             }
             if (target_id != invalid_execution_node_id && needs_mtp_final_hidden
-                && model.graph.nodes[target_id].type == ExecutionNodeType::FinalNorm)
+                && model.graph.layers[target_id].kind == ExecutionNodeType::FinalNorm)
                 target_id = invalid_execution_node_id;
             if (target_id != invalid_execution_node_id)
             {
-                const auto& target = model.graph.nodes[target_id];
+                const auto& target = model.graph.layers[target_id];
                 std::string error;
-                if (target.type == ExecutionNodeType::FinalNorm)
+                if (target.kind == ExecutionNodeType::FinalNorm)
                     pending_continuation = model.gpu_head->prepare_head_continuation(logits_output != LogitsOutput::None,
                                                                                      logits_output == LogitsOutput::Last, state.gpu_segment, error);
                 else
                 {
-                    const auto& next_layer = model.graph.layer_plans[target.layer_plan_index];
+                    const auto& next_layer = model.graph.layer_plans[target.plan_index];
                     if (next_layer.layer_id >= state.layers.size())
                         return Error{ErrorCode::InternalError, "resident Vulkan continuation layer cache is out of range"};
                     auto& positions = state.attention_positions;
@@ -1299,8 +1299,8 @@ Result<void> forward_model(const CompiledModel& model,
                     caches.assign(input_ids.size(), &state.layers[next_layer.layer_id]);
                     for (size_t row = 0; row < positions.size(); ++row) positions[row] = position_offset + row;
                     auto options = route_opt(model, next_layer.moe, input_ids, state.expert_scratch.explicit_expert_ids);
-                    pending_continuation = model.gpu_segments[target.layer_plan_index]->prepare_continuation(positions, caches, options,
-                                                                                                             state.gpu_segment, error);
+                    pending_continuation = model.gpu_segments[target.plan_index]->prepare_continuation(positions, caches, options,
+                                                                                                       state.gpu_segment, error);
                 }
                 if (!pending_continuation || !layer_state.region->set_continuation(pending_continuation))
                     return Error{ErrorCode::InternalError, "cannot prepare resident Vulkan continuation from layer " + std::to_string(layer.layer_id) + ": " + error};
@@ -1457,41 +1457,41 @@ Result<void> forward_model(const CompiledModel& model,
     };
     for (const ExecutionNodeId node_id : model.schedule.node_order)
     {
-        if (node_id >= model.graph.nodes.size())
+        if (node_id >= model.graph.layers.size())
             return Error{ErrorCode::InternalError, "execution schedule references an invalid node"};
-        const ExecutionNode* node = &model.graph.nodes[node_id];
+        const Layer* node = &model.graph.layers[node_id];
         if (resident_chain_finished) continue;
-        if (resident_prefix_layers != 0 && node->layer_plan_index < resident_prefix_layers)
+        if (resident_prefix_layers != 0 && node->plan_index < resident_prefix_layers)
             continue;
-        if (node->type == ExecutionNodeType::TokenEmbedding)
+        if (node->kind == ExecutionNodeType::TokenEmbedding)
         {
             auto stepped = fwd_embedding(node);
             if (!stepped) return stepped;
             continue;
         }
-        if (node->type == ExecutionNodeType::FinalNorm)
+        if (node->kind == ExecutionNodeType::FinalNorm)
         {
             auto stepped = fwd_norm(node);
             if (!stepped) return stepped;
             continue;
         }
-        if (node->type == ExecutionNodeType::LmHead)
+        if (node->kind == ExecutionNodeType::LmHead)
         {
             auto stepped = fwd_head(node);
             if (!stepped) return stepped;
             continue;
         }
-        if (node->layer_plan_index >= model.graph.layer_plans.size())
+        if (node->plan_index >= model.graph.layer_plans.size())
             return Error{ErrorCode::InternalError, "execution node layer is out of range"};
 
-        const CompiledLayerPlan& layer = model.graph.layer_plans[node->layer_plan_index];
+        const CompiledLayerPlan& layer = model.graph.layer_plans[node->plan_index];
         if (layer.layer_id >= state.layers.size())
             return Error{ErrorCode::InternalError, "execution layer id is out of range"};
         LayerState& layer_state = state.execution_state;
         const MoeBlockPlan& moe = layer.moe;
 
         Result<void> stepped;
-        switch (node->type)
+        switch (node->kind)
         {
         case ExecutionNodeType::DenseFfn:
             stepped = fwd_ffn(node, layer, layer_state);
@@ -1744,8 +1744,8 @@ Result<void> forward_decode_batch(const CompiledModel& model,
     ExecutionNodeId continuation_target = invalid_execution_node_id;
     bool resident_chain_finished = false;
 
-    const auto fwd_staged_embedding = [&](const ExecutionNode* node) -> Result<void> {
-        if (node->weight_inputs.size() != 1)
+    const auto fwd_staged_embedding = [&](const Layer* node) -> Result<void> {
+        if (node->weights.size() != 1)
             return Error{ErrorCode::InternalError, "token embedding node has an invalid weight binding"};
         ExpertScratch& scratch = workspace.expert;
         std::vector<int32_t>& input_ids = workspace.staged_input_ids;
@@ -1754,7 +1754,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         {
             input_ids[session_index] = entries[session_index].input_id;
         }
-        forward_embedding(model.weights.at(node->weight_inputs[0]),
+        forward_embedding(model.weights.at(node->weights[0]),
                           input_ids,
                           scratch.staged_output);
         if (hyper_multiplier > 1)
@@ -1810,7 +1810,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         }
         return {};
     };
-    const auto fwd_staged_norm = [&](const ExecutionNode* node) -> Result<void> {
+    const auto fwd_staged_norm = [&](const Layer* node) -> Result<void> {
         if (pending_continuation)
         {
             ActivationBuffer& gpu_logits = workspace.expert.staged_output;
@@ -1849,9 +1849,9 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                 return Error{ErrorCode::InternalError, "resident staged Vulkan head boundary failed: " + error};
         }
         const size_t weight_count = model.descriptor.final_norm == NormType::None ? 1 : 2;
-        if (node->weight_inputs.size() != weight_count)
+        if (node->weights.size() != weight_count)
             return Error{ErrorCode::InternalError, "final norm node has an invalid weight binding"};
-        const CompiledOperator& lm_head_operator = model.operators.at_weight(node->weight_inputs.back());
+        const CompiledOperator& lm_head_operator = model.operators.at_weight(node->weights.back());
         if (model.descriptor.final_norm == NormType::RmsNorm
             && hyper_multiplier == 1
             && model.descriptor.hyper_connection_kind == HyperConnectionKind::None
@@ -1906,7 +1906,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             {
                 return Error{ErrorCode::InternalError, "cannot merge staged hidden rows"};
             }
-            norm_fwd(model, node->weight_inputs[0], merged, scratch.staged_output);
+            norm_fwd(model, node->weights[0], merged, scratch.staged_output);
             if (!split_hidden_rows(scratch.staged_output))
                 return Error{ErrorCode::InternalError, "cannot split staged final norm rows"};
         }
@@ -1926,10 +1926,10 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         }
         return {};
     };
-    const auto fwd_staged_head = [&](const ExecutionNode* node) -> Result<void> {
+    const auto fwd_staged_head = [&](const Layer* node) -> Result<void> {
         if (resident_head_finished) return {};
         const size_t weight_count = model.descriptor.final_norm == NormType::None ? 1 : 2;
-        if (node->weight_inputs.size() != weight_count)
+        if (node->weights.size() != weight_count)
             return Error{ErrorCode::InternalError, "LM head node has an invalid weight binding"};
         if (head_deferred)
         {
@@ -1967,7 +1967,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                 return Error{ErrorCode::InternalError, "staged LM head rows have an invalid shape"};
             std::copy_n(hidden.row(0), hidden.columns(), merged.row(output_row++));
         }
-        const CompiledOperator& lm_head_operator = model.operators.at_weight(node->weight_inputs[0]);
+        const CompiledOperator& lm_head_operator = model.operators.at_weight(node->weights[0]);
         auto headed = fwd_lm_head(model, *node, lm_head_operator, merged,
                                   workspace.staged_router_logits, scratch.staged_output,
                                   norm_deferred);
@@ -1982,8 +1982,8 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         workspace.expert.staged_logits_full_rows = false;
         return {};
     };
-    const auto fwd_staged_attn = [&](const ExecutionNode* node, const CompiledLayerPlan& layer, const MoeBlockPlan& moe) -> Result<void> {
-        const auto segment = node->layer_plan_index < model.gpu_segments.size() ? model.gpu_segments[node->layer_plan_index] : nullptr;
+    const auto fwd_staged_attn = [&](const Layer* node, const CompiledLayerPlan& layer, const MoeBlockPlan& moe) -> Result<void> {
+        const auto segment = node->plan_index < model.gpu_segments.size() ? model.gpu_segments[node->plan_index] : nullptr;
         if (segment)
         {
             if (node->backend != ExecutionBackend::Vulkan)
@@ -2233,7 +2233,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         }
         return {};
     };
-    const auto fwd_staged_dispatch = [&](const ExecutionNode* node, const CompiledLayerPlan& layer, const MoeBlockPlan& moe) -> Result<void> {
+    const auto fwd_staged_dispatch = [&](const Layer* node, const CompiledLayerPlan& layer, const MoeBlockPlan& moe) -> Result<void> {
         LayerState& combined = workspace.staged_state;
         combined.reset();
         if (resident_router_ready)
@@ -2326,7 +2326,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         }
         return {};
     };
-    const auto fwd_staged_experts = [&](const ExecutionNode* node, const CompiledLayerPlan& layer, const MoeBlockPlan& moe) -> Result<void> {
+    const auto fwd_staged_experts = [&](const Layer* node, const CompiledLayerPlan& layer, const MoeBlockPlan& moe) -> Result<void> {
         LayerState& combined = workspace.staged_state;
         auto resident = open_region(model, combined, node->backend);
         if (!resident) return resident.error();
@@ -2347,26 +2347,26 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             }
             if (target_id != invalid_execution_node_id && use_speculative_context
                 && model.speculative.kind == SpeculativeModelKind::Mtp
-                && model.graph.nodes[target_id].type == ExecutionNodeType::FinalNorm)
+                && model.graph.layers[target_id].kind == ExecutionNodeType::FinalNorm)
                 target_id = invalid_execution_node_id;
             if (target_id != invalid_execution_node_id)
             {
-                const auto& target = model.graph.nodes[target_id];
+                const auto& target = model.graph.layers[target_id];
                 std::string error;
-                if (target.type == ExecutionNodeType::FinalNorm)
+                if (target.kind == ExecutionNodeType::FinalNorm)
                     pending_continuation = model.gpu_head->prepare_head_continuation(requested_count != 0, false,
                                                                                      workspace.gpu_segment, error);
                 else
                 {
-                    const auto& next_layer = model.graph.layer_plans[target.layer_plan_index];
+                    const auto& next_layer = model.graph.layer_plans[target.plan_index];
                     auto& positions = workspace.staged_attention_positions;
                     auto& caches = workspace.staged_attention_caches;
                     auto filled = fill_attn_rows(entries, next_layer.layer_id, positions, caches);
                     if (!filled)
                         return filled.error();
                     auto options = route_opt(model, next_layer.moe, workspace.staged_input_ids, batch_scratch.explicit_expert_ids);
-                    pending_continuation = model.gpu_segments[target.layer_plan_index]->prepare_continuation(positions, caches, options,
-                                                                                                             workspace.gpu_segment, error);
+                    pending_continuation = model.gpu_segments[target.plan_index]->prepare_continuation(positions, caches, options,
+                                                                                                       workspace.gpu_segment, error);
                 }
                 if (!pending_continuation || !combined.region->set_continuation(pending_continuation))
                     return Error{ErrorCode::InternalError, "cannot prepare resident staged Vulkan continuation from layer " + std::to_string(layer.layer_id) + ": " + error};
@@ -2596,40 +2596,40 @@ Result<void> forward_decode_batch(const CompiledModel& model,
     };
     for (const ExecutionNodeId node_id : model.schedule.node_order)
     {
-        if (node_id >= model.graph.nodes.size())
+        if (node_id >= model.graph.layers.size())
         {
             return Error{ErrorCode::InternalError, "execution schedule references an invalid node"};
         }
-        const ExecutionNode* node = &model.graph.nodes[node_id];
+        const Layer* node = &model.graph.layers[node_id];
         if (resident_chain_finished) continue;
-        if (node->type == ExecutionNodeType::TokenEmbedding)
+        if (node->kind == ExecutionNodeType::TokenEmbedding)
         {
             auto stepped = fwd_staged_embedding(node);
             if (!stepped) return stepped;
             continue;
         }
-        if (node->type == ExecutionNodeType::FinalNorm)
+        if (node->kind == ExecutionNodeType::FinalNorm)
         {
             auto stepped = fwd_staged_norm(node);
             if (!stepped) return stepped;
             continue;
         }
-        if (node->type == ExecutionNodeType::LmHead)
+        if (node->kind == ExecutionNodeType::LmHead)
         {
             auto stepped = fwd_staged_head(node);
             if (!stepped) return stepped;
             continue;
         }
-        if (node->layer_plan_index >= model.graph.layer_plans.size())
+        if (node->plan_index >= model.graph.layer_plans.size())
         {
             return Error{ErrorCode::InternalError, "execution node layer is out of range"};
         }
 
-        const CompiledLayerPlan& layer = model.graph.layer_plans[node->layer_plan_index];
+        const CompiledLayerPlan& layer = model.graph.layer_plans[node->plan_index];
         const MoeBlockPlan& moe = layer.moe;
 
         Result<void> stepped;
-        switch (node->type)
+        switch (node->kind)
         {
         case ExecutionNodeType::DenseFfn:
         {

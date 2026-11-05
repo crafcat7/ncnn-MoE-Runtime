@@ -9595,18 +9595,18 @@ public:
         : compiled(const_cast<CompiledModel&>(model_compiled(model))),
           throw_exception(exception)
     {
-        for (ExecutionNode& candidate : compiled.graph.nodes)
+        for (Layer& candidate : compiled.graph.layers)
         {
-            if (candidate.type == ExecutionNodeType::LmHead)
+            if (candidate.kind == ExecutionNodeType::LmHead)
             {
-                node = &candidate;
+                layer = &candidate;
                 break;
             }
         }
-        check(node != nullptr);
+        check(layer != nullptr);
         if (throw_exception)
         {
-            TensorData& weight = compiled.weights.at_mutable(node->weight_inputs.front());
+            TensorData& weight = compiled.weights.at_mutable(layer->weights.front());
             saved_weight = weight;
             check(weight.dtype == DType::Float32);
             weight.float32_data.clear();
@@ -9615,21 +9615,21 @@ public:
         }
         else
         {
-            saved_bindings.swap(node->weight_inputs);
+            saved_bindings.swap(layer->weights);
         }
     }
 
     ~ScopedLmHeadFailure()
     {
         if (throw_exception)
-            compiled.weights.at_mutable(node->weight_inputs.front()) = std::move(saved_weight);
+            compiled.weights.at_mutable(layer->weights.front()) = std::move(saved_weight);
         else
-            saved_bindings.swap(node->weight_inputs);
+            saved_bindings.swap(layer->weights);
     }
 
 private:
     CompiledModel& compiled;
-    ExecutionNode* node = nullptr;
+    Layer* layer = nullptr;
     bool throw_exception;
     TensorData saved_weight;
     std::vector<TensorHandle> saved_bindings;
@@ -15340,6 +15340,7 @@ void test_latent_attention_scratch_reuse()
         node.layer_plan_index = static_cast<uint32_t>(layer);
         dspark_model.speculative.layer_nodes[layer].attention = static_cast<ExecutionNodeId>(layer);
     }
+    refresh_layers(dspark_model.speculative.graph);
     SessionState reused_speculative_state;
     SessionState reference_speculative_state;
     SessionStatistics reused_speculative_statistics;
@@ -19941,6 +19942,7 @@ void test_batch_workspace_reuse()
             }
             check(found_expert_group);
         }
+        refresh_layers(execution_model.graph);
         std::array<SessionState, 3> states;
         std::array<SessionState, 3> references;
         std::array<SessionStatistics, 3> statistics;

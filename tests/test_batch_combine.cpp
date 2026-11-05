@@ -355,6 +355,7 @@ static CompiledModel make_backend_model(const CompiledModel& cpu_model)
     }
     require(expert_group_nodes == 1, "batch combine test expected one dynamic ExpertGroup node");
     require(static_cast<bool>(model.schedule.validate(model.graph)), "batch combine backend schedule is invalid");
+    refresh_layers(model.graph);
 
     MoeBlockPlan& moe = model.graph.layer_plans.front().moe;
     for (uint32_t expert_id = 0; expert_id < moe.experts.size(); ++expert_id)

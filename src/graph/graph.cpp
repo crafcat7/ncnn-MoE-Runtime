@@ -265,7 +265,25 @@ Result<void> schedule_graph(ExecutionGraph& graph, ExecutionSchedule& schedule, 
     ret = schedule.validate(graph);
     if (!ret)
         return ret.error();
+    refresh_layers(graph);
     return {};
+}
+
+void refresh_layers(ExecutionGraph& graph)
+{
+    graph.layers.resize(graph.nodes.size());
+    for (size_t index = 0; index < graph.nodes.size(); ++index)
+    {
+        const ExecutionNode& node = graph.nodes[index];
+        Layer& layer = graph.layers[index];
+        layer.id = node.id;
+        layer.kind = node.type;
+        layer.backend = node.backend;
+        layer.backend_mask = node.backend_mask;
+        layer.flags = node.flags;
+        layer.plan_index = node.layer_plan_index;
+        layer.weights = node.weight_inputs;
+    }
 }
 
 static ExecutionTensorId add_tensor(ExecutionGraph& graph, std::string name, DType dtype, std::vector<uint32_t> shape)

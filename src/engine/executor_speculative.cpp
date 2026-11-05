@@ -26,11 +26,11 @@ static ExecutionBackend shared_lm_head_backend(const CompiledModel& model)
     // The draft shares the target head, including its selected backend and
     // device-only weight lifetime. Other draft projections keep their own
     // placement; Hybrid mode alone does not imply that the head uses Vulkan.
-    for (const ExecutionNode& node : model.graph.nodes)
+    for (const Layer& node : model.graph.layers)
     {
-        if (node.type == ExecutionNodeType::LmHead
-            && !node.weight_inputs.empty()
-            && node.weight_inputs.front() == model.lm_head_weight)
+        if (node.kind == ExecutionNodeType::LmHead
+            && !node.weights.empty()
+            && node.weights.front() == model.lm_head_weight)
             return node.backend;
     }
     return ExecutionBackend::Cpu;
@@ -50,19 +50,19 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
 {
     const ExecutionGraph& graph = model.speculative.graph;
     if (layer_plan_index >= graph.layer_plans.size()
-        || execution.attention >= graph.nodes.size()
-        || execution.router >= graph.nodes.size()
-        || execution.expert_dispatch >= graph.nodes.size()
-        || execution.expert_group >= graph.nodes.size()
-        || execution.combine >= graph.nodes.size())
+        || execution.attention >= graph.layers.size()
+        || execution.router >= graph.layers.size()
+        || execution.expert_dispatch >= graph.layers.size()
+        || execution.expert_group >= graph.layers.size()
+        || execution.combine >= graph.layers.size())
     {
         return Error{
             ErrorCode::InternalError,
             "speculative execution graph has an incomplete layer binding"};
     }
     const CompiledLayerPlan& layer = graph.layer_plans[layer_plan_index];
-    const ExecutionNode& attention_node = graph.nodes[execution.attention];
-    const ExecutionNode& expert_group_node = graph.nodes[execution.expert_group];
+    const Layer& attention_node = graph.layers[execution.attention];
+    const Layer& expert_group_node = graph.layers[execution.expert_group];
     const ExecutionBackend attention_backend = attention_node.backend;
     const ExecutionBackend expert_backend = expert_group_node.backend;
     const bool cpu_prefetch = has_flag(expert_group_node.flags, ExecutionNodeCpuPrefetch);
@@ -181,9 +181,9 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
         return dispatched.error();
     prepare_experts(moe, layer_state, &statistics);
     const auto execute_shared = [&]() -> Result<void> {
-        if (execution.shared_expert_group >= graph.nodes.size())
+        if (execution.shared_expert_group >= graph.layers.size())
             return Error{ErrorCode::InternalError, "speculative execution graph has no shared Expert binding"};
-        const bool require_gpu = graph.nodes[execution.shared_expert_group].backend == ExecutionBackend::Vulkan
+        const bool require_gpu = graph.layers[execution.shared_expert_group].backend == ExecutionBackend::Vulkan
                                  && model.opt.hybrid_mode == HybridMode::HybridExperts;
         try
         {
@@ -197,9 +197,9 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
         return {};
     };
 
-    if (has_flag(graph.nodes[execution.expert_dispatch].flags, ExecutionNodeRequestExperts))
+    if (has_flag(graph.layers[execution.expert_dispatch].flags, ExecutionNodeRequestExperts))
     {
-        if (!moe.has_shared_expert || execution.shared_expert_group >= graph.nodes.size())
+        if (!moe.has_shared_expert || execution.shared_expert_group >= graph.layers.size())
             return Error{ErrorCode::InternalError, "speculative execution graph has no shared Expert binding"};
         auto requested = request_experts(model,
                                          moe,
@@ -389,7 +389,7 @@ static Result<void> append_mtp_context(const CompiledModel& model,
     if (!prepared)
         return prepared.error();
     const SpeculativeModelPlan::LayerNodes& execution = layer_nodes.front();
-    if (execution.attention >= graph.nodes.size())
+    if (execution.attention >= graph.layers.size())
     {
         return Error{
             ErrorCode::InternalError,
@@ -399,7 +399,7 @@ static Result<void> append_mtp_context(const CompiledModel& model,
     auto appended = append_attention_context(model.weights,
                                              model.operators,
                                              layer.attention,
-                                             graph.nodes[execution.attention].backend,
+                                             graph.layers[execution.attention].backend,
                                              position_offset,
                                              state.speculative_layers.front(),
                                              state.attention_scratch,
@@ -558,7 +558,7 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
     for (size_t layer_index = 0; layer_index < layer_nodes.size(); ++layer_index)
     {
         const SpeculativeModelPlan::LayerNodes& execution = layer_nodes[layer_index];
-        if (execution.attention >= graph.nodes.size())
+        if (execution.attention >= graph.layers.size())
         {
             return Error{
                 ErrorCode::InternalError,
@@ -568,7 +568,7 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
         auto appended = append_dspark_attention_context(model.weights,
                                                         model.operators,
                                                         layer.attention,
-                                                        graph.nodes[execution.attention].backend,
+                                                        graph.layers[execution.attention].backend,
                                                         state.speculative_main_hidden_position,
                                                         state.speculative_layers[layer_index],
                                                         attention_scratch,
