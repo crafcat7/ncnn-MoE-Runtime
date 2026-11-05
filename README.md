@@ -52,63 +52,115 @@ Token-ID requests remain available when native text assets are absent.
 
 ## Quick start
 
-Requirements:
+NMR does not load PyTorch or pnnx graphs directly. A supported model is a
+Safetensors directory or GGUF package parsed by a built-in model adapter. The
+runtime path is:
 
-- CMake 3.21+
-- C++20 compiler
-- Git and the `third_party/ncnn` submodule
-- Python 3.10+ for the CLI
-- a Vulkan-capable driver for GPU execution (optional)
+```text
+model package -> ModelAdapter -> CompiledModel -> Net -> Session
+```
+
+The commands below assume the native worker has been built. See
+[Build and demo the worker](#build-and-demo-the-worker) for the build step.
+
+### 1. Get the source and Python CLI
 
 ```bash
 git clone --recurse-submodules https://github.com/crafcat7/ncnn-MoE-Runtime.git
 cd ncnn-MoE-Runtime
 
 python -m pip install -r requirements.txt
-
-cmake -S . -B build-ncnn -DNCNN_MOE_BUILD_TESTS=OFF
-cmake --build build-ncnn --config Release --target ncnn_moe_worker --parallel
 ```
 
-On Windows the default worker path is:
+Python 3.10+ is required for the CLI. The native runtime and tokenizer do not
+require `transformers`, `tokenizers`, or a Python Unicode package.
+
+### 2. Prepare a model package
+
+A native package is either:
 
 ```text
-build-ncnn/Release/ncnn_moe_worker.exe
+model-directory/
+├── config.json
+├── tokenizer assets for native text input
+└── *.safetensors
 ```
 
-On Linux/macOS it is:
+or a GGUF file supported by its model adapter.
+
+For quantized checkpoints, use the optional importers before running:
+
+```bash
+python tools/import_quantized.py --help
+python tools/compile_qwen_artifact.py --help
+```
+
+Models without tokenizer assets can still be driven by token IDs.
+
+### 3. Build the native worker
+
+Build once with the instructions in
+[Build and demo the worker](#build-and-demo-the-worker). The default worker
+location is:
 
 ```text
-build-ncnn/ncnn_moe_worker
+Windows: build-ncnn/Release/ncnn_moe_worker.exe
+Linux/macOS: build-ncnn/ncnn_moe_worker
+```
+
+### 4. Run with the Python CLI
+
+Inspect the resolved backend, memory plan, Expert cache, and placement:
+
+```bash
+python tools/ncnn_moe.py inspect --model PATH/TO/MODEL
 ```
 
 Run one prompt:
 
 ```bash
-python tools/ncnn_moe.py inspect --model PATH/TO/MODEL
 python tools/ncnn_moe.py run --model PATH/TO/MODEL --prompt "Hello" --max-new-tokens 32
 ```
 
-Interactive chat:
+Interactive chat with persisted history:
 
 ```bash
-python tools/ncnn_moe.py chat --model PATH/TO/MODEL
+python tools/ncnn_moe.py chat --model PATH/TO/MODEL --session demo
 ```
 
-`inspect` prints the detected CPU/Vulkan capabilities, memory plan, Expert
-cache policy, and compiled placement. `run` and `chat` use the native tokenizer
-and stream decoded text by default.
-
-If the worker is in a non-default build directory, pass it explicitly:
+Useful variants:
 
 ```bash
+# stream runtime metrics
+python tools/ncnn_moe.py run --model PATH/TO/MODEL --prompt "Hello" --metrics
+
+# CPU-only comparison
+python tools/ncnn_moe.py run --model PATH/TO/MODEL --prompt "Hello" --cpu
+
+# explicit worker or device
 python tools/ncnn_moe.py run \
   --model PATH/TO/MODEL \
   --worker build-worker/Release/ncnn_moe_worker.exe \
+  --vulkan-device 0 \
   --prompt "Hello"
 ```
 
-A minimal C++ embedding follows the same flow:
+Common runtime controls:
+
+```text
+--backend auto|cpu|hybrid
+--cpu / --hybrid
+--host-memory-mb N
+--expert-memory auto|eager|on-demand
+--expert-cache-mb N
+--expert-gpu-cache-mb N
+--expert-io-workers N
+--vulkan-device N
+--vulkan-devices 0,1
+--expected-concurrency N
+```
+
+### 5. Run with the C++ API
 
 ```cpp
 #include "ncnn/moe/runtime.h"
@@ -132,9 +184,21 @@ options.stop_tokens = model.value()->stop_tokens();
 auto generated = session.value()->generate(prompt.value(), options);
 ```
 
+`Model` is immutable and shared by Sessions. `Session` owns KV/recurrent state,
+sampling state, and reusable execution scratch. `Runtime::synchronize_model_caches`
+is available as an explicit synchronization point before shutdown or after
+warm-up.
+
 ---
 
 ## Build and demo the worker
+
+Requirements:
+
+- CMake 3.21+
+- C++20 compiler
+- Git and the `third_party/ncnn` submodule
+- a Vulkan-capable driver for GPU execution (optional)
 
 The worker is a long-lived native process that owns one `Model` and multiple
 `Session` objects. It speaks strict UTF-8 JSONL over stdin/stdout. Generation is
@@ -143,7 +207,7 @@ reads events.
 
 ### Build the worker
 
-Direct CMake build:
+From the repository root:
 
 ```powershell
 cmake -S . -B build-ncnn `
@@ -159,8 +223,8 @@ cmake --preset worker-release
 cmake --build --preset worker-release
 ```
 
-`worker-release` builds the worker with Vulkan enabled. `worker-release-cpu`
-builds it with `NCNN_MOE_USE_VULKAN=OFF`.
+`worker-release` builds with Vulkan enabled. `worker-release-cpu` builds with
+`NCNN_MOE_USE_VULKAN=OFF`.
 
 Useful build switches:
 
@@ -180,13 +244,11 @@ Useful build switches:
 
 ### Run the worker directly
 
-Start the worker:
-
 ```bash
 build-ncnn/Release/ncnn_moe_worker.exe PATH/TO/MODEL --hybrid
 ```
 
-It prints a `ready` event first. Then send one JSON object per line:
+The worker prints a `ready` event first. Then send one JSON object per line:
 
 ```json
 {"op":"create_session","session_id":"demo"}
@@ -229,49 +291,20 @@ or:
 The message path uses the C++ tokenizer/chat template. The token path is useful
 for benchmarks and applications that already own a tokenizer.
 
-### Demo through Python
+The Python CLI wraps this protocol; use the commands in
+[Quick start](#quick-start) for normal text and chat usage.
 
-The Python CLI wraps the same worker protocol:
-
-```bash
-# hardware, memory, and placement
-python tools/ncnn_moe.py inspect --model PATH/TO/MODEL --json
-
-# one prompt, human-readable output
-python tools/ncnn_moe.py run --model PATH/TO/MODEL --prompt "Hello"
-
-# stream and print periodic runtime metrics
-python tools/ncnn_moe.py run --model PATH/TO/MODEL --prompt "Hello" --metrics
-
-# CPU-only comparison
-python tools/ncnn_moe.py run --model PATH/TO/MODEL --prompt "Hello" --cpu
-
-# persist conversation history and large context
-python tools/ncnn_moe.py chat --model PATH/TO/MODEL --session demo
-```
-
-Common runtime controls:
-
-```text
---backend auto|cpu|hybrid
---cpu / --hybrid
---host-memory-mb N
---expert-memory auto|eager|on-demand
---expert-cache-mb N
---expert-gpu-cache-mb N
---expert-io-workers N
---vulkan-device N
---vulkan-devices 0,1
---expected-concurrency N
-```
-
-For tests and local validation:
+### Tests and local validation
 
 ```bash
 cmake -S . -B build-test -DNCNN_MOE_BUILD_TESTS=ON
 cmake --build build-test --config Release --parallel
 ctest --test-dir build-test -C Release --output-on-failure
 ```
+
+Build all targets before running CTest; building only `ncnn_moe_tests` leaves
+other test executables unavailable. The style test requires `clang-format` on
+`PATH` in addition to Python 3.10+.
 
 ---
 
