@@ -10248,7 +10248,7 @@ void test_speculative_generation()
                     check(static_cast<bool>(build_graph(candidate, false)));
                 };
                 const auto speculative_shared_node = [](const CompiledModel& candidate) -> const Layer& {
-                    const ExecutionNodeId id = candidate.speculative.layer_nodes.front().shared_expert_group;
+                    const LayerId id = candidate.speculative.layer_nodes.front().shared_expert_group;
                     check(id < candidate.speculative.graph.layers.size());
                     return candidate.speculative.graph.layers[id];
                 };
@@ -11079,12 +11079,12 @@ void test_attention_graph_without_bias_or_sink()
     check(static_cast<bool>(speculative_graph));
     check(speculative_compiled.speculative.layer_nodes.size() == 1);
     const SpeculativeModelPlan::LayerNodes& speculative_nodes = speculative_compiled.speculative.layer_nodes.front();
-    check(speculative_nodes.attention != invalid_execution_node_id);
-    check(speculative_nodes.router != invalid_execution_node_id);
-    check(speculative_nodes.expert_dispatch != invalid_execution_node_id);
-    check(speculative_nodes.expert_group != invalid_execution_node_id);
-    check(speculative_nodes.shared_expert_group == invalid_execution_node_id);
-    check(speculative_nodes.combine != invalid_execution_node_id);
+    check(speculative_nodes.attention != invalid_layer_id);
+    check(speculative_nodes.router != invalid_layer_id);
+    check(speculative_nodes.expert_dispatch != invalid_layer_id);
+    check(speculative_nodes.expert_group != invalid_layer_id);
+    check(speculative_nodes.shared_expert_group == invalid_layer_id);
+    check(speculative_nodes.combine != invalid_layer_id);
     check(speculative_compiled.speculative.graph.layers[speculative_nodes.attention].kind
           == LayerKind::Attention);
     check(speculative_compiled.speculative.graph.layers[speculative_nodes.router].kind
@@ -11135,7 +11135,7 @@ void test_attention_graph_without_bias_or_sink()
     check(static_cast<bool>(rebuilt_speculative));
     check(moved_speculative.speculative.layer_nodes.size() == 1);
     const SpeculativeModelPlan::LayerNodes& rebuilt_nodes = moved_speculative.speculative.layer_nodes.front();
-    check(rebuilt_nodes.attention != invalid_execution_node_id);
+    check(rebuilt_nodes.attention != invalid_layer_id);
     check(moved_speculative.speculative.graph.layers[rebuilt_nodes.attention].kind
           == LayerKind::Attention);
 
@@ -12362,7 +12362,7 @@ void test_execution_graph_and_scheduler()
     const ExecutionSchedule& compiled_schedule = compiled.schedule;
     check(static_cast<bool>(compiled_schedule.validate(graph)));
     check(static_cast<bool>(compiled_schedule.node_order.size() == graph.layers.size()));
-    for (ExecutionNodeId node_id : compiled_schedule.node_order)
+    for (LayerId node_id : compiled_schedule.node_order)
         check(static_cast<bool>(graph.layers[node_id].backend == ExecutionBackend::Cpu));
 
     auto session = runtime.create_session(model.value());
@@ -12397,7 +12397,7 @@ void test_execution_graph_and_scheduler()
     }
 
     ExecutionGraph branch_graph;
-    for (ExecutionNodeId node_id = 0; node_id < 5; ++node_id)
+    for (LayerId node_id = 0; node_id < 5; ++node_id)
     {
         Layer node;
         node.id = node_id;
@@ -12414,7 +12414,7 @@ void test_execution_graph_and_scheduler()
     ExecutionSchedule branch_schedule;
     auto branch_status = schedule_graph(branch_graph, branch_schedule, ExecutionBackendCpu);
     check(static_cast<bool>(branch_status));
-    check(static_cast<bool>(branch_schedule.node_order == std::vector<ExecutionNodeId>{1, 3, 2, 0, 4}));
+    check(static_cast<bool>(branch_schedule.node_order == std::vector<LayerId>{1, 3, 2, 0, 4}));
 
     ExecutionGraph duplicate_dependency_graph = branch_graph;
     duplicate_dependency_graph.layers.back().dependencies = {0, 2, 0};
@@ -12520,14 +12520,14 @@ void test_execution_graph_and_scheduler()
     check(static_cast<bool>(invalid_backend_status.error().message == "execution schedule node backend is not allowed by its backend mask"));
 
     ExecutionGraph invalid_dependency_graph = hybrid_graph;
-    invalid_dependency_graph.layers.back().dependencies.push_back(invalid_execution_node_id);
+    invalid_dependency_graph.layers.back().dependencies.push_back(invalid_layer_id);
     ExecutionSchedule invalid_dependency_schedule;
     auto invalid_dependency_status = schedule_graph(invalid_dependency_graph, invalid_dependency_schedule, scheduling_backends);
     check(!invalid_dependency_status);
     check(static_cast<bool>(invalid_dependency_status.error().code == ErrorCode::InvalidModel));
     check(static_cast<bool>(invalid_dependency_status.error().message == "execution graph dependency is out of range"));
 
-    for (ExecutionNodeId invalid_id : {static_cast<ExecutionNodeId>(graph.layers.size()), invalid_execution_node_id, ExecutionNodeId{0}})
+    for (LayerId invalid_id : {static_cast<LayerId>(graph.layers.size()), invalid_layer_id, LayerId{0}})
     {
         ExecutionGraph invalid_graph = hybrid_graph;
         invalid_graph.layers.back().id = invalid_id;
@@ -12539,7 +12539,7 @@ void test_execution_graph_and_scheduler()
     }
 
     ExecutionGraph unavailable_graph = hybrid_graph;
-    unavailable_graph.layers.back().id = invalid_execution_node_id;
+    unavailable_graph.layers.back().id = invalid_layer_id;
     unavailable_graph.layers.front().backend_mask = 0;
     ExecutionSchedule unavailable_schedule;
     auto unavailable_schedule_status = schedule_graph(unavailable_graph, unavailable_schedule, scheduling_backends);
@@ -15334,11 +15334,11 @@ void test_latent_attention_scratch_reuse()
     {
         dspark_model.speculative.graph.layer_plans[layer].attention = dspark_plan;
         Layer& node = dspark_model.speculative.graph.layers[layer];
-        node.id = static_cast<ExecutionNodeId>(layer);
+        node.id = static_cast<LayerId>(layer);
         node.kind = LayerKind::Attention;
         node.backend = ExecutionBackend::Cpu;
         node.plan_index = static_cast<uint32_t>(layer);
-        dspark_model.speculative.layer_nodes[layer].attention = static_cast<ExecutionNodeId>(layer);
+        dspark_model.speculative.layer_nodes[layer].attention = static_cast<LayerId>(layer);
     }
     SessionState reused_speculative_state;
     SessionState reference_speculative_state;

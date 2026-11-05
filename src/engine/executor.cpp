@@ -606,8 +606,8 @@ static void norm_fwd(const CompiledModel& model,
 }
 
 [[nodiscard]] static Result<bool> publish_pending_head(std::shared_ptr<GpuSegmentContinuation_vulkan>& pending,
-                                                       ExecutionNodeId& target,
-                                                       ExecutionNodeId node_id,
+                                                       LayerId& target,
+                                                       LayerId node_id,
                                                        ActivationBuffer& logits,
                                                        GpuSegmentWorkspace_vulkan& gpu,
                                                        std::shared_ptr<ResidentFfnRegion_vulkan>& region,
@@ -620,13 +620,13 @@ static void norm_fwd(const CompiledModel& model,
         return Error{ErrorCode::InternalError, std::string(error_prefix) + error};
     pending.reset();
     region.reset();
-    target = invalid_execution_node_id;
+    target = invalid_layer_id;
     return true;
 }
 
 [[nodiscard]] static Result<bool> publish_segment(std::shared_ptr<GpuSegmentContinuation_vulkan>& pending,
-                                                  ExecutionNodeId& target,
-                                                  ExecutionNodeId node_id,
+                                                  LayerId& target,
+                                                  LayerId node_id,
                                                   ExpertDispatchPlan& plan,
                                                   GpuSegmentWorkspace_vulkan& gpu,
                                                   std::shared_ptr<ResidentFfnRegion_vulkan>& region,
@@ -639,7 +639,7 @@ static void norm_fwd(const CompiledModel& model,
         return Error{ErrorCode::InternalError, std::string(error_prefix) + error};
     pending.reset();
     region.reset();
-    target = invalid_execution_node_id;
+    target = invalid_layer_id;
     return true;
 }
 
@@ -770,7 +770,7 @@ Result<void> forward_model(const CompiledModel& model,
     std::shared_ptr<GpuSegmentContinuation_vulkan> pending_continuation;
     std::shared_ptr<ResidentFfnRegion_vulkan> continuation_region;
     const ScopedResidentContinuation continuation_scope{pending_continuation, continuation_region};
-    ExecutionNodeId continuation_target = invalid_execution_node_id;
+    LayerId continuation_target = invalid_layer_id;
     bool resident_chain_finished = false;
     uint32_t resident_prefix_layers = 0;
 
@@ -1270,18 +1270,18 @@ Result<void> forward_model(const CompiledModel& model,
             const bool capture_boundary = use_speculative_context
                                           && std::find(model.speculative.target_layer_ids.begin(), model.speculative.target_layer_ids.end(), layer.layer_id)
                                                  != model.speculative.target_layer_ids.end();
-            ExecutionNodeId target_id = invalid_execution_node_id;
+            LayerId target_id = invalid_layer_id;
             if (!capture_boundary)
             {
-                uint32_t fence_id = invalid_execution_node_id;
+                uint32_t fence_id = invalid_layer_id;
                 const auto resolved = GpuSegment_vulkan::continuation_target(model, node->id, fence_id);
                 if (!resolved) return resolved.error();
                 target_id = resolved.value();
             }
-            if (target_id != invalid_execution_node_id && needs_mtp_final_hidden
+            if (target_id != invalid_layer_id && needs_mtp_final_hidden
                 && model.graph.layers[target_id].kind == LayerKind::FinalNorm)
-                target_id = invalid_execution_node_id;
-            if (target_id != invalid_execution_node_id)
+                target_id = invalid_layer_id;
+            if (target_id != invalid_layer_id)
             {
                 const auto& target = model.graph.layers[target_id];
                 std::string error;
@@ -1455,7 +1455,7 @@ Result<void> forward_model(const CompiledModel& model,
         layer_state.reset();
         return {};
     };
-    for (const ExecutionNodeId node_id : model.schedule.node_order)
+    for (const LayerId node_id : model.schedule.node_order)
     {
         if (node_id >= model.graph.layers.size())
             return Error{ErrorCode::InternalError, "execution schedule references an invalid node"};
@@ -1741,7 +1741,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
     std::shared_ptr<GpuSegmentContinuation_vulkan> pending_continuation;
     std::shared_ptr<ResidentFfnRegion_vulkan> continuation_region;
     const ScopedResidentContinuation continuation_scope{pending_continuation, continuation_region};
-    ExecutionNodeId continuation_target = invalid_execution_node_id;
+    LayerId continuation_target = invalid_layer_id;
     bool resident_chain_finished = false;
 
     const auto fwd_staged_embedding = [&](const Layer* node) -> Result<void> {
@@ -2337,19 +2337,19 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             const bool capture_boundary = use_speculative_context
                                           && std::find(model.speculative.target_layer_ids.begin(), model.speculative.target_layer_ids.end(), layer.layer_id)
                                                  != model.speculative.target_layer_ids.end();
-            ExecutionNodeId target_id = invalid_execution_node_id;
+            LayerId target_id = invalid_layer_id;
             if (!capture_boundary)
             {
-                uint32_t fence_id = invalid_execution_node_id;
+                uint32_t fence_id = invalid_layer_id;
                 const auto resolved = GpuSegment_vulkan::continuation_target(model, node->id, fence_id);
                 if (!resolved) return resolved.error();
                 target_id = resolved.value();
             }
-            if (target_id != invalid_execution_node_id && use_speculative_context
+            if (target_id != invalid_layer_id && use_speculative_context
                 && model.speculative.kind == SpeculativeModelKind::Mtp
                 && model.graph.layers[target_id].kind == LayerKind::FinalNorm)
-                target_id = invalid_execution_node_id;
-            if (target_id != invalid_execution_node_id)
+                target_id = invalid_layer_id;
+            if (target_id != invalid_layer_id)
             {
                 const auto& target = model.graph.layers[target_id];
                 std::string error;
@@ -2594,7 +2594,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         router_fused = false;
         return {};
     };
-    for (const ExecutionNodeId node_id : model.schedule.node_order)
+    for (const LayerId node_id : model.schedule.node_order)
     {
         if (node_id >= model.graph.layers.size())
         {

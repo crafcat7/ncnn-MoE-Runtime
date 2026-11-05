@@ -16,9 +16,9 @@ namespace moe {
 
 struct CompiledModel;
 
-using ExecutionNodeId = uint32_t;
+using LayerId = uint32_t;
 using ExecutionTensorId = uint32_t;
-inline constexpr ExecutionNodeId invalid_execution_node_id = std::numeric_limits<ExecutionNodeId>::max();
+inline constexpr LayerId invalid_layer_id = std::numeric_limits<LayerId>::max();
 inline constexpr ExecutionTensorId invalid_execution_tensor_id = std::numeric_limits<ExecutionTensorId>::max();
 inline constexpr uint32_t invalid_execution_layer_id = std::numeric_limits<uint32_t>::max();
 
@@ -51,23 +51,21 @@ enum ExecutionBackendMask : uint32_t
     ExecutionBackendVulkan = UINT32_C(1) << NCNN_MOE_BACKEND_VULKAN_BIT
 };
 
-#define NCNN_MOE_NODE_CPU_PREFETCH_BIT    0
-#define NCNN_MOE_NODE_REQUEST_EXPERTS_BIT 1
+#define NCNN_MOE_LAYER_CPU_PREFETCH_BIT    0
+#define NCNN_MOE_LAYER_REQUEST_EXPERTS_BIT 1
 
 enum LayerFlag : uint32_t
 {
-    LayerCpuPrefetch = UINT32_C(1) << NCNN_MOE_NODE_CPU_PREFETCH_BIT,
+    LayerCpuPrefetch = UINT32_C(1) << NCNN_MOE_LAYER_CPU_PREFETCH_BIT,
     // Submit exact reads during dispatch, before independent shared CPU work.
-    LayerRequestExperts = UINT32_C(1) << NCNN_MOE_NODE_REQUEST_EXPERTS_BIT
+    LayerRequestExperts = UINT32_C(1) << NCNN_MOE_LAYER_REQUEST_EXPERTS_BIT
 };
 
-// Runtime view of one scheduled step. Planning-only fields (dependencies,
-// tensor edges and names) stay in Layer until the P2 migration.
-using LayerKind = LayerKind;
-
+// One scheduled execution step. Planning-only fields (dependencies, tensor
+// edges and names) stay on Layer until P3 moves them into the Blob graph.
 struct Layer
 {
-    ExecutionNodeId id = invalid_execution_node_id;
+    LayerId id = invalid_layer_id;
     LayerKind kind = LayerKind::TokenEmbedding;
     ExecutionBackend backend = ExecutionBackend::Cpu;
     uint32_t backend_mask = ExecutionBackendCpu;
@@ -77,7 +75,7 @@ struct Layer
     // Planning-only fields, retained on the layer until P3 moves the tensor
     // edges fully into the Blob graph.
     std::string name;
-    std::vector<ExecutionNodeId> dependencies;
+    std::vector<LayerId> dependencies;
     std::vector<ExecutionTensorId> inputs;
     std::vector<ExecutionTensorId> outputs;
 };
@@ -88,8 +86,8 @@ struct ExecutionTensor
     std::string name;
     DType dtype = DType::Float32;
     std::vector<uint32_t> shape;
-    ExecutionNodeId producer = invalid_execution_node_id;
-    std::vector<ExecutionNodeId> consumers;
+    LayerId producer = invalid_layer_id;
+    std::vector<LayerId> consumers;
 };
 
 struct ExecutionGraph
@@ -101,7 +99,7 @@ struct ExecutionGraph
 
 struct ExecutionSchedule
 {
-    std::vector<ExecutionNodeId> node_order;
+    std::vector<LayerId> node_order;
 
     [[nodiscard]] Result<void> validate(const ExecutionGraph& graph) const;
 };

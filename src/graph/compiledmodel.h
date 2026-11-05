@@ -52,12 +52,12 @@ struct SpeculativeModelPlan
     {
         // Populated with IDs when the speculative graph is built; backend
         // placement and prefetch flags remain owned by the graph nodes.
-        ExecutionNodeId attention = invalid_execution_node_id;
-        ExecutionNodeId router = invalid_execution_node_id;
-        ExecutionNodeId expert_dispatch = invalid_execution_node_id;
-        ExecutionNodeId expert_group = invalid_execution_node_id;
-        ExecutionNodeId shared_expert_group = invalid_execution_node_id;
-        ExecutionNodeId combine = invalid_execution_node_id;
+        LayerId attention = invalid_layer_id;
+        LayerId router = invalid_layer_id;
+        LayerId expert_dispatch = invalid_layer_id;
+        LayerId expert_group = invalid_layer_id;
+        LayerId shared_expert_group = invalid_layer_id;
+        LayerId combine = invalid_layer_id;
     };
 
     // Speculative execution is a separate graph region because its layer

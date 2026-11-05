@@ -428,25 +428,25 @@ std::shared_ptr<GpuSegment_vulkan> GpuSegment_vulkan::create_head(const Compiled
 Result<uint32_t> GpuSegment_vulkan::continuation_target(const CompiledModel& model, uint32_t expert_node_id,
                                                         uint32_t& fence_id)
 {
-    fence_id = invalid_execution_node_id;
-    if (expert_node_id >= model.graph.layers.size()) return invalid_execution_node_id;
+    fence_id = invalid_layer_id;
+    if (expert_node_id >= model.graph.layers.size()) return invalid_layer_id;
     const auto& source = model.graph.layers[expert_node_id];
     if (source.kind != LayerKind::ExpertGroup || source.backend != ExecutionBackend::Vulkan
         || source.plan_index >= model.graph.layer_plans.size()
         || source.plan_index >= model.gpu_segments.size() || !model.gpu_segments[source.plan_index])
-        return invalid_execution_node_id;
+        return invalid_layer_id;
     const auto& source_layer = model.graph.layer_plans[source.plan_index];
     const auto& context = model.gpu_segments[source.plan_index]->context();
-    if (!context) return invalid_execution_node_id;
+    if (!context) return invalid_layer_id;
     auto next = std::find(model.schedule.node_order.begin(), model.schedule.node_order.end(), expert_node_id);
-    if (next == model.schedule.node_order.end()) return invalid_execution_node_id;
+    if (next == model.schedule.node_order.end()) return invalid_layer_id;
     bool combined = false;
-    uint32_t target_id = invalid_execution_node_id;
+    uint32_t target_id = invalid_layer_id;
     bool head = false;
     while (++next != model.schedule.node_order.end())
     {
-        const ExecutionNodeId candidate_id = *next;
-        if (candidate_id >= model.graph.layers.size()) return invalid_execution_node_id;
+        const LayerId candidate_id = *next;
+        if (candidate_id >= model.graph.layers.size()) return invalid_layer_id;
         const auto& candidate = model.graph.layers[candidate_id];
         if (!combined && candidate.plan_index == source.plan_index
             && candidate.backend == ExecutionBackend::Vulkan && candidate.kind == LayerKind::SharedExpertGroup)
@@ -457,7 +457,7 @@ Result<uint32_t> GpuSegment_vulkan::continuation_target(const CompiledModel& mod
             combined = true;
             continue;
         }
-        if (!combined || candidate.backend != ExecutionBackend::Vulkan) return invalid_execution_node_id;
+        if (!combined || candidate.backend != ExecutionBackend::Vulkan) return invalid_layer_id;
         if (candidate.kind == LayerKind::Attention
             && candidate.plan_index < model.graph.layer_plans.size()
             && candidate.plan_index < model.gpu_segments.size()
@@ -477,15 +477,15 @@ Result<uint32_t> GpuSegment_vulkan::continuation_target(const CompiledModel& mod
         }
         // All other nodes are explicit boundaries. Follow actual schedule
         // order rather than assuming that layer ids are consecutive.
-        return invalid_execution_node_id;
+        return invalid_layer_id;
     }
-    if (target_id == invalid_execution_node_id) return invalid_execution_node_id;
+    if (target_id == invalid_layer_id) return invalid_layer_id;
 
-    uint32_t resolved_fence = invalid_execution_node_id;
+    uint32_t resolved_fence = invalid_layer_id;
     auto fence = next;
     while (++fence != model.schedule.node_order.end())
     {
-        const ExecutionNodeId candidate_id = *fence;
+        const LayerId candidate_id = *fence;
         if (candidate_id >= model.graph.layers.size())
             return Error{ErrorCode::InvalidModel, "GPU continuation memory target has an invalid scheduled fence"};
         const auto& candidate = model.graph.layers[candidate_id];
@@ -502,7 +502,7 @@ Result<uint32_t> GpuSegment_vulkan::continuation_target(const CompiledModel& mod
             || candidate.kind == LayerKind::DenseFfn || candidate.kind == LayerKind::TokenEmbedding)
             break;
     }
-    if (resolved_fence == invalid_execution_node_id || model.graph.layers[resolved_fence].backend != ExecutionBackend::Vulkan)
+    if (resolved_fence == invalid_layer_id || model.graph.layers[resolved_fence].backend != ExecutionBackend::Vulkan)
         return Error{ErrorCode::InvalidModel, "GPU continuation memory target has no selected Router or LM head fence"};
 
     const auto device_index = [&](const Layer& node) {

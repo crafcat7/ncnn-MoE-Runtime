@@ -2984,9 +2984,9 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
     if (resident_chain)
     {
         const uint32_t chunk = resident_chunk_layers(model, rows);
-        std::vector<ExecutionNodeId> attention(graph.layer_plans.size(), invalid_execution_node_id);
-        std::vector<ExecutionNodeId> combine(graph.layer_plans.size(), invalid_execution_node_id);
-        ExecutionNodeId head = invalid_execution_node_id;
+        std::vector<LayerId> attention(graph.layer_plans.size(), invalid_layer_id);
+        std::vector<LayerId> combine(graph.layer_plans.size(), invalid_layer_id);
+        LayerId head = invalid_layer_id;
         for (const Layer& node : graph.layers)
         {
             if (node.kind == LayerKind::LmHead) head = node.id;
@@ -2997,8 +2997,8 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
         for (uint32_t first = 0; first < graph.layer_plans.size(); first += chunk)
         {
             const uint32_t last = std::min<uint32_t>(static_cast<uint32_t>(graph.layer_plans.size()), first + chunk) - 1;
-            const ExecutionNodeId finish = last + 1 == graph.layer_plans.size() ? head : combine[last];
-            if (attention[first] == invalid_execution_node_id || finish == invalid_execution_node_id)
+            const LayerId finish = last + 1 == graph.layer_plans.size() ? head : combine[last];
+            if (attention[first] == invalid_layer_id || finish == invalid_layer_id)
                 return Error{ErrorCode::InvalidModel, "resident graph has no recording boundary"};
             const uint32_t device = graph_node_device(model, graph, graph.layers[attention[first]]);
             submissions.push_back({device, positions[attention[first]], positions[finish]});
@@ -3015,15 +3015,15 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
         }
     }
     else if (&graph == &model.graph)
-        for (ExecutionNodeId node_id : schedule.node_order)
+        for (LayerId node_id : schedule.node_order)
         {
             const Layer& source = graph.layers[node_id];
             if (source.kind != LayerKind::ExpertGroup) continue;
-            uint32_t fence_id = invalid_execution_node_id;
+            uint32_t fence_id = invalid_layer_id;
             const auto resolved = GpuSegment_vulkan::continuation_target(model, node_id, fence_id);
             if (!resolved) return resolved.error();
             const uint32_t target_id = resolved.value();
-            if (target_id == invalid_execution_node_id) continue;
+            if (target_id == invalid_layer_id) continue;
             if (target_id >= graph.layers.size() || fence_id >= graph.layers.size()
                 || positions[target_id] <= positions[node_id] || positions[fence_id] <= positions[target_id])
                 return Error{ErrorCode::InvalidModel, "GPU continuation memory target or fence does not follow its Expert group"};
@@ -3091,7 +3091,7 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
         uint32_t last = ends[tensor.producer];
         std::map<std::pair<uint32_t, uint32_t>, std::pair<uint32_t, uint32_t>> copies;
         std::map<std::pair<uint32_t, uint32_t>, uint64_t> copy_elements;
-        for (ExecutionNodeId consumer_id : tensor.consumers)
+        for (LayerId consumer_id : tensor.consumers)
         {
             if (consumer_id >= graph.layers.size() || positions[consumer_id] <= positions[tensor.producer])
                 return Error{ErrorCode::InvalidModel, "graph memory tensor consumer precedes its producer"};
@@ -3111,7 +3111,7 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
             // one normalized upload. Its gathered allocation is counted here;
             // the retained upload and final aggregate are opaque node scratch.
             // Shared and dense FFN own independent host-normalized operands.
-            const std::pair<uint32_t, uint32_t> key{device, host_normalized ? consumer.id : invalid_execution_node_id};
+            const std::pair<uint32_t, uint32_t> key{device, host_normalized ? consumer.id : invalid_layer_id};
             auto [it, inserted] = copies.try_emplace(key, starts[consumer_id], positions[consumer_id]);
             if (!inserted) it->second.second = std::max(it->second.second, positions[consumer_id]);
             uint64_t consumed = elements;
@@ -3147,7 +3147,7 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
             if (!ret) return ret.error();
         }
     }
-    for (ExecutionNodeId node_id : schedule.node_order)
+    for (LayerId node_id : schedule.node_order)
     {
         const Layer& node = graph.layers[node_id];
         if (node.backend != ExecutionBackend::Vulkan) continue;
