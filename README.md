@@ -130,6 +130,10 @@ cmake --preset worker-release
 cmake --build --preset worker-release
 ```
 
+Presets use `build-worker`; pass `--worker build-worker/Release/ncnn_moe_worker.exe`
+(or the single-config path) to the Python CLI. The direct `build-ncnn` command
+matches the CLI default.
+
 Useful options:
 
 | Option | Meaning |
@@ -139,8 +143,10 @@ Useful options:
 | `NCNN_MOE_ENABLE_OPENMP` | Enable OpenMP |
 | `NCNN_MOE_ENABLE_X86_SIMD` | Build AVX2/AVX512 kernels |
 | `NCNN_MOE_ENABLE_ARM_SVE2` | Build ARM SVE2 MXFP4 kernels |
+| `NCNN_MOE_ENABLE_MSVC_MP` | MSVC multiprocessor compilation |
 | `NCNN_MOE_ENABLE_LTO` | Enable Release LTO |
 | `NCNN_MOE_OPT_LEVEL` | `O0`, `O1`, `O2`, `O3`, or `Os` |
+| `NCNN_MOE_SIZE_OPTIMIZE_COLD_PATHS` | Size-optimize loader/tokenizer paths |
 
 Tests:
 
