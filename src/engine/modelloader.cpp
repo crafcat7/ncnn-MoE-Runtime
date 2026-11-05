@@ -1107,8 +1107,8 @@ Result<void> ModelLoader::load(const std::filesystem::path& model_path)
             return ret.error();
     }
     if (!model.expert_backend && (model.gpu_expert_banks.empty() || partial_banks)
-        && std::any_of(model.graph.nodes.begin(), model.graph.nodes.end(), [](const ExecutionNode& node) {
-               return node.type == ExecutionNodeType::ExpertGroup && node.backend == ExecutionBackend::Vulkan;
+        && std::any_of(model.graph.layers.begin(), model.graph.layers.end(), [](const Layer& node) {
+               return node.kind == LayerKind::ExpertGroup && node.backend == ExecutionBackend::Vulkan;
            }))
         return Error{ErrorCode::UnsupportedModel, "GPU Expert placement requires an executable device cache; CPU retry is disabled"};
     if (model.gated_residual_chain && !model.expert_backend && model.gpu_expert_banks.empty())

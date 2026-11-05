@@ -95,7 +95,7 @@ static void check_budget_admission(const MoeModelDescriptor& descriptor, const W
         if (budget == 0)
         {
             check(static_cast<bool>(compiled), compiled ? "" : compiled.error().message);
-            check(std::any_of(model.graph.nodes.begin(), model.graph.nodes.end(), [](const ExecutionNode& node) {
+            check(std::any_of(model.graph.layers.begin(), model.graph.layers.end(), [](const Layer& node) {
                       return node.backend == ExecutionBackend::Vulkan;
                   }),
                   "automatic live-heap planning did not place supported dense work on Vulkan");
@@ -914,15 +914,15 @@ static void run_dense_package(const std::filesystem::path& root, bool tied, bool
         size_t cached_ffn_count = 0;
         size_t static_ffn_count = 0;
         size_t dense_ffn_nodes = 0;
-        for (const ExecutionNode& node : compiled.graph.nodes)
+        for (const Layer& node : compiled.graph.layers)
         {
-            if (node.type != ExecutionNodeType::DenseFfn)
+            if (node.kind != LayerKind::DenseFfn)
                 continue;
             ++dense_ffn_nodes;
             if (node.backend == ExecutionBackend::Cpu)
                 continue;
             check(node.backend == ExecutionBackend::Vulkan, "dense FFN selected an unsupported backend");
-            const CompiledLayerPlan& layer = compiled.graph.layer_plans[node.layer_plan_index];
+            const CompiledLayerPlan& layer = compiled.graph.layer_plans[node.plan_index];
             if (layer.dense_ffn.use_gpu_cache)
             {
                 check(static_cast<bool>(compiled.expert_backend), "cached dense Vulkan FFN lacks an Expert backend");

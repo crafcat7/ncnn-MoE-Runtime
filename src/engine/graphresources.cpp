@@ -114,7 +114,7 @@ static bool bank_chain_supported(const CompiledModel& model)
     const size_t layers = model.graph.layer_plans.size();
     if (model.opt.hybrid_mode != HybridMode::HybridExperts || !model.gpu_head || layers == 0
         || model.gpu_segments.size() != layers || model.speculative.enabled()
-        || !model.speculative.graph.nodes.empty() || has_flag(model.opt.flags, OptionRouterPrediction)
+        || !model.speculative.graph.layers.empty() || has_flag(model.opt.flags, OptionRouterPrediction)
         || has_flag(model.opt.flags, OptionDisableGpuExpertExecution)) return false;
     const auto context = model.gpu_head ? model.gpu_head->context() : nullptr;
     if (!context || std::any_of(model.gpu_segments.begin(), model.gpu_segments.end(), [&](const auto& segment) {
@@ -123,35 +123,35 @@ static bool bank_chain_supported(const CompiledModel& model)
     // The bank executor bypasses exactly this scheduled chain. Any additional
     // host consumer or a different ordering keeps explicit GPU streaming.
     size_t position = 0;
-    const auto next = [&](ExecutionNodeType type, size_t layer, bool gpu) {
+    const auto next = [&](LayerKind type, size_t layer, bool gpu) {
         if (position >= model.schedule.node_order.size()) return false;
-        const ExecutionNode& node = model.graph.nodes[model.schedule.node_order[position]];
-        const bool ok = node.type == type && (layer >= layers || node.layer_plan_index == layer)
+        const Layer& node = model.graph.layers[model.schedule.node_order[position]];
+        const bool ok = node.kind == type && (layer >= layers || node.plan_index == layer)
                         && (!gpu || node.backend == ExecutionBackend::Vulkan);
         if (!ok) return false;
         ++position;
         return true;
     };
-    if (!next(ExecutionNodeType::TokenEmbedding, layers, false)) return false;
+    if (!next(LayerKind::TokenEmbedding, layers, false)) return false;
     for (size_t layer = 0; layer < layers; ++layer)
     {
         const CompiledLayerPlan& plan = model.graph.layer_plans[layer];
         if (plan.dense_ffn.down_weight != invalid_tensor_handle)
         {
-            if (!next(ExecutionNodeType::Attention, layer, true)
-                || !next(ExecutionNodeType::DenseFfn, layer, true)) return false;
+            if (!next(LayerKind::Attention, layer, true)
+                || !next(LayerKind::DenseFfn, layer, true)) return false;
             continue;
         }
         const MoeBlockPlan& moe = plan.moe;
         if (moe.experts.empty() || moe.top_k == 0 || moe.top_k > 64 || moe.top_k > moe.experts.size()
-            || !next(ExecutionNodeType::Attention, layer, true)
-            || !next(ExecutionNodeType::Router, layer, true)
-            || !next(ExecutionNodeType::ExpertDispatch, layer, false)
-            || !next(ExecutionNodeType::ExpertGroup, layer, true)
-            || (moe.has_shared_expert && !next(ExecutionNodeType::SharedExpertGroup, layer, true))
-            || !next(ExecutionNodeType::Combine, layer, true)) return false;
+            || !next(LayerKind::Attention, layer, true)
+            || !next(LayerKind::Router, layer, true)
+            || !next(LayerKind::ExpertDispatch, layer, false)
+            || !next(LayerKind::ExpertGroup, layer, true)
+            || (moe.has_shared_expert && !next(LayerKind::SharedExpertGroup, layer, true))
+            || !next(LayerKind::Combine, layer, true)) return false;
     }
-    return next(ExecutionNodeType::FinalNorm, layers, true) && next(ExecutionNodeType::LmHead, layers, true)
+    return next(LayerKind::FinalNorm, layers, true) && next(LayerKind::LmHead, layers, true)
            && position == model.schedule.node_order.size();
 }
 

@@ -28,7 +28,7 @@ enum class ExecutionBackend
     Vulkan
 };
 
-enum class ExecutionNodeType
+enum class LayerKind
 {
     TokenEmbedding,
     Attention,
@@ -54,16 +54,16 @@ enum ExecutionBackendMask : uint32_t
 #define NCNN_MOE_NODE_CPU_PREFETCH_BIT    0
 #define NCNN_MOE_NODE_REQUEST_EXPERTS_BIT 1
 
-enum ExecutionNodeFlag : uint32_t
+enum LayerFlag : uint32_t
 {
-    ExecutionNodeCpuPrefetch = UINT32_C(1) << NCNN_MOE_NODE_CPU_PREFETCH_BIT,
+    LayerCpuPrefetch = UINT32_C(1) << NCNN_MOE_NODE_CPU_PREFETCH_BIT,
     // Submit exact reads during dispatch, before independent shared CPU work.
-    ExecutionNodeRequestExperts = UINT32_C(1) << NCNN_MOE_NODE_REQUEST_EXPERTS_BIT
+    LayerRequestExperts = UINT32_C(1) << NCNN_MOE_NODE_REQUEST_EXPERTS_BIT
 };
 
 // Runtime view of one scheduled step. Planning-only fields (dependencies,
-// tensor edges and names) stay in ExecutionNode until the P2 migration.
-using LayerKind = ExecutionNodeType;
+// tensor edges and names) stay in Layer until the P2 migration.
+using LayerKind = LayerKind;
 
 struct Layer
 {
@@ -74,6 +74,12 @@ struct Layer
     uint32_t flags = 0;
     uint32_t plan_index = invalid_execution_layer_id;
     std::vector<TensorHandle> weights;
+    // Planning-only fields, retained on the layer until P3 moves the tensor
+    // edges fully into the Blob graph.
+    std::string name;
+    std::vector<ExecutionNodeId> dependencies;
+    std::vector<ExecutionTensorId> inputs;
+    std::vector<ExecutionTensorId> outputs;
 };
 
 struct ExecutionTensor
@@ -86,38 +92,12 @@ struct ExecutionTensor
     std::vector<ExecutionNodeId> consumers;
 };
 
-struct ExecutionNode
-{
-    ExecutionNodeId id = invalid_execution_node_id;
-    ExecutionNodeType type = ExecutionNodeType::TokenEmbedding;
-    ExecutionBackend backend = ExecutionBackend::Cpu;
-    uint32_t backend_mask = ExecutionBackendCpu;
-    uint32_t flags = 0;
-    // Index into ExecutionGraph::layer_plans.  The graph owns both execution
-    // order and the immutable layer payload consumed by the executor.
-    uint32_t layer_plan_index = invalid_execution_layer_id;
-    // WeightStore handles consumed by non-layer nodes.  Layer nodes resolve
-    // their complete operator payload through layer_plan_index instead.
-    std::vector<TensorHandle> weight_inputs;
-    std::string name;
-    std::vector<ExecutionNodeId> dependencies;
-    std::vector<ExecutionTensorId> inputs;
-    std::vector<ExecutionTensorId> outputs;
-};
-
 struct ExecutionGraph
 {
     std::vector<ExecutionTensor> tensors;
-    std::vector<ExecutionNode> nodes;
-    std::vector<CompiledLayerPlan> layer_plans;
-    // Runtime layer view built from nodes after scheduling. P2 removes the
-    // parallel ExecutionNode storage once modelpipeline also consumes layers.
     std::vector<Layer> layers;
+    std::vector<CompiledLayerPlan> layer_plans;
 };
-
-// Rebuild the runtime Layer view from the planning nodes. Called by
-// schedule_graph, and by tests that mutate nodes after scheduling.
-void refresh_layers(ExecutionGraph& graph);
 
 struct ExecutionSchedule
 {

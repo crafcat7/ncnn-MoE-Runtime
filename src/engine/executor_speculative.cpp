@@ -28,7 +28,7 @@ static ExecutionBackend shared_lm_head_backend(const CompiledModel& model)
     // placement; Hybrid mode alone does not imply that the head uses Vulkan.
     for (const Layer& node : model.graph.layers)
     {
-        if (node.kind == ExecutionNodeType::LmHead
+        if (node.kind == LayerKind::LmHead
             && !node.weights.empty()
             && node.weights.front() == model.lm_head_weight)
             return node.backend;
@@ -38,7 +38,7 @@ static ExecutionBackend shared_lm_head_backend(const CompiledModel& model)
 
 static Result<void> forward_speculative_layer(const CompiledModel& model,
                                               const SpeculativeModelPlan::LayerNodes& execution,
-                                              size_t layer_plan_index,
+                                              size_t plan_index,
                                               uint64_t position_offset,
                                               LayerCache& cache,
                                               ActivationBuffer& hidden,
@@ -49,7 +49,7 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
                                               AttentionScratch& attention_scratch)
 {
     const ExecutionGraph& graph = model.speculative.graph;
-    if (layer_plan_index >= graph.layer_plans.size()
+    if (plan_index >= graph.layer_plans.size()
         || execution.attention >= graph.layers.size()
         || execution.router >= graph.layers.size()
         || execution.expert_dispatch >= graph.layers.size()
@@ -60,12 +60,12 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
             ErrorCode::InternalError,
             "speculative execution graph has an incomplete layer binding"};
     }
-    const CompiledLayerPlan& layer = graph.layer_plans[layer_plan_index];
+    const CompiledLayerPlan& layer = graph.layer_plans[plan_index];
     const Layer& attention_node = graph.layers[execution.attention];
     const Layer& expert_group_node = graph.layers[execution.expert_group];
     const ExecutionBackend attention_backend = attention_node.backend;
     const ExecutionBackend expert_backend = expert_group_node.backend;
-    const bool cpu_prefetch = has_flag(expert_group_node.flags, ExecutionNodeCpuPrefetch);
+    const bool cpu_prefetch = has_flag(expert_group_node.flags, LayerCpuPrefetch);
 
     // Target and draft layers execute sequentially with the same FFN workspace.
     layer_state.reset();
@@ -197,7 +197,7 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
         return {};
     };
 
-    if (has_flag(graph.layers[execution.expert_dispatch].flags, ExecutionNodeRequestExperts))
+    if (has_flag(graph.layers[execution.expert_dispatch].flags, LayerRequestExperts))
     {
         if (!moe.has_shared_expert || execution.shared_expert_group >= graph.layers.size())
             return Error{ErrorCode::InternalError, "speculative execution graph has no shared Expert binding"};

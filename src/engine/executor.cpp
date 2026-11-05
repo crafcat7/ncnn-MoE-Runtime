@@ -1248,7 +1248,7 @@ Result<void> forward_model(const CompiledModel& model,
         if (hidden.rows() == 1 && layer.layer_id < state.layers.size())
             resolve_routes(model, layer, plan, state, statistics, true);
         prepare_experts(moe, layer_state, &statistics);
-        if (has_flag(node->flags, ExecutionNodeRequestExperts))
+        if (has_flag(node->flags, LayerRequestExperts))
         {
             auto requested = request_experts(model, moe, layer_state,
                                              state.expert_scratch,
@@ -1279,13 +1279,13 @@ Result<void> forward_model(const CompiledModel& model,
                 target_id = resolved.value();
             }
             if (target_id != invalid_execution_node_id && needs_mtp_final_hidden
-                && model.graph.layers[target_id].kind == ExecutionNodeType::FinalNorm)
+                && model.graph.layers[target_id].kind == LayerKind::FinalNorm)
                 target_id = invalid_execution_node_id;
             if (target_id != invalid_execution_node_id)
             {
                 const auto& target = model.graph.layers[target_id];
                 std::string error;
-                if (target.kind == ExecutionNodeType::FinalNorm)
+                if (target.kind == LayerKind::FinalNorm)
                     pending_continuation = model.gpu_head->prepare_head_continuation(logits_output != LogitsOutput::None,
                                                                                      logits_output == LogitsOutput::Last, state.gpu_segment, error);
                 else
@@ -1322,7 +1322,7 @@ Result<void> forward_model(const CompiledModel& model,
                                     state.expert_scratch,
                                     layer.layer_id,
                                     node->backend,
-                                    has_flag(node->flags, ExecutionNodeCpuPrefetch),
+                                    has_flag(node->flags, LayerCpuPrefetch),
                                     overlap ? MoEOverlap{&shared, run_shared_overlap} : MoEOverlap{});
         if (overlap && !shared.result) return shared.result.error();
         if (!executed)
@@ -1463,19 +1463,19 @@ Result<void> forward_model(const CompiledModel& model,
         if (resident_chain_finished) continue;
         if (resident_prefix_layers != 0 && node->plan_index < resident_prefix_layers)
             continue;
-        if (node->kind == ExecutionNodeType::TokenEmbedding)
+        if (node->kind == LayerKind::TokenEmbedding)
         {
             auto stepped = fwd_embedding(node);
             if (!stepped) return stepped;
             continue;
         }
-        if (node->kind == ExecutionNodeType::FinalNorm)
+        if (node->kind == LayerKind::FinalNorm)
         {
             auto stepped = fwd_norm(node);
             if (!stepped) return stepped;
             continue;
         }
-        if (node->kind == ExecutionNodeType::LmHead)
+        if (node->kind == LayerKind::LmHead)
         {
             auto stepped = fwd_head(node);
             if (!stepped) return stepped;
@@ -1493,26 +1493,26 @@ Result<void> forward_model(const CompiledModel& model,
         Result<void> stepped;
         switch (node->kind)
         {
-        case ExecutionNodeType::DenseFfn:
+        case LayerKind::DenseFfn:
             stepped = fwd_ffn(node, layer, layer_state);
             break;
-        case ExecutionNodeType::Attention:
+        case LayerKind::Attention:
             stepped = fwd_attn(node, layer, layer_state, moe);
             break;
-        case ExecutionNodeType::Router:
+        case LayerKind::Router:
             stepped = fwd_router(layer, layer_state, moe);
             break;
-        case ExecutionNodeType::ExpertDispatch:
+        case LayerKind::ExpertDispatch:
             stepped = fwd_dispatch(node, layer, layer_state, moe);
             break;
-        case ExecutionNodeType::ExpertGroup:
+        case LayerKind::ExpertGroup:
             stepped = fwd_experts(node, layer, layer_state, moe);
             break;
-        case ExecutionNodeType::SharedExpertGroup:
+        case LayerKind::SharedExpertGroup:
             stepped = fwd_shared_group(model, moe, layer_state.normalized.rows(), layer_state,
                                        router_fused, node->backend);
             break;
-        case ExecutionNodeType::Combine:
+        case LayerKind::Combine:
             stepped = fwd_combine(layer, layer_state, moe);
             break;
         default:
@@ -2317,7 +2317,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         std::sort(active.begin(), active.end(), [](const ExpertState& left, const ExpertState& right) {
             return left.batch.expert_id < right.batch.expert_id;
         });
-        if (has_flag(node->flags, ExecutionNodeRequestExperts))
+        if (has_flag(node->flags, LayerRequestExperts))
         {
             auto requested = request_experts(model, moe, combined, batch_scratch,
                                              layer.layer_id);
@@ -2347,13 +2347,13 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             }
             if (target_id != invalid_execution_node_id && use_speculative_context
                 && model.speculative.kind == SpeculativeModelKind::Mtp
-                && model.graph.layers[target_id].kind == ExecutionNodeType::FinalNorm)
+                && model.graph.layers[target_id].kind == LayerKind::FinalNorm)
                 target_id = invalid_execution_node_id;
             if (target_id != invalid_execution_node_id)
             {
                 const auto& target = model.graph.layers[target_id];
                 std::string error;
-                if (target.kind == ExecutionNodeType::FinalNorm)
+                if (target.kind == LayerKind::FinalNorm)
                     pending_continuation = model.gpu_head->prepare_head_continuation(requested_count != 0, false,
                                                                                      workspace.gpu_segment, error);
                 else
@@ -2386,7 +2386,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                                     workspace.expert,
                                     layer.layer_id,
                                     node->backend,
-                                    has_flag(node->flags, ExecutionNodeCpuPrefetch),
+                                    has_flag(node->flags, LayerCpuPrefetch),
                                     overlap ? MoEOverlap{&shared, run_shared_overlap} : MoEOverlap{});
         if (overlap && !shared.result) return shared.result.error();
         if (!executed)
@@ -2602,19 +2602,19 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         }
         const Layer* node = &model.graph.layers[node_id];
         if (resident_chain_finished) continue;
-        if (node->kind == ExecutionNodeType::TokenEmbedding)
+        if (node->kind == LayerKind::TokenEmbedding)
         {
             auto stepped = fwd_staged_embedding(node);
             if (!stepped) return stepped;
             continue;
         }
-        if (node->kind == ExecutionNodeType::FinalNorm)
+        if (node->kind == LayerKind::FinalNorm)
         {
             auto stepped = fwd_staged_norm(node);
             if (!stepped) return stepped;
             continue;
         }
-        if (node->kind == ExecutionNodeType::LmHead)
+        if (node->kind == LayerKind::LmHead)
         {
             auto stepped = fwd_staged_head(node);
             if (!stepped) return stepped;
@@ -2631,7 +2631,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         Result<void> stepped;
         switch (node->kind)
         {
-        case ExecutionNodeType::DenseFfn:
+        case LayerKind::DenseFfn:
         {
             ActivationBuffer& merged = batch_scratch.staged_merged;
             if (!workspace.gpu_segment.active() && !layer_workspace.active() && !merge_hidden_rows(merged))
@@ -2645,10 +2645,10 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                 stepped = Error{ErrorCode::InternalError, "cannot split staged dense FFN rows"};
             break;
         }
-        case ExecutionNodeType::Attention:
+        case LayerKind::Attention:
             stepped = fwd_staged_attn(node, layer, moe);
             break;
-        case ExecutionNodeType::Router:
+        case LayerKind::Router:
         {
             if (!router_fused)
             {
@@ -2665,17 +2665,17 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             }
             break;
         }
-        case ExecutionNodeType::ExpertDispatch:
+        case LayerKind::ExpertDispatch:
             stepped = fwd_staged_dispatch(node, layer, moe);
             break;
-        case ExecutionNodeType::ExpertGroup:
+        case LayerKind::ExpertGroup:
             stepped = fwd_staged_experts(node, layer, moe);
             break;
-        case ExecutionNodeType::SharedExpertGroup:
+        case LayerKind::SharedExpertGroup:
             stepped = fwd_shared_group(model, moe, session_count, workspace.staged_state,
                                        router_fused, node->backend);
             break;
-        case ExecutionNodeType::Combine:
+        case LayerKind::Combine:
             stepped = fwd_staged_combine(layer, moe);
             break;
         default:

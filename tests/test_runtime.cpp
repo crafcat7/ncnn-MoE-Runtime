@@ -858,7 +858,7 @@ void test_prefill_decode_and_reset()
     check(owned_logits == all_output);
 
     CompiledModel missing_logits_model = compiled;
-    check(missing_logits_model.graph.nodes[missing_logits_model.schedule.node_order.back()].type == ExecutionNodeType::LmHead);
+    check(missing_logits_model.graph.layers[missing_logits_model.schedule.node_order.back()].kind == LayerKind::LmHead);
     missing_logits_model.schedule.node_order.pop_back();
     auto missing_logits = forward_model(missing_logits_model, direct_prompt, reused_statistics,
                                         reused_state, 0, LogitsOutput::Last);
@@ -915,9 +915,9 @@ void test_prefill_decode_and_reset()
 
     // A dependency-valid schedule must still finish the live FFN workspace.
     ExecutionGraph overlapping_graph = layered_model.graph;
-    for (ExecutionNode& node : overlapping_graph.nodes)
+    for (Layer& node : overlapping_graph.layers)
     {
-        if (node.type == ExecutionNodeType::Router && node.layer_plan_index == 1)
+        if (node.kind == LayerKind::Router && node.plan_index == 1)
             node.dependencies = {0};
     }
     ExecutionSchedule overlapping_schedule;
@@ -9597,7 +9597,7 @@ public:
     {
         for (Layer& candidate : compiled.graph.layers)
         {
-            if (candidate.kind == ExecutionNodeType::LmHead)
+            if (candidate.kind == LayerKind::LmHead)
             {
                 layer = &candidate;
                 break;
@@ -9988,9 +9988,9 @@ void test_speculative_generation()
             check(static_cast<bool>(build_graph(compiled, false)));
             const auto check_head_backend = [&](ExecutionBackend backend) {
                 bool found = false;
-                for (const ExecutionNode& node : compiled.graph.nodes)
+                for (const Layer& node : compiled.graph.layers)
                 {
-                    if (node.type == ExecutionNodeType::LmHead)
+                    if (node.kind == LayerKind::LmHead)
                     {
                         check(node.backend == backend);
                         found = true;
@@ -10247,10 +10247,10 @@ void test_speculative_generation()
                         throw std::runtime_error("DSpark Hybrid preparation failed: " + prepared.error().message);
                     check(static_cast<bool>(build_graph(candidate, false)));
                 };
-                const auto speculative_shared_node = [](const CompiledModel& candidate) -> const ExecutionNode& {
+                const auto speculative_shared_node = [](const CompiledModel& candidate) -> const Layer& {
                     const ExecutionNodeId id = candidate.speculative.layer_nodes.front().shared_expert_group;
-                    check(id < candidate.speculative.graph.nodes.size());
-                    return candidate.speculative.graph.nodes[id];
+                    check(id < candidate.speculative.graph.layers.size());
+                    return candidate.speculative.graph.layers[id];
                 };
                 CompiledModel no_shared_dspark = compiled;
                 prepare_hybrid_dspark(no_shared_dspark);
@@ -10886,9 +10886,9 @@ void test_generic_mtp_int4_cache_key()
         check(support_vulkan_attention(hybrid.operators, gpu_attention));
         check(hybrid.speculative.layer_nodes.size() == 1);
         const uint32_t attention_node_id = hybrid.speculative.layer_nodes.front().attention;
-        check(attention_node_id < hybrid.speculative.graph.nodes.size());
-        const ExecutionNode& attention_node = hybrid.speculative.graph.nodes[attention_node_id];
-        check(attention_node.type == ExecutionNodeType::Attention);
+        check(attention_node_id < hybrid.speculative.graph.layers.size());
+        const Layer& attention_node = hybrid.speculative.graph.layers[attention_node_id];
+        check(attention_node.kind == LayerKind::Attention);
         check(attention_node.backend == ExecutionBackend::Vulkan);
 
         SessionState cpu_state;
@@ -11056,10 +11056,10 @@ void test_attention_graph_without_bias_or_sink()
     hybrid_compiled.opt.optimization_flags |= OptimizationVulkanAttention;
     auto rebuilt_graph = build_graph(hybrid_compiled, false);
     check(static_cast<bool>(rebuilt_graph));
-    const ExecutionNode* attention_node = nullptr;
-    for (const ExecutionNode& node : hybrid_compiled.graph.nodes)
+    const Layer* attention_node = nullptr;
+    for (const Layer& node : hybrid_compiled.graph.layers)
     {
-        if (node.type == ExecutionNodeType::Attention)
+        if (node.kind == LayerKind::Attention)
         {
             attention_node = &node;
             break;
@@ -11085,23 +11085,23 @@ void test_attention_graph_without_bias_or_sink()
     check(speculative_nodes.expert_group != invalid_execution_node_id);
     check(speculative_nodes.shared_expert_group == invalid_execution_node_id);
     check(speculative_nodes.combine != invalid_execution_node_id);
-    check(speculative_compiled.speculative.graph.nodes[speculative_nodes.attention].type
-          == ExecutionNodeType::Attention);
-    check(speculative_compiled.speculative.graph.nodes[speculative_nodes.router].type
-          == ExecutionNodeType::Router);
-    check(speculative_compiled.speculative.graph.nodes[speculative_nodes.expert_dispatch].type
-          == ExecutionNodeType::ExpertDispatch);
-    check(speculative_compiled.speculative.graph.nodes[speculative_nodes.expert_group].type
-          == ExecutionNodeType::ExpertGroup);
-    check(speculative_compiled.speculative.graph.nodes[speculative_nodes.combine].type
-          == ExecutionNodeType::Combine);
+    check(speculative_compiled.speculative.graph.layers[speculative_nodes.attention].kind
+          == LayerKind::Attention);
+    check(speculative_compiled.speculative.graph.layers[speculative_nodes.router].kind
+          == LayerKind::Router);
+    check(speculative_compiled.speculative.graph.layers[speculative_nodes.expert_dispatch].kind
+          == LayerKind::ExpertDispatch);
+    check(speculative_compiled.speculative.graph.layers[speculative_nodes.expert_group].kind
+          == LayerKind::ExpertGroup);
+    check(speculative_compiled.speculative.graph.layers[speculative_nodes.combine].kind
+          == LayerKind::Combine);
 
     CompiledModel copied_speculative = speculative_compiled;
     const SpeculativeModelPlan::LayerNodes& copied_nodes = copied_speculative.speculative.layer_nodes.front();
-    check(&copied_speculative.speculative.graph.nodes[copied_nodes.attention]
-          != &speculative_compiled.speculative.graph.nodes[speculative_nodes.attention]);
-    check(copied_speculative.speculative.graph.nodes[copied_nodes.attention].type
-          == ExecutionNodeType::Attention);
+    check(&copied_speculative.speculative.graph.layers[copied_nodes.attention]
+          != &speculative_compiled.speculative.graph.layers[speculative_nodes.attention]);
+    check(copied_speculative.speculative.graph.layers[copied_nodes.attention].kind
+          == LayerKind::Attention);
 
     CompiledModel missing_attention_speculative = speculative_compiled;
     missing_attention_speculative.speculative.graph.layer_plans.front().attention.kind = AttentionKind::None;
@@ -11114,8 +11114,8 @@ void test_attention_graph_without_bias_or_sink()
 
     CompiledModel moved_speculative = std::move(copied_speculative);
     const SpeculativeModelPlan::LayerNodes& moved_nodes = moved_speculative.speculative.layer_nodes.front();
-    check(moved_speculative.speculative.graph.nodes[moved_nodes.expert_group].type
-          == ExecutionNodeType::ExpertGroup);
+    check(moved_speculative.speculative.graph.layers[moved_nodes.expert_group].kind
+          == LayerKind::ExpertGroup);
 
     ExecutionGraph rescheduled_speculative_graph = moved_speculative.speculative.graph;
     ExecutionSchedule rescheduled_speculative_schedule;
@@ -11125,10 +11125,10 @@ void test_attention_graph_without_bias_or_sink()
     check(static_cast<bool>(rescheduled_speculative_status));
     check(rescheduled_speculative_schedule.node_order
           == moved_speculative.speculative.schedule.node_order);
-    check(rescheduled_speculative_graph.nodes[moved_nodes.attention].type
-          == ExecutionNodeType::Attention);
-    check(rescheduled_speculative_graph.nodes[moved_nodes.expert_group].type
-          == ExecutionNodeType::ExpertGroup);
+    check(rescheduled_speculative_graph.layers[moved_nodes.attention].kind
+          == LayerKind::Attention);
+    check(rescheduled_speculative_graph.layers[moved_nodes.expert_group].kind
+          == LayerKind::ExpertGroup);
 
     moved_speculative.speculative.layer_nodes.clear();
     auto rebuilt_speculative = build_graph(moved_speculative, false);
@@ -11136,8 +11136,8 @@ void test_attention_graph_without_bias_or_sink()
     check(moved_speculative.speculative.layer_nodes.size() == 1);
     const SpeculativeModelPlan::LayerNodes& rebuilt_nodes = moved_speculative.speculative.layer_nodes.front();
     check(rebuilt_nodes.attention != invalid_execution_node_id);
-    check(moved_speculative.speculative.graph.nodes[rebuilt_nodes.attention].type
-          == ExecutionNodeType::Attention);
+    check(moved_speculative.speculative.graph.layers[rebuilt_nodes.attention].kind
+          == LayerKind::Attention);
 
     auto full_attention = forward_attention(compiled.weights,
                                             compiled.operators,
@@ -11300,7 +11300,7 @@ void test_attention_graph_without_bias_or_sink()
     const LayerDescriptor& layer = cpu_model.value()->descriptor().layers[0];
     check(static_cast<bool>(!has_flag(layer.attention.flags, AttentionDescriptorBias)));
     check(static_cast<bool>(!has_flag(layer.attention.flags, AttentionDescriptorSinks)));
-    for (const ExecutionNode& node : cpu_compiled.graph.nodes)
+    for (const Layer& node : cpu_compiled.graph.layers)
         check(static_cast<bool>(node.backend == ExecutionBackend::Cpu));
 
     auto cpu_session = runtime.create_session(cpu_model.value());
@@ -11318,17 +11318,17 @@ void test_attention_graph_without_bias_or_sink()
         const ExecutionGraph& hybrid_graph = model_compiled(*hybrid_model.value()).graph;
         size_t vulkan_attention_nodes = 0;
         size_t vulkan_lm_head_nodes = 0;
-        for (const ExecutionNode& node : hybrid_graph.nodes)
+        for (const Layer& node : hybrid_graph.layers)
         {
-            if (node.type == ExecutionNodeType::Attention && node.backend == ExecutionBackend::Vulkan)
+            if (node.kind == LayerKind::Attention && node.backend == ExecutionBackend::Vulkan)
             {
                 ++vulkan_attention_nodes;
             }
-            if (node.type == ExecutionNodeType::LmHead && node.backend == ExecutionBackend::Vulkan)
+            if (node.kind == LayerKind::LmHead && node.backend == ExecutionBackend::Vulkan)
             {
                 ++vulkan_lm_head_nodes;
             }
-            if (node.type == ExecutionNodeType::ExpertGroup)
+            if (node.kind == LayerKind::ExpertGroup)
                 check(static_cast<bool>(node.backend == ExecutionBackend::Cpu));
         }
         check(static_cast<bool>(vulkan_attention_nodes == 1));
@@ -11689,23 +11689,23 @@ void test_shared_expert_descriptor()
     // Keep the previous routed-then-shared schedule as an independent
     // numerical reference for both ordinary and staged execution.
     const auto restore_serial_shared_schedule = [](ExecutionGraph& graph, ExecutionSchedule& schedule) {
-        ExecutionNode* dispatch = nullptr;
-        ExecutionNode* routed = nullptr;
-        ExecutionNode* shared = nullptr;
-        for (ExecutionNode& node : graph.nodes)
+        Layer* dispatch = nullptr;
+        Layer* routed = nullptr;
+        Layer* shared = nullptr;
+        for (Layer& node : graph.layers)
         {
-            if (node.type == ExecutionNodeType::ExpertDispatch)
+            if (node.kind == LayerKind::ExpertDispatch)
                 dispatch = &node;
-            else if (node.type == ExecutionNodeType::ExpertGroup)
+            else if (node.kind == LayerKind::ExpertGroup)
                 routed = &node;
-            else if (node.type == ExecutionNodeType::SharedExpertGroup)
+            else if (node.kind == LayerKind::SharedExpertGroup)
                 shared = &node;
         }
         check(dispatch != nullptr && routed != nullptr && shared != nullptr);
-        check(has_flag(dispatch->flags, ExecutionNodeRequestExperts));
+        check(has_flag(dispatch->flags, LayerRequestExperts));
         check(std::find(schedule.node_order.begin(), schedule.node_order.end(), shared->id)
               < std::find(schedule.node_order.begin(), schedule.node_order.end(), routed->id));
-        dispatch->flags &= ~ExecutionNodeRequestExperts;
+        dispatch->flags &= ~LayerRequestExperts;
         routed->dependencies = {dispatch->id};
         shared->dependencies = {routed->id};
         check(static_cast<bool>(schedule_graph(graph, schedule, ExecutionBackendCpu)));
@@ -12335,35 +12335,35 @@ void test_execution_graph_and_scheduler()
     check(invalid_normalization_compile_status.error().message == "model descriptor layer has an invalid router normalization");
     const ExecutionGraph& graph = compiled.graph;
     check(compiled.graph.layer_plans.front().attention.kind == AttentionKind::None);
-    check(static_cast<bool>(graph.nodes.size() == 7));
+    check(static_cast<bool>(graph.layers.size() == 7));
     check(static_cast<bool>(!graph.tensors.empty()));
-    const std::vector<ExecutionNodeType> expected_types = {
-        ExecutionNodeType::TokenEmbedding,
-        ExecutionNodeType::Router,
-        ExecutionNodeType::ExpertDispatch,
-        ExecutionNodeType::ExpertGroup,
-        ExecutionNodeType::Combine,
-        ExecutionNodeType::FinalNorm,
-        ExecutionNodeType::LmHead,
+    const std::vector<LayerKind> expected_types = {
+        LayerKind::TokenEmbedding,
+        LayerKind::Router,
+        LayerKind::ExpertDispatch,
+        LayerKind::ExpertGroup,
+        LayerKind::Combine,
+        LayerKind::FinalNorm,
+        LayerKind::LmHead,
     };
     for (size_t index = 0; index < expected_types.size(); ++index)
     {
-        check(static_cast<bool>(graph.nodes[index].id == index));
-        check(static_cast<bool>(graph.nodes[index].type == expected_types[index]));
-        check(static_cast<bool>(graph.nodes[index].backend == ExecutionBackend::Cpu));
+        check(static_cast<bool>(graph.layers[index].id == index));
+        check(static_cast<bool>(graph.layers[index].kind == expected_types[index]));
+        check(static_cast<bool>(graph.layers[index].backend == ExecutionBackend::Cpu));
     }
-    check(static_cast<bool>(graph.nodes[3].flags == 0));
-    check(static_cast<bool>(graph.nodes[3].layer_plan_index == 0));
-    check(static_cast<bool>(graph.nodes[3].inputs.size() == 2));
-    check(static_cast<bool>(graph.nodes[3].inputs[1] == graph.nodes[2].outputs[0]));
-    check(static_cast<bool>(graph.nodes[4].dependencies.size() == 1));
-    check(static_cast<bool>(graph.nodes[4].dependencies[0] == 3));
+    check(static_cast<bool>(graph.layers[3].flags == 0));
+    check(static_cast<bool>(graph.layers[3].plan_index == 0));
+    check(static_cast<bool>(graph.layers[3].inputs.size() == 2));
+    check(static_cast<bool>(graph.layers[3].inputs[1] == graph.layers[2].outputs[0]));
+    check(static_cast<bool>(graph.layers[4].dependencies.size() == 1));
+    check(static_cast<bool>(graph.layers[4].dependencies[0] == 3));
 
     const ExecutionSchedule& compiled_schedule = compiled.schedule;
     check(static_cast<bool>(compiled_schedule.validate(graph)));
-    check(static_cast<bool>(compiled_schedule.node_order.size() == graph.nodes.size()));
+    check(static_cast<bool>(compiled_schedule.node_order.size() == graph.layers.size()));
     for (ExecutionNodeId node_id : compiled_schedule.node_order)
-        check(static_cast<bool>(graph.nodes[node_id].backend == ExecutionBackend::Cpu));
+        check(static_cast<bool>(graph.layers[node_id].backend == ExecutionBackend::Cpu));
 
     auto session = runtime.create_session(model.value());
     check(static_cast<bool>(session));
@@ -12382,13 +12382,13 @@ void test_execution_graph_and_scheduler()
     check(static_cast<bool>(repeated_rescheduled_status));
     check(static_cast<bool>(rescheduled_schedule.node_order == compiled_schedule.node_order));
 
-    for (ExecutionNodeType type : {ExecutionNodeType::ExpertGroup, ExecutionNodeType::SharedExpertGroup})
+    for (LayerKind type : {LayerKind::ExpertGroup, LayerKind::SharedExpertGroup})
     {
         for (uint32_t binding : {invalid_execution_layer_id, static_cast<uint32_t>(graph.layer_plans.size())})
         {
             ExecutionGraph invalid_graph = graph;
-            invalid_graph.nodes[3].type = type;
-            invalid_graph.nodes[3].layer_plan_index = binding;
+            invalid_graph.layers[3].kind = type;
+            invalid_graph.layers[3].plan_index = binding;
             ExecutionSchedule invalid_schedule;
             auto ret = schedule_graph(invalid_graph, invalid_schedule, ExecutionBackendCpu);
             check(!ret && ret.error().code == ErrorCode::InvalidModel);
@@ -12399,80 +12399,80 @@ void test_execution_graph_and_scheduler()
     ExecutionGraph branch_graph;
     for (ExecutionNodeId node_id = 0; node_id < 5; ++node_id)
     {
-        ExecutionNode node;
+        Layer node;
         node.id = node_id;
-        node.type = ExecutionNodeType::FinalNorm;
+        node.kind = LayerKind::FinalNorm;
         node.backend = ExecutionBackend::Cpu;
         node.backend_mask = ExecutionBackendCpu;
         node.name = "branch." + std::to_string(node_id);
-        node.weight_inputs = {node_id};
-        branch_graph.nodes.push_back(std::move(node));
+        node.weights = {node_id};
+        branch_graph.layers.push_back(std::move(node));
     }
-    branch_graph.nodes[0].dependencies = {3};
-    branch_graph.nodes[2].dependencies = {1};
-    branch_graph.nodes[4].dependencies = {0, 2};
+    branch_graph.layers[0].dependencies = {3};
+    branch_graph.layers[2].dependencies = {1};
+    branch_graph.layers[4].dependencies = {0, 2};
     ExecutionSchedule branch_schedule;
     auto branch_status = schedule_graph(branch_graph, branch_schedule, ExecutionBackendCpu);
     check(static_cast<bool>(branch_status));
     check(static_cast<bool>(branch_schedule.node_order == std::vector<ExecutionNodeId>{1, 3, 2, 0, 4}));
 
     ExecutionGraph duplicate_dependency_graph = branch_graph;
-    duplicate_dependency_graph.nodes.back().dependencies = {0, 2, 0};
+    duplicate_dependency_graph.layers.back().dependencies = {0, 2, 0};
     ExecutionSchedule duplicate_schedule;
     auto duplicate_schedule_status = schedule_graph(duplicate_dependency_graph, duplicate_schedule, ExecutionBackendCpu);
     check(!duplicate_schedule_status);
     check(duplicate_schedule_status.error().message == "execution graph contains a duplicate dependency");
 
     ExecutionGraph cpu_only_graph = graph;
-    cpu_only_graph.nodes.back().backend = ExecutionBackend::Vulkan;
-    cpu_only_graph.nodes.back().backend_mask |= ExecutionBackendVulkan;
+    cpu_only_graph.layers.back().backend = ExecutionBackend::Vulkan;
+    cpu_only_graph.layers.back().backend_mask |= ExecutionBackendVulkan;
     ExecutionSchedule cpu_only_schedule;
     auto cpu_only_status = schedule_graph(cpu_only_graph, cpu_only_schedule, ExecutionBackendCpu);
     check(static_cast<bool>(cpu_only_status));
-    check(static_cast<bool>(cpu_only_graph.nodes.back().backend == ExecutionBackend::Cpu));
-    check(static_cast<bool>(cpu_only_schedule.node_order.size() == cpu_only_graph.nodes.size()));
+    check(static_cast<bool>(cpu_only_graph.layers.back().backend == ExecutionBackend::Cpu));
+    check(static_cast<bool>(cpu_only_schedule.node_order.size() == cpu_only_graph.layers.size()));
 
     ExecutionGraph hybrid_graph = graph;
-    hybrid_graph.nodes.back().backend_mask |= ExecutionBackendVulkan;
+    hybrid_graph.layers.back().backend_mask |= ExecutionBackendVulkan;
     constexpr uint32_t scheduling_backends = ExecutionBackendCpu | ExecutionBackendVulkan;
     ExecutionSchedule hybrid_schedule;
     auto hybrid_status = schedule_graph(hybrid_graph, hybrid_schedule, scheduling_backends);
     check(static_cast<bool>(hybrid_status));
     check(static_cast<bool>(hybrid_schedule.validate(hybrid_graph)));
-    check(static_cast<bool>(hybrid_schedule.node_order.size() == hybrid_graph.nodes.size()));
-    check(static_cast<bool>(hybrid_graph.nodes.back().backend == ExecutionBackend::Vulkan));
+    check(static_cast<bool>(hybrid_schedule.node_order.size() == hybrid_graph.layers.size()));
+    check(static_cast<bool>(hybrid_graph.layers.back().backend == ExecutionBackend::Vulkan));
     for (size_t index = 0; index + 1 < hybrid_schedule.node_order.size(); ++index)
-        check(static_cast<bool>(hybrid_graph.nodes[hybrid_schedule.node_order[index]].backend == ExecutionBackend::Cpu));
-    check(static_cast<bool>(hybrid_graph.nodes[hybrid_schedule.node_order.back()].backend == ExecutionBackend::Vulkan));
+        check(static_cast<bool>(hybrid_graph.layers[hybrid_schedule.node_order[index]].backend == ExecutionBackend::Cpu));
+    check(static_cast<bool>(hybrid_graph.layers[hybrid_schedule.node_order.back()].backend == ExecutionBackend::Vulkan));
 
-    for (ExecutionNodeType type : {
-             ExecutionNodeType::Attention,
-             ExecutionNodeType::ExpertGroup,
-             ExecutionNodeType::SharedExpertGroup,
-             ExecutionNodeType::DenseFfn})
+    for (LayerKind type : {
+             LayerKind::Attention,
+             LayerKind::ExpertGroup,
+             LayerKind::SharedExpertGroup,
+             LayerKind::DenseFfn})
     {
         ExecutionGraph eligible_graph = graph;
-        ExecutionNode& eligible_node = eligible_graph.nodes[3];
-        eligible_node.type = type;
+        Layer& eligible_node = eligible_graph.layers[3];
+        eligible_node.kind = type;
         eligible_node.backend = ExecutionBackend::Cpu;
         eligible_node.backend_mask |= ExecutionBackendVulkan;
-        eligible_graph.nodes.front().backend = ExecutionBackend::Vulkan;
+        eligible_graph.layers.front().backend = ExecutionBackend::Vulkan;
 
         ExecutionSchedule eligible_schedule;
         auto cpu_status = schedule_graph(eligible_graph, eligible_schedule, ExecutionBackendCpu);
         check(static_cast<bool>(cpu_status));
         check(static_cast<bool>(eligible_node.backend == ExecutionBackend::Cpu));
-        for (const ExecutionNode& node : eligible_graph.nodes)
+        for (const Layer& node : eligible_graph.layers)
         {
             if (node.backend_mask == ExecutionBackendCpu)
                 check(static_cast<bool>(node.backend == ExecutionBackend::Cpu));
         }
 
-        eligible_graph.nodes.front().backend = ExecutionBackend::Vulkan;
+        eligible_graph.layers.front().backend = ExecutionBackend::Vulkan;
         auto hybrid_status = schedule_graph(eligible_graph, eligible_schedule, scheduling_backends);
         check(static_cast<bool>(hybrid_status));
         check(static_cast<bool>(eligible_node.backend == ExecutionBackend::Vulkan));
-        for (const ExecutionNode& node : eligible_graph.nodes)
+        for (const Layer& node : eligible_graph.layers)
         {
             if (node.backend_mask == ExecutionBackendCpu)
                 check(static_cast<bool>(node.backend == ExecutionBackend::Cpu));
@@ -12484,20 +12484,20 @@ void test_execution_graph_and_scheduler()
     }
 
     ExecutionGraph vulkan_only_graph;
-    ExecutionNode vulkan_dense_node;
+    Layer vulkan_dense_node;
     vulkan_dense_node.id = 0;
-    vulkan_dense_node.type = ExecutionNodeType::LmHead;
+    vulkan_dense_node.kind = LayerKind::LmHead;
     vulkan_dense_node.backend = ExecutionBackend::Cpu;
     vulkan_dense_node.backend_mask = scheduling_backends;
     vulkan_dense_node.name = "vulkan_only_lm_head";
-    vulkan_dense_node.weight_inputs = {0};
-    vulkan_only_graph.nodes.push_back(std::move(vulkan_dense_node));
+    vulkan_dense_node.weights = {0};
+    vulkan_only_graph.layers.push_back(std::move(vulkan_dense_node));
     ExecutionSchedule vulkan_only_schedule;
     auto vulkan_only_status = schedule_graph(vulkan_only_graph,
                                              vulkan_only_schedule,
                                              ExecutionBackendVulkan);
     check(static_cast<bool>(vulkan_only_status));
-    check(static_cast<bool>(vulkan_only_graph.nodes.front().backend == ExecutionBackend::Vulkan));
+    check(static_cast<bool>(vulkan_only_graph.layers.front().backend == ExecutionBackend::Vulkan));
 
     ExecutionSchedule no_backend_schedule;
     auto no_backend_status = schedule_graph(vulkan_only_graph, no_backend_schedule, 0);
@@ -12513,24 +12513,24 @@ void test_execution_graph_and_scheduler()
     check(static_cast<bool>(invalid_node_order_status.error().message == "execution schedule violates a node dependency"));
 
     ExecutionGraph invalid_backend_graph = hybrid_graph;
-    invalid_backend_graph.nodes.back().backend_mask = ExecutionBackendCpu;
+    invalid_backend_graph.layers.back().backend_mask = ExecutionBackendCpu;
     auto invalid_backend_status = hybrid_schedule.validate(invalid_backend_graph);
     check(!invalid_backend_status);
     check(static_cast<bool>(invalid_backend_status.error().code == ErrorCode::InvalidModel));
     check(static_cast<bool>(invalid_backend_status.error().message == "execution schedule node backend is not allowed by its backend mask"));
 
     ExecutionGraph invalid_dependency_graph = hybrid_graph;
-    invalid_dependency_graph.nodes.back().dependencies.push_back(invalid_execution_node_id);
+    invalid_dependency_graph.layers.back().dependencies.push_back(invalid_execution_node_id);
     ExecutionSchedule invalid_dependency_schedule;
     auto invalid_dependency_status = schedule_graph(invalid_dependency_graph, invalid_dependency_schedule, scheduling_backends);
     check(!invalid_dependency_status);
     check(static_cast<bool>(invalid_dependency_status.error().code == ErrorCode::InvalidModel));
     check(static_cast<bool>(invalid_dependency_status.error().message == "execution graph dependency is out of range"));
 
-    for (ExecutionNodeId invalid_id : {static_cast<ExecutionNodeId>(graph.nodes.size()), invalid_execution_node_id, ExecutionNodeId{0}})
+    for (ExecutionNodeId invalid_id : {static_cast<ExecutionNodeId>(graph.layers.size()), invalid_execution_node_id, ExecutionNodeId{0}})
     {
         ExecutionGraph invalid_graph = hybrid_graph;
-        invalid_graph.nodes.back().id = invalid_id;
+        invalid_graph.layers.back().id = invalid_id;
         ExecutionSchedule invalid_schedule;
         auto invalid_schedule_status = schedule_graph(invalid_graph, invalid_schedule, scheduling_backends);
         check(!invalid_schedule_status);
@@ -12539,32 +12539,32 @@ void test_execution_graph_and_scheduler()
     }
 
     ExecutionGraph unavailable_graph = hybrid_graph;
-    unavailable_graph.nodes.back().id = invalid_execution_node_id;
-    unavailable_graph.nodes.front().backend_mask = 0;
+    unavailable_graph.layers.back().id = invalid_execution_node_id;
+    unavailable_graph.layers.front().backend_mask = 0;
     ExecutionSchedule unavailable_schedule;
     auto unavailable_schedule_status = schedule_graph(unavailable_graph, unavailable_schedule, scheduling_backends);
     check(!unavailable_schedule_status);
     check(unavailable_schedule_status.error().code == ErrorCode::UnsupportedModel);
-    check(unavailable_schedule_status.error().message == "execution node has no available backend: " + graph.nodes.front().name);
+    check(unavailable_schedule_status.error().message == "execution node has no available backend: " + graph.layers.front().name);
 
     ExecutionGraph cyclic;
-    ExecutionNode cyclic_router;
+    Layer cyclic_router;
     cyclic_router.id = 0;
-    cyclic_router.type = ExecutionNodeType::Router;
+    cyclic_router.kind = LayerKind::Router;
     cyclic_router.backend = ExecutionBackend::Cpu;
     cyclic_router.backend_mask = ExecutionBackendCpu;
-    cyclic_router.layer_plan_index = 0;
+    cyclic_router.plan_index = 0;
     cyclic_router.name = "router";
     cyclic_router.dependencies = {1};
-    ExecutionNode cyclic_combine;
+    Layer cyclic_combine;
     cyclic_combine.id = 1;
-    cyclic_combine.type = ExecutionNodeType::Combine;
+    cyclic_combine.kind = LayerKind::Combine;
     cyclic_combine.backend = ExecutionBackend::Cpu;
     cyclic_combine.backend_mask = ExecutionBackendCpu;
-    cyclic_combine.layer_plan_index = 0;
+    cyclic_combine.plan_index = 0;
     cyclic_combine.name = "combine";
     cyclic_combine.dependencies = {0};
-    cyclic.nodes = {
+    cyclic.layers = {
         std::move(cyclic_router),
         std::move(cyclic_combine),
     };
@@ -15328,19 +15328,18 @@ void test_latent_attention_scratch_reuse()
     dspark_model.speculative.main_projection_weight = dspark_plan.key_value_weight;
     dspark_model.speculative.main_norm_weight = dspark_plan.key_value_norm_weight;
     dspark_model.speculative.graph.layer_plans.resize(2);
-    dspark_model.speculative.graph.nodes.resize(2);
+    dspark_model.speculative.graph.layers.resize(2);
     dspark_model.speculative.layer_nodes.resize(2);
     for (size_t layer = 0; layer < 2; ++layer)
     {
         dspark_model.speculative.graph.layer_plans[layer].attention = dspark_plan;
-        ExecutionNode& node = dspark_model.speculative.graph.nodes[layer];
+        Layer& node = dspark_model.speculative.graph.layers[layer];
         node.id = static_cast<ExecutionNodeId>(layer);
-        node.type = ExecutionNodeType::Attention;
+        node.kind = LayerKind::Attention;
         node.backend = ExecutionBackend::Cpu;
-        node.layer_plan_index = static_cast<uint32_t>(layer);
+        node.plan_index = static_cast<uint32_t>(layer);
         dspark_model.speculative.layer_nodes[layer].attention = static_cast<ExecutionNodeId>(layer);
     }
-    refresh_layers(dspark_model.speculative.graph);
     SessionState reused_speculative_state;
     SessionState reference_speculative_state;
     SessionStatistics reused_speculative_statistics;
@@ -16659,10 +16658,10 @@ void test_qwen4_exp_vulkan_projections()
         const AttentionBlockPlan& selected_plan = hybrid_model.graph.layer_plans[3].attention;
         check(has_flag(selected_plan.flags, AttentionBlockExternalResidual));
         check(!support_vulkan_attention(hybrid_model.operators, selected_plan));
-        const auto attention_node = std::find_if(hybrid_model.graph.nodes.begin(), hybrid_model.graph.nodes.end(), [](const ExecutionNode& node) {
-            return node.type == ExecutionNodeType::Attention && node.layer_plan_index == 3;
+        const auto attention_node = std::find_if(hybrid_model.graph.layers.begin(), hybrid_model.graph.layers.end(), [](const Layer& node) {
+            return node.kind == LayerKind::Attention && node.plan_index == 3;
         });
-        if (attention_node == hybrid_model.graph.nodes.end() || attention_node->backend != ExecutionBackend::Cpu)
+        if (attention_node == hybrid_model.graph.layers.end() || attention_node->backend != ExecutionBackend::Cpu)
             throw std::runtime_error("projection-only Qwen Attention must have explicit CPU placement (QSA="
                                      + std::to_string(qsa_attention) + ", flags=" + std::to_string(selected_plan.flags) + ")");
         const VulkanStatistics before = get_vulkan_statistics(hybrid_model.vulkan_runtime);
@@ -16876,8 +16875,8 @@ void test_gated_delta_vulkan_budget_admission()
             }
             check(gated_delta_layers == 3 && qsa_layers == 1);
             uint32_t gpu_expert_nodes = 0;
-            for (const ExecutionNode& node : model.graph.nodes)
-                if (node.type == ExecutionNodeType::ExpertGroup && node.backend == ExecutionBackend::Vulkan)
+            for (const Layer& node : model.graph.layers)
+                if (node.kind == LayerKind::ExpertGroup && node.backend == ExecutionBackend::Vulkan)
                     ++gpu_expert_nodes;
             check(gpu_expert_nodes == full_descriptor.layers.size());
         }
@@ -16954,10 +16953,10 @@ void test_gated_delta_vulkan_budget_admission()
             admitted_layers += admitted;
             check((attention.fused_delta_input_operator != invalid_compiled_operator_handle) == admitted);
             check(static_cast<bool>(model.operators.at_weight(attention.output_weight).bfloat16) == admitted);
-            const auto node = std::find_if(model.graph.nodes.begin(), model.graph.nodes.end(), [&](const ExecutionNode& candidate) {
-                return candidate.type == ExecutionNodeType::Attention && candidate.layer_plan_index == layer.layer_id;
+            const auto node = std::find_if(model.graph.layers.begin(), model.graph.layers.end(), [&](const Layer& candidate) {
+                return candidate.kind == LayerKind::Attention && candidate.plan_index == layer.layer_id;
             });
-            check(node != model.graph.nodes.end());
+            check(node != model.graph.layers.end());
             check((node->backend == ExecutionBackend::Vulkan) == admitted);
             for (const ExpertPlan& expert : layer.moe.experts)
                 check(static_cast<bool>(model.weights.at(expert.gate_up_weight).mxfp4_file_storage));
@@ -16971,8 +16970,8 @@ void test_gated_delta_vulkan_budget_admission()
             check(resources.expert_cache_reserve >= test_case.cache_reserve);
         }
         uint32_t gpu_expert_nodes = 0;
-        for (const ExecutionNode& node : model.graph.nodes)
-            if (node.type == ExecutionNodeType::ExpertGroup && node.backend == ExecutionBackend::Vulkan)
+        for (const Layer& node : model.graph.layers)
+            if (node.kind == LayerKind::ExpertGroup && node.backend == ExecutionBackend::Vulkan)
                 ++gpu_expert_nodes;
         check(gpu_expert_nodes == (test_case.gpu_experts ? descriptor.layers.size() : 0));
 
@@ -19932,17 +19931,16 @@ void test_batch_workspace_reuse()
         if (force_cpu_prefetch)
         {
             bool found_expert_group = false;
-            for (ExecutionNode& node : execution_model.graph.nodes)
+            for (Layer& node : execution_model.graph.layers)
             {
-                if (node.type != ExecutionNodeType::ExpertGroup)
+                if (node.kind != LayerKind::ExpertGroup)
                     continue;
                 check(node.backend == ExecutionBackend::Cpu);
-                node.flags |= ExecutionNodeCpuPrefetch;
+                node.flags |= LayerCpuPrefetch;
                 found_expert_group = true;
             }
             check(found_expert_group);
         }
-        refresh_layers(execution_model.graph);
         std::array<SessionState, 3> states;
         std::array<SessionState, 3> references;
         std::array<SessionStatistics, 3> statistics;
@@ -19989,7 +19987,7 @@ void test_batch_workspace_reuse()
             }
             check_released();
         }
-        check(execution_model.graph.nodes[execution_model.schedule.node_order.back()].type == ExecutionNodeType::LmHead);
+        check(execution_model.graph.layers[execution_model.schedule.node_order.back()].kind == LayerKind::LmHead);
         execution_model.schedule.node_order.pop_back();
         auto missing_logits = forward_decode_batch(execution_model, entries, workspace);
         check(!missing_logits);

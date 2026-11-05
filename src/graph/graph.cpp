@@ -16,7 +16,7 @@ namespace moe {
 static Result<void> validate_graph(const ExecutionGraph& graph, std::vector<ExecutionNodeId>& node_order)
 {
     const std::vector<ExecutionTensor>& tensors = graph.tensors;
-    const std::vector<ExecutionNode>& nodes = graph.nodes;
+    const std::vector<Layer>& nodes = graph.layers;
     const std::vector<CompiledLayerPlan>& layer_plans = graph.layer_plans;
     if (nodes.empty())
         return Error{ErrorCode::InvalidModel, "execution graph cannot be empty"};
@@ -51,7 +51,7 @@ static Result<void> validate_graph(const ExecutionGraph& graph, std::vector<Exec
                                                 0);
     for (size_t node_index = 0; node_index < nodes.size(); ++node_index)
     {
-        const ExecutionNode& node = nodes[node_index];
+        const Layer& node = nodes[node_index];
         if (node.id != node_index)
         {
             return Error{ErrorCode::InvalidModel, "execution graph node ids must be contiguous and index-aligned"};
@@ -63,8 +63,8 @@ static Result<void> validate_graph(const ExecutionGraph& graph, std::vector<Exec
         {
             return Error{ErrorCode::InvalidModel, "execution node selected backend is not allowed by its backend mask"};
         }
-        if (has_flag(node.flags, ExecutionNodeRequestExperts)
-            && node.type != ExecutionNodeType::ExpertDispatch)
+        if (has_flag(node.flags, LayerRequestExperts)
+            && node.kind != LayerKind::ExpertDispatch)
         {
             return Error{ErrorCode::InvalidModel, "exact Expert reads must be scheduled by ExpertDispatch"};
         }
@@ -105,42 +105,42 @@ static Result<void> validate_graph(const ExecutionGraph& graph, std::vector<Exec
                 return Error{ErrorCode::InvalidModel, "execution output tensor does not list its producer"};
             }
         }
-        const bool layer_bound = node.type == ExecutionNodeType::Attention
-                                 || node.type == ExecutionNodeType::DenseFfn
-                                 || node.type == ExecutionNodeType::Router
-                                 || node.type == ExecutionNodeType::ExpertDispatch
-                                 || node.type == ExecutionNodeType::ExpertGroup
-                                 || node.type == ExecutionNodeType::SharedExpertGroup
-                                 || node.type == ExecutionNodeType::Combine;
+        const bool layer_bound = node.kind == LayerKind::Attention
+                                 || node.kind == LayerKind::DenseFfn
+                                 || node.kind == LayerKind::Router
+                                 || node.kind == LayerKind::ExpertDispatch
+                                 || node.kind == LayerKind::ExpertGroup
+                                 || node.kind == LayerKind::SharedExpertGroup
+                                 || node.kind == LayerKind::Combine;
         if (layer_bound
-                ? node.layer_plan_index == invalid_execution_layer_id
-                : node.layer_plan_index != invalid_execution_layer_id)
+                ? node.plan_index == invalid_execution_layer_id
+                : node.plan_index != invalid_execution_layer_id)
         {
             return Error{ErrorCode::InvalidModel, "execution graph node has an invalid layer plan binding"};
         }
-        if (node.layer_plan_index != invalid_execution_layer_id
-            && node.layer_plan_index >= layer_plans.size())
+        if (node.plan_index != invalid_execution_layer_id
+            && node.plan_index >= layer_plans.size())
         {
             return Error{ErrorCode::InvalidModel, "execution graph node layer plan is out of range"};
         }
-        if (node.layer_plan_index != invalid_execution_layer_id)
-            referenced_layer_plans[node.layer_plan_index] = 1;
-        const bool weight_bound = node.type == ExecutionNodeType::TokenEmbedding
-                                  || node.type == ExecutionNodeType::FinalNorm
-                                  || node.type == ExecutionNodeType::LmHead;
-        if (weight_bound && node.weight_inputs.empty())
+        if (node.plan_index != invalid_execution_layer_id)
+            referenced_layer_plans[node.plan_index] = 1;
+        const bool weight_bound = node.kind == LayerKind::TokenEmbedding
+                                  || node.kind == LayerKind::FinalNorm
+                                  || node.kind == LayerKind::LmHead;
+        if (weight_bound && node.weights.empty())
         {
             return Error{
                 ErrorCode::InvalidModel,
                 "execution graph weight-bound node has no weight inputs"};
         }
-        if (!weight_bound && !node.weight_inputs.empty())
+        if (!weight_bound && !node.weights.empty())
         {
             return Error{
                 ErrorCode::InvalidModel,
                 "execution graph layer node cannot own weight inputs"};
         }
-        for (TensorHandle weight : node.weight_inputs)
+        for (TensorHandle weight : node.weights)
         {
             if (weight == invalid_tensor_handle)
             {
@@ -186,45 +186,45 @@ static Result<void> validate_graph(const ExecutionGraph& graph, std::vector<Exec
 
 Result<void> ExecutionSchedule::validate(const ExecutionGraph& graph) const
 {
-    if (graph.nodes.empty())
+    if (graph.layers.empty())
         return Error{ErrorCode::InvalidModel, "execution schedule cannot reference an empty graph"};
-    if (node_order.size() != graph.nodes.size())
+    if (node_order.size() != graph.layers.size())
         return Error{ErrorCode::InvalidModel, "execution schedule node order is incomplete"};
 
-    std::vector<uint32_t> positions(graph.nodes.size(), invalid_execution_layer_id);
+    std::vector<uint32_t> positions(graph.layers.size(), invalid_execution_layer_id);
     uint32_t active_ffn = invalid_execution_layer_id;
     for (size_t order_index = 0; order_index < node_order.size(); ++order_index)
     {
         const ExecutionNodeId node_id = node_order[order_index];
-        if (node_id >= graph.nodes.size())
+        if (node_id >= graph.layers.size())
             return Error{ErrorCode::InvalidModel, "execution schedule node order is out of range"};
         if (positions[node_id] != invalid_execution_layer_id)
             return Error{ErrorCode::InvalidModel, "execution schedule contains a duplicate node"};
         positions[node_id] = static_cast<uint32_t>(order_index);
         // Execution reuses one FFN workspace from Router through Combine.
-        const ExecutionNode& node = graph.nodes[node_id];
+        const Layer& node = graph.layers[node_id];
         const uint32_t selected_backend = node.backend == ExecutionBackend::Cpu ? ExecutionBackendCpu : ExecutionBackendVulkan;
         if (!has_flag(node.backend_mask, selected_backend))
         {
             return Error{ErrorCode::InvalidModel, "execution schedule node backend is not allowed by its backend mask"};
         }
-        if (active_ffn != invalid_execution_layer_id && node.layer_plan_index != active_ffn)
+        if (active_ffn != invalid_execution_layer_id && node.plan_index != active_ffn)
             return Error{ErrorCode::InvalidModel, "execution schedule overlaps an unfinished FFN layer"};
-        if (node.type == ExecutionNodeType::Router)
+        if (node.kind == LayerKind::Router)
         {
             if (active_ffn != invalid_execution_layer_id)
                 return Error{ErrorCode::InvalidModel, "execution schedule restarts an unfinished FFN layer"};
-            active_ffn = node.layer_plan_index;
+            active_ffn = node.plan_index;
         }
-        else if (node.type == ExecutionNodeType::Combine)
+        else if (node.kind == LayerKind::Combine)
         {
             if (active_ffn == invalid_execution_layer_id)
                 return Error{ErrorCode::InvalidModel, "execution schedule combines without an FFN layer"};
             active_ffn = invalid_execution_layer_id;
         }
-        for (ExecutionNodeId dependency : graph.nodes[node_id].dependencies)
+        for (ExecutionNodeId dependency : graph.layers[node_id].dependencies)
         {
-            if (dependency >= graph.nodes.size()
+            if (dependency >= graph.layers.size()
                 || positions[dependency] == invalid_execution_layer_id
                 || positions[dependency] >= order_index)
             {
@@ -245,7 +245,7 @@ Result<void> schedule_graph(ExecutionGraph& graph, ExecutionSchedule& schedule, 
     if (available_backends == 0)
         return Error{ErrorCode::InvalidArgument, "runtime scheduler requires at least one backend"};
 
-    for (ExecutionNode& node : graph.nodes)
+    for (Layer& node : graph.layers)
     {
         const uint32_t usable = node.backend_mask & available_backends;
         if (usable == 0)
@@ -265,25 +265,7 @@ Result<void> schedule_graph(ExecutionGraph& graph, ExecutionSchedule& schedule, 
     ret = schedule.validate(graph);
     if (!ret)
         return ret.error();
-    refresh_layers(graph);
     return {};
-}
-
-void refresh_layers(ExecutionGraph& graph)
-{
-    graph.layers.resize(graph.nodes.size());
-    for (size_t index = 0; index < graph.nodes.size(); ++index)
-    {
-        const ExecutionNode& node = graph.nodes[index];
-        Layer& layer = graph.layers[index];
-        layer.id = node.id;
-        layer.kind = node.type;
-        layer.backend = node.backend;
-        layer.backend_mask = node.backend_mask;
-        layer.flags = node.flags;
-        layer.plan_index = node.layer_plan_index;
-        layer.weights = node.weight_inputs;
-    }
 }
 
 static ExecutionTensorId add_tensor(ExecutionGraph& graph, std::string name, DType dtype, std::vector<uint32_t> shape)
@@ -297,16 +279,16 @@ static ExecutionTensorId add_tensor(ExecutionGraph& graph, std::string name, DTy
     return id;
 }
 
-static ExecutionNodeId add_node(ExecutionGraph& graph, ExecutionNodeType type, ExecutionBackend backend, uint32_t backend_mask, std::string name, std::vector<ExecutionNodeId> dependencies, std::vector<ExecutionTensorId> inputs,
-                                std::vector<ExecutionTensorId> outputs, uint32_t layer_plan_index, uint32_t flags)
+static ExecutionNodeId add_node(ExecutionGraph& graph, LayerKind type, ExecutionBackend backend, uint32_t backend_mask, std::string name, std::vector<ExecutionNodeId> dependencies, std::vector<ExecutionTensorId> inputs,
+                                std::vector<ExecutionTensorId> outputs, uint32_t plan_index, uint32_t flags)
 {
-    const ExecutionNodeId node_id = static_cast<ExecutionNodeId>(graph.nodes.size());
-    ExecutionNode& node = graph.nodes.emplace_back();
+    const ExecutionNodeId node_id = static_cast<ExecutionNodeId>(graph.layers.size());
+    Layer& node = graph.layers.emplace_back();
     node.id = node_id;
-    node.type = type;
+    node.kind = type;
     node.backend = backend;
     node.backend_mask = backend_mask;
-    node.layer_plan_index = layer_plan_index;
+    node.plan_index = plan_index;
     node.flags = flags;
     node.name = std::move(name);
     node.dependencies = std::move(dependencies);
@@ -347,7 +329,7 @@ static ExecutionNodeId add_moe_nodes(ExecutionGraph& graph,
                                                        DType::Float32,
                                                        {0, static_cast<uint32_t>(layer.moe.experts.size())});
     const ExecutionNodeId router = add_node(graph,
-                                            ExecutionNodeType::Router,
+                                            LayerKind::Router,
                                             resident ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu,
                                             resident ? ExecutionBackendVulkan : ExecutionBackendCpu,
                                             prefix + "router",
@@ -361,7 +343,7 @@ static ExecutionNodeId add_moe_nodes(ExecutionGraph& graph,
                                                      DType::Int32,
                                                      {0, 3});
     const ExecutionNodeId dispatch = add_node(graph,
-                                              ExecutionNodeType::ExpertDispatch,
+                                              LayerKind::ExpertDispatch,
                                               ExecutionBackend::Cpu,
                                               ExecutionBackendCpu,
                                               prefix + "expert_dispatch",
@@ -378,14 +360,14 @@ static ExecutionNodeId add_moe_nodes(ExecutionGraph& graph,
     const ExecutionBackend expert_backend = can_use_vulkan_experts ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
     const uint32_t expert_backend_mask = can_use_vulkan_experts ? ExecutionBackendCpu | ExecutionBackendVulkan : ExecutionBackendCpu;
     const uint32_t expert_flags = compiled.opt.hybrid_mode == HybridMode::HybridExperts
-                                      ? ExecutionNodeCpuPrefetch
+                                      ? LayerCpuPrefetch
                                       : 0u;
     const ExecutionTensorId expert_output = add_tensor(graph,
                                                        prefix + "experts.output",
                                                        compiled.descriptor.activation_dtype,
                                                        {0, compiled.descriptor.hidden_size});
     const ExecutionNodeId expert_group = add_node(graph,
-                                                  ExecutionNodeType::ExpertGroup,
+                                                  LayerKind::ExpertGroup,
                                                   expert_backend,
                                                   expert_backend_mask,
                                                   prefix + "experts",
@@ -413,7 +395,7 @@ static ExecutionNodeId add_moe_nodes(ExecutionGraph& graph,
                                                            compiled.descriptor.activation_dtype,
                                                            {0, compiled.descriptor.hidden_size});
         const ExecutionNodeId shared_node = add_node(graph,
-                                                     ExecutionNodeType::SharedExpertGroup,
+                                                     LayerKind::SharedExpertGroup,
                                                      shared_backend,
                                                      shared_backend_mask,
                                                      prefix + "shared_experts",
@@ -424,14 +406,14 @@ static ExecutionNodeId add_moe_nodes(ExecutionGraph& graph,
                                                      0);
         if (shared_before_routed)
         {
-            graph.nodes[dispatch].flags |= ExecutionNodeRequestExperts;
-            graph.nodes[expert_group].dependencies = {shared_node};
+            graph.layers[dispatch].flags |= LayerRequestExperts;
+            graph.layers[expert_group].dependencies = {shared_node};
         }
         combine_dependencies.push_back(shared_node);
         combine_inputs.push_back(shared_output);
     }
     const ExecutionNodeId combine = add_node(graph,
-                                             ExecutionNodeType::Combine,
+                                             LayerKind::Combine,
                                              resident ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu,
                                              resident ? ExecutionBackendVulkan : ExecutionBackendCpu,
                                              prefix + "combine",
@@ -451,7 +433,7 @@ static Result<void> build_speculative_graph(CompiledModel& compiled,
         return {};
 
     ExecutionGraph& graph = compiled.speculative.graph;
-    graph.nodes.clear();
+    graph.layers.clear();
     graph.tensors.clear();
     ExecutionSchedule& schedule = compiled.speculative.schedule;
     ExecutionTensorId hidden = add_tensor(graph,
@@ -459,7 +441,7 @@ static Result<void> build_speculative_graph(CompiledModel& compiled,
                                           compiled.descriptor.activation_dtype,
                                           {0, compiled.descriptor.hidden_size});
     ExecutionNodeId previous = add_node(graph,
-                                        ExecutionNodeType::TokenEmbedding,
+                                        LayerKind::TokenEmbedding,
                                         ExecutionBackend::Cpu,
                                         ExecutionBackendCpu,
                                         "speculative.input",
@@ -468,7 +450,7 @@ static Result<void> build_speculative_graph(CompiledModel& compiled,
                                         {hidden},
                                         invalid_execution_layer_id,
                                         0);
-    graph.nodes[previous].weight_inputs = {compiled.token_embedding};
+    graph.layers[previous].weights = {compiled.token_embedding};
 
     for (size_t plan_index = 0; plan_index < graph.layer_plans.size(); ++plan_index)
     {
@@ -502,7 +484,7 @@ static Result<void> build_speculative_graph(CompiledModel& compiled,
                                                                   compiled.descriptor.activation_dtype,
                                                                   {0, compiled.descriptor.hidden_size});
             previous = add_node(graph,
-                                ExecutionNodeType::Attention,
+                                LayerKind::Attention,
                                 backend,
                                 backend_mask,
                                 prefix + "attention",
@@ -530,41 +512,41 @@ static Result<void> build_speculative_graph(CompiledModel& compiled,
     layer_nodes.resize(graph.layer_plans.size());
     for (ExecutionNodeId node_id : schedule.node_order)
     {
-        if (node_id >= graph.nodes.size())
+        if (node_id >= graph.layers.size())
         {
             return Error{
                 ErrorCode::InternalError,
                 "speculative schedule references an invalid node"};
         }
-        const ExecutionNode& node = graph.nodes[node_id];
-        if (node.layer_plan_index == invalid_execution_layer_id)
+        const Layer& node = graph.layers[node_id];
+        if (node.plan_index == invalid_execution_layer_id)
             continue;
-        if (node.layer_plan_index >= layer_nodes.size())
+        if (node.plan_index >= layer_nodes.size())
         {
             return Error{
                 ErrorCode::InternalError,
                 "speculative node layer binding is out of range"};
         }
-        SpeculativeModelPlan::LayerNodes& layer = layer_nodes[node.layer_plan_index];
+        SpeculativeModelPlan::LayerNodes& layer = layer_nodes[node.plan_index];
         ExecutionNodeId* target = nullptr;
-        switch (node.type)
+        switch (node.kind)
         {
-        case ExecutionNodeType::Attention:
+        case LayerKind::Attention:
             target = &layer.attention;
             break;
-        case ExecutionNodeType::Router:
+        case LayerKind::Router:
             target = &layer.router;
             break;
-        case ExecutionNodeType::ExpertDispatch:
+        case LayerKind::ExpertDispatch:
             target = &layer.expert_dispatch;
             break;
-        case ExecutionNodeType::ExpertGroup:
+        case LayerKind::ExpertGroup:
             target = &layer.expert_group;
             break;
-        case ExecutionNodeType::SharedExpertGroup:
+        case LayerKind::SharedExpertGroup:
             target = &layer.shared_expert_group;
             break;
-        case ExecutionNodeType::Combine:
+        case LayerKind::Combine:
             target = &layer.combine;
             break;
         default:
@@ -599,12 +581,12 @@ static Result<void> build_speculative_graph(CompiledModel& compiled,
 Result<void> build_graph(CompiledModel& compiled, bool use_vulkan_experts)
 {
     ExecutionGraph& graph = compiled.graph;
-    graph.nodes.clear();
+    graph.layers.clear();
     graph.tensors.clear();
     ExecutionSchedule& schedule = compiled.schedule;
     ExecutionTensorId hidden = add_tensor(graph, "embedding.hidden", compiled.descriptor.activation_dtype, {0, compiled.descriptor.hidden_size});
-    ExecutionNodeId previous = add_node(graph, ExecutionNodeType::TokenEmbedding, ExecutionBackend::Cpu, ExecutionBackendCpu, "token_embedding", {}, {}, {hidden}, invalid_execution_layer_id, 0);
-    graph.nodes[previous].weight_inputs = {compiled.token_embedding};
+    ExecutionNodeId previous = add_node(graph, LayerKind::TokenEmbedding, ExecutionBackend::Cpu, ExecutionBackendCpu, "token_embedding", {}, {}, {hidden}, invalid_execution_layer_id, 0);
+    graph.layers[previous].weights = {compiled.token_embedding};
 
     for (size_t plan_index = 0; plan_index < graph.layer_plans.size(); ++plan_index)
     {
@@ -635,7 +617,7 @@ Result<void> build_graph(CompiledModel& compiled, bool use_vulkan_experts)
                                                        gated_delta_attention ? DType::Float32 : compiled.descriptor.kv_cache_dtype,
                                                        std::move(cache_shape));
             const ExecutionTensorId attention_output = add_tensor(graph, prefix + "attention.hidden", compiled.descriptor.activation_dtype, {0, compiled.descriptor.hidden_size});
-            previous = add_node(graph, ExecutionNodeType::Attention, backend, backend == ExecutionBackend::Vulkan ? ExecutionBackendVulkan : ExecutionBackendCpu, prefix + "attention",
+            previous = add_node(graph, LayerKind::Attention, backend, backend == ExecutionBackend::Vulkan ? ExecutionBackendVulkan : ExecutionBackendCpu, prefix + "attention",
                                 {previous}, {hidden}, {attention_output, cache},
                                 static_cast<uint32_t>(plan_index), 0);
             hidden = attention_output;
@@ -648,7 +630,7 @@ Result<void> build_graph(CompiledModel& compiled, bool use_vulkan_experts)
                                     || support_vulkan_dense_ffn(compiled.operators, layer.dense_ffn));
             const ExecutionTensorId output = add_tensor(graph, prefix + "ffn.hidden", compiled.descriptor.activation_dtype,
                                                         {0, compiled.descriptor.hidden_size});
-            previous = add_node(graph, ExecutionNodeType::DenseFfn, vulkan ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu,
+            previous = add_node(graph, LayerKind::DenseFfn, vulkan ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu,
                                 vulkan ? ExecutionBackendCpu | ExecutionBackendVulkan : ExecutionBackendCpu,
                                 prefix + "ffn", {previous}, {hidden}, {output},
                                 static_cast<uint32_t>(plan_index), 0);
@@ -662,14 +644,14 @@ Result<void> build_graph(CompiledModel& compiled, bool use_vulkan_experts)
     }
 
     const ExecutionTensorId normalized = add_tensor(graph, "final_norm.hidden", compiled.descriptor.activation_dtype, {0, compiled.descriptor.hidden_size});
-    previous = add_node(graph, ExecutionNodeType::FinalNorm, compiled.gpu_head ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu,
+    previous = add_node(graph, LayerKind::FinalNorm, compiled.gpu_head ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu,
                         compiled.gpu_head ? ExecutionBackendVulkan : ExecutionBackendCpu, "final_norm",
                         {previous}, {hidden}, {normalized},
                         invalid_execution_layer_id, 0);
-    graph.nodes[previous].weight_inputs = compiled.final_norm_weight == invalid_tensor_handle
-                                              ? std::vector<TensorHandle>{compiled.lm_head_weight}
-                                              : std::vector<TensorHandle>{compiled.final_norm_weight,
-                                                                          compiled.lm_head_weight};
+    graph.layers[previous].weights = compiled.final_norm_weight == invalid_tensor_handle
+                                         ? std::vector<TensorHandle>{compiled.lm_head_weight}
+                                         : std::vector<TensorHandle>{compiled.final_norm_weight,
+                                                                     compiled.lm_head_weight};
 
     const CompiledOperator& lm_head_operator = compiled.operators.at_weight(compiled.lm_head_weight);
     const bool vulkan_lm_head = compiled.opt.hybrid_mode != HybridMode::CpuOnly
@@ -677,13 +659,13 @@ Result<void> build_graph(CompiledModel& compiled, bool use_vulkan_experts)
                                     || lm_head_operator.float8 || lm_head_operator.qnk);
     const ExecutionBackend lm_head_backend = vulkan_lm_head ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu;
     const ExecutionTensorId logits = add_tensor(graph, "logits", DType::Float32, {0, compiled.descriptor.vocabulary_size});
-    const ExecutionNodeId lm_head_node = add_node(graph, ExecutionNodeType::LmHead, lm_head_backend, lm_head_backend == ExecutionBackend::Vulkan ? ExecutionBackendVulkan : ExecutionBackendCpu, "lm_head",
+    const ExecutionNodeId lm_head_node = add_node(graph, LayerKind::LmHead, lm_head_backend, lm_head_backend == ExecutionBackend::Vulkan ? ExecutionBackendVulkan : ExecutionBackendCpu, "lm_head",
                                                   {previous}, {normalized}, {logits},
                                                   invalid_execution_layer_id, 0);
-    graph.nodes[lm_head_node].weight_inputs = compiled.final_norm_weight == invalid_tensor_handle
-                                                  ? std::vector<TensorHandle>{compiled.lm_head_weight}
-                                                  : std::vector<TensorHandle>{compiled.lm_head_weight,
-                                                                              compiled.final_norm_weight};
+    graph.layers[lm_head_node].weights = compiled.final_norm_weight == invalid_tensor_handle
+                                             ? std::vector<TensorHandle>{compiled.lm_head_weight}
+                                             : std::vector<TensorHandle>{compiled.lm_head_weight,
+                                                                         compiled.final_norm_weight};
 
     uint32_t available_backends = ExecutionBackendCpu;
     if (compiled.opt.hybrid_mode != HybridMode::CpuOnly)

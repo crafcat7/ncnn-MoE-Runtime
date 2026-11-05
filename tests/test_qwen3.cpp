@@ -349,11 +349,11 @@ static void test_fixture(const std::filesystem::path& root, bool tied)
     auto status = compile_model(desc, mapping.value(), compiled, HybridMode::CpuOnly, opt);
     check(static_cast<bool>(status), status ? "" : status.error().message);
     size_t dense_count = 0;
-    for (const auto& node : compiled.graph.nodes)
+    for (const auto& node : compiled.graph.layers)
     {
-        dense_count += node.type == ExecutionNodeType::DenseFfn;
-        check(node.type != ExecutionNodeType::Router && node.type != ExecutionNodeType::ExpertDispatch
-                  && node.type != ExecutionNodeType::ExpertGroup && node.type != ExecutionNodeType::Combine,
+        dense_count += node.kind == LayerKind::DenseFfn;
+        check(node.kind != LayerKind::Router && node.kind != LayerKind::ExpertDispatch
+                  && node.kind != LayerKind::ExpertGroup && node.kind != LayerKind::Combine,
               "Qwen3 compiled a MoE graph node");
     }
     check(dense_count == 2, "Qwen3 did not compile one dense FFN per layer");

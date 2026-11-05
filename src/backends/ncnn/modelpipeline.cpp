@@ -2646,10 +2646,10 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
 }
 
 static uint32_t graph_node_device(const CompiledModel& model, const ExecutionGraph& graph,
-                                  const ExecutionNode& node)
+                                  const Layer& node)
 {
-    return node.layer_plan_index < graph.layer_plans.size()
-               ? graph.layer_plans[node.layer_plan_index].vulkan_device_index
+    return node.plan_index < graph.layer_plans.size()
+               ? graph.layer_plans[node.plan_index].vulkan_device_index
                : model.opt.vulkan_device_index;
 }
 
@@ -2667,28 +2667,28 @@ static bool graph_has_expert_banks(const CompiledModel& model, const ExecutionGr
 static uint64_t graph_tensor_elements(const CompiledModel& model, const ExecutionGraph& graph,
                                       const ExecutionTensor& tensor, uint32_t rows, uint32_t logits_rows)
 {
-    if (tensor.producer >= graph.nodes.size()) return UINT64_MAX;
-    const ExecutionNode& producer = graph.nodes[tensor.producer];
+    if (tensor.producer >= graph.layers.size()) return UINT64_MAX;
+    const Layer& producer = graph.layers[tensor.producer];
     // Full-bank recording folds routed aggregation and the following Combine
     // into one output. The ExpertGroup tensor is not materialized there.
-    if (producer.type == ExecutionNodeType::ExpertGroup && graph_has_expert_banks(model, graph)) return 0;
+    if (producer.kind == LayerKind::ExpertGroup && graph_has_expert_banks(model, graph)) return 0;
     // The cache output documents the state dependency; the cache has a
     // Session lifetime and is not an activation in the reusable graph arena.
-    if (producer.type == ExecutionNodeType::Attention && producer.outputs.size() > 1
+    if (producer.kind == LayerKind::Attention && producer.outputs.size() > 1
         && producer.outputs[1] == tensor.id) return 0;
     uint64_t elements = 1;
     for (size_t dimension = 0; dimension < tensor.shape.size(); ++dimension)
     {
         const uint64_t extent = dimension == 0 && tensor.shape[dimension] == 0
-                                    ? (producer.type == ExecutionNodeType::LmHead ? logits_rows : rows)
+                                    ? (producer.kind == LayerKind::LmHead ? logits_rows : rows)
                                     : tensor.shape[dimension];
         elements = saturating_multiply_u64(elements, extent);
     }
-    if (producer.type == ExecutionNodeType::ExpertGroup && producer.layer_plan_index < graph.layer_plans.size())
-        elements = saturating_multiply_u64(elements, graph.layer_plans[producer.layer_plan_index].moe.top_k);
+    if (producer.kind == LayerKind::ExpertGroup && producer.plan_index < graph.layer_plans.size())
+        elements = saturating_multiply_u64(elements, graph.layer_plans[producer.plan_index].moe.top_k);
     if (model.descriptor.hyper_connection_kind != HyperConnectionKind::None
-        && (producer.type == ExecutionNodeType::TokenEmbedding || producer.type == ExecutionNodeType::Attention
-            || producer.type == ExecutionNodeType::Combine || producer.type == ExecutionNodeType::DenseFfn))
+        && (producer.kind == LayerKind::TokenEmbedding || producer.kind == LayerKind::Attention
+            || producer.kind == LayerKind::Combine || producer.kind == LayerKind::DenseFfn))
         elements = saturating_multiply_u64(elements, model.descriptor.hyper_connection_multiplier);
     return elements;
 }
@@ -2728,7 +2728,7 @@ uint32_t resident_chunk_layers(const CompiledModel& model, uint32_t rows) noexce
 // These are their private intermediates only: graph inputs, graph outputs,
 // persistent weights/state and host-visible transfer-slot storage are omitted.
 static Result<void> append_graph_node_scratch(const CompiledModel& model, const ExecutionGraph& graph,
-                                              const ExecutionNode& node, uint32_t rows, uint32_t context_tokens,
+                                              const Layer& node, uint32_t rows, uint32_t context_tokens,
                                               uint32_t sequence_count,
                                               uint64_t alignment, uint32_t first, uint32_t last,
                                               std::vector<GraphMemoryBuffer>& buffers)
@@ -2750,7 +2750,7 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
         }
         return {};
     };
-    if (node.type == ExecutionNodeType::LmHead)
+    if (node.kind == LayerKind::LmHead)
     {
         const uint64_t copies = model.descriptor.hyper_connection_multiplier;
         const uint64_t expanded = saturating_multiply_u64(hidden, copies);
@@ -2769,10 +2769,10 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
         }
         return add_projection(model.lm_head_weight);
     }
-    if (node.layer_plan_index >= graph.layer_plans.size()) return {};
-    const CompiledLayerPlan& layer = graph.layer_plans[node.layer_plan_index];
+    if (node.plan_index >= graph.layer_plans.size()) return {};
+    const CompiledLayerPlan& layer = graph.layer_plans[node.plan_index];
     const AttentionBlockPlan& attention = layer.attention;
-    if (node.type == ExecutionNodeType::Attention)
+    if (node.kind == LayerKind::Attention)
     {
         std::vector<uint64_t> elements;
         if (attention.kind == AttentionKind::GatedDeltaNet)
@@ -2835,15 +2835,15 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
         }
         return {};
     }
-    if (node.type == ExecutionNodeType::DenseFfn || node.type == ExecutionNodeType::SharedExpertGroup
-        || node.type == ExecutionNodeType::ExpertGroup)
+    if (node.kind == LayerKind::DenseFfn || node.kind == LayerKind::SharedExpertGroup
+        || node.kind == LayerKind::ExpertGroup)
     {
-        const bool routed = node.type == ExecutionNodeType::ExpertGroup;
-        const bool shared = node.type == ExecutionNodeType::SharedExpertGroup;
+        const bool routed = node.kind == LayerKind::ExpertGroup;
+        const bool shared = node.kind == LayerKind::SharedExpertGroup;
         if (routed && graph_has_expert_banks(model, graph)
-            && node.layer_plan_index < model.resident_bank_layers)
+            && node.plan_index < model.resident_bank_layers)
         {
-            const ExpertBankPlan_vulkan& bank = model.gpu_expert_bank_plans[node.layer_plan_index];
+            const ExpertBankPlan_vulkan& bank = model.gpu_expert_bank_plans[node.plan_index];
             for (uint64_t elements : ExpertBank_vulkan::scratch_elements(bank, rows, layer.moe.top_k))
             {
                 auto ret = add(elements, 1);
@@ -2851,8 +2851,8 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
             }
             return {};
         }
-        const bool segment_input = graph_has_gpu_segment(model, graph, node.layer_plan_index);
-        if (node.type == ExecutionNodeType::DenseFfn && graph_has_resident_chain(model, graph))
+        const bool segment_input = graph_has_gpu_segment(model, graph, node.plan_index);
+        if (node.kind == LayerKind::DenseFfn && graph_has_resident_chain(model, graph))
         {
             auto branch = add(hidden);
             if (!branch) return branch.error();
@@ -2974,10 +2974,10 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
                                                std::vector<GraphMemoryBuffer>& buffers,
                                                std::vector<GraphMemorySubmission>& submissions)
 {
-    if (graph.nodes.empty()) return {};
+    if (graph.layers.empty()) return {};
     auto valid = schedule.validate(graph);
     if (!valid) return valid.error();
-    std::vector<uint32_t> positions(graph.nodes.size());
+    std::vector<uint32_t> positions(graph.layers.size());
     for (uint32_t position = 0; position < schedule.node_order.size(); ++position)
         positions[schedule.node_order[position]] = node_offset + position;
     const bool resident_chain = graph_has_resident_chain(model, graph);
@@ -2987,12 +2987,12 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
         std::vector<ExecutionNodeId> attention(graph.layer_plans.size(), invalid_execution_node_id);
         std::vector<ExecutionNodeId> combine(graph.layer_plans.size(), invalid_execution_node_id);
         ExecutionNodeId head = invalid_execution_node_id;
-        for (const ExecutionNode& node : graph.nodes)
+        for (const Layer& node : graph.layers)
         {
-            if (node.type == ExecutionNodeType::LmHead) head = node.id;
-            if (node.layer_plan_index >= graph.layer_plans.size()) continue;
-            if (node.type == ExecutionNodeType::Attention) attention[node.layer_plan_index] = node.id;
-            if (node.type == ExecutionNodeType::Combine || node.type == ExecutionNodeType::DenseFfn) combine[node.layer_plan_index] = node.id;
+            if (node.kind == LayerKind::LmHead) head = node.id;
+            if (node.plan_index >= graph.layer_plans.size()) continue;
+            if (node.kind == LayerKind::Attention) attention[node.plan_index] = node.id;
+            if (node.kind == LayerKind::Combine || node.kind == LayerKind::DenseFfn) combine[node.plan_index] = node.id;
         }
         for (uint32_t first = 0; first < graph.layer_plans.size(); first += chunk)
         {
@@ -3000,7 +3000,7 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
             const ExecutionNodeId finish = last + 1 == graph.layer_plans.size() ? head : combine[last];
             if (attention[first] == invalid_execution_node_id || finish == invalid_execution_node_id)
                 return Error{ErrorCode::InvalidModel, "resident graph has no recording boundary"};
-            const uint32_t device = graph_node_device(model, graph, graph.nodes[attention[first]]);
+            const uint32_t device = graph_node_device(model, graph, graph.layers[attention[first]]);
             submissions.push_back({device, positions[attention[first]], positions[finish]});
             // One zeroed validation word is shared by the entire chunk. Its
             // blob allocation is rounded to the real device alignment; host
@@ -3017,14 +3017,14 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
     else if (&graph == &model.graph)
         for (ExecutionNodeId node_id : schedule.node_order)
         {
-            const ExecutionNode& source = graph.nodes[node_id];
-            if (source.type != ExecutionNodeType::ExpertGroup) continue;
+            const Layer& source = graph.layers[node_id];
+            if (source.kind != LayerKind::ExpertGroup) continue;
             uint32_t fence_id = invalid_execution_node_id;
             const auto resolved = GpuSegment_vulkan::continuation_target(model, node_id, fence_id);
             if (!resolved) return resolved.error();
             const uint32_t target_id = resolved.value();
             if (target_id == invalid_execution_node_id) continue;
-            if (target_id >= graph.nodes.size() || fence_id >= graph.nodes.size()
+            if (target_id >= graph.layers.size() || fence_id >= graph.layers.size()
                 || positions[target_id] <= positions[node_id] || positions[fence_id] <= positions[target_id])
                 return Error{ErrorCode::InvalidModel, "GPU continuation memory target or fence does not follow its Expert group"};
             const uint32_t device = graph_node_device(model, graph, source);
@@ -3042,19 +3042,19 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
                                   && model.operators.at_weight(layer.attention.query_a_weight).latent_layer);
     }
     if (has_flag(model.opt.optimization_flags, OptimizationVulkanSharedExpertOverlap))
-        for (const ExecutionNode& shared : graph.nodes)
+        for (const Layer& shared : graph.layers)
         {
-            if (shared.type != ExecutionNodeType::SharedExpertGroup || shared.backend != ExecutionBackend::Vulkan) continue;
-            for (const ExecutionNode& expert : graph.nodes)
-                if (expert.type == ExecutionNodeType::ExpertGroup && expert.backend == ExecutionBackend::Vulkan
-                    && expert.layer_plan_index == shared.layer_plan_index)
+            if (shared.kind != LayerKind::SharedExpertGroup || shared.backend != ExecutionBackend::Vulkan) continue;
+            for (const Layer& expert : graph.layers)
+                if (expert.kind == LayerKind::ExpertGroup && expert.backend == ExecutionBackend::Vulkan
+                    && expert.plan_index == shared.plan_index)
                     starts[shared.id] = std::min(starts[shared.id], positions[expert.id]);
         }
     for (size_t index = 0; index < schedule.node_order.size(); ++index)
     {
-        const ExecutionNode& node = graph.nodes[schedule.node_order[index]];
-        if ((node.type != ExecutionNodeType::Combine && !(resident_chain && node.type == ExecutionNodeType::DenseFfn)) || node.layer_plan_index >= fused_layers.size()
-            || !fused_layers[node.layer_plan_index]) continue;
+        const Layer& node = graph.layers[schedule.node_order[index]];
+        if ((node.kind != LayerKind::Combine && !(resident_chain && node.kind == LayerKind::DenseFfn)) || node.plan_index >= fused_layers.size()
+            || !fused_layers[node.plan_index]) continue;
         // Fused layers defer the combine and FFN post until the next device
         // Attention, materialization, or final head submission actually runs.
         uint32_t finish = positions[node.id];
@@ -3062,29 +3062,29 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
         {
             finish = positions[schedule.node_order[index + 1]];
             if ((model.gpu_head || model.gated_residual_device_head || model.operators.at_weight(model.hyper_head_function).layer_head)
-                && graph.nodes[schedule.node_order[index + 1]].type == ExecutionNodeType::FinalNorm
+                && graph.layers[schedule.node_order[index + 1]].kind == LayerKind::FinalNorm
                 && index + 2 < schedule.node_order.size())
                 finish = positions[schedule.node_order[index + 2]];
         }
-        layer_finish[node.layer_plan_index] = finish;
+        layer_finish[node.plan_index] = finish;
     }
     // The logical Shared Expert and residual nodes are recorded in the next
     // device segment. Their operands coexist with that segment's Attention.
-    for (const ExecutionNode& node : graph.nodes)
+    for (const Layer& node : graph.layers)
     {
-        if (!graph_has_gpu_segment(model, graph, node.layer_plan_index)) continue;
-        if (!resident_chain && (node.type == ExecutionNodeType::SharedExpertGroup || node.type == ExecutionNodeType::Combine))
-            starts[node.id] = ends[node.id] = layer_finish[node.layer_plan_index];
-        if (node.type == ExecutionNodeType::Router)
-            for (const ExecutionNode& attention : graph.nodes)
-                if (attention.type == ExecutionNodeType::Attention && attention.layer_plan_index == node.layer_plan_index)
+        if (!graph_has_gpu_segment(model, graph, node.plan_index)) continue;
+        if (!resident_chain && (node.kind == LayerKind::SharedExpertGroup || node.kind == LayerKind::Combine))
+            starts[node.id] = ends[node.id] = layer_finish[node.plan_index];
+        if (node.kind == LayerKind::Router)
+            for (const Layer& attention : graph.layers)
+                if (attention.kind == LayerKind::Attention && attention.plan_index == node.plan_index)
                     starts[node.id] = positions[attention.id];
     }
     for (const ExecutionTensor& tensor : graph.tensors)
     {
-        if (tensor.producer >= graph.nodes.size())
+        if (tensor.producer >= graph.layers.size())
             return Error{ErrorCode::InvalidModel, "graph memory tensor has no scheduled producer"};
-        const ExecutionNode& producer = graph.nodes[tensor.producer];
+        const Layer& producer = graph.layers[tensor.producer];
         const uint64_t elements = graph_tensor_elements(model, graph, tensor, rows, logits_rows);
         if (elements == 0) continue;
         const uint32_t producer_device = graph_node_device(model, graph, producer);
@@ -3093,19 +3093,19 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
         std::map<std::pair<uint32_t, uint32_t>, uint64_t> copy_elements;
         for (ExecutionNodeId consumer_id : tensor.consumers)
         {
-            if (consumer_id >= graph.nodes.size() || positions[consumer_id] <= positions[tensor.producer])
+            if (consumer_id >= graph.layers.size() || positions[consumer_id] <= positions[tensor.producer])
                 return Error{ErrorCode::InvalidModel, "graph memory tensor consumer precedes its producer"};
-            const ExecutionNode& consumer = graph.nodes[consumer_id];
+            const Layer& consumer = graph.layers[consumer_id];
             last = std::max(last, ends[consumer_id]);
             if (consumer.backend != ExecutionBackend::Vulkan) continue;
             // Assignments are control edges. The Expert recorder uploads its
             // own compact route buffers, accounted with its opaque operands.
-            if (consumer.type == ExecutionNodeType::ExpertGroup && consumer.inputs.size() > 1
+            if (consumer.kind == LayerKind::ExpertGroup && consumer.inputs.size() > 1
                 && consumer.inputs[1] == tensor.id) continue;
             const uint32_t device = graph_node_device(model, graph, consumer);
-            const bool host_normalized = (consumer.type == ExecutionNodeType::ExpertGroup || consumer.type == ExecutionNodeType::SharedExpertGroup
-                                          || consumer.type == ExecutionNodeType::DenseFfn)
-                                         && (consumer.layer_plan_index >= fused_layers.size() || !fused_layers[consumer.layer_plan_index]);
+            const bool host_normalized = (consumer.kind == LayerKind::ExpertGroup || consumer.kind == LayerKind::SharedExpertGroup
+                                          || consumer.kind == LayerKind::DenseFfn)
+                                         && (consumer.plan_index >= fused_layers.size() || !fused_layers[consumer.plan_index]);
             if (producer.backend == ExecutionBackend::Vulkan && device == producer_device && !host_normalized) continue;
             // Generic routed FFN gathers route-major input on the device from
             // one normalized upload. Its gathered allocation is counted here;
@@ -3115,22 +3115,22 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
             auto [it, inserted] = copies.try_emplace(key, starts[consumer_id], positions[consumer_id]);
             if (!inserted) it->second.second = std::max(it->second.second, positions[consumer_id]);
             uint64_t consumed = elements;
-            if (consumer.type == ExecutionNodeType::LmHead)
+            if (consumer.kind == LayerKind::LmHead)
                 consumed = saturating_multiply_u64(logits_rows, model.descriptor.hidden_size);
-            else if (consumer.type == ExecutionNodeType::ExpertGroup || consumer.type == ExecutionNodeType::SharedExpertGroup
-                     || consumer.type == ExecutionNodeType::DenseFfn)
+            else if (consumer.kind == LayerKind::ExpertGroup || consumer.kind == LayerKind::SharedExpertGroup
+                     || consumer.kind == LayerKind::DenseFfn)
                 consumed = saturating_multiply_u64(rows, model.descriptor.hidden_size);
-            if (host_normalized && consumer.type == ExecutionNodeType::ExpertGroup)
-                consumed = saturating_multiply_u64(consumed, graph.layer_plans[consumer.layer_plan_index].moe.top_k);
+            if (host_normalized && consumer.kind == LayerKind::ExpertGroup)
+                consumed = saturating_multiply_u64(consumed, graph.layer_plans[consumer.plan_index].moe.top_k);
             copy_elements[key] = std::max(copy_elements[key], consumed);
         }
-        if (producer.layer_plan_index < layer_finish.size()
-            && (producer.type == ExecutionNodeType::Attention || producer.type == ExecutionNodeType::ExpertGroup
-                || producer.type == ExecutionNodeType::SharedExpertGroup))
-            last = std::max(last, layer_finish[producer.layer_plan_index]);
+        if (producer.plan_index < layer_finish.size()
+            && (producer.kind == LayerKind::Attention || producer.kind == LayerKind::ExpertGroup
+                || producer.kind == LayerKind::SharedExpertGroup))
+            last = std::max(last, layer_finish[producer.plan_index]);
         // Separate submissions release route-major slots at this Expert node.
         // Selected continuation ranges retain them through the shared fence.
-        if (producer.type == ExecutionNodeType::ExpertGroup && graph_has_gpu_segment(model, graph, producer.layer_plan_index))
+        if (producer.kind == LayerKind::ExpertGroup && graph_has_gpu_segment(model, graph, producer.plan_index))
             last = positions[producer.id];
         if (producer.backend == ExecutionBackend::Vulkan)
         {
@@ -3149,29 +3149,29 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
     }
     for (ExecutionNodeId node_id : schedule.node_order)
     {
-        const ExecutionNode& node = graph.nodes[node_id];
+        const Layer& node = graph.layers[node_id];
         if (node.backend != ExecutionBackend::Vulkan) continue;
         const uint32_t device = graph_node_device(model, graph, node);
         const uint32_t position = positions[node_id];
         const uint64_t alignment = std::max<uint64_t>(4, gpu_buffer_alignment(model, device));
-        if (!resident_chain && node.type == ExecutionNodeType::ExpertGroup && graph_has_gpu_segment(model, graph, node.layer_plan_index))
+        if (!resident_chain && node.kind == LayerKind::ExpertGroup && graph_has_gpu_segment(model, graph, node.plan_index))
         {
             // One token-major aggregate survives to the next segment. The
             // submission ranges also retain final-wave route-major operands
             // when that segment is recorded before the same fence.
             auto aggregate = append_graph_buffer(buffers, device, saturating_multiply_u64(model.descriptor.hidden_size, rows), alignment,
-                                                 position, std::max(position, layer_finish[node.layer_plan_index]));
+                                                 position, std::max(position, layer_finish[node.plan_index]));
             if (!aggregate) return aggregate.error();
         }
-        if (node.type == ExecutionNodeType::Attention && node.layer_plan_index < fused_layers.size()
-            && fused_layers[node.layer_plan_index])
+        if (node.kind == LayerKind::Attention && node.plan_index < fused_layers.size()
+            && fused_layers[node.plan_index])
         {
-            const CompiledLayerPlan& layer = graph.layer_plans[node.layer_plan_index];
+            const CompiledLayerPlan& layer = graph.layer_plans[node.plan_index];
             const uint64_t hidden = model.descriptor.hidden_size;
             const uint64_t copies = model.descriptor.hyper_connection_multiplier;
             const uint64_t expanded = saturating_multiply_u64(hidden, copies);
             std::vector<uint64_t> private_columns;
-            const bool resident_segment = graph_has_gpu_segment(model, graph, node.layer_plan_index);
+            const bool resident_segment = graph_has_gpu_segment(model, graph, node.plan_index);
             if (resident_segment)
             {
                 // Compact router selection and the residual/Norm temporaries
@@ -3227,8 +3227,8 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
             for (uint64_t columns : private_columns)
             {
                 auto extra = append_graph_buffer(buffers, device, saturating_multiply_u64(columns, rows), alignment,
-                                                 position, resident_segment ? position : layer_finish[node.layer_plan_index] > position ? layer_finish[node.layer_plan_index] - 1
-                                                                                                                                        : position);
+                                                 position, resident_segment ? position : layer_finish[node.plan_index] > position ? layer_finish[node.plan_index] - 1
+                                                                                                                                  : position);
                 if (!extra) return extra.error();
             }
             // Only the next FFN post's normalized input and mixing operands
@@ -3238,11 +3238,11 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
             for (uint64_t columns : retained)
             {
                 auto extra = append_graph_buffer(buffers, device, saturating_multiply_u64(columns, rows), alignment,
-                                                 position, std::max(position, layer_finish[node.layer_plan_index]));
+                                                 position, std::max(position, layer_finish[node.plan_index]));
                 if (!extra) return extra.error();
             }
         }
-        auto ret = append_graph_node_scratch(model, graph, node, node.type == ExecutionNodeType::LmHead ? logits_rows : rows,
+        auto ret = append_graph_node_scratch(model, graph, node, node.kind == LayerKind::LmHead ? logits_rows : rows,
                                              context_tokens, sequence_count, alignment, starts[node_id], ends[node_id], buffers);
         if (!ret) return ret.error();
     }
@@ -3260,8 +3260,8 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
     result.context_tokens = std::max(prefill_rows, context_tokens);
     uint32_t host_output_rows = 0;
     for (const ExecutionGraph* graph : {&compiled.graph, &compiled.speculative.graph})
-        if (std::any_of(graph->nodes.begin(), graph->nodes.end(), [](const ExecutionNode& node) {
-                return node.type == ExecutionNodeType::LmHead && node.backend == ExecutionBackend::Vulkan;
+        if (std::any_of(graph->layers.begin(), graph->layers.end(), [](const Layer& node) {
+                return node.kind == LayerKind::LmHead && node.backend == ExecutionBackend::Vulkan;
             }))
         {
             host_output_rows = std::max({host_output_rows, prefill_rows, sequence_count});
@@ -3277,7 +3277,7 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
         result.host_output_slot_size = slot_size.value();
         result.host_output_workspace_size = slot_size.value() * 2;
     }
-    const uint64_t total_nodes = static_cast<uint64_t>(compiled.graph.nodes.size()) + compiled.speculative.graph.nodes.size();
+    const uint64_t total_nodes = static_cast<uint64_t>(compiled.graph.layers.size()) + compiled.speculative.graph.layers.size();
     if (total_nodes > UINT32_MAX)
         return Error{ErrorCode::InvalidModel, "graph memory schedule exceeds the node position range"};
     const auto shape_plan = [&](uint32_t rows) -> Result<GraphMemoryPlan> {
@@ -3291,7 +3291,7 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
         const uint32_t draft_rows = std::max(rows, compiled.speculative.block_size);
         ret = append_graph_region_memory(compiled, compiled.speculative.graph, compiled.speculative.schedule,
                                          draft_rows, draft_rows,
-                                         result.context_tokens, sequence_count, static_cast<uint32_t>(compiled.graph.nodes.size()), buffers, submissions);
+                                         result.context_tokens, sequence_count, static_cast<uint32_t>(compiled.graph.layers.size()), buffers, submissions);
         if (!ret) return ret.error();
         auto plan = plan_graph_memory(buffers, submissions);
         if (!plan) return plan.error();
@@ -3342,11 +3342,11 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
     const bool resident_chain = graph_has_resident_chain(compiled, compiled.graph);
     std::vector<uint64_t> resident_growth(compiled.graph.layer_plans.size(), 0);
     for (const ExecutionGraph* graph : {&compiled.graph, &compiled.speculative.graph})
-        for (const ExecutionNode& node : graph->nodes)
+        for (const Layer& node : graph->layers)
         {
-            if (node.type != ExecutionNodeType::Attention || node.backend != ExecutionBackend::Vulkan
-                || node.layer_plan_index >= graph->layer_plans.size()) continue;
-            const CompiledLayerPlan& layer = graph->layer_plans[node.layer_plan_index];
+            if (node.kind != LayerKind::Attention || node.backend != ExecutionBackend::Vulkan
+                || node.plan_index >= graph->layer_plans.size()) continue;
+            const CompiledLayerPlan& layer = graph->layer_plans[node.plan_index];
             uint64_t bytes = attention_session_state_size(compiled, layer.attention, layer.vulkan_device_index,
                                                           result.context_tokens);
             if (layer.attention.kind == AttentionKind::Standard)
@@ -3359,7 +3359,7 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
                                                                              std::max(1u, result.context_tokens / 2))
                                               : 0;
                 if (resident_chain && graph == &compiled.graph)
-                    resident_growth[node.layer_plan_index] = previous;
+                    resident_growth[node.plan_index] = previous;
                 else
                     growth[layer.vulkan_device_index] = std::max(growth[layer.vulkan_device_index], previous);
             }
