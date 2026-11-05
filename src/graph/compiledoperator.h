@@ -72,13 +72,6 @@ public:
         return entries.size();
     }
 
-    [[nodiscard]] CompiledOperatorHandle handle_for_weight(TensorHandle handle) const noexcept
-    {
-        return handle < weight_count
-                   ? handle
-                   : invalid_compiled_operator_handle;
-    }
-
     [[nodiscard]] const CompiledOperator& at(CompiledOperatorHandle handle) const noexcept
     {
         return handle < entries.size() ? entries[handle] : empty_operator;
@@ -93,7 +86,9 @@ public:
 
     [[nodiscard]] const CompiledOperator& at_weight(TensorHandle handle) const noexcept
     {
-        return at(handle_for_weight(handle));
+        // Weight-indexed products live at their weight handle. Fused/shared
+        // products must use their explicit arena handle with at().
+        return at(handle);
     }
 
     [[nodiscard]] const CompiledOperator* find_weight(TensorHandle handle) const noexcept
@@ -104,9 +99,8 @@ public:
 
     [[nodiscard]] CompiledOperator& at_weight_mutable(TensorHandle handle)
     {
-        const CompiledOperatorHandle compiled_handle = handle_for_weight(handle);
-        assert(compiled_handle != invalid_compiled_operator_handle);
-        return at_mutable(compiled_handle);
+        assert(handle < weight_count);
+        return at_mutable(handle);
     }
 
 private:

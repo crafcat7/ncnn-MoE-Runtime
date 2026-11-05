@@ -557,7 +557,9 @@ static Result<void> prepare_ffn_operators(WeightStore& weights,
                                               vulkan_device_index, vulkan_runtime, optimization_flags);
             if (!prepared) return prepared.error();
         }
-        ffn.vulkan_operator = operators.handle_for_weight(ffn.gate_weight);
+        const CompiledOperatorHandle handle = operators.allocate();
+        operators.at_mutable(handle).float8 = operators.at_weight(ffn.gate_weight).float8;
+        ffn.vulkan_operator = handle;
         return {};
     }
     if (gate.dtype == DType::BFloat16 && up.dtype == DType::BFloat16
