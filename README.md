@@ -165,6 +165,23 @@ The worker build is the fast default for the unified CLI. CMake does not build
 the model-specific reference runners or the MXFP4 microbenchmark unless they
 are explicitly enabled. MSVC builds use multiprocessor compilation by default;
 set `-DNCNN_MOE_ENABLE_MSVC_MP=OFF` only when a toolchain does not support it.
+Release builds enable per-function sections and linker dead-code elimination.
+Set `-DNCNN_MOE_ENABLE_LTO=ON` for the smallest worker; the tradeoff is a much
+larger static `.lib`, so leave it OFF when shipping the SDK library.
+
+Release builds also compile loader/import/tokenizer sources for size
+(`NCNN_MOE_SIZE_OPTIMIZE_COLD_PATHS`, default ON) while keeping kernels and
+execution at O3 (`-O3`, or MSVC `/O2 /Ob3 /Ot`) by default; set
+`-DNCNN_MOE_ENABLE_O3=OFF` to fall back to O2. Portable presets are available
+in `CMakePresets.json`:
+
+```powershell
+cmake --preset worker-release
+cmake --build --preset worker-release
+cmake --preset worker-release-cpu      # Vulkan off
+cmake --preset dev-tests               # tests on
+cmake --preset sdk-release             # library only
+```
 
 For the full development and CTest targets, use a separate build directory.
 The style test requires clang-format 10+ on PATH in addition to Python 3.10+.
@@ -174,8 +191,7 @@ the other test executables unavailable.
 ```powershell
 clang-format --version
 cmake -S . -B build-test `
-  -DNCNN_MOE_BUILD_TESTS=ON `
-  -DNCNN_MOE_BUILD_REFERENCE_RUNNERS=ON
+  -DNCNN_MOE_BUILD_TESTS=ON
 cmake --build build-test --config Release --parallel
 ctest --test-dir build-test -C Release --output-on-failure
 ```
@@ -203,12 +219,10 @@ and commit both the updated submodule pointer and any patch changes. The current
 patch is based on release `20261020` (`7e36d25`); builds do not fetch or advance
 the pinned revision automatically.
 
-To compare native text handling with the official Python implementations, build
-`ncnn_moe_tokenizer_test` and run
-`python tools/test_tokenizer.py build/ncnn_moe_tokenizer_test MODEL_DIRECTORY`.
-The script lists its test-only dependencies and reads local tokenizer assets;
-model weights are not required. It checks exact token IDs, text-message
-templates, stop IDs, and incremental UTF-8 decoding.
+Tokenizer, quantization, model-format and public-API checks run through CTest
+(`ctest --test-dir build -C Release --output-on-failure`). Per-kernel Vulkan
+micro-tests are not part of the default suite; model-level checks already cover
+the same operator paths.
 
 ## Unified examples
 
@@ -592,9 +606,8 @@ src/storage/       Weight storage, mapped-file I/O, host ARC, and Vulkan victim 
 src/kernels/       Portable CPU Attention/Linear, BF16 helpers, Qn_K pack/decode, and runtime-selected FP8/MXFP4 SIMD kernels
 src/backends/ncnn/ ncnn operator packaging, mixed Attention, Vulkan contexts, and native MXFP4 Experts
 models/            Model catalog and model-family execution guides
-assets/            Published benchmark visualizations used by model reports
-examples/          Unified worker, benchmark/reference runners, protocol helpers, and MXFP4 microbenchmark
-tools/             Unified CLI/adapters, fixtures, packed-Expert tooling, and Qn_K/runtime benchmarks
+examples/          Unified worker and model-specific reference runners
+tools/             Unified CLI/client, Qwen artifact compiler, and quantized-package importer
 tests/             Deterministic, parity, cache, scheduling, concurrency, and error-path tests
 third_party/ncnn/  Pinned upstream ncnn source submodule
 third_party/patches/ncnn/  Runtime extensions applied by CMake
