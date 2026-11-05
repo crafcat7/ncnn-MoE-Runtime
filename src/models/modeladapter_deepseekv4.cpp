@@ -90,9 +90,9 @@ static Result<void> add_experts(WeightMapping& mapping, const SafetensorsArchive
             }
             continue;
         }
-        auto gate_up = archive.load_interleaved_mxfp4_tensor(expert_source + "w1.weight", expert_source + "w1.scale",
-                                                             expert_source + "w3.weight", expert_source + "w3.scale",
-                                                             intermediate_size, hidden_size, flags);
+        auto gate_up = archive.load_mxfp4(expert_source + "w1.weight", expert_source + "w1.scale",
+                                          expert_source + "w3.weight", expert_source + "w3.scale",
+                                          intermediate_size, hidden_size, flags);
         if (!gate_up)
             return gate_up.error();
         mapping.emplace(expert_target + "gate_up.weight", std::move(gate_up).value());

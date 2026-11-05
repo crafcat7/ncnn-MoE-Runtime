@@ -325,8 +325,8 @@ bool ResidentFfnRegion_vulkan::record_outputs(std::span<const Output> outputs, n
     if (d->output_mode == ResidentFfnOutput_vulkan::Host)
     {
         if (!prepare_staging_batch(d->download, d->rows, d->output_columns, option.staging_vkallocator)
-            || !record_prepared_activation_staging_download(d->combined, d->rows, d->output_columns, d->download,
-                                                            command, d->context->device(), option))
+            || !record_staging_download(d->combined, d->rows, d->output_columns, d->download,
+                                        command, d->context->device(), option))
             return d->reject_wave();
         downloaded = true;
     }

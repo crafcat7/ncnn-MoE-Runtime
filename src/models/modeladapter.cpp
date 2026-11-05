@@ -783,16 +783,16 @@ static Result<void> validate_u8_artifact_tensor(const SafetensorsArchive& archiv
     return {};
 }
 
-Result<void> validate_mxfp4_artifact_identity(const SafetensorsArchive& archive,
-                                              const ModelPackage& package,
-                                              const char* identity_prefix,
-                                              uint32_t layer_count,
-                                              uint32_t mtp_layer_count,
-                                              uint32_t expert_count,
-                                              uint32_t hidden_size,
-                                              uint32_t intermediate_size,
-                                              const char* identity_description,
-                                              const char* artifact_description)
+Result<void> validate_artifact_id(const SafetensorsArchive& archive,
+                                  const ModelPackage& package,
+                                  const char* identity_prefix,
+                                  uint32_t layer_count,
+                                  uint32_t mtp_layer_count,
+                                  uint32_t expert_count,
+                                  uint32_t hidden_size,
+                                  uint32_t intermediate_size,
+                                  const char* identity_description,
+                                  const char* artifact_description)
 {
     uint64_t config_hash = UINT64_C(14695981039346656037);
     for (unsigned char value : package.manifest.raw_json)
@@ -822,12 +822,12 @@ Result<void> validate_mxfp4_artifact_identity(const SafetensorsArchive& archive,
     return {};
 }
 
-Result<void> validate_mxfp4_artifact_expert_bank(const SafetensorsArchive& archive,
-                                                 const std::string& prefix,
-                                                 uint32_t expert_count,
-                                                 uint32_t hidden_size,
-                                                 uint32_t intermediate_size,
-                                                 const char* description)
+Result<void> validate_artifact_bank(const SafetensorsArchive& archive,
+                                    const std::string& prefix,
+                                    uint32_t expert_count,
+                                    uint32_t hidden_size,
+                                    uint32_t intermediate_size,
+                                    const char* description)
 {
     auto status = validate_u8_artifact_tensor(archive,
                                               prefix + "gate_up.blocks",
@@ -894,7 +894,7 @@ Result<TensorData> select_tensor_rows(const TensorData& source,
             || source.mxfp4_blocks.size() != static_cast<uint64_t>(source.shape[0]) * columns / 2
             || source.mxfp4_scales.size() != static_cast<uint64_t>(source.shape[0]) * columns / 32)
             return Error{ErrorCode::InvalidModel, "invalid MXFP4 matrix row storage"};
-        auto valid_columns = validate_input_column_indices(source);
+        auto valid_columns = check_input_columns(source);
         if (!valid_columns)
             return valid_columns.error();
         TensorData result;
@@ -1002,7 +1002,7 @@ Result<TensorData> select_tensor_rows(const TensorData& source,
     {
         if (!qnk_shape_supported(source.dtype, source.shape[0], columns))
             return Error{ErrorCode::InvalidModel, "invalid Qn_K matrix row shape"};
-        auto status = validate_input_column_indices(source);
+        auto status = check_input_columns(source);
         if (!status)
             return status.error();
         result.input_column_indices = source.input_column_indices;

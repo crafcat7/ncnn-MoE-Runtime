@@ -53,7 +53,7 @@ public:
     [[nodiscard]] const std::shared_ptr<VulkanContext>& context() const noexcept;
     // Shared by execution and lifetime planning. Returns a target and writes
     // its Router/LM-head fence. A legal non-applicable boundary returns
-    // invalid_execution_node_id; a matched target without a valid fence or
+    // invalid_layer_id; a matched target without a valid fence or
     // device range is an error.
     [[nodiscard]] static Result<uint32_t> continuation_target(const CompiledModel& model, uint32_t expert_node_id,
                                                               uint32_t& fence_id);

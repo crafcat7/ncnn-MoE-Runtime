@@ -244,11 +244,11 @@ static void append_cache(LayerCache& cache, DType dtype, const ActivationBuffer&
     record_standard_cache_transaction_rows(cache, key.rows());
 }
 
-static void scaled_dot_product_attention_into(const AttentionBlockPlan& plan, const TensorData* sinks, uint64_t position_offset, const ActivationBuffer& query,
-                                              const LayerCache& cache, ActivationBuffer& output, AttentionScratch& scratch,
-                                              std::span<const size_t> selected_offsets,
-                                              std::span<const uint32_t> selected_indices,
-                                              uint64_t optimization_flags)
+static void sdpa_into(const AttentionBlockPlan& plan, const TensorData* sinks, uint64_t position_offset, const ActivationBuffer& query,
+                      const LayerCache& cache, ActivationBuffer& output, AttentionScratch& scratch,
+                      std::span<const size_t> selected_offsets,
+                      std::span<const uint32_t> selected_indices,
+                      uint64_t optimization_flags)
 {
     std::vector<float>& key_cache = scratch.key_cache;
     std::vector<float>& value_cache = scratch.value_cache;
@@ -2065,16 +2065,16 @@ Result<void> forward_attention(const WeightStore& weights,
     qsa_status = prepare_qsa_selection(weights, plan, position_offset, cache, scratch);
     if (!qsa_status)
         return qsa_status.error();
-    scaled_dot_product_attention_into(plan,
-                                      plan.sinks == invalid_tensor_handle ? nullptr : &weights.at(plan.sinks),
-                                      position_offset,
-                                      query,
-                                      cache,
-                                      scratch.attention,
-                                      scratch,
-                                      scratch.qsa_selected_offsets,
-                                      scratch.qsa_selected_indices,
-                                      optimization_flags);
+    sdpa_into(plan,
+              plan.sinks == invalid_tensor_handle ? nullptr : &weights.at(plan.sinks),
+              position_offset,
+              query,
+              cache,
+              scratch.attention,
+              scratch,
+              scratch.qsa_selected_offsets,
+              scratch.qsa_selected_indices,
+              optimization_flags);
     if (has_flag(plan.flags, AttentionBlockOutputGate))
     {
         if (!gate_ready)

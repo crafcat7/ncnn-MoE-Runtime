@@ -691,7 +691,7 @@ uint64_t mxfp4_q8_packed_storage_bytes(size_t row_count,
     return group_count * block_count * bytes_per_block;
 }
 
-bool mxfp4_q8_packed_kernel_available() noexcept
+bool mxfp4_q8_ready() noexcept
 {
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
     return mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2
@@ -706,7 +706,7 @@ bool mxfp4_q8_packed_kernel_available() noexcept
 
 bool mxfp4_q8_kernel_available() noexcept
 {
-    return mxfp4_q8_packed_kernel_available();
+    return mxfp4_q8_ready();
 }
 
 bool mxfp4_q8_pack_weights(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, size_t row_count,

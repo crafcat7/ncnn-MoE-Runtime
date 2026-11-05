@@ -1,37 +1,11 @@
 #ifndef NCNN_MOE_BFLOAT16_H
 #define NCNN_MOE_BFLOAT16_H
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
 namespace ncnn {
 namespace moe {
-
-class Bf16Counter
-{
-public:
-    [[nodiscard]] uint64_t dispatches() const noexcept;
-
-private:
-    friend void record_bf16_dispatch() noexcept;
-    std::atomic<uint64_t> count{0};
-};
-
-class Bf16Scope
-{
-public:
-    explicit Bf16Scope(Bf16Counter* counter) noexcept;
-    ~Bf16Scope();
-
-    Bf16Scope(const Bf16Scope&) = delete;
-    Bf16Scope& operator=(const Bf16Scope&) = delete;
-
-private:
-    Bf16Counter* previous = nullptr;
-};
-
-[[nodiscard]] Bf16Counter* current_bf16_counter() noexcept;
 
 // Runtime-dispatched BF16-by-FP32 dot product with scalar fallback.
 [[nodiscard]] float bfloat16_dot(const uint16_t* weights, const float* input, uint32_t count) noexcept;

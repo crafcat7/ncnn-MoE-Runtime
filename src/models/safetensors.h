@@ -84,9 +84,9 @@ public:
     [[nodiscard]] Result<TensorData> load_qnk_expert(const std::string& name, DType dtype, uint32_t expert_id, uint32_t expert_count,
                                                      uint32_t rows, uint32_t columns, uint32_t flags = 0) const;
     [[nodiscard]] Result<TensorData> load_mxfp4_tensor(const std::string& blocks_name, const std::string& scales_name, uint32_t rows, uint32_t columns, uint32_t flags = 0) const;
-    [[nodiscard]] Result<TensorData> load_interleaved_mxfp4_tensor(const std::string& gate_blocks_name, const std::string& gate_scales_name,
-                                                                   const std::string& up_blocks_name, const std::string& up_scales_name,
-                                                                   uint32_t rows, uint32_t columns, uint32_t flags = 0) const;
+    [[nodiscard]] Result<TensorData> load_mxfp4(const std::string& gate_blocks_name, const std::string& gate_scales_name,
+                                                const std::string& up_blocks_name, const std::string& up_scales_name,
+                                                uint32_t rows, uint32_t columns, uint32_t flags = 0) const;
     [[nodiscard]] Result<TensorData> load_mxfp4_expert(const std::string& blocks_name, const std::string& scales_name, uint32_t expert_id, uint32_t rows, uint32_t columns, uint32_t flags = 0) const;
 
 private:

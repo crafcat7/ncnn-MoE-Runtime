@@ -164,7 +164,7 @@ int cpu_linear_team_size(uint64_t operation_count, DType dtype) noexcept
 #endif
 }
 
-static int openmp_mxfp4_group_team_size(uint64_t operation_count) noexcept
+static int mxfp4_group_threads(uint64_t operation_count) noexcept
 {
 #if defined(_OPENMP)
     static constexpr uint64_t minimum_operations_per_thread = 128 * 1024;
@@ -269,7 +269,7 @@ void forward_embedding_row(const TensorData& embedding, uint32_t row_index, floa
             || embedding.mxfp4_scales.size() != total_blocks)
             throw std::runtime_error("invalid MXFP4 embedding layout");
         const bool remap = !embedding.input_column_indices.empty();
-        if (remap && !validate_input_column_indices(embedding))
+        if (remap && !check_input_columns(embedding))
             throw std::runtime_error("invalid MXFP4 embedding column mapping");
         const size_t row_offset = static_cast<size_t>(row_index) * static_cast<size_t>(row_blocks);
         std::array<float, 32> decoded;
@@ -1126,7 +1126,7 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
     ActivationBuffer local_input;
     if (!matrix.input_column_indices.empty())
     {
-        if (!validate_input_column_indices(matrix)
+        if (!check_input_columns(matrix)
             || input.dtype() != DType::Float32)
         {
             throw std::runtime_error("invalid quantized linear input column map");
@@ -1291,7 +1291,7 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
                                     q8_input);
             if (has_flag(optimization_flags, OptimizationCpuPackedWeights)
                 && output_columns >= 4
-                && mxfp4_q8_packed_kernel_available())
+                && mxfp4_q8_ready())
             {
                 const std::shared_ptr<const Mxfp4Q8PackedMatrix>
                     packed_weights = get_mxfp4_q8_packed_weights(matrix,
@@ -1787,10 +1787,10 @@ static void locate_mxfp4_group(uint64_t flat_index, std::span<const Mxfp4Task> t
     local_index = 0;
 }
 
-static size_t find_shared_q8_input_owner(std::span<const Mxfp4Task> tasks,
-                                         std::span<const size_t> owners,
-                                         size_t task_index,
-                                         size_t invalid_owner) noexcept
+static size_t find_q8_owner(std::span<const Mxfp4Task> tasks,
+                            std::span<const size_t> owners,
+                            size_t task_index,
+                            size_t invalid_owner) noexcept
 {
     const Mxfp4Task& task = tasks[task_index];
     if (!task.input)
@@ -1881,9 +1881,9 @@ private:
     Mxfp4Scratch& buffers;
 };
 
-static bool forward_experts_mxfp4_decode(std::span<const Mxfp4Task> tasks,
-                                         Mxfp4Scratch* scratch,
-                                         uint64_t optimization_flags)
+static bool forward_mxfp4_decode(std::span<const Mxfp4Task> tasks,
+                                 Mxfp4Scratch* scratch,
+                                 uint64_t optimization_flags)
 {
     Mxfp4Scratch local_scratch;
     Mxfp4Scratch& buffers = scratch ? *scratch : local_scratch;
@@ -1940,7 +1940,7 @@ static bool forward_experts_mxfp4_decode(std::span<const Mxfp4Task> tasks,
             q8_down_enabled[task_index] = 1;
             if (has_flag(optimization_flags, OptimizationCpuPackedWeights)
                 && task.down->shape[0] >= 4
-                && mxfp4_q8_packed_kernel_available())
+                && mxfp4_q8_ready())
             {
                 q8_down_packed[task_index] = get_mxfp4_q8_packed_weights(*task.down,
                                                                          task.down_operator ? &task.down_operator->mxfp4_q8_packed : nullptr,
@@ -1950,10 +1950,10 @@ static bool forward_experts_mxfp4_decode(std::span<const Mxfp4Task> tasks,
         }
         if (use_q8 && task.input->columns() % 32 == 0)
         {
-            const size_t input_owner = find_shared_q8_input_owner(tasks,
-                                                                  q8_input_owner,
-                                                                  task_index,
-                                                                  invalid_q8_owner);
+            const size_t input_owner = find_q8_owner(tasks,
+                                                     q8_input_owner,
+                                                     task_index,
+                                                     invalid_q8_owner);
             q8_input_owner[task_index] = input_owner;
             if (input_owner == task_index)
             {
@@ -1965,7 +1965,7 @@ static bool forward_experts_mxfp4_decode(std::span<const Mxfp4Task> tasks,
             }
             if (has_flag(optimization_flags, OptimizationCpuPackedWeights)
                 && task.gate_up->shape[0] >= 4
-                && mxfp4_q8_packed_kernel_available())
+                && mxfp4_q8_ready())
             {
                 q8_gate_packed[task_index] = 1;
             }
@@ -2006,7 +2006,7 @@ static bool forward_experts_mxfp4_decode(std::span<const Mxfp4Task> tasks,
         }
     }
 
-    const int group_team_size = openmp_mxfp4_group_team_size(operation_count);
+    const int group_team_size = mxfp4_group_threads(operation_count);
     const bool parallelize_group = group_team_size > 1 && allow_openmp_parallel_region();
     const int64_t parallel_gate_pair_groups = static_cast<int64_t>(gate_pair_group_count);
     const int64_t parallel_down_pair_groups = static_cast<int64_t>(down_pair_group_count);
@@ -2253,8 +2253,8 @@ static bool forward_experts_mxfp4_decode(std::span<const Mxfp4Task> tasks,
     return true;
 }
 
-static uint64_t exact_float_row_hash(const float* values,
-                                     uint32_t count) noexcept
+static uint64_t exact_row_hash(const float* values,
+                               uint32_t count) noexcept
 {
     uint64_t hash = UINT64_C(1469598103934665603);
     for (uint32_t index = 0; index < count; ++index)
@@ -2296,7 +2296,7 @@ bool forward_experts_mxfp4(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scrat
                 scratch->unique_row_maps[task_index].clear();
             }
         }
-        return forward_experts_mxfp4_decode(tasks, scratch, optimization_flags);
+        return forward_mxfp4_decode(tasks, scratch, optimization_flags);
     }
 
     Mxfp4Scratch local_scratch;
@@ -2339,8 +2339,8 @@ bool forward_experts_mxfp4(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scrat
              ++row)
         {
             uint32_t selected = static_cast<uint32_t>(representatives.size());
-            const uint64_t row_hash = exact_float_row_hash(task.input->row(row),
-                                                           task.input->columns());
+            const uint64_t row_hash = exact_row_hash(task.input->row(row),
+                                                     task.input->columns());
             for (size_t unique_row = 0;
                  unique_row < representatives.size();
                  ++unique_row)
@@ -2427,10 +2427,10 @@ bool forward_experts_mxfp4(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scrat
                                      || use_q8_single);
         if (task_use_q8 && task.input->columns() % 32 == 0)
         {
-            const size_t input_owner = find_shared_q8_input_owner(execution_tasks,
-                                                                  q8_input_owner,
-                                                                  task_index,
-                                                                  invalid_q8_owner);
+            const size_t input_owner = find_q8_owner(execution_tasks,
+                                                     q8_input_owner,
+                                                     task_index,
+                                                     invalid_q8_owner);
             q8_input_owner[task_index] = input_owner;
             if (input_owner == task_index)
             {
@@ -2465,7 +2465,7 @@ bool forward_experts_mxfp4(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scrat
         }
     }
 
-    const int group_team_size = openmp_mxfp4_group_team_size(operation_count);
+    const int group_team_size = mxfp4_group_threads(operation_count);
     const bool parallelize_group = group_team_size > 1 && allow_openmp_parallel_region();
 #pragma omp parallel num_threads(group_team_size) if (parallelize_group)
     {

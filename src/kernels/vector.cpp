@@ -1074,22 +1074,22 @@ void float_scale_add(float* output,
     function(output, output_scale, input, input_scale, count);
 }
 
-void float_scale_inplace_and_scaled_add(float* values,
-                                        float value_scale,
-                                        float* output,
-                                        float output_scale,
-                                        uint32_t count) noexcept
+void scale_add(float* values,
+               float value_scale,
+               float* output,
+               float output_scale,
+               uint32_t count) noexcept
 {
     static const FloatScaleInplaceAndScaledAddFunction function = select_float_scale_inplace_and_scaled_add();
     function(values, value_scale, output, output_scale, count);
 }
 
-void float_scaled_add_and_accumulate(float* values,
-                                     const float* input,
-                                     float input_scale,
-                                     float* output,
-                                     float output_scale,
-                                     uint32_t count) noexcept
+void scaled_acc(float* values,
+                const float* input,
+                float input_scale,
+                float* output,
+                float output_scale,
+                uint32_t count) noexcept
 {
     static const FloatScaledAddAndAccumulateFunction function = select_float_scaled_add_and_accumulate();
     function(values, input, input_scale, output, output_scale, count);

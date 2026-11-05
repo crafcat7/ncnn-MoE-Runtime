@@ -154,6 +154,11 @@ struct ExpertScratch
     ActivationBuffer staged_merged;
     ActivationBuffer staged_output;
     std::vector<uint32_t> explicit_expert_ids;
+    // Per-Expert/per-Session dedup bitmap for staged route accounting.
+    std::vector<uint8_t> expert_seen;
+    // Canonical staged logits published by the final-stage handlers.
+    bool staged_logits_ready = false;
+    bool staged_logits_full_rows = false;
     // Full-bank routing spans are borrowed only through forward_resident.
     std::vector<std::vector<uint32_t>> bank_ids;
     std::vector<ExpertDispatchOptions> bank_options;
@@ -177,7 +182,6 @@ struct BatchWorkspace
     std::vector<uint64_t> staged_attention_positions;
     std::vector<LayerCache*> staged_attention_caches;
     std::vector<AttentionBatchEntry> attention_batch_entries;
-    std::vector<size_t> combined_by_expert;
     AttentionScratch attention;
     HyperConnectionScratch hyper_connection;
 };

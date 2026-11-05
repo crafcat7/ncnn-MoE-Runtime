@@ -707,7 +707,7 @@ static uint64_t native_expert_storage_bytes(const TensorData& gate_up, const Ten
         else if (matrix->dtype == DType::MxFp4)
         {
             if (!has_flag(optimization_flags, OptimizationVulkanQnK)
-                || !validate_input_column_indices(*matrix))
+                || !check_input_columns(*matrix))
                 return 0;
         }
         else if (!has_flag(optimization_flags, OptimizationVulkanQnK)
@@ -715,7 +715,7 @@ static uint64_t native_expert_storage_bytes(const TensorData& gate_up, const Ten
                  || !qnk_shape_supported(matrix->dtype, matrix->shape[0], matrix->shape[1])
                  || (!matrix->mxfp4_file_storage
                      && matrix->qnk_values().size() != qnk_storage_bytes(matrix->dtype, matrix->shape[0], matrix->shape[1]))
-                 || !validate_input_column_indices(*matrix))
+                 || !check_input_columns(*matrix))
         {
             return 0;
         }
@@ -742,11 +742,11 @@ static bool is_packed_mxfp4_expert(const TensorData* gate_up,
            && down->input_column_indices.empty();
 }
 
-static uint64_t executable_expert_storage_bytes(const TensorData& gate_up, const TensorData* up,
-                                                const TensorData& down, const VulkanContext& context,
-                                                uint64_t optimization_flags, const TensorData* gate_up_bias,
-                                                const TensorData* up_bias, const TensorData* down_bias,
-                                                ExpertActivation activation, float activation_limit)
+static uint64_t exec_expert_bytes(const TensorData& gate_up, const TensorData* up,
+                                  const TensorData& down, const VulkanContext& context,
+                                  uint64_t optimization_flags, const TensorData* gate_up_bias,
+                                  const TensorData* up_bias, const TensorData* down_bias,
+                                  ExpertActivation activation, float activation_limit)
 {
     if (gate_up.shape.size() != 2 || down.shape.size() != 2
         || gate_up.shape[0] == 0 || gate_up.shape[1] == 0 || down.shape[0] == 0 || down.shape[1] == 0
@@ -838,9 +838,9 @@ bool VulkanExpertBackend::make_admission(const ExpertDemandRequest& request,
     if (request.key.empty() || !request.gate_up || !request.down)
         return false;
     const TensorData* up_bias = request.up ? request.up_bias : nullptr;
-    const uint64_t size = executable_expert_storage_bytes(*request.gate_up, request.up.get(), *request.down, *vulkan_context,
-                                                          optimization_flags, request.gate_up_bias, up_bias, request.down_bias,
-                                                          request.activation, request.activation_limit);
+    const uint64_t size = exec_expert_bytes(*request.gate_up, request.up.get(), *request.down, *vulkan_context,
+                                            optimization_flags, request.gate_up_bias, up_bias, request.down_bias,
+                                            request.activation, request.activation_limit);
     if (size == 0 || size > cache_size)
         return false;
 
@@ -2033,11 +2033,11 @@ bool VulkanExpertBackend::route_aggregation_enabled(std::span<const ExpertReques
     return true;
 }
 
-bool VulkanExpertBackend::build_route_aggregation_metadata(std::span<const ExpertRequest> requests,
-                                                           std::span<const Selection> selected,
-                                                           std::vector<uint32_t>& offsets,
-                                                           std::vector<uint32_t>& rows,
-                                                           std::vector<float>& weights)
+bool VulkanExpertBackend::build_ra_meta(std::span<const ExpertRequest> requests,
+                                        std::span<const Selection> selected,
+                                        std::vector<uint32_t>& offsets,
+                                        std::vector<uint32_t>& rows,
+                                        std::vector<float>& weights)
 {
     if (selected.empty())
         return false;
@@ -2764,27 +2764,27 @@ bool VulkanExpertBackend::forward_qnk_batch(WorkItem& work,
 
 #endif // NCNN_MOE_WITH_VULKAN
 
-uint64_t native_quantized_expert_storage_bytes(const TensorData& gate_up, const TensorData* up,
-                                               const TensorData& down, uint32_t device_index,
-                                               const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags)
+uint64_t quant_expert_bytes(const TensorData& gate_up, const TensorData* up,
+                            const TensorData& down, uint32_t device_index,
+                            const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags)
 {
-    return native_quantized_expert_storage_bytes(gate_up, up, down, device_index, vulkan_runtime,
-                                                 optimization_flags, nullptr, nullptr, nullptr, ExpertActivation::Silu, 0.0f);
+    return quant_expert_bytes(gate_up, up, down, device_index, vulkan_runtime,
+                              optimization_flags, nullptr, nullptr, nullptr, ExpertActivation::Silu, 0.0f);
 }
 
-uint64_t native_quantized_expert_storage_bytes(const TensorData& gate_up, const TensorData* up,
-                                               const TensorData& down, uint32_t device_index,
-                                               const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags,
-                                               const TensorData* gate_up_bias, const TensorData* up_bias,
-                                               const TensorData* down_bias, ExpertActivation activation,
-                                               float activation_limit)
+uint64_t quant_expert_bytes(const TensorData& gate_up, const TensorData* up,
+                            const TensorData& down, uint32_t device_index,
+                            const VulkanRuntimePtr& vulkan_runtime, uint64_t optimization_flags,
+                            const TensorData* gate_up_bias, const TensorData* up_bias,
+                            const TensorData* down_bias, ExpertActivation activation,
+                            float activation_limit)
 {
 #if NCNN_MOE_WITH_VULKAN
     auto context = VulkanContext::acquire(device_index, vulkan_runtime, optimization_flags);
     if (!context)
         return 0;
-    return executable_expert_storage_bytes(gate_up, up, down, *context, optimization_flags,
-                                           gate_up_bias, up_bias, down_bias, activation, activation_limit);
+    return exec_expert_bytes(gate_up, up, down, *context, optimization_flags,
+                             gate_up_bias, up_bias, down_bias, activation, activation_limit);
 #else
     (void)gate_up;
     (void)up;
@@ -2801,8 +2801,8 @@ uint64_t native_quantized_expert_storage_bytes(const TensorData& gate_up, const 
 #endif
 }
 
-uint64_t native_quantized_gpu_cache_size(uint64_t available_size, uint64_t total_size,
-                                         uint64_t largest_expert_size) noexcept
+uint64_t quant_cache_size(uint64_t available_size, uint64_t total_size,
+                          uint64_t largest_expert_size) noexcept
 {
     if (total_size < largest_expert_size || largest_expert_size == 0)
         return 0;

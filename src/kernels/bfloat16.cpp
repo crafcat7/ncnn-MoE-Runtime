@@ -8,7 +8,6 @@
 #endif
 
 #include <algorithm>
-#include <atomic>
 #include <cstring>
 #include <limits>
 #include <utility>
@@ -663,39 +662,6 @@ static float scalar_bfloat16_pair_dot(const uint16_t* left,
     return sum;
 }
 
-// Scoped instrumentation context only. Model weights, activation scratch,
-// scheduling, and session state never use thread-local storage.
-static thread_local Bf16Counter* active_bf16_counter = nullptr;
-
-uint64_t Bf16Counter::dispatches() const noexcept
-{
-    return count.load(std::memory_order_relaxed);
-}
-
-Bf16Scope::Bf16Scope(Bf16Counter* counter) noexcept
-    : previous(active_bf16_counter)
-{
-    active_bf16_counter = counter;
-}
-
-Bf16Scope::~Bf16Scope()
-{
-    active_bf16_counter = previous;
-}
-
-Bf16Counter* current_bf16_counter() noexcept
-{
-    return active_bf16_counter;
-}
-
-void record_bf16_dispatch() noexcept
-{
-    if (active_bf16_counter)
-    {
-        active_bf16_counter->count.fetch_add(1, std::memory_order_relaxed);
-    }
-}
-
 static Bfloat16DotFunction select_bfloat16_dot() noexcept
 {
     const uint64_t isa = cpu_isa_flags();
@@ -874,7 +840,6 @@ bool forward_linear_bf16(const uint16_t* weights,
                                                      input_columns,
                                                      output,
                                                      std::max(1, thread_count));
-            record_bf16_dispatch();
             return true;
         }
         msvc_avx512_bfloat16_batched_linear(weights,
@@ -887,7 +852,6 @@ bool forward_linear_bf16(const uint16_t* weights,
                                             output_stride,
                                             std::max(1, thread_count),
                                             packed_input);
-        record_bf16_dispatch();
         return true;
     }
 #elif (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
@@ -922,7 +886,6 @@ bool forward_linear_bf16(const uint16_t* weights,
                                                     input_columns,
                                                     output);
             }
-            record_bf16_dispatch();
             return true;
         }
         avx512bf16_batched_linear(weights,
@@ -935,7 +898,6 @@ bool forward_linear_bf16(const uint16_t* weights,
                                   output_stride,
                                   std::max(1, thread_count),
                                   packed_input);
-        record_bf16_dispatch();
         return true;
     }
 #else

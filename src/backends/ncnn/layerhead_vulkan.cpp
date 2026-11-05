@@ -67,7 +67,7 @@ std::shared_ptr<LayerHead_vulkan> LayerHead_vulkan::create(const TensorData& fun
     Implementation& implementation = *result->d;
     if (lm_head.qnk && lm_head.qnk->vulkan_context()
         && lm_head.qnk->input_columns() == hidden_size
-        && vulkan_activation_storage_variant(lm_head.qnk->option()) == 0)
+        && activation_variant(lm_head.qnk->option()) == 0)
     {
         implementation.qnk = lm_head.qnk;
         implementation.context = lm_head.qnk->vulkan_context();
@@ -75,7 +75,7 @@ std::shared_ptr<LayerHead_vulkan> LayerHead_vulkan::create(const TensorData& fun
     }
     else if (lm_head.float8 && lm_head.float8->vulkan_context()
              && lm_head.float8->input_columns() == hidden_size
-             && hidden_size % 128 == 0 && vulkan_activation_storage_variant(lm_head.float8->option()) == 0)
+             && hidden_size % 128 == 0 && activation_variant(lm_head.float8->option()) == 0)
     {
         implementation.float8 = lm_head.float8;
         implementation.context = lm_head.float8->vulkan_context();
@@ -83,7 +83,7 @@ std::shared_ptr<LayerHead_vulkan> LayerHead_vulkan::create(const TensorData& fun
     }
     else if (lm_head.bfloat16 && lm_head.bfloat16->vulkan_context()
              && lm_head.bfloat16->input_columns() == hidden_size
-             && vulkan_activation_storage_variant(lm_head.bfloat16->option()) == 0)
+             && activation_variant(lm_head.bfloat16->option()) == 0)
     {
         implementation.bfloat16 = lm_head.bfloat16;
         implementation.context = lm_head.bfloat16->vulkan_context();
@@ -91,7 +91,7 @@ std::shared_ptr<LayerHead_vulkan> LayerHead_vulkan::create(const TensorData& fun
     }
     else if (lm_head.linear && lm_head.linear->vulkan_context()
              && lm_head.linear->input_columns() == hidden_size
-             && vulkan_activation_storage_variant(lm_head.linear->option()) == 0)
+             && activation_variant(lm_head.linear->option()) == 0)
     {
         implementation.linear = lm_head.linear;
         implementation.context = lm_head.linear->vulkan_context();

@@ -438,8 +438,8 @@ bool GatedResidualLayer_vulkan::forward(const ActivationBuffer& initial_hidden, 
     {
         if (initial_hidden.rows() != tokens.size() || initial_hidden.columns() != impl.hidden * impl.copies
             || initial_hidden.dtype() != DType::Float32 || !fill_staging_upload(initial_hidden, slot.upload, slot.staging_allocator)
-            || !record_mapped_activation_upload(slot.upload, input, cmd, impl.context->device(), impl.opt,
-                                                DType::Float32))
+            || !record_mapped_act_upload(slot.upload, input, cmd, impl.context->device(), impl.opt,
+                                         DType::Float32))
             return fail("initial activation upload");
         ++uploads;
     }
@@ -517,8 +517,8 @@ bool GatedResidualLayer_vulkan::forward(const ActivationBuffer& initial_hidden, 
         || !impl.router->record(normalized, options, router_work, cmd)) return fail("attention post, FFN pre or GPU router");
     const uint32_t selected_columns = Router_vulkan::selected_columns(options.top_k);
     if (!prepare_staging_batch(slot.download, tokens.size(), selected_columns, slot.staging_allocator)
-        || !record_prepared_activation_staging_download(router_work.selected, tokens.size(), selected_columns,
-                                                        slot.download, cmd, impl.context->device(), impl.router->option())) return fail("route metadata staging");
+        || !record_staging_download(router_work.selected, tokens.size(), selected_columns,
+                                    slot.download, cmd, impl.context->device(), impl.router->option())) return fail("route metadata staging");
     if (submit_compute_and_wait(cmd, impl.context->device()) != 0)
     {
         if (impl.delta) delta_work.mark_submit_failed();
@@ -642,7 +642,7 @@ bool GatedResidualLayer_vulkan::finish(const CompiledModel& model, bool produce_
         normalized = reduced;
     if (!head.lm_head->record_forward(normalized, output, cmd, buffers)) return false;
     if (!prepare_staging_batch(slot.download, output.h, output.w, slot.staging_allocator)
-        || !record_prepared_activation_staging_download(output, output.h, output.w, slot.download, cmd, head.context->device(), head.opt)
+        || !record_staging_download(output, output.h, output.w, slot.download, cmd, head.context->device(), head.opt)
         || submit_compute_and_wait(cmd, head.context->device()) != 0) return false;
     logits.reset(output.h, output.w, false);
     if (!copy_staging_to_cpu_batch(slot.download, logits)) return false;

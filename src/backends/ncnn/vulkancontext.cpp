@@ -81,14 +81,14 @@ static ncnn::Option activation_source_option(const ncnn::Option& option,
     return source_option;
 }
 
-bool record_mapped_activation_upload(ncnn::VkMat& staging,
-                                     ncnn::VkMat& destination,
-                                     ncnn::VkCompute& command,
-                                     ncnn::VulkanDevice* device,
-                                     const ncnn::Option& option,
-                                     DType source_dtype)
+bool record_mapped_act_upload(ncnn::VkMat& staging,
+                              ncnn::VkMat& destination,
+                              ncnn::VkCompute& command,
+                              ncnn::VulkanDevice* device,
+                              const ncnn::Option& option,
+                              DType source_dtype)
 {
-    if (vulkan_activation_storage_variant(option) == 0)
+    if (activation_variant(option) == 0)
     {
         if (source_dtype == DType::Float32)
         {
@@ -142,7 +142,7 @@ bool record_mapped_activation_upload(ncnn::VkMat& staging,
                             command,
                             source_option);
     return !destination.empty()
-           && destination.elemsize == vulkan_activation_element_size(option);
+           && destination.elemsize == act_element_size(option);
 }
 
 ncnn::VkMat bind_direct_host_input(ncnn::VkMat& staging)
@@ -246,14 +246,14 @@ bool record_prepared_staging_upload(const ncnn::VkMat& staging,
     return !destination.empty();
 }
 
-bool record_prepared_activation_staging_download(const ncnn::VkMat& source,
-                                                 size_t rows,
-                                                 uint32_t columns,
-                                                 ncnn::VkMat& staging,
-                                                 ncnn::VkCompute& command,
-                                                 ncnn::VulkanDevice* device,
-                                                 const ncnn::Option& option,
-                                                 DType output_dtype)
+bool record_staging_download(const ncnn::VkMat& source,
+                             size_t rows,
+                             uint32_t columns,
+                             ncnn::VkMat& staging,
+                             ncnn::VkCompute& command,
+                             ncnn::VulkanDevice* device,
+                             const ncnn::Option& option,
+                             DType output_dtype)
 {
     const size_t output_element_size = output_dtype == DType::Float32
                                            ? sizeof(float)
@@ -272,7 +272,7 @@ bool record_prepared_activation_staging_download(const ncnn::VkMat& source,
                                           && source.h == static_cast<int>(rows)
                                           && source.elempack == 1
                                           && source.elemsize == output_element_size;
-    if (vulkan_activation_storage_variant(option) == 0
+    if (activation_variant(option) == 0
         && output_dtype == DType::Float32
         && source_matches_cpu_batch)
     {
@@ -787,7 +787,7 @@ int wait_submitted_compute(ncnn::VkCompute& command, const ncnn::VulkanDevice* p
         [](void* context) noexcept {
             const VkQueue borrowed = static_cast<WaitContext*>(context)->queue;
             if (borrowed)
-                return classify_vulkan_completion_probe(vkQueueWaitIdle(borrowed), VK_ERROR_DEVICE_LOST);
+                return classify_probe(vkQueueWaitIdle(borrowed), VK_ERROR_DEVICE_LOST);
             const ncnn::VulkanDevice* device = static_cast<WaitContext*>(context)->device;
             if (!device)
                 return VulkanCompletionProbeResult::Retry;
@@ -800,10 +800,10 @@ int wait_submitted_compute(ncnn::VkCompute& command, const ncnn::VulkanDevice* p
                 return VulkanCompletionProbeResult::Retry;
             const VkResult probe_result = vkQueueWaitIdle(queue);
             device->reclaim_queue(family, queue);
-            return classify_vulkan_completion_probe(probe_result, VK_ERROR_DEVICE_LOST);
+            return classify_probe(probe_result, VK_ERROR_DEVICE_LOST);
         },
         [](void*) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }};
-    return wait_for_vulkan_submission_completion(callbacks);
+    return wait_submit(callbacks);
 }
 
 VulkanComputeBatch::VulkanComputeBatch(VulkanContext& owner) : context(owner)

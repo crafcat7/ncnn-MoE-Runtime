@@ -558,7 +558,7 @@ bool MoeCombine_vulkan::materialize(const DeviceTensor_vulkan& input, Activation
     input.prepare_read();
     auto& cmd = *slot.command;
     if (!prepare_staging_batch(slot.download, input.rows(), input.columns(), slot.staging_allocator)
-        || !record_prepared_activation_staging_download(*input.value(), input.rows(), input.columns(), slot.download, cmd, context->device(), opt)) return false;
+        || !record_staging_download(*input.value(), input.rows(), input.columns(), slot.download, cmd, context->device(), opt)) return false;
     if (submit_compute_and_wait(cmd, context->device()) != 0) return false;
     ActivationBuffer completed(input.rows(), input.columns());
     if (!copy_staging_to_cpu_batch(slot.download, completed)) return false;

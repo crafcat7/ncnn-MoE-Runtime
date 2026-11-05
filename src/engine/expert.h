@@ -7,7 +7,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 
 namespace ncnn {
@@ -56,7 +55,7 @@ ExpertVictimExecutionMetadata victim_metadata(const CompiledModel& model,
 // Transfer dispatched routes into reusable execution slots and record demand.
 void prepare_experts(const MoeBlockPlan& moe,
                      LayerState& layer_state,
-                     SessionStatistics& stats);
+                     SessionStatistics* stats);
 
 // Submit exact reads without waiting or acquiring compute-time leases.
 [[nodiscard]] Result<void> request_experts(const CompiledModel& model,
@@ -65,8 +64,14 @@ void prepare_experts(const MoeBlockPlan& moe,
                                            ExpertScratch& scratch,
                                            uint32_t residency_group);
 
-// independent_work runs at most once, after a demand ticket begins and
-// before its wait; callers retain the normal graph-node fallback if it never runs.
+// Direct overlap callback: runs at most once, after a demand ticket begins and
+// before its wait. Callers retain the normal graph-node fallback if it never runs.
+struct MoEOverlap
+{
+    void* context = nullptr;
+    void (*run)(void*) = nullptr;
+};
+
 [[nodiscard]] Result<void> forward_moe(const CompiledModel& model,
                                        const MoeBlockPlan& moe,
                                        LayerState& layer_state,
@@ -75,7 +80,7 @@ void prepare_experts(const MoeBlockPlan& moe,
                                        uint32_t residency_group,
                                        ExecutionBackend backend,
                                        bool prefetch,
-                                       const std::function<void()>& independent_work = {});
+                                       MoEOverlap overlap = {});
 
 // Consume a committed aggregate, or initialize a zeroed CPU accumulator.
 bool init_moe_output(ExpertScratch& scratch,

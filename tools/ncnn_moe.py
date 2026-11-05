@@ -4,42 +4,900 @@
 from __future__ import annotations
 
 import argparse
+import datetime as _datetime
 import hashlib
 import json
 import math
 import os
+import re
 import shlex
+import struct
+import subprocess
 import sys
 import time
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Callable, Iterable, TextIO
 
-try:
-    from ncnn_moe_adapters import (
-        AdapterError, Completion, ModelAdapter, NATIVE_TEXT_VERSION, create_adapter,
-        model_asset_root, model_config_path, model_weight_files, weight_fingerprint_samples,
+
+# --- merged model adapters (tools/ncnn_moe_adapters.py) ---
+NATIVE_TEXT_VERSION = "ncnn-moe-text-v2"
+
+
+class AdapterError(RuntimeError):
+    """The model or native worker cannot provide the required text interface."""
+
+
+def model_asset_root(model: Path) -> Path:
+    return model.parent if model.is_file() else model
+
+
+def model_config_path(model: Path) -> Path:
+    return model_asset_root(model) / "config.json"
+
+
+def model_weight_files(model: Path) -> list[Path]:
+    if model.is_file():
+        if model.suffix.lower() != ".gguf":
+            raise AdapterError(f"model file must be GGUF: {model}")
+        split = re.fullmatch(r"(.+)-(\d{5})-of-(\d{5})\.gguf", model.name, re.IGNORECASE)
+        if split is None:
+            return [model]
+        shards = [model.with_name(model.name[:split.start(2)] + f"{index:05d}" + model.name[split.end(2):])
+                  for index in range(1, int(split[3]) + 1)]
+        if not shards or any(not path.is_file() for path in shards):
+            raise AdapterError(f"GGUF split package is incomplete: {model}")
+        return shards
+    files = [path for path in model.iterdir() if path.is_file()]
+    safetensors = sorted(path for path in files if path.suffix == ".safetensors")
+    if safetensors:
+        return safetensors
+    return sorted(path for path in files if path.suffix.lower() == ".gguf")
+
+
+def _gguf_prefix_size(path: Path) -> int:
+    """Find metadata and tensor descriptors without visiting weight payloads."""
+    with path.open("rb") as stream:
+        size = path.stat().st_size
+
+        def take(count: int) -> bytes:
+            if count < 0 or count > size - stream.tell():
+                raise AdapterError(f"truncated GGUF header: {path}")
+            value = stream.read(count)
+            if len(value) != count:
+                raise AdapterError(f"truncated GGUF header: {path}")
+            return value
+
+        def skip(count: int) -> None:
+            if count < 0 or count > size - stream.tell():
+                raise AdapterError(f"truncated GGUF header: {path}")
+            stream.seek(count, 1)
+
+        def string() -> None:
+            skip(struct.unpack("<Q", take(8))[0])
+
+        scalar_sizes = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+
+        def value(kind: int, depth: int = 0) -> None:
+            if kind == 8:
+                string()
+            elif kind in scalar_sizes:
+                skip(scalar_sizes[kind])
+            elif kind == 9 and depth < 8:
+                element, count = struct.unpack("<IQ", take(12))
+                if element in scalar_sizes:
+                    skip(scalar_sizes[element] * count)
+                else:
+                    if count > size - stream.tell():
+                        raise AdapterError(f"invalid GGUF array: {path}")
+                    for _ in range(count):
+                        value(element, depth + 1)
+            else:
+                raise AdapterError(f"unsupported GGUF metadata type: {kind}")
+
+        magic, version, tensors, metadata = struct.unpack("<4sIQQ", take(24))
+        if magic != b"GGUF" or version not in (2, 3) or metadata > size // 12 or tensors > size // 24:
+            raise AdapterError(f"invalid GGUF header: {path}")
+        for _ in range(metadata):
+            string()
+            value(struct.unpack("<I", take(4))[0])
+        for _ in range(tensors):
+            string()
+            dimensions = struct.unpack("<I", take(4))[0]
+            if dimensions > 8:
+                raise AdapterError(f"invalid GGUF tensor dimensions: {path}")
+            skip(dimensions * 8 + 12)
+        return stream.tell()
+
+
+def weight_fingerprint_samples(path: Path) -> tuple[bytes, bytes]:
+    size = path.stat().st_size
+    prefix = _gguf_prefix_size(path) if path.suffix.lower() == ".gguf" else 4096
+    if prefix > 256 * 1024 * 1024:
+        raise AdapterError(f"GGUF metadata exceeds the fingerprint limit: {path}")
+    with path.open("rb") as stream:
+        head = stream.read(prefix)
+        tail = b""
+        if size > prefix:
+            stream.seek(-min(size, 4096), 2)
+            tail = stream.read(4096)
+    return head, tail
+
+
+@dataclass(frozen=True)
+class Completion:
+    reasoning: str
+    answer: str
+
+    @property
+    def text(self) -> str:
+        return self.answer or self.reasoning
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise AdapterError(f"config.json is missing from: {path.parent}") from error
+    except json.JSONDecodeError as error:
+        raise AdapterError(f"invalid JSON in {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise AdapterError(f"model config must be a JSON object: {path}")
+    return value
+
+
+def _split_thinking(text: str, thinking: bool) -> Completion:
+    """Split the first thinking boundary, accepting an optional opening tag."""
+    if not thinking:
+        return Completion("", text.strip())
+    text = text.lstrip().removeprefix("<think>")
+    marker = "</think>"
+    if marker in text:
+        reasoning, answer = text.split(marker, 1)
+        return Completion(reasoning.strip(), answer.lstrip("\r\n"))
+    return Completion(text.strip(), "")
+
+
+def _decode_deepseek(text: str, thinking: bool) -> Completion:
+    if not thinking:
+        return Completion("", text.strip())
+    split = _split_thinking(text, thinking)
+    return Completion(split.reasoning.strip(), split.answer.strip())
+
+
+class ModelAdapter:
+    """A small model profile; tokenization and decoding stay in the worker."""
+
+    def __init__(
+        self,
+        model: Path,
+        *,
+        thinking: bool = True,
+        native_stop_tokens: list[int] | None = None,
+        native_model_info: dict[str, Any] | None = None,
+    ) -> None:
+        self.model = Path(model).resolve()
+        self._asset_root = model_asset_root(self.model)
+        self._config_path = model_config_path(self.model)
+        self._weight_files = model_weight_files(self.model)
+        self._gguf = bool(self._weight_files and self._weight_files[0].suffix.lower() == ".gguf")
+        self.config = _load_json(self._config_path) if self._config_path.is_file() else {}
+        self._native_model_info = native_model_info or {}
+        if not self.config and not self._gguf:
+            raise AdapterError(f"config.json is missing from: {self._asset_root}")
+        config_type = self.config.get("model_type")
+        native_type = self._native_model_info.get("model_type")
+        # GGUF metadata is authoritative even when an unrelated HF config is
+        # present beside a self-contained package.
+        resolved_type = (native_type or config_type) if self._gguf else (config_type or native_type)
+        self.model_type = str(resolved_type or "unknown").lower()
+        self.name = self._model_name(self.model_type)
+        # PhiMoE is a plain instruct model without a reasoning channel.
+        self.thinking = bool(thinking) and self.name != "phimoe"
+        self._stop_tokens = self._validate_stop_tokens(native_stop_tokens)
+        self.model_fingerprint, self.legacy_model_fingerprints = self._fingerprints()
+
+    @staticmethod
+    def _model_name(model_type: str) -> str:
+        if model_type in {"gpt_oss", "gpt-oss", "gpt_oss_moe"}:
+            return "gpt-oss"
+        if model_type in {"deepseek_v4", "deepseek-v4", "deepseek_v4_flash", "deepseek4"}:
+            return "deepseek-v4"
+        if model_type in {"qwen4_exp", "qwen4_exp_text", "qwen4exp"}:
+            return "qwen3.8"
+        if model_type == "qwen3":
+            return "qwen3"
+        if model_type in {"qwen3_5_moe", "qwen3_6", "qwen3.6", "qwen3_5", "qwen35", "qwen35moe"}:
+            return "qwen3.6"
+        if model_type == "phimoe":
+            return "phimoe"
+        if model_type == "bailing_hybrid":
+            return "ling"
+        raise AdapterError(f"unsupported model_type: {model_type or '<missing>'}")
+
+    @staticmethod
+    def _validate_stop_tokens(value: list[int] | None) -> list[int]:
+        if value is None:
+            return []
+        if not isinstance(value, list) or any(
+            isinstance(token, bool) or not isinstance(token, int) or token < 0
+            for token in value
+        ):
+            raise AdapterError("worker native stop-token metadata is invalid")
+        return list(dict.fromkeys(value))
+
+    @property
+    def stop_tokens(self) -> list[int]:
+        return list(self._stop_tokens)
+
+    @property
+    def context_limit(self) -> int | None:
+        native_limit = self._native_model_info.get("max_context_tokens")
+        valid_native_limit = isinstance(native_limit, int) and not isinstance(native_limit, bool) and native_limit > 0
+        if self._gguf and valid_native_limit:
+            return native_limit
+        configs = [self.config]
+        text_config = self.config.get("text_config")
+        if isinstance(text_config, dict):
+            configs.append(text_config)
+        for config in configs:
+            for key in (
+                "max_position_embeddings",
+                "max_sequence_length",
+                "max_seq_len",
+                "max_context_length",
+            ):
+                value = config.get(key)
+                if isinstance(value, int) and value > 0:
+                    return value
+        return native_limit if valid_native_limit else None
+
+    def _fingerprints(self) -> tuple[str, tuple[str, ...]]:
+        """Hash current and pre-v2 identities while scanning model weights once."""
+        legacy = hashlib.sha256()
+        legacy.update((self.model_type + "\0").encode("utf-8"))
+        config_path = self._config_path
+        if config_path.is_file():
+            legacy.update(config_path.read_bytes())
+
+        current = hashlib.sha256()
+        current.update(
+            (NATIVE_TEXT_VERSION + "\0" + self.name + "\0" + self.model_type + "\0").encode("utf-8")
+        )
+        model_files = (
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "chat_template.jinja",
+            "generation_config.json",
+        )
+        for name in model_files:
+            path = self._config_path if name == "config.json" else self._asset_root / name
+            current.update(name.encode("utf-8") + b"\0")
+            if not path.is_file():
+                current.update(b"\0")
+                continue
+            current.update(b"\1")
+            with path.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    current.update(block)
+
+        for name in ("tokenizer.json", "chat_template.jinja", "encoding/encoding_dsv4.py"):
+            path = self._asset_root / name
+            if path.is_file():
+                legacy.update(name.encode("utf-8"))
+                legacy.update(str(path.stat().st_size).encode("ascii"))
+
+        for path in self._weight_files:
+            relative = path.name if self._gguf else path.relative_to(self._asset_root).as_posix()
+            size = path.stat().st_size
+            legacy.update(relative.encode("utf-8"))
+            legacy.update(str(size).encode("ascii"))
+            current.update(relative.encode("utf-8") + b"\0" + str(size).encode("ascii") + b"\0")
+            head, tail = weight_fingerprint_samples(path)
+            legacy.update(head)
+            if tail:
+                legacy.update(tail)
+            current.update(head)
+            if tail:
+                current.update(tail)
+
+        legacy_base = legacy.hexdigest()[:20]
+        prior_fingerprints = [legacy_base]
+        if self.name.startswith("qwen") and not self._gguf:
+            old_qwen = hashlib.sha256()
+            old_qwen.update(legacy_base.encode("ascii"))
+            old_qwen.update(b"ncnn-moe-tokenizer-json-v1\0")
+            if self.model_type == "qwen3_5_moe":
+                old_qwen.update(b"ncnn-moe-qwen3.6-nfc9-regex16-v1\0")
+            for name in model_files:
+                path = self._asset_root / name
+                old_qwen.update(name.encode("utf-8") + b"\0")
+                if not path.is_file():
+                    old_qwen.update(b"\0")
+                    continue
+                old_qwen.update(b"\1")
+                with path.open("rb") as stream:
+                    for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        old_qwen.update(block)
+            prior_fingerprints.insert(0, old_qwen.hexdigest()[:20])
+        return current.hexdigest()[:20], () if self._gguf else tuple(prior_fingerprints)
+
+    def validate(self) -> None:
+        if not self._config_path.is_file() and not self._gguf:
+            raise AdapterError(f"config.json is missing from: {self._asset_root}")
+
+    def decode_completion_text(self, text: str) -> Completion:
+        if self.name == "gpt-oss":
+            raise AdapterError(
+                "GPT-OSS completion decoding requires native token events to preserve Harmony boundaries"
+            )
+        if self.name == "phimoe":
+            return Completion("", text.strip())
+        if self.name == "deepseek-v4":
+            return _decode_deepseek(text, self.thinking)
+        return _split_thinking(text, self.thinking)
+
+    @staticmethod
+    def visible_completion(completion: Completion, *, final_only: bool = False) -> str:
+        if final_only:
+            return completion.answer
+        if completion.answer:
+            if completion.reasoning:
+                return f"[reasoning]\n{completion.reasoning}\n[answer]\n{completion.answer}"
+            return f"[answer]\n{completion.answer}"
+        return f"[reasoning]\n{completion.reasoning}" if completion.reasoning else ""
+
+
+def create_adapter(model: Path, **options: Any) -> ModelAdapter:
+    adapter = ModelAdapter(model, **options)
+    adapter.validate()
+    return adapter
+
+
+# --- merged worker protocol (tools/ncnn_moe_protocol.py) ---
+class WorkerError(RuntimeError):
+    """A protocol, process, or native-runtime error."""
+
+    def __init__(self, message: str, event: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.event = event or {}
+
+
+EventCallback = Callable[[dict[str, Any]], None]
+
+
+class WorkerClient:
+    """Strict UTF-8 JSONL client; generation runs asynchronously in C++."""
+
+    def __init__(
+        self,
+        worker: Path,
+        model: Path,
+        runtime_args: Iterable[str] = (),
+        *,
+        verbose: bool = False,
+    ) -> None:
+        self.worker = Path(worker).resolve()
+        self.model = Path(model).resolve()
+        if not self.worker.is_file():
+            raise WorkerError(f"worker does not exist: {self.worker}")
+        if not self.model.is_dir() and not (self.model.is_file() and self.model.suffix.lower() == ".gguf"):
+            raise WorkerError(f"model directory or GGUF file does not exist: {self.model}")
+        self._process = subprocess.Popen(
+            [str(self.worker), str(self.model), *map(str, runtime_args)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None if verbose else subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            bufsize=1,
+        )
+        self._closed = False
+        try:
+            ready = self._read_event()
+            if ready.get("event") == "error":
+                raise WorkerError(ready.get("message", "worker failed to load the model"), ready)
+            if ready.get("event") != "ready":
+                raise WorkerError(f"worker did not send ready event: {ready}", ready)
+            self.ready = ready
+        except BaseException:
+            self._terminate()
+            raise
+
+    @property
+    def process(self) -> subprocess.Popen[str]:
+        return self._process
+
+    def _send(self, payload: dict[str, Any]) -> None:
+        if self._closed or self._process.stdin is None:
+            raise WorkerError("worker is closed")
+        try:
+            self._process.stdin.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+        except UnicodeEncodeError as error:
+            raise WorkerError("worker request must contain valid UTF-8 text") from error
+        self._process.stdin.flush()
+
+    def _read_event(self) -> dict[str, Any]:
+        if self._process.stdout is None:
+            raise WorkerError("worker stdout is unavailable")
+        try:
+            line = self._process.stdout.readline()
+        except UnicodeDecodeError as error:
+            raise WorkerError("worker emitted invalid UTF-8") from error
+        if not line:
+            return_code = self._process.poll()
+            raise WorkerError(f"worker exited before sending an event (return code {return_code})")
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise WorkerError(f"worker emitted invalid JSONL: {line.rstrip()!r}") from error
+        if not isinstance(event, dict):
+            raise WorkerError(f"worker event must be a JSON object: {event!r}")
+        return event
+
+    @staticmethod
+    def _raise_for_error(event: dict[str, Any]) -> None:
+        if event.get("event") == "error":
+            code = event.get("code", "worker_error")
+            message = event.get("message", "native worker error")
+            raise WorkerError(f"{code}: {message}", event)
+
+    def request(
+        self,
+        payload: dict[str, Any],
+        *,
+        expected: str | tuple[str, ...],
+    ) -> dict[str, Any]:
+        self._send(payload)
+        event = self._read_event()
+        self._raise_for_error(event)
+        expected_events = (expected,) if isinstance(expected, str) else expected
+        if event.get("event") not in expected_events:
+            raise WorkerError(
+                f"expected {expected_events}, received {event.get('event')!r}",
+                event,
+            )
+        return event
+
+    def create_session(
+        self,
+        session_id: str,
+        *,
+        seed: int = 0,
+        prefill_chunk_size: int = 512,
+        enable_speculative_context: bool = True,
+    ) -> dict[str, Any]:
+        return self.request(
+            {
+                "op": "create_session",
+                "session_id": session_id,
+                "seed": seed,
+                "prefill_chunk_size": prefill_chunk_size,
+                "enable_speculative_context": enable_speculative_context,
+            },
+            expected="session_created",
+        )
+
+    def generate(
+        self,
+        session_id: str,
+        prompt_tokens: list[int] | None = None,
+        *,
+        messages: list[dict[str, str]] | None = None,
+        enable_thinking: bool | None = None,
+        context_tokens: int | None = None,
+        request_id: str = "generate",
+        max_new_tokens: int = 1024,
+        temperature: float = 0.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        min_p: float = 0.0,
+        stop_tokens: list[int] | None = None,
+        enable_speculative: bool = True,
+        speculative_confidence: float = 0.5,
+        speculative_max_draft: int = 0,
+        metrics_enabled: bool = True,
+        metrics_interval_ms: int = 1000,
+        on_event: EventCallback | None = None,
+    ) -> tuple[dict[str, Any], list[int]]:
+        if (prompt_tokens is None) == (messages is None):
+            raise WorkerError("generate requires exactly one of prompt_tokens or messages")
+        payload: dict[str, Any] = {
+            "op": "generate",
+            "request_id": request_id,
+            "session_id": session_id,
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p,
+            "min_p": min_p,
+            "enable_speculative": enable_speculative,
+            "speculative_confidence": speculative_confidence,
+            "speculative_max_draft": speculative_max_draft,
+            "metrics_enabled": metrics_enabled,
+            "metrics_interval_ms": metrics_interval_ms,
+        }
+        if messages is None:
+            payload["prompt_tokens"] = prompt_tokens
+            if stop_tokens is not None:
+                payload["stop_tokens"] = stop_tokens
+        else:
+            payload["messages"] = messages
+            if enable_thinking is not None:
+                payload["enable_thinking"] = enable_thinking
+            if context_tokens is not None:
+                payload["context_tokens"] = context_tokens
+        self._send(payload)
+        tokens: list[int] = []
+        callback_error: Exception | None = None
+        try:
+            while True:
+                event = self._read_event()
+                self._raise_for_error(event)
+                if on_event is not None and callback_error is None:
+                    try:
+                        on_event(event)
+                    except Exception as error:
+                        callback_error = error
+                if event.get("event") == "token":
+                    tokens.append(int(event["token_id"]))
+                elif event.get("event") == "done":
+                    if callback_error is not None:
+                        raise callback_error
+                    return event, tokens
+        except KeyboardInterrupt as error:
+            # A synchronous client cannot call cancel() while it is reading a
+            # generation. Send the same protocol operation directly, drain the
+            # native completion, then let the REPL report the interruption.
+            try:
+                self._send({"op": "cancel", "request_id": request_id})
+                while True:
+                    event = self._read_event()
+                    self._raise_for_error(event)
+                    if on_event is not None and callback_error is None:
+                        try:
+                            on_event(event)
+                        except Exception as callback_exception:
+                            callback_error = callback_exception
+                    if event.get("event") == "token":
+                        tokens.append(int(event["token_id"]))
+                    elif event.get("event") == "done":
+                        break
+            except (OSError, WorkerError):
+                pass
+            raise WorkerError("generation cancelled by user") from error
+
+    def reset(self, session_id: str) -> dict[str, Any]:
+        return self.request(
+            {"op": "reset", "session_id": session_id}, expected="reset"
+        )
+
+    def compact(
+        self,
+        session_id: str,
+        replay_tokens: list[int] | None = None,
+        *,
+        messages: list[dict[str, str]] | None = None,
+        enable_thinking: bool | None = None,
+        context_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        if (replay_tokens is None) == (messages is None):
+            raise WorkerError("compact requires exactly one of replay_tokens or messages")
+        payload: dict[str, Any] = {"op": "compact", "session_id": session_id}
+        if messages is None:
+            payload["replay_tokens"] = replay_tokens
+        else:
+            payload["messages"] = messages
+            if enable_thinking is not None:
+                payload["enable_thinking"] = enable_thinking
+            if context_tokens is not None:
+                payload["context_tokens"] = context_tokens
+        return self.request(
+            payload,
+            expected="compacted",
+        )
+
+    def stats(
+        self,
+        session_id: str,
+        *,
+        messages: list[dict[str, str]] | None = None,
+        enable_thinking: bool | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"op": "stats", "session_id": session_id}
+        if messages is not None:
+            payload["messages"] = messages
+            if enable_thinking is not None:
+                payload["enable_thinking"] = enable_thinking
+        return self.request(
+            payload, expected="stats"
+        )
+
+    def cancel(self, request_id: str = "") -> dict[str, Any]:
+        payload: dict[str, Any] = {"op": "cancel"}
+        if request_id:
+            payload["request_id"] = request_id
+        return self.request(payload, expected="cancel_requested")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self._process.poll() is None and self._process.stdin is not None:
+                self._process.stdin.write('{"op":"shutdown"}\n')
+                self._process.stdin.flush()
+                while True:
+                    event = self._read_event()
+                    if event.get("event") in {"shutdown", "error"}:
+                        break
+        except (BrokenPipeError, OSError, WorkerError):
+            pass
+        finally:
+            self._terminate()
+
+    def _terminate(self) -> None:
+        if self._process.poll() is None:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait(timeout=3)
+        for stream in (self._process.stdin, self._process.stdout):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+    def __enter__(self) -> "WorkerClient":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+# --- merged persistent state (tools/ncnn_moe_state.py) ---
+def state_root() -> Path:
+    """Return the project-local state root unless explicitly overridden."""
+    override = os.environ.get("NCNN_MOE_CONFIG_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    source_root = Path(__file__).resolve().parents[1]
+    if (source_root / "CMakeLists.txt").is_file():
+        return source_root / ".ncnn-moe"
+    return Path.cwd().resolve() / ".ncnn-moe"
+
+
+def now_iso() -> str:
+    return _datetime.datetime.now(_datetime.timezone.utc).isoformat()
+
+
+def safe_name(value: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip(".-")
+    return value[:80] or "session"
+
+
+def read_json(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return default
+
+
+def write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
-    from ncnn_moe_protocol import WorkerClient, WorkerError
-    from ncnn_moe_state import (
-        SessionStore,
-        hardware_fingerprint,
-        merge_runtime_settings,
-        profile_key,
-        runtime_args_from_settings,
-    )
-except ModuleNotFoundError:  # Installed entry point: tools is a package.
-    from .ncnn_moe_adapters import (
-        AdapterError, Completion, ModelAdapter, NATIVE_TEXT_VERSION, create_adapter,
-        model_asset_root, model_config_path, model_weight_files, weight_fingerprint_samples,
-    )
-    from .ncnn_moe_protocol import WorkerClient, WorkerError
-    from .ncnn_moe_state import (
-        SessionStore,
-        hardware_fingerprint,
-        merge_runtime_settings,
-        profile_key,
-        runtime_args_from_settings,
-    )
+    temporary.replace(path)
+
+
+def hardware_fingerprint(ready: dict[str, Any]) -> str:
+    capabilities = ready.get("capabilities", {})
+    stable = {
+        "physical_memory_bytes": capabilities.get("physical_memory_bytes"),
+        "logical_cpu_count": capabilities.get("logical_cpu_count"),
+        "physical_cpu_core_count": capabilities.get("physical_cpu_core_count"),
+        "cpu_isa": capabilities.get("cpu_isa"),
+        "vulkan_devices": [
+            {
+                "vendor_id": device.get("vendor_id"),
+                "device_id": device.get("device_id"),
+                "name": device.get("name"),
+                "heap_budget_bytes": device.get("heap_budget_bytes"),
+            }
+            for device in capabilities.get("vulkan_devices", [])
+        ],
+    }
+    payload = json.dumps(stable, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:20]
+
+
+class SessionStore:
+    def __init__(self, root: Path | None = None) -> None:
+        self.root = (root or state_root()).resolve()
+        self.sessions_dir = self.root / "sessions"
+        self.config_path = self.root / "config.json"
+        self.profiles_path = self.root / "tuning_profiles.json"
+
+    def user_config(self) -> dict[str, Any]:
+        value = read_json(self.config_path, {})
+        return value if isinstance(value, dict) else {}
+
+    def save_user_config(self, value: dict[str, Any]) -> None:
+        write_json(self.config_path, value)
+
+    def profiles(self) -> dict[str, Any]:
+        value = read_json(self.profiles_path, {})
+        return value if isinstance(value, dict) else {}
+
+    def save_profile(self, key: str, value: dict[str, Any]) -> None:
+        profiles = self.profiles()
+        profiles[key] = value
+        write_json(self.profiles_path, profiles)
+
+    def profile(self, key: str) -> dict[str, Any] | None:
+        value = self.profiles().get(key)
+        return value if isinstance(value, dict) else None
+
+    def new_id(self) -> str:
+        return _datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+
+    def path_for(self, session_id: str) -> Path:
+        return self.sessions_dir / f"{safe_name(session_id)}.json"
+
+    def load(self, session_id: str) -> dict[str, Any] | None:
+        path = self.path_for(session_id)
+        value = read_json(path, None)
+        if not isinstance(value, dict):
+            return None
+        return value
+
+    def save(self, record: dict[str, Any]) -> None:
+        session_id = str(record.get("id", ""))
+        if not session_id:
+            raise ValueError("session record requires id")
+        record = dict(record)
+        record["updated_at"] = now_iso()
+        write_json(self.path_for(session_id), record)
+
+    def delete(self, session_id: str) -> bool:
+        path = self.path_for(session_id)
+        try:
+            path.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+
+    def rename(self, session_id: str, title: str) -> dict[str, Any]:
+        record = self.load(session_id)
+        if record is None:
+            raise ValueError(f"session does not exist: {session_id}")
+        record["title"] = title.strip() or session_id
+        self.save(record)
+        return record
+
+    def list(self) -> list[dict[str, Any]]:
+        if not self.sessions_dir.is_dir():
+            return []
+        records = []
+        for path in sorted(self.sessions_dir.glob("*.json"), reverse=True):
+            value = read_json(path, None)
+            if isinstance(value, dict) and value.get("id"):
+                records.append(value)
+        return records
+
+
+def profile_key(
+    *,
+    hardware: str,
+    model: str,
+    context_tokens: int,
+    session_count: int,
+) -> str:
+    return f"{hardware}:{model}:{context_tokens}:{session_count}"
+
+
+_EXPERT_IO_KEYS = ("mmap_experts", "buffered_expert_io")
+
+
+def _validate_expert_io_settings(settings: dict[str, Any]) -> None:
+    if sum(bool(settings.get(key)) for key in _EXPERT_IO_KEYS) > 1:
+        raise ValueError("Expert mmap and buffered I/O modes are mutually exclusive")
+
+
+def runtime_args_from_settings(settings: dict[str, Any]) -> list[str]:
+    _validate_expert_io_settings(settings)
+    args: list[str] = []
+    backend = settings.get("backend")
+    if backend and backend != "auto":
+        backend_flags = {
+            "cpu": "--cpu",
+            "hybrid": "--hybrid",
+        }
+        backend_flag = backend_flags.get(backend) if isinstance(backend, str) else None
+        if backend_flag is None:
+            raise ValueError(f"unknown backend in runtime settings: {backend}")
+        args.append(backend_flag)
+    cpu_packed_weights = settings.get("cpu_packed_weights")
+    if cpu_packed_weights is not None:
+        if cpu_packed_weights not in ("off", "on"):
+            raise ValueError(
+                "CPU packed weights in runtime settings must be off or on"
+            )
+        args.extend(["--cpu-packed-weights", cpu_packed_weights])
+    for key, option in (
+        ("host_memory_mb", "--host-memory-mb"),
+        ("expert_cache_mb", "--expert-cache-mb"),
+        ("expert_gpu_cache_mb", "--expert-gpu-cache-mb"),
+        ("expert_gpu_victim_cache_mb", "--expert-gpu-victim-cache-mb"),
+        ("expert_io_workers", "--expert-io-workers"),
+        ("expert_memory", "--expert-memory"),
+        ("expected_concurrency", "--expected-concurrency"),
+    ):
+        value = settings.get(key)
+        if value is not None and value != 0:
+            args.extend([option, str(value)])
+    if settings.get("vulkan_device") is not None:
+        args.extend(["--vulkan-device", str(settings["vulkan_device"])])
+    if settings.get("vulkan_devices"):
+        devices = settings["vulkan_devices"]
+        if isinstance(devices, (list, tuple)):
+            devices = ",".join(str(device) for device in devices)
+        args.extend(["--vulkan-devices", str(devices)])
+    for key, option in (
+        ("mmap_experts", "--mmap-experts"),
+        ("buffered_expert_io", "--buffered-expert-io"),
+        ("disable_gpu_victim_execution", "--disable-gpu-victim-execution"),
+        ("disable_vulkan_joint_cache_eviction", "--disable-vulkan-joint-cache-eviction"),
+        ("disable_vulkan_mxfp4_row_tile", "--disable-vulkan-mxfp4-row-tile"),
+        ("disable_vulkan_expert_direct_staging", "--disable-vulkan-expert-direct-staging"),
+        ("disable_vulkan_shared_expert_overlap", "--disable-vulkan-shared-expert-overlap"),
+    ):
+        if settings.get(key):
+            args.append(option)
+    return args
+
+
+def merge_runtime_settings(
+    *,
+    cli: dict[str, Any],
+    session: dict[str, Any] | None,
+    profile: dict[str, Any] | None,
+    user: dict[str, Any] | None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for source in (user or {}, profile or {}, session or {}, cli):
+        io_settings = {key: source[key] for key in _EXPERT_IO_KEYS if source.get(key) is not None}
+        _validate_expert_io_settings(io_settings)
+        if io_settings:
+            # A higher-priority layer selects the whole I/O mode. Explicit
+            # false values select Auto; omitted/None preferences inherit.
+            for key in _EXPERT_IO_KEYS:
+                result.pop(key, None)
+        for key, value in source.items():
+            if value is not None:
+                result[key] = value
+    # Ignore removed experimental options in saved sessions/configs/profiles.
+    for key in (
+        "release_vulkan_dense_host",
+        "no_speculative",
+        "direct_expert_io",
+        "gpu_decode_experts",
+        "profiling",
+        "vulkan_expert_concurrent_commands",
+        "disable_vulkan_expert_concurrent_commands",
+    ):
+        result.pop(key, None)
+    result.setdefault("backend", "auto")
+    return result
 
 
 def configure_standard_streams() -> None:

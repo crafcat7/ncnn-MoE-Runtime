@@ -393,9 +393,9 @@ Result<WeightMapping> GptOssModelAdapter::map_weights(const ModelPackage& packag
             const std::string native_expert = experts_source + std::to_string(expert_id) + ".";
             if (const auto* info = archive.find(native_expert + "gate_proj.weight"); info && info->ggml_type == 39)
             {
-                auto gate_up = archive.load_interleaved_mxfp4_tensor(native_expert + "gate_proj.weight", {},
-                                                                     native_expert + "up_proj.weight", {},
-                                                                     descriptor.intermediate_size, descriptor.hidden_size, expert_load_flags);
+                auto gate_up = archive.load_mxfp4(native_expert + "gate_proj.weight", {},
+                                                  native_expert + "up_proj.weight", {},
+                                                  descriptor.intermediate_size, descriptor.hidden_size, expert_load_flags);
                 if (!gate_up)
                     return gate_up.error();
                 mapping.emplace(expert + "gate_up.weight", std::move(gate_up).value());

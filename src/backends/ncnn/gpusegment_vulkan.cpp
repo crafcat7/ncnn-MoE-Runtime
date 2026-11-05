@@ -243,7 +243,7 @@ bool GpuSegment_vulkan::supports(const CompiledModel& model, const CompiledLayer
     if (layer.attention.kind == AttentionKind::GatedDeltaNet)
     {
         const auto& operation = model.operators.at(layer.attention.gated_delta_vulkan_operator).gated_delta;
-        return operation && vulkan_activation_storage_variant(operation->option()) == 0;
+        return operation && activation_variant(operation->option()) == 0;
     }
     if (layer.attention.kind == AttentionKind::MultiHeadLatent)
     {
@@ -251,14 +251,14 @@ bool GpuSegment_vulkan::supports(const CompiledModel& model, const CompiledLayer
             return false;
         const auto& operation = model.operators.at_weight(layer.attention.query_a_weight).latent_attention;
         const bool supported = operation && operation->can_record()
-                               && vulkan_activation_storage_variant(operation->option()) == 0;
+                               && activation_variant(operation->option()) == 0;
         return supported;
     }
     if (layer.attention.kind != AttentionKind::Standard) return false;
     const auto& operation = model.operators.at(layer.attention.vulkan_attention_operator);
     return has_flag(layer.attention.flags, AttentionBlockQsa)
-               ? operation.qsa_attention && vulkan_activation_storage_variant(operation.qsa_attention->option()) == 0
-               : operation.attention && vulkan_activation_storage_variant(operation.attention->option()) == 0;
+               ? operation.qsa_attention && activation_variant(operation.qsa_attention->option()) == 0
+               : operation.attention && activation_variant(operation.attention->option()) == 0;
 #else
     (void)model;
     (void)layer;
@@ -275,10 +275,10 @@ bool GpuSegment_vulkan::supports_head(const CompiledModel& model) noexcept
         || !segment_norm_supported(model, model.final_norm_weight, model.final_norm_bias,
                                    model.descriptor.hidden_size)) return false;
     const auto& operation = model.operators.at_weight(model.lm_head_weight);
-    if (operation.qnk) return operation.qnk->vulkan_context() && vulkan_activation_storage_variant(operation.qnk->option()) == 0;
-    if (operation.float8) return operation.float8->vulkan_context() && vulkan_activation_storage_variant(operation.float8->option()) == 0;
-    if (operation.bfloat16) return operation.bfloat16->vulkan_context() && vulkan_activation_storage_variant(operation.bfloat16->option()) == 0;
-    return operation.linear && operation.linear->vulkan_context() && vulkan_activation_storage_variant(operation.linear->option()) == 0;
+    if (operation.qnk) return operation.qnk->vulkan_context() && activation_variant(operation.qnk->option()) == 0;
+    if (operation.float8) return operation.float8->vulkan_context() && activation_variant(operation.float8->option()) == 0;
+    if (operation.bfloat16) return operation.bfloat16->vulkan_context() && activation_variant(operation.bfloat16->option()) == 0;
+    return operation.linear && operation.linear->vulkan_context() && activation_variant(operation.linear->option()) == 0;
 #else
     (void)model;
     return false;
@@ -428,48 +428,48 @@ std::shared_ptr<GpuSegment_vulkan> GpuSegment_vulkan::create_head(const Compiled
 Result<uint32_t> GpuSegment_vulkan::continuation_target(const CompiledModel& model, uint32_t expert_node_id,
                                                         uint32_t& fence_id)
 {
-    fence_id = invalid_execution_node_id;
-    if (expert_node_id >= model.graph.nodes.size()) return invalid_execution_node_id;
-    const auto& source = model.graph.nodes[expert_node_id];
-    if (source.type != ExecutionNodeType::ExpertGroup || source.backend != ExecutionBackend::Vulkan
-        || source.layer_plan_index >= model.graph.layer_plans.size()
-        || source.layer_plan_index >= model.gpu_segments.size() || !model.gpu_segments[source.layer_plan_index])
-        return invalid_execution_node_id;
-    const auto& source_layer = model.graph.layer_plans[source.layer_plan_index];
-    const auto& context = model.gpu_segments[source.layer_plan_index]->context();
-    if (!context) return invalid_execution_node_id;
-    auto next = std::find(model.schedule.node_order.begin(), model.schedule.node_order.end(), expert_node_id);
-    if (next == model.schedule.node_order.end()) return invalid_execution_node_id;
+    fence_id = invalid_layer_id;
+    if (expert_node_id >= model.net.layers.size()) return invalid_layer_id;
+    const auto& source = model.net.layers[expert_node_id];
+    if (source.kind != LayerKind::ExpertGroup || source.backend != ExecutionBackend::Vulkan
+        || source.plan_index >= model.net.layer_plans.size()
+        || source.plan_index >= model.gpu_segments.size() || !model.gpu_segments[source.plan_index])
+        return invalid_layer_id;
+    const auto& source_layer = model.net.layer_plans[source.plan_index];
+    const auto& context = model.gpu_segments[source.plan_index]->context();
+    if (!context) return invalid_layer_id;
+    auto next = std::find(model.net.order.begin(), model.net.order.end(), expert_node_id);
+    if (next == model.net.order.end()) return invalid_layer_id;
     bool combined = false;
-    uint32_t target_id = invalid_execution_node_id;
+    uint32_t target_id = invalid_layer_id;
     bool head = false;
-    while (++next != model.schedule.node_order.end())
+    while (++next != model.net.order.end())
     {
-        const ExecutionNodeId candidate_id = *next;
-        if (candidate_id >= model.graph.nodes.size()) return invalid_execution_node_id;
-        const auto& candidate = model.graph.nodes[candidate_id];
-        if (!combined && candidate.layer_plan_index == source.layer_plan_index
-            && candidate.backend == ExecutionBackend::Vulkan && candidate.type == ExecutionNodeType::SharedExpertGroup)
+        const LayerId candidate_id = *next;
+        if (candidate_id >= model.net.layers.size()) return invalid_layer_id;
+        const auto& candidate = model.net.layers[candidate_id];
+        if (!combined && candidate.plan_index == source.plan_index
+            && candidate.backend == ExecutionBackend::Vulkan && candidate.kind == LayerKind::SharedExpertGroup)
             continue;
-        if (!combined && candidate.layer_plan_index == source.layer_plan_index
-            && candidate.backend == ExecutionBackend::Vulkan && candidate.type == ExecutionNodeType::Combine)
+        if (!combined && candidate.plan_index == source.plan_index
+            && candidate.backend == ExecutionBackend::Vulkan && candidate.kind == LayerKind::Combine)
         {
             combined = true;
             continue;
         }
-        if (!combined || candidate.backend != ExecutionBackend::Vulkan) return invalid_execution_node_id;
-        if (candidate.type == ExecutionNodeType::Attention
-            && candidate.layer_plan_index < model.graph.layer_plans.size()
-            && candidate.layer_plan_index < model.gpu_segments.size()
-            && candidate.layer_plan_index != source.layer_plan_index
-            && model.graph.layer_plans[candidate.layer_plan_index].vulkan_device_index == source_layer.vulkan_device_index
-            && model.gpu_segments[candidate.layer_plan_index]
-            && model.gpu_segments[candidate.layer_plan_index]->context() == context)
+        if (!combined || candidate.backend != ExecutionBackend::Vulkan) return invalid_layer_id;
+        if (candidate.kind == LayerKind::Attention
+            && candidate.plan_index < model.net.layer_plans.size()
+            && candidate.plan_index < model.gpu_segments.size()
+            && candidate.plan_index != source.plan_index
+            && model.net.layer_plans[candidate.plan_index].vulkan_device_index == source_layer.vulkan_device_index
+            && model.gpu_segments[candidate.plan_index]
+            && model.gpu_segments[candidate.plan_index]->context() == context)
         {
             target_id = candidate_id;
             break;
         }
-        if (candidate.type == ExecutionNodeType::FinalNorm && model.gpu_head && model.gpu_head->context() == context)
+        if (candidate.kind == LayerKind::FinalNorm && model.gpu_head && model.gpu_head->context() == context)
         {
             target_id = candidate_id;
             head = true;
@@ -477,41 +477,41 @@ Result<uint32_t> GpuSegment_vulkan::continuation_target(const CompiledModel& mod
         }
         // All other nodes are explicit boundaries. Follow actual schedule
         // order rather than assuming that layer ids are consecutive.
-        return invalid_execution_node_id;
+        return invalid_layer_id;
     }
-    if (target_id == invalid_execution_node_id) return invalid_execution_node_id;
+    if (target_id == invalid_layer_id) return invalid_layer_id;
 
-    uint32_t resolved_fence = invalid_execution_node_id;
+    uint32_t resolved_fence = invalid_layer_id;
     auto fence = next;
-    while (++fence != model.schedule.node_order.end())
+    while (++fence != model.net.order.end())
     {
-        const ExecutionNodeId candidate_id = *fence;
-        if (candidate_id >= model.graph.nodes.size())
+        const LayerId candidate_id = *fence;
+        if (candidate_id >= model.net.layers.size())
             return Error{ErrorCode::InvalidModel, "GPU continuation memory target has an invalid scheduled fence"};
-        const auto& candidate = model.graph.nodes[candidate_id];
-        if ((head && candidate.type == ExecutionNodeType::LmHead)
-            || (!head && candidate.type == ExecutionNodeType::Router
-                && candidate.layer_plan_index == model.graph.nodes[target_id].layer_plan_index))
+        const auto& candidate = model.net.layers[candidate_id];
+        if ((head && candidate.kind == LayerKind::LmHead)
+            || (!head && candidate.kind == LayerKind::Router
+                && candidate.plan_index == model.net.layers[target_id].plan_index))
         {
             resolved_fence = candidate_id;
             break;
         }
         // Match the memory planner's existing stop points. In particular, do
         // not search beyond another layer's Expert/Attention/FFN boundary.
-        if (candidate.type == ExecutionNodeType::ExpertGroup || candidate.type == ExecutionNodeType::Attention
-            || candidate.type == ExecutionNodeType::DenseFfn || candidate.type == ExecutionNodeType::TokenEmbedding)
+        if (candidate.kind == LayerKind::ExpertGroup || candidate.kind == LayerKind::Attention
+            || candidate.kind == LayerKind::DenseFfn || candidate.kind == LayerKind::TokenEmbedding)
             break;
     }
-    if (resolved_fence == invalid_execution_node_id || model.graph.nodes[resolved_fence].backend != ExecutionBackend::Vulkan)
+    if (resolved_fence == invalid_layer_id || model.net.layers[resolved_fence].backend != ExecutionBackend::Vulkan)
         return Error{ErrorCode::InvalidModel, "GPU continuation memory target has no selected Router or LM head fence"};
 
-    const auto device_index = [&](const ExecutionNode& node) {
-        return node.layer_plan_index < model.graph.layer_plans.size()
-                   ? model.graph.layer_plans[node.layer_plan_index].vulkan_device_index
+    const auto device_index = [&](const Layer& node) {
+        return node.plan_index < model.net.layer_plans.size()
+                   ? model.net.layer_plans[node.plan_index].vulkan_device_index
                    : model.opt.vulkan_device_index;
     };
     const uint32_t device = device_index(source);
-    if (device_index(model.graph.nodes[target_id]) != device || device_index(model.graph.nodes[resolved_fence]) != device)
+    if (device_index(model.net.layers[target_id]) != device || device_index(model.net.layers[resolved_fence]) != device)
         return Error{ErrorCode::InvalidModel, "GPU continuation memory submission crosses a device boundary"};
 
     fence_id = resolved_fence;
@@ -722,8 +722,8 @@ public:
         selected_columns = Router_vulkan::selected_columns(options.top_k);
         if (!download_routes) return true;
         if (!prepare_staging_batch(selected_staging, positions.size(), selected_columns, d->context->staging_allocator())
-            || !record_prepared_activation_staging_download(router_work.selected, positions.size(), selected_columns,
-                                                            selected_staging, command, d->context->device(), d->option)) return fail("cannot record compact Vulkan routes download");
+            || !record_staging_download(router_work.selected, positions.size(), selected_columns,
+                                        selected_staging, command, d->context->device(), d->option)) return fail("cannot record compact Vulkan routes download");
 
         return true;
     }
@@ -821,7 +821,7 @@ public:
                 host_output_slot_size = std::max(planned.value(), host_output->planned_capacity());
             }
             if (!host_output->prepare(d->context, output_rows, output.w, host_output_slot_size, selected_staging, pending_logits)
-                || !record_prepared_activation_staging_download(output, output_rows, output.w, selected_staging, command, d->context->device(), d->option))
+                || !record_staging_download(output, output_rows, output.w, selected_staging, command, d->context->device(), d->option))
             {
                 error = "cannot record Vulkan logits download";
                 return false;
@@ -879,12 +879,12 @@ public:
 
     void prepare_work_coefficients(const CompiledModel& model)
     {
-        if (work_coefficients_model == &model && layer_work_coefficients.size() == model.graph.layer_plans.size()) return;
+        if (work_coefficients_model == &model && layer_work_coefficients.size() == model.net.layer_plans.size()) return;
         // A copied compiled model may share its head but own a different graph.
         // Bind this cache to the current immutable compiled model as well.
         // Inspect weight shapes once; rows and selected-expert counts remain
         // runtime inputs. Publish the cache only after all shapes are read.
-        std::vector<LayerWorkCoefficients> prepared(model.graph.layer_plans.size());
+        std::vector<LayerWorkCoefficients> prepared(model.net.layer_plans.size());
         const auto projection_work = [&](TensorHandle handle) -> double {
             if (handle == invalid_tensor_handle) return 0;
             const auto& shape = model.weights.at(handle).shape;
@@ -896,7 +896,7 @@ public:
         };
         for (size_t layer = 0; layer < prepared.size(); ++layer)
         {
-            const auto& plan = model.graph.layer_plans[layer];
+            const auto& plan = model.net.layer_plans[layer];
             const auto& a = plan.attention;
             auto& coefficients = prepared[layer];
             for (auto handle : {a.query_weight, a.key_weight, a.value_weight, a.output_weight, a.output_gate_weight,
@@ -1008,7 +1008,7 @@ void GpuSegmentContinuation_vulkan::abort() noexcept
 bool GpuSegmentContinuation_vulkan::record(const ncnn::VkMat& combined, ncnn::VkCompute& command, const ncnn::Option& option)
 {
     if (!d->previous.context || d->previous.combined || combined.empty()
-        || vulkan_activation_storage_variant(option) != 0) return false;
+        || activation_variant(option) != 0) return false;
     return d->record_work(&combined, command);
 }
 #endif
@@ -1210,7 +1210,7 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
                                          GpuSegmentWorkspace_vulkan* workspace, uint32_t layer_limit)
 {
 #if NCNN_MOE_WITH_VULKAN
-    const size_t layers = model.graph.layer_plans.size();
+    const size_t layers = model.net.layer_plans.size();
     const size_t rows = positions.size();
     const size_t limit = layer_limit == 0 ? layers : std::min(layers, static_cast<size_t>(layer_limit));
     if (layers == 0 || limit == 0 || rows == 0 || rows > static_cast<size_t>(std::numeric_limits<int>::max())
@@ -1236,7 +1236,7 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
             error = "resident graph chain has incompatible devices";
             return false;
         }
-        const bool dense = model.graph.layer_plans[layer].dense_ffn.down_weight != invalid_tensor_handle;
+        const bool dense = model.net.layer_plans[layer].dense_ffn.down_weight != invalid_tensor_handle;
         if (dense)
         {
             const bool attention_ready = segment->d->attention || segment->d->delta || segment->d->qsa;
@@ -1409,7 +1409,7 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
             if (produce_logits) budget.record(head_work);
         }
         auto& command = *recording;
-        if (routed && (!prepare_staging_batch(validation_download, 1, 1, context->staging_allocator()) || !record_prepared_activation_staging_download(validation, 1, 1, validation_download, command, context->device(), option)))
+        if (routed && (!prepare_staging_batch(validation_download, 1, 1, context->staging_allocator()) || !record_staging_download(validation, 1, 1, validation_download, command, context->device(), option)))
             return fail("cannot record resident Expert bank validation download");
         submitted = chunk_attempted = true;
         if (batches.submit() != 0)
@@ -1607,7 +1607,7 @@ bool GpuSegment_vulkan::materialize_hidden(GpuSegmentWorkspace_vulkan& workspace
         output = *current.normalized->value();
     if ((!current.dense_ready && !current.record_hidden(output, command, storage, statistics))
         || !prepare_staging_batch(slot.download, rows, columns, slot.staging_allocator)
-        || !record_prepared_activation_staging_download(output, rows, columns, slot.download, command, context->device(), current.option)
+        || !record_staging_download(output, rows, columns, slot.download, command, context->device(), current.option)
         || submit_compute_and_wait(command, context->device()) != 0)
     {
         error = "Vulkan hidden materialization failed";

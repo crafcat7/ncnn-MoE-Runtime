@@ -118,7 +118,7 @@ static std::vector<float> dense_reference(const CompiledModel& model, int32_t to
     std::vector<float> hidden(4);
     for (uint32_t column = 0; column < hidden.size(); ++column)
         hidden[column] = dense_value(embedding, static_cast<size_t>(token) * 4 + column);
-    for (const CompiledLayerPlan& layer : model.graph.layer_plans)
+    for (const CompiledLayerPlan& layer : model.net.layer_plans)
     {
         const std::vector<float> normalized = dense_normalize(hidden, model.weights.at(layer.dense_pre_ffn_norm_weight), model.descriptor.norm_epsilon);
         std::vector<float> gate = dense_project(model.weights.at(layer.dense_ffn.gate_weight), normalized);
@@ -357,12 +357,12 @@ void test_dense_ffn()
         auto compiled = compile_model(descriptor, dense_mapping(descriptor), model, HybridMode::CpuOnly, options);
         dense_check(static_cast<bool>(compiled), "compilation failed");
         size_t ffn_nodes = 0;
-        for (const ExecutionNode& node : model.graph.nodes)
+        for (const Layer& node : model.net.layers)
         {
-            if (node.type == ExecutionNodeType::DenseFfn)
+            if (node.kind == LayerKind::DenseFfn)
                 ++ffn_nodes;
-            dense_check(node.type != ExecutionNodeType::Router && node.type != ExecutionNodeType::ExpertDispatch
-                            && node.type != ExecutionNodeType::ExpertGroup && node.type != ExecutionNodeType::Combine,
+            dense_check(node.kind != LayerKind::Router && node.kind != LayerKind::ExpertDispatch
+                            && node.kind != LayerKind::ExpertGroup && node.kind != LayerKind::Combine,
                         "dense model has routed graph nodes");
         }
         dense_check(ffn_nodes == descriptor.layers.size(), "missing dense graph nodes");

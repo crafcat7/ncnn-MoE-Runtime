@@ -36,7 +36,7 @@ private:
                                                                                         std::vector<std::shared_ptr<ExpertVictimCache>>& victim_caches);
     [[nodiscard]] Result<void> create_expert_backend(const std::vector<uint64_t>& gpu_cache_sizes,
                                                      const std::vector<std::shared_ptr<ExpertVictimCache>>& victim_caches);
-    [[nodiscard]] Result<void> configure_resident_expert_backend();
+    [[nodiscard]] Result<void> configure_resident();
 
     [[nodiscard]] uint32_t resolve_expert_io_threads() const;
 

@@ -10,14 +10,11 @@
 #include "ncnn/moe/option.h"
 #include "ncnn/moe/types.h"
 #include "backends/ncnn/vulkan.h"
-#include "backends/ncnn/expertbank_vulkan.h"
+#include "backends/ncnn/expertbankplan_vulkan.h"
 #include "storage/weightstore.h"
 
 #include <cstdint>
-#include <limits>
 #include <memory>
-#include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace ncnn {
@@ -29,6 +26,7 @@ class ExpertBackend;
 class Tokenizer;
 class GatedResidualLayer_vulkan;
 class GpuSegment_vulkan;
+class ExpertBank_vulkan;
 class GraphResources;
 
 // Runtime settings after hardware/resource Auto values have been resolved;
@@ -54,20 +52,19 @@ struct SpeculativeModelPlan
     {
         // Populated with IDs when the speculative graph is built; backend
         // placement and prefetch flags remain owned by the graph nodes.
-        ExecutionNodeId attention = invalid_execution_node_id;
-        ExecutionNodeId router = invalid_execution_node_id;
-        ExecutionNodeId expert_dispatch = invalid_execution_node_id;
-        ExecutionNodeId expert_group = invalid_execution_node_id;
-        ExecutionNodeId shared_expert_group = invalid_execution_node_id;
-        ExecutionNodeId combine = invalid_execution_node_id;
+        LayerId attention = invalid_layer_id;
+        LayerId router = invalid_layer_id;
+        LayerId expert_dispatch = invalid_layer_id;
+        LayerId expert_group = invalid_layer_id;
+        LayerId shared_expert_group = invalid_layer_id;
+        LayerId combine = invalid_layer_id;
     };
 
     // Speculative execution is a separate graph region because its layer
     // payloads are not part of the target model's main layer vector.  The
     // graph is still the sole owner of order, backend placement, and
     // prefetch policy for this region.
-    ExecutionGraph graph;
-    ExecutionSchedule schedule;
+    Net net;
     std::vector<LayerNodes> layer_nodes;
     std::vector<uint32_t> target_layer_ids;
     TensorHandle mtp_embedding_norm_weight = invalid_tensor_handle;
@@ -90,7 +87,7 @@ struct SpeculativeModelPlan
     [[nodiscard]] bool enabled() const noexcept
     {
         return kind != SpeculativeModelKind::None
-               && !graph.layer_plans.empty()
+               && !net.layer_plans.empty()
                && block_size != 0;
     }
 };
@@ -98,8 +95,7 @@ struct SpeculativeModelPlan
 struct CompiledModel
 {
     MoeModelDescriptor descriptor;
-    ExecutionGraph graph;
-    ExecutionSchedule schedule;
+    Net net;
     ModelMemoryPlan memory_plan;
     std::shared_ptr<GraphResources> graph_resources;
     uint64_t released_dense_host_size = 0;

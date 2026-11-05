@@ -43,7 +43,7 @@ static bool support_cpu_packed_weights(const MoeModelDescriptor& descriptor,
         if (dtype == DType::MxFp4
             && has_flag(opt.optimization_flags,
                         OptimizationCpuMxfp4Q8)
-            && mxfp4_q8_packed_kernel_available())
+            && mxfp4_q8_ready())
         {
             return true;
         }
@@ -597,11 +597,11 @@ Result<void> ModelLoader::compile_model()
     if (use_file_backed_experts)
         compiler_opt.flags |= BackendFileBackedExperts;
 
-    auto ret = ncnn::moe::compile_model(std::move(descriptor),
-                                        std::move(weights).value(),
-                                        model,
-                                        opt.hybrid_mode,
-                                        compiler_opt);
+    auto ret = ncnn::moe::compile_model_validated(std::move(descriptor),
+                                                  std::move(weights).value(),
+                                                  model,
+                                                  opt.hybrid_mode,
+                                                  compiler_opt);
     if (!ret)
         return ret.error();
 
@@ -622,9 +622,9 @@ uint32_t ModelLoader::resolve_expert_io_threads() const
     }
 
     uint32_t max_active_experts = 1;
-    for (const CompiledLayerPlan& layer : model.graph.layer_plans)
+    for (const CompiledLayerPlan& layer : model.net.layer_plans)
         max_active_experts = std::max(max_active_experts, layer.moe.top_k);
-    for (const CompiledLayerPlan& layer : model.speculative.graph.layer_plans)
+    for (const CompiledLayerPlan& layer : model.speculative.net.layer_plans)
         max_active_experts = std::max(max_active_experts, layer.moe.top_k);
 
     const uint32_t max_io_threads = max_active_experts > std::numeric_limits<uint32_t>::max() / 2
@@ -780,21 +780,21 @@ Result<void> ModelLoader::create_expert_backend(const std::vector<uint64_t>& gpu
 
     if (use_victim_source)
     {
-        model.expert_backend = create_key_sharded_expert_backend(std::move(backends),
-                                                                 cache_devices);
+        model.expert_backend = create_key_sharded(std::move(backends),
+                                                  cache_devices);
     }
     else
     {
         std::vector<uint32_t> group_device_indices;
-        group_device_indices.reserve(model.graph.layer_plans.size() + model.speculative.graph.layer_plans.size());
-        for (const CompiledLayerPlan& layer : model.graph.layer_plans)
+        group_device_indices.reserve(model.net.layer_plans.size() + model.speculative.net.layer_plans.size());
+        for (const CompiledLayerPlan& layer : model.net.layer_plans)
             group_device_indices.push_back(layer.vulkan_device_index);
-        for (const CompiledLayerPlan& layer : model.speculative.graph.layer_plans)
+        for (const CompiledLayerPlan& layer : model.speculative.net.layer_plans)
             group_device_indices.push_back(layer.vulkan_device_index);
 
-        model.expert_backend = create_multi_device_expert_backend(std::move(backends),
-                                                                  cache_devices,
-                                                                  std::move(group_device_indices));
+        model.expert_backend = create_multi_device(std::move(backends),
+                                                   cache_devices,
+                                                   std::move(group_device_indices));
     }
 
     if (!model.expert_backend)
@@ -828,7 +828,7 @@ Result<void> ModelLoader::configure_expert_cache()
     if (!ret)
         return ret.error();
 
-    const size_t group_count = model.graph.layer_plans.size() + model.speculative.graph.layer_plans.size();
+    const size_t group_count = model.net.layer_plans.size() + model.speculative.net.layer_plans.size();
     if (group_count > std::numeric_limits<uint32_t>::max())
         return Error{ErrorCode::InvalidModel, "the total Expert residency-group count overflows"};
 
@@ -858,7 +858,7 @@ Result<void> ModelLoader::configure_expert_cache()
     return {};
 }
 
-Result<void> ModelLoader::configure_resident_expert_backend()
+Result<void> ModelLoader::configure_resident()
 {
     if (opt.hybrid_mode != HybridMode::HybridExperts
         || has_flag(opt.flags, OptionDisableGpuExpertExecution)
@@ -883,7 +883,7 @@ Result<void> ModelLoader::configure_resident_expert_backend()
         else
             total += size;
     };
-    const auto inspect_graph = [&](const ExecutionGraph& graph) {
+    const auto inspect_graph = [&](const Net& graph) {
         for (const CompiledLayerPlan& layer : graph.layer_plans)
         {
             const auto found = std::find(device_indices.begin(), device_indices.end(), layer.vulkan_device_index);
@@ -921,16 +921,16 @@ Result<void> ModelLoader::configure_resident_expert_backend()
                     || ((quantized(gate_up) || quantized(down) || (up && quantized(*up)))
                         && support_vulkan_expert(expert, gate_up, down, model.opt.optimization_flags, up)))
                 {
-                    const uint64_t bytes = native_quantized_expert_storage_bytes(gate_up, up, down,
-                                                                                 device_indices[device],
-                                                                                 model.vulkan_runtime,
-                                                                                 model.opt.optimization_flags,
-                                                                                 (up ? expert.gate_bias : expert.gate_up_bias) == invalid_tensor_handle
-                                                                                     ? nullptr
-                                                                                     : &model.weights.at(up ? expert.gate_bias : expert.gate_up_bias),
-                                                                                 expert.up_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.up_bias),
-                                                                                 expert.down_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.down_bias),
-                                                                                 expert.activation, expert.activation_limit);
+                    const uint64_t bytes = quant_expert_bytes(gate_up, up, down,
+                                                              device_indices[device],
+                                                              model.vulkan_runtime,
+                                                              model.opt.optimization_flags,
+                                                              (up ? expert.gate_bias : expert.gate_up_bias) == invalid_tensor_handle
+                                                                  ? nullptr
+                                                                  : &model.weights.at(up ? expert.gate_bias : expert.gate_up_bias),
+                                                              expert.up_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.up_bias),
+                                                              expert.down_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.down_bias),
+                                                              expert.activation, expert.activation_limit);
                     // A storage size of zero also denotes an unsupported
                     // device/dtype combination. Keep its CPU implementation.
                     if (bytes == 0)
@@ -947,8 +947,8 @@ Result<void> ModelLoader::configure_resident_expert_backend()
             max_pair_sizes[device] = std::max(max_pair_sizes[device], layer_maximum);
         }
     };
-    inspect_graph(model.graph);
-    inspect_graph(model.speculative.graph);
+    inspect_graph(model.net);
+    inspect_graph(model.speculative.net);
     if (invalid_storage_size)
         return Error{ErrorCode::InvalidArgument, "resident quantized Expert GPU storage size is invalid or overflows"};
 
@@ -1016,8 +1016,8 @@ Result<void> ModelLoader::configure_resident_expert_backend()
                                                             gpu_infos, model);
             if (available.size() != 1)
                 continue;
-            cache_sizes[index] = native_quantized_gpu_cache_size(available.front(), total_sizes[device],
-                                                                 max_pair_sizes[device]);
+            cache_sizes[index] = quant_cache_size(available.front(), total_sizes[device],
+                                                  max_pair_sizes[device]);
         }
     }
 
@@ -1046,13 +1046,13 @@ Result<void> ModelLoader::configure_resident_expert_backend()
     if (backends.empty())
         return {};
     std::vector<uint32_t> group_device_indices;
-    group_device_indices.reserve(model.graph.layer_plans.size() + model.speculative.graph.layer_plans.size());
-    for (const CompiledLayerPlan& layer : model.graph.layer_plans)
+    group_device_indices.reserve(model.net.layer_plans.size() + model.speculative.net.layer_plans.size());
+    for (const CompiledLayerPlan& layer : model.net.layer_plans)
         group_device_indices.push_back(layer.vulkan_device_index);
-    for (const CompiledLayerPlan& layer : model.speculative.graph.layer_plans)
+    for (const CompiledLayerPlan& layer : model.speculative.net.layer_plans)
         group_device_indices.push_back(layer.vulkan_device_index);
-    model.expert_backend = create_multi_device_expert_backend(std::move(backends), std::move(cache_devices),
-                                                              std::move(group_device_indices));
+    model.expert_backend = create_multi_device(std::move(backends), std::move(cache_devices),
+                                               std::move(group_device_indices));
     if (!model.expert_backend)
         return Error{ErrorCode::UnsupportedModel, "cannot create the Vulkan quantized Expert execution backend"};
     model.opt.expert_gpu_cache_size = total_cache_size;
@@ -1090,25 +1090,25 @@ Result<void> ModelLoader::load(const std::filesystem::path& model_path)
         // owns the whole graph. Without it, keep the ordinary dense node path
         // instead of materializing the device hidden at that layer.
         for (size_t index = 0; index < model.gpu_segments.size()
-                               && index < model.graph.layer_plans.size();
+                               && index < model.net.layer_plans.size();
              ++index)
-            if (model.graph.layer_plans[index].dense_ffn.down_weight != invalid_tensor_handle)
+            if (model.net.layer_plans[index].dense_ffn.down_weight != invalid_tensor_handle)
                 model.gpu_segments[index].reset();
     }
     const bool partial_banks = model.resident_bank_layers != 0
-                               && model.resident_bank_layers < model.graph.layer_plans.size();
+                               && model.resident_bank_layers < model.net.layer_plans.size();
     if (model.gpu_expert_banks.empty() || partial_banks)
     {
         ret = configure_expert_cache();
         if (!ret)
             return ret.error();
-        ret = configure_resident_expert_backend();
+        ret = configure_resident();
         if (!ret)
             return ret.error();
     }
     if (!model.expert_backend && (model.gpu_expert_banks.empty() || partial_banks)
-        && std::any_of(model.graph.nodes.begin(), model.graph.nodes.end(), [](const ExecutionNode& node) {
-               return node.type == ExecutionNodeType::ExpertGroup && node.backend == ExecutionBackend::Vulkan;
+        && std::any_of(model.net.layers.begin(), model.net.layers.end(), [](const Layer& node) {
+               return node.kind == LayerKind::ExpertGroup && node.backend == ExecutionBackend::Vulkan;
            }))
         return Error{ErrorCode::UnsupportedModel, "GPU Expert placement requires an executable device cache; CPU retry is disabled"};
     if (model.gated_residual_chain && !model.expert_backend && model.gpu_expert_banks.empty())

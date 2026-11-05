@@ -309,10 +309,10 @@ bool LatentLayer_vulkan::forward(const ActivationBuffer& initial_hidden,
     const auto selected_columns = Router_vulkan::selected_columns(options.top_k);
     if (!prepare_staging_batch(slot.download, positions.size(), normalized_gpu.w, slot.staging_allocator)
         || !prepare_staging_batch(selected_staging, positions.size(), selected_columns, slot.staging_allocator)
-        || !record_prepared_activation_staging_download(normalized_gpu, positions.size(), normalized_gpu.w, slot.download,
-                                                        cmd, context->device(), attention->option())
-        || !record_prepared_activation_staging_download(router_work.selected, positions.size(), selected_columns, selected_staging,
-                                                        cmd, context->device(), router->option()))
+        || !record_staging_download(normalized_gpu, positions.size(), normalized_gpu.w, slot.download,
+                                    cmd, context->device(), attention->option())
+        || !record_staging_download(router_work.selected, positions.size(), selected_columns, selected_staging,
+                                    cmd, context->device(), router->option()))
         return false;
     if (submit_compute_and_wait(cmd, context->device()) != 0)
         return false;
@@ -466,8 +466,8 @@ bool LatentLayer_vulkan::materialize_hidden(LatentLayerWorkspace_vulkan& workspa
     ncnn::VkMat uploaded;
     if (!impl.record_hidden(result, uploaded, slot.upload, cmd, combine_storage, combine_uploads)
         || !prepare_staging_batch(slot.download, result.h, result.w, slot.staging_allocator)
-        || !record_prepared_activation_staging_download(result, result.h, result.w, slot.download, cmd,
-                                                        impl.context->device(), impl.ffn_post->option()))
+        || !record_staging_download(result, result.h, result.w, slot.download, cmd,
+                                    impl.context->device(), impl.ffn_post->option()))
         return false;
     if (submit_compute_and_wait(cmd, impl.context->device()) != 0)
         return false;
@@ -544,9 +544,9 @@ bool LatentLayer_vulkan::finish(LatentLayerWorkspace_vulkan& workspace,
     }
     ncnn::VkMat hidden_staging;
     if (!prepare_staging_batch(hidden_staging, normalized.h, normalized.w, slot.staging_allocator)
-        || !record_prepared_activation_staging_download(normalized, normalized.h, normalized.w, hidden_staging,
-                                                        cmd, impl.context->device(), head.option())
-        || (produce_logits && (!prepare_staging_batch(slot.download, output.h, output.w, slot.staging_allocator) || !record_prepared_activation_staging_download(output, output.h, output.w, slot.download, cmd, impl.context->device(), head.option()))))
+        || !record_staging_download(normalized, normalized.h, normalized.w, hidden_staging,
+                                    cmd, impl.context->device(), head.option())
+        || (produce_logits && (!prepare_staging_batch(slot.download, output.h, output.w, slot.staging_allocator) || !record_staging_download(output, output.h, output.w, slot.download, cmd, impl.context->device(), head.option()))))
         return false;
     if (submit_compute_and_wait(cmd, impl.context->device()) != 0)
         return false;

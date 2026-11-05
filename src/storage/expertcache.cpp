@@ -1050,7 +1050,7 @@ void ExpertCache::wait_for_background_work()
         victim_cache->wait_for_background_work();
 }
 
-static bool is_file_backed_bfloat16_tensor(const TensorData& tensor) noexcept
+static bool is_file_bf16(const TensorData& tensor) noexcept
 {
     if (tensor.dtype != DType::BFloat16
         || tensor.shape.size() != 2
@@ -1082,8 +1082,8 @@ static bool is_supported_file_backed_pair(const TensorData& gate_up,
                           && gate_up.mxfp4_file_storage
                           && down.mxfp4_file_storage;
     return mxfp4_pair || qnk_pair
-           || (is_file_backed_bfloat16_tensor(gate_up)
-               && is_file_backed_bfloat16_tensor(down));
+           || (is_file_bf16(gate_up)
+               && is_file_bf16(down));
 }
 
 static Result<uint64_t> gguf_mxfp4_stored_size(const TensorData& tensor)
@@ -1119,7 +1119,7 @@ static Result<uint64_t> gguf_mxfp4_stored_size(const TensorData& tensor)
 
 Result<uint64_t> ExpertCache::stored_size(const TensorData& tensor)
 {
-    if (is_file_backed_bfloat16_tensor(tensor))
+    if (is_file_bf16(tensor))
         return tensor.mapped_size;
     if (is_qnk_dtype(tensor.dtype))
     {
@@ -1147,7 +1147,7 @@ Result<uint64_t> ExpertCache::stored_size(const TensorData& tensor)
         {
             return Error{ErrorCode::InvalidModel, "invalid file-backed Qn_K primary range"};
         }
-        auto columns = validate_input_column_indices(tensor);
+        auto columns = check_input_columns(tensor);
         if (!columns)
             return columns.error();
         uint64_t size = source.blocks_size;
@@ -1247,8 +1247,8 @@ Result<uint64_t> ExpertCache::packed_weight_size(const TensorData& tensor)
 
 std::string ExpertCache::make_pair_key(const TensorData& gate_up, const TensorData& down)
 {
-    if (is_file_backed_bfloat16_tensor(gate_up)
-        && is_file_backed_bfloat16_tensor(down))
+    if (is_file_bf16(gate_up)
+        && is_file_bf16(down))
     {
         return "bf16:"
                + std::to_string(reinterpret_cast<uintptr_t>(gate_up.mapped_data.get()))
@@ -1544,7 +1544,7 @@ Result<std::shared_ptr<TensorData>> ExpertCache::load_gguf_tensor(const TensorDa
 
 Result<std::shared_ptr<TensorData>> ExpertCache::load_tensor(const TensorData& source, uint64_t& mapped_range_count, uint64_t& mapped_size)
 {
-    if (is_file_backed_bfloat16_tensor(source))
+    if (is_file_bf16(source))
     {
         auto loaded = std::make_shared<TensorData>();
         loaded->dtype = DType::BFloat16;
@@ -1846,8 +1846,8 @@ Result<ExpertVictimPair> ExpertCache::load_interleaved_pair(const TensorData& ga
 
 Result<ExpertVictimPair> ExpertCache::load_pair(const TensorData& gate_up, const TensorData& down, uint64_t& mapped_range_count, uint64_t& mapped_size)
 {
-    if (is_file_backed_bfloat16_tensor(gate_up)
-        && is_file_backed_bfloat16_tensor(down))
+    if (is_file_bf16(gate_up)
+        && is_file_bf16(down))
     {
         auto loaded_gate = load_tensor(gate_up, mapped_range_count, mapped_size);
         if (!loaded_gate)
@@ -1994,8 +1994,8 @@ Result<std::vector<ExpertVictimPair>> ExpertCache::load_coalesced_pairs(std::spa
         return std::vector<ExpertVictimPair>();
     for (const std::shared_ptr<Entry>& entry : batch)
     {
-        if (is_file_backed_bfloat16_tensor(entry->gate_up_source)
-            || is_file_backed_bfloat16_tensor(entry->down_source)
+        if (is_file_bf16(entry->gate_up_source)
+            || is_file_bf16(entry->down_source)
             || is_qnk_dtype(entry->gate_up_source.dtype)
             || is_qnk_dtype(entry->down_source.dtype))
         {

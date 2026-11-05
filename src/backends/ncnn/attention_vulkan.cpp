@@ -357,11 +357,11 @@ static bool attention_decode_window_is_visible(const LayerCache& cache,
     return query_position == cache.start_position + cache.token_count;
 }
 
-static bool fill_attention_cache_promotion_staging(ncnn::VkMat& key_staging,
-                                                   ncnn::VkMat& value_staging,
-                                                   const LayerCache& cache,
-                                                   const AttentionConfig_vulkan& config,
-                                                   ncnn::VkAllocator* allocator)
+static bool fill_promotion_stage(ncnn::VkMat& key_staging,
+                                 ncnn::VkMat& value_staging,
+                                 const LayerCache& cache,
+                                 const AttentionConfig_vulkan& config,
+                                 ncnn::VkAllocator* allocator)
 {
     const uint32_t columns = config.kv_head_count * config.head_dimension;
     if (cache.token_count == 0
@@ -452,7 +452,7 @@ static bool create_attention_pipeline(const std::shared_ptr<VulkanContext>& cont
                                       int shader_size,
                                       std::shared_ptr<ncnn::Pipeline>& destination)
 {
-    const size_t storage_variant = vulkan_activation_storage_variant(option);
+    const size_t storage_variant = activation_variant(option);
     const size_t pipeline_variant = storage_variant + (option.use_subgroup_ops ? 3u : 0u);
     const std::shared_ptr<const std::vector<uint32_t>> spirv = context->shader_binary(shader, shader_size, option, pipeline_variant);
     if (!spirv || spirv->empty())
@@ -631,7 +631,7 @@ bool Attention_vulkan::record_qkv_rope(const ncnn::VkMat& fused_qkv,
     const ncnn::Pipeline* pipeline = implementation.qkv_rope_pipeline.get();
     const AttentionConfig_vulkan& config = implementation.config;
     const float rope_concentration = implementation.rope_concentration;
-    const size_t key_value_element_size = vulkan_activation_element_size(implementation.kv_option);
+    const size_t key_value_element_size = act_element_size(implementation.kv_option);
     ncnn::VkAllocator* allocator = implementation.option.blob_vkallocator;
     const uint32_t query_columns = config.head_count * config.head_dimension;
     const uint32_t key_value_columns = config.kv_head_count * config.head_dimension;
@@ -755,7 +755,7 @@ bool Attention_vulkan::record_qkv_norm_rope(const ncnn::VkMat& fused_qkv,
                                       : implementation.key_norm_weight;
     const AttentionConfig_vulkan& config = implementation.config;
     const float rope_concentration = implementation.rope_concentration;
-    const size_t key_value_element_size = vulkan_activation_element_size(implementation.kv_option);
+    const size_t key_value_element_size = act_element_size(implementation.kv_option);
     ncnn::VkAllocator* allocator = implementation.option.blob_vkallocator;
     const uint32_t query_columns = config.head_count * config.head_dimension;
     const uint32_t key_value_columns = config.kv_head_count * config.head_dimension;
@@ -1511,7 +1511,7 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
         AttentionDecodePlan plan;
         const AttentionDecodeShape shape{config.head_count, config.kv_head_count, config.head_dimension, 1,
                                          config.kv_cache_dtype == DType::BFloat16,
-                                         vulkan_activation_element_size(implementation.kv_option) == sizeof(uint16_t)};
+                                         act_element_size(implementation.kv_option) == sizeof(uint16_t)};
         if (!make_attention_decode_plan(implementation.decode_capabilities, shape, plan))
             return {};
         if (plan.path == AttentionDecodePath::Matrix)
@@ -1981,7 +1981,7 @@ bool Attention_vulkan::decode_workspace_bytes(uint32_t context_tokens, uint64_t&
     AttentionDecodePlan plan;
     const AttentionDecodeShape shape{d->config.head_count, d->config.kv_head_count, d->config.head_dimension,
                                      std::max(1u, context_tokens), d->config.kv_cache_dtype == DType::BFloat16,
-                                     vulkan_activation_element_size(d->kv_option) == sizeof(uint16_t)};
+                                     act_element_size(d->kv_option) == sizeof(uint16_t)};
     if (!make_attention_decode_plan(d->decode_capabilities, shape, plan)
         || plan.path != AttentionDecodePath::Matrix) return false;
     bytes = plan.scratch_bytes;
@@ -2000,7 +2000,7 @@ bool Attention_vulkan::record_decode(const ncnn::VkMat& query, const ncnn::VkMat
         AttentionDecodePlan plan;
         const AttentionDecodeShape shape{d->config.head_count, d->config.kv_head_count, d->config.head_dimension,
                                          static_cast<uint32_t>(destination_count - sink_rows), d->config.kv_cache_dtype == DType::BFloat16,
-                                         vulkan_activation_element_size(d->kv_option) == sizeof(uint16_t)};
+                                         act_element_size(d->kv_option) == sizeof(uint16_t)};
         if (!make_attention_decode_plan(d->decode_capabilities, shape, plan)
             || plan.path != AttentionDecodePath::Matrix) return false;
         // The general SDPA view includes a synthetic sink row. Matrix decode
@@ -2032,8 +2032,8 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
     const size_t token_count = ticket.rows;
     const Implementation& implementation = *d;
     const AttentionConfig_vulkan& config = implementation.config;
-    const size_t activation_element_size = vulkan_activation_element_size(implementation.kv_option);
-    const bool low_precision_kv = vulkan_activation_storage_variant(implementation.kv_option) != 0;
+    const size_t activation_element_size = act_element_size(implementation.kv_option);
+    const bool low_precision_kv = activation_variant(implementation.kv_option) != 0;
     const bool has_device_cache = cache.vulkan_attention_cache != nullptr;
     const bool promote_host_cache = cache.token_count != 0 && !has_device_cache;
     if (!has_flag(config.optimization_flags, OptimizationVulkanAttention)
@@ -2154,11 +2154,11 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
             && !fill_attention_mask_staging(ticket.attention_mask, token_count, destination_count, position_offset, cache, config, implementation.sinks,
                                             bfloat16_storage, implementation.vulkan_context->staging_allocator()))
         || (promote_host_cache
-            && !fill_attention_cache_promotion_staging(ticket.attention_cache_key,
-                                                       ticket.attention_cache_value,
-                                                       cache,
-                                                       config,
-                                                       implementation.vulkan_context->staging_allocator())))
+            && !fill_promotion_stage(ticket.attention_cache_key,
+                                     ticket.attention_cache_value,
+                                     cache,
+                                     config,
+                                     implementation.vulkan_context->staging_allocator())))
     {
         return false;
     }
@@ -2182,16 +2182,16 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
         return false;
     }
     if (promote_host_cache
-        && (!record_mapped_activation_upload(ticket.attention_cache_key,
-                                             promoted_key_gpu,
-                                             command,
-                                             vkdev,
-                                             implementation.kv_option)
-            || !record_mapped_activation_upload(ticket.attention_cache_value,
-                                                promoted_value_gpu,
-                                                command,
-                                                vkdev,
-                                                implementation.kv_option)))
+        && (!record_mapped_act_upload(ticket.attention_cache_key,
+                                      promoted_key_gpu,
+                                      command,
+                                      vkdev,
+                                      implementation.kv_option)
+            || !record_mapped_act_upload(ticket.attention_cache_value,
+                                         promoted_value_gpu,
+                                         command,
+                                         vkdev,
+                                         implementation.kv_option)))
     {
         return false;
     }
@@ -2403,7 +2403,7 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
 
     const size_t source_element_size = use_qkv_rope
                                            ? activation_element_size
-                                           : vulkan_activation_element_size(implementation.option);
+                                           : act_element_size(implementation.option);
     if (query_rope.elempack != 1 || query_rope.dims != 3 || query_rope.w != static_cast<int>(config.head_dimension)
         || query_rope.h != static_cast<int>(token_count) || query_rope.c != static_cast<int>(config.head_count)
         || (!use_qkv_ring
@@ -2704,11 +2704,11 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
         }
     };
     std::unique_ptr<void, decltype(cleanup)> guard(reinterpret_cast<void*>(1), cleanup);
-    const bool direct_host_input = input.rows() == 1 && vulkan_activation_storage_variant(implementation.option) == 0
+    const bool direct_host_input = input.rows() == 1 && activation_variant(implementation.option) == 0
                                    && context->support_direct_host_buffer(static_cast<size_t>(input.columns()) * sizeof(float), input.dtype());
     if (direct_host_input)
         input_gpu = bind_direct_host_input(slot.upload);
-    else if (!record_mapped_activation_upload(slot.upload, input_gpu, command, context->device(), implementation.option, input.dtype()))
+    else if (!record_mapped_act_upload(slot.upload, input_gpu, command, context->device(), implementation.option, input.dtype()))
         return false;
     // The recorder's public operand contract is unpacked FP32. Legacy host
     // upload helpers may choose pack4 for four rows even with packing disabled.
@@ -2719,8 +2719,8 @@ bool Attention_vulkan::forward(uint64_t position_offset, LayerCache& cache, cons
         if (input_gpu.empty()) return false;
     }
     if (!record_forward(position_offset, cache, input_gpu, output_gpu, command, work)
-        || !record_prepared_activation_staging_download(output_gpu, input.rows(), input.columns(), slot.download,
-                                                        command, context->device(), implementation.option)) return false;
+        || !record_staging_download(output_gpu, input.rows(), input.columns(), slot.download,
+                                    command, context->device(), implementation.option)) return false;
     attempted = true;
     if (submit_compute_and_wait(command, context->device()) != 0) return false;
     ActivationBuffer completed(input.rows(), input.columns());
@@ -2764,7 +2764,7 @@ bool Attention_vulkan::materialize_device_cache(LayerCache& cache) const
         return false;
     }
 
-    const size_t element_size = vulkan_activation_element_size(implementation.kv_option);
+    const size_t element_size = act_element_size(implementation.kv_option);
     const AttentionCache_vulkan& device_cache = *cache.vulkan_attention_cache;
     if (device_cache.key.empty()
         || device_cache.value.empty()
@@ -2859,7 +2859,7 @@ bool Attention_vulkan::materialize_device_cache(LayerCache& cache) const
         return false;
     }
 
-    const size_t storage_variant = vulkan_activation_storage_variant(implementation.kv_option);
+    const size_t storage_variant = activation_variant(implementation.kv_option);
     ncnn::Mat key_float_storage;
     ncnn::Mat value_float_storage;
     const ncnn::Mat* key_float_source = &key_mapped;
@@ -3011,8 +3011,8 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
     const Implementation& implementation = *d;
     VulkanRuntimeState& runtime_state = implementation.vulkan_context->runtime_state();
     const AttentionConfig_vulkan& config = implementation.config;
-    const size_t activation_element_size = vulkan_activation_element_size(implementation.kv_option);
-    const bool low_precision_kv = vulkan_activation_storage_variant(implementation.kv_option) != 0;
+    const size_t activation_element_size = act_element_size(implementation.kv_option);
+    const bool low_precision_kv = activation_variant(implementation.kv_option) != 0;
     const bool bfloat16_storage = config.activation_dtype == DType::BFloat16
                                   && implementation.option.use_bf16_storage;
     const uint64_t query_columns_u64 = static_cast<uint64_t>(config.head_count)
@@ -3039,7 +3039,7 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
     VulkanTransferLease transfer_lease = implementation.vulkan_context->acquire_transfer_slot();
     VulkanTransferSlot& transfer_slot = transfer_lease.slot();
     // Host dtype is checked per entry before direct binding.
-    const bool direct_host_input = vulkan_activation_storage_variant(implementation.option) == 0
+    const bool direct_host_input = activation_variant(implementation.option) == 0
                                    && implementation.vulkan_context->support_direct_host_buffer(static_cast<size_t>(config.hidden_size) * sizeof(float),
                                                                                                 DType::Float32);
 
@@ -3253,26 +3253,26 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
             return AttentionBatchResult_vulkan::NotExecuted;
         }
         if (!work.device_rope
-            && (!record_mapped_activation_upload(work.rope_cosine,
-                                                 work.cosine_gpu,
-                                                 command,
-                                                 vkdev,
-                                                 implementation.option)
-                || !record_mapped_activation_upload(work.rope_sine,
-                                                    work.sine_gpu,
-                                                    command,
-                                                    vkdev,
-                                                    implementation.option)))
+            && (!record_mapped_act_upload(work.rope_cosine,
+                                          work.cosine_gpu,
+                                          command,
+                                          vkdev,
+                                          implementation.option)
+                || !record_mapped_act_upload(work.rope_sine,
+                                             work.sine_gpu,
+                                             command,
+                                             vkdev,
+                                             implementation.option)))
         {
             return AttentionBatchResult_vulkan::NotExecuted;
         }
         if (!work.use_decode_sdpa)
         {
-            if (!record_mapped_activation_upload(work.attention_mask,
-                                                 work.mask_gpu,
-                                                 command,
-                                                 vkdev,
-                                                 implementation.option))
+            if (!record_mapped_act_upload(work.attention_mask,
+                                          work.mask_gpu,
+                                          command,
+                                          vkdev,
+                                          implementation.option))
             {
                 return AttentionBatchResult_vulkan::NotExecuted;
             }
@@ -3475,7 +3475,7 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
 
         const size_t source_element_size = use_qkv_rope
                                                ? activation_element_size
-                                               : vulkan_activation_element_size(implementation.option);
+                                               : act_element_size(implementation.option);
         if (work.query_rope.elempack != 1
             || work.query_rope.dims != 3
             || work.query_rope.w
@@ -3725,14 +3725,14 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
                                    implementation.option);
             work.download_gpu = unpacked;
         }
-        if (!record_prepared_activation_staging_download(work.download_gpu,
-                                                         1,
-                                                         config.hidden_size,
-                                                         work.download,
-                                                         command,
-                                                         vkdev,
-                                                         implementation.option,
-                                                         work.entry->output->dtype()))
+        if (!record_staging_download(work.download_gpu,
+                                     1,
+                                     config.hidden_size,
+                                     work.download,
+                                     command,
+                                     vkdev,
+                                     implementation.option,
+                                     work.entry->output->dtype()))
         {
             return AttentionBatchResult_vulkan::NotExecuted;
         }

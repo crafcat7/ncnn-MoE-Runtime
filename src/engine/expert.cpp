@@ -424,10 +424,10 @@ static std::string gpu_expert_error(const CompiledModel& model, uint32_t group,
                                     const char* operation, const char* reason)
 {
     uint32_t device = model.opt.vulkan_device_index;
-    if (group < model.graph.layer_plans.size())
-        device = model.graph.layer_plans[group].vulkan_device_index;
-    else if (group - model.graph.layer_plans.size() < model.speculative.graph.layer_plans.size())
-        device = model.speculative.graph.layer_plans[group - model.graph.layer_plans.size()].vulkan_device_index;
+    if (group < model.net.layer_plans.size())
+        device = model.net.layer_plans[group].vulkan_device_index;
+    else if (group - model.net.layer_plans.size() < model.speculative.net.layer_plans.size())
+        device = model.speculative.net.layer_plans[group - model.net.layer_plans.size()].vulkan_device_index;
     return std::string(reason) + " (layer " + std::to_string(group) + ", op " + operation
            + ", Vulkan device " + std::to_string(device) + ")";
 }
@@ -774,7 +774,7 @@ void forward_shared_expert(const CompiledModel& model,
     }
 }
 
-static bool expert_cache_wait_timing_enabled(const CompiledModel& model) noexcept
+static bool wait_timing(const CompiledModel& model) noexcept
 {
     // Queue latency drives rank-adaptive router prefetch.
     return has_flag(model.opt.flags, OptionRouterPrediction)
@@ -783,8 +783,8 @@ static bool expert_cache_wait_timing_enabled(const CompiledModel& model) noexcep
 
 static std::chrono::steady_clock::time_point expert_cache_wait_start(const CompiledModel& model)
 {
-    return expert_cache_wait_timing_enabled(model) ? std::chrono::steady_clock::now()
-                                                   : std::chrono::steady_clock::time_point{};
+    return wait_timing(model) ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
 }
 
 static uint64_t expert_cache_wait_elapsed(std::chrono::steady_clock::time_point start)
@@ -1121,7 +1121,6 @@ static void forward_experts(const CompiledModel& model,
     }
 #endif
     const int64_t count = static_cast<int64_t>(active_indices.size());
-    Bf16Counter* const bf16_counter = current_bf16_counter();
     const size_t workspace_count = parallelize_experts
                                        ? static_cast<size_t>(expert_team_size)
                                        : 1;
@@ -1141,7 +1140,6 @@ static void forward_experts(const CompiledModel& model,
     };
     if (!parallelize_experts)
     {
-        const Bf16Scope bf16_scope(bf16_counter);
         for (int64_t task_index = 0; task_index < count; ++task_index)
             forward(task_index, 0);
         return;
@@ -1149,7 +1147,6 @@ static void forward_experts(const CompiledModel& model,
 #pragma omp parallel for schedule(dynamic, 1) num_threads(expert_team_size)
     for (int64_t task_index = 0; task_index < count; ++task_index)
     {
-        const Bf16Scope bf16_scope(bf16_counter);
         size_t workspace_index = 0;
 #if defined(_OPENMP)
         workspace_index = static_cast<size_t>(omp_get_thread_num());
@@ -1274,28 +1271,32 @@ ExpertVictimExecutionMetadata victim_metadata(const CompiledModel& model,
 
 void prepare_experts(const MoeBlockPlan& moe,
                      LayerState& layer_state,
-                     SessionStatistics& stats)
+                     SessionStatistics* stats)
 {
     ExpertDispatchPlan& plan = layer_state.dispatch_plan;
-    stats.expert_assignments += plan.assignment_count;
+    if (stats)
+        stats->expert_assignments += plan.assignment_count;
     layer_state.resize_experts(plan.batches.size());
     for (size_t batch_index = 0; batch_index < plan.batches.size(); ++batch_index)
     {
         ExpertBatch& batch = plan.batches[batch_index];
-        const uint64_t weight_size = moe.experts[batch.expert_id].weight_size;
-        if (stats.expert_batch_weight_bytes > std::numeric_limits<uint64_t>::max() - weight_size)
-            stats.expert_batch_weight_bytes = std::numeric_limits<uint64_t>::max();
-        else
-            stats.expert_batch_weight_bytes += weight_size;
-        const uint64_t route_count = static_cast<uint64_t>(batch.routes.size());
-        const uint64_t route_weight_size = weight_size != 0
-                                                   && batch.routes.size() > std::numeric_limits<uint64_t>::max() / weight_size
-                                               ? std::numeric_limits<uint64_t>::max()
-                                               : weight_size * route_count;
-        if (stats.expert_route_weight_bytes > std::numeric_limits<uint64_t>::max() - route_weight_size)
-            stats.expert_route_weight_bytes = std::numeric_limits<uint64_t>::max();
-        else
-            stats.expert_route_weight_bytes += route_weight_size;
+        if (stats)
+        {
+            const uint64_t weight_size = moe.experts[batch.expert_id].weight_size;
+            if (stats->expert_batch_weight_bytes > std::numeric_limits<uint64_t>::max() - weight_size)
+                stats->expert_batch_weight_bytes = std::numeric_limits<uint64_t>::max();
+            else
+                stats->expert_batch_weight_bytes += weight_size;
+            const uint64_t route_count = static_cast<uint64_t>(batch.routes.size());
+            const uint64_t route_weight_size = weight_size != 0
+                                                       && batch.routes.size() > std::numeric_limits<uint64_t>::max() / weight_size
+                                                   ? std::numeric_limits<uint64_t>::max()
+                                                   : weight_size * route_count;
+            if (stats->expert_route_weight_bytes > std::numeric_limits<uint64_t>::max() - route_weight_size)
+                stats->expert_route_weight_bytes = std::numeric_limits<uint64_t>::max();
+            else
+                stats->expert_route_weight_bytes += route_weight_size;
+        }
         layer_state.active_experts()[batch_index].prepare(batch);
     }
 }
@@ -1344,7 +1345,7 @@ Result<void> forward_moe(const CompiledModel& model,
                          uint32_t residency_group,
                          ExecutionBackend backend,
                          bool prefetch,
-                         const std::function<void()>& independent_work)
+                         MoEOverlap overlap)
 try
 {
     // Declare before submission owners so exception/early-return cleanup
@@ -1370,11 +1371,11 @@ try
             scratch.prepared_pins.clear();
         }
     } wave_cleanup{scratch, layer_state};
-    bool independent_work_started = false;
-    const auto run_independent_work = [&] {
-        if (!independent_work || independent_work_started) return;
-        independent_work_started = true;
-        independent_work();
+    bool overlap_started = false;
+    const auto run_overlap = [&] {
+        if (!overlap.run || overlap_started) return;
+        overlap_started = true;
+        overlap.run(overlap.context);
     };
     const bool require_gpu_execution = backend == ExecutionBackend::Vulkan
                                        && model.opt.hybrid_mode == HybridMode::HybridExperts;
@@ -1845,7 +1846,7 @@ try
             // Shared computation depends only on normalized input. Start it
             // after cold transfer work exists, while resident requests and
             // the upload still own their independent bounded reservations.
-            if (prestaged_upload) run_independent_work();
+            if (prestaged_upload) run_overlap();
         }
     }
     if (gpu_priority)
@@ -2106,7 +2107,7 @@ try
                 upload = model.expert_backend->begin_demand_batch(wave_demands);
                 // Do not move Shared ahead of cold demand: its compute CB
                 // overlaps the already-started upload and preparation lane.
-                if (upload) run_independent_work();
+                if (upload) run_overlap();
                 prepared = upload ? upload->wait(prepared_pins) : 0;
             }
             bool valid_prefix = prepared <= attempt_count;
@@ -2365,7 +2366,7 @@ try
         for (size_t index = 0; index < backend_status.size(); ++index)
             if (backend_status[index] == ExpertStatus::Executed)
                 stats->expert_gpu_routes += layer_state.active_experts()[index].batch.routes.size();
-        if (expert_cache_wait_timing_enabled(model))
+        if (wait_timing(model))
         {
             for (const ExpertState& active : layer_state.active_experts())
             {

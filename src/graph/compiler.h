@@ -54,6 +54,9 @@ struct CompilerOption
 
 [[nodiscard]] Result<void> compile_model(MoeModelDescriptor descriptor, WeightMapping mapping, CompiledModel& compiled, HybridMode hybrid_mode, const CompilerOption& opt);
 
+// Compile a descriptor that the caller has already validated.
+[[nodiscard]] Result<void> compile_model_validated(MoeModelDescriptor descriptor, WeightMapping mapping, CompiledModel& compiled, HybridMode hybrid_mode, const CompilerOption& opt);
+
 } // namespace moe
 } // namespace ncnn
 

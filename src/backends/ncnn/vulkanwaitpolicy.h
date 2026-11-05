@@ -15,7 +15,7 @@ enum class VulkanCompletionProbeResult
 // A probe uses an exclusively leased queue, which can differ from the original
 // submission's queue. Only device loss permits abandoning the original fence.
 // Success or a transient error on the probe says nothing about that fence.
-constexpr VulkanCompletionProbeResult classify_vulkan_completion_probe(int result, int device_lost) noexcept
+constexpr VulkanCompletionProbeResult classify_probe(int result, int device_lost) noexcept
 {
     return result == device_lost ? VulkanCompletionProbeResult::DeviceLost : VulkanCompletionProbeResult::Retry;
 }
@@ -31,7 +31,7 @@ struct VulkanCompletionCallbacks
     void (*pause)(void*);
 };
 
-inline int wait_for_vulkan_submission_completion(const VulkanCompletionCallbacks& callbacks)
+inline int wait_submit(const VulkanCompletionCallbacks& callbacks)
 {
     for (;;)
     {

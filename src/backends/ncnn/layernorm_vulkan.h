@@ -23,11 +23,11 @@ public:
     // An optional weight allocator must outlive the operator. Output storage
     // continues to use the Context's graph allocator.
     [[nodiscard]] static std::shared_ptr<LayerNorm_vulkan> create(const TensorData& weight,
-                                                                 const TensorData& bias,
-                                                                 float epsilon,
-                                                                 std::shared_ptr<VulkanContext> context,
-                                                                 const ncnn::Option& opt,
-                                                                 ncnn::VkAllocator* weight_allocator = nullptr);
+                                                                  const TensorData& bias,
+                                                                  float epsilon,
+                                                                  std::shared_ptr<VulkanContext> context,
+                                                                  const ncnn::Option& opt,
+                                                                  ncnn::VkAllocator* weight_allocator = nullptr);
     // The caller holds the context lock, which protects record scratch, and
     // retains outputs until submission completes.
     // Input and output variables must differ; an output view sharing input

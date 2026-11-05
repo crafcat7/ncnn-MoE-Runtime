@@ -2,6 +2,7 @@
 #define NCNN_MOE_EXPERTBANK_VULKAN_H
 
 #include "vulkan.h"
+#include "expertbankplan_vulkan.h"
 #include "ncnn/moe/result.h"
 #include "ncnn/moe/types.h"
 
@@ -35,32 +36,6 @@ struct ExpertBankWeights_vulkan
     // A loader may retain a cache lease here. create copies this pair into
     // mapped upload storage before releasing it or loading the next expert.
     std::shared_ptr<const void> owner;
-};
-
-struct ExpertBankPlan_vulkan
-{
-    DType dtype = DType::Float32;
-    ExpertLayout layout = ExpertLayout::InterleavedGateUpDown;
-    ExpertActivation activation = ExpertActivation::Silu;
-    float activation_limit = 0.0f;
-    uint32_t expert_count = 0;
-    uint32_t input_columns = 0;
-    uint32_t intermediate_columns = 0;
-    uint32_t output_columns = 0;
-    uint32_t device_index = 0;
-    uint64_t storage_size = 0;
-    uint64_t physical_size = 0;
-    uint64_t alignment = 4;
-    // Byte offsets and expert strides. Gate offsets are relative to each gate
-    // slice; down_scales/down_bias are relative to each down slice, whose bank
-    // begins at down_weights in the single immutable weight buffer.
-    uint64_t gate_stride = 0;
-    uint64_t down_stride = 0;
-    uint64_t gate_scales = 0;
-    uint64_t gate_bias = 0;
-    uint64_t down_weights = 0;
-    uint64_t down_scales = 0;
-    uint64_t down_bias = 0;
 };
 
 using ExpertBankLoader_vulkan = std::function<Result<ExpertBankWeights_vulkan>(uint32_t expert)>;

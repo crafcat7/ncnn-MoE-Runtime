@@ -160,14 +160,14 @@ bool record_mapped_upload(ncnn::VkMat& staging,
                           ncnn::VkCompute& command,
                           const ncnn::Option& option);
 
-bool record_mapped_activation_upload(ncnn::VkMat& staging,
-                                     ncnn::VkMat& destination,
-                                     ncnn::VkCompute& command,
-                                     ncnn::VulkanDevice* device,
-                                     const ncnn::Option& option,
-                                     DType source_dtype = DType::Float32);
+bool record_mapped_act_upload(ncnn::VkMat& staging,
+                              ncnn::VkMat& destination,
+                              ncnn::VkCompute& command,
+                              ncnn::VulkanDevice* device,
+                              const ncnn::Option& option,
+                              DType source_dtype = DType::Float32);
 
-[[nodiscard]] inline size_t vulkan_activation_storage_variant(const ncnn::Option& option) noexcept
+[[nodiscard]] inline size_t activation_variant(const ncnn::Option& option) noexcept
 {
     return option.use_fp16_storage
                ? 1
@@ -175,9 +175,9 @@ bool record_mapped_activation_upload(ncnn::VkMat& staging,
                                      : 0;
 }
 
-[[nodiscard]] inline size_t vulkan_activation_element_size(const ncnn::Option& option) noexcept
+[[nodiscard]] inline size_t act_element_size(const ncnn::Option& option) noexcept
 {
-    return vulkan_activation_storage_variant(option) == 0
+    return activation_variant(option) == 0
                ? sizeof(float)
                : sizeof(uint16_t);
 }
@@ -225,14 +225,14 @@ bool record_prepared_staging_upload(const ncnn::VkMat& staging,
                                     const ncnn::Option& option,
                                     DType source_dtype = DType::Float32);
 
-bool record_prepared_activation_staging_download(const ncnn::VkMat& source,
-                                                 size_t rows,
-                                                 uint32_t columns,
-                                                 ncnn::VkMat& staging,
-                                                 ncnn::VkCompute& command,
-                                                 ncnn::VulkanDevice* device,
-                                                 const ncnn::Option& option,
-                                                 DType output_dtype = DType::Float32);
+bool record_staging_download(const ncnn::VkMat& source,
+                             size_t rows,
+                             uint32_t columns,
+                             ncnn::VkMat& staging,
+                             ncnn::VkCompute& command,
+                             ncnn::VulkanDevice* device,
+                             const ncnn::Option& option,
+                             DType output_dtype = DType::Float32);
 
 bool copy_staging_to_cpu_batch(ncnn::VkMat& staging,
                                ActivationBuffer& output);

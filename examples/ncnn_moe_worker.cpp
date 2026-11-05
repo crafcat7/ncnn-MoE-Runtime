@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -159,10 +160,8 @@ static std::string expert_metrics_json(const RuntimeMetricCounters& counters)
     result.add_uint("cache_resident_bytes", counters.expert_cache_resident_size);
     result.add_uint("gpu_cache_hit", counters.expert_gpu_cache_hits);
     result.add_uint("gpu_cache_miss", counters.expert_gpu_cache_misses);
-    result.add_uint("gpu_cache_admissions", counters.expert_gpu_cache_admissions);
     result.add_uint("gpu_cache_stores", counters.expert_gpu_cache_stores);
     result.add_uint("gpu_cache_evictions", counters.expert_gpu_cache_evictions);
-    result.add_uint("gpu_cache_dropped_admissions", counters.expert_gpu_cache_dropped_admissions);
     result.add_uint("gpu_cache_resident_bytes", counters.expert_gpu_cache_resident_size);
     result.add_uint("gpu_cache_pending_bytes", counters.expert_gpu_cache_pending_size);
     result.add_uint("gpu_executions", counters.expert_gpu_executions);
@@ -170,9 +169,6 @@ static std::string expert_metrics_json(const RuntimeMetricCounters& counters)
     result.add_uint("speculative_proposals", counters.speculative_proposals);
     result.add_uint("speculative_draft_tokens", counters.speculative_draft_tokens);
     result.add_uint("speculative_accepted_tokens", counters.speculative_accepted_tokens);
-    result.add_uint("gpu_route_aggregation_batches", counters.expert_gpu_route_aggregation_batches);
-    result.add_uint("gpu_route_aggregation_routes", counters.expert_gpu_route_aggregation_routes);
-    result.add_uint("gpu_route_aggregation_bytes_saved", counters.expert_gpu_route_aggregation_bytes_saved);
     const uint64_t cache_requests = counters.expert_cache_hits + counters.expert_cache_misses;
     if (cache_requests == 0)
         result.add_null("cache_hit_rate");
@@ -192,26 +188,12 @@ static std::string gpu_metrics_json(const RuntimeMetricCounters& counters, bool 
     result.add_uint("linear_dispatches", counters.vulkan_linear_dispatches);
     result.add_uint("int4_dispatches", counters.vulkan_int4_dispatches);
     result.add_uint("attention_blocks", counters.vulkan_attention_blocks);
-    result.add_uint("gated_delta_fusions", counters.vulkan_gated_delta_fusions);
     result.add_uint("gated_delta_submissions", counters.vulkan_gated_delta_submissions);
-    result.add_uint("qwen_layers", counters.vulkan_qwen_layers);
-    result.add_uint("gated_residual_blocks", counters.vulkan_gated_residual_blocks);
-    result.add_uint("ple_blocks", counters.vulkan_ple_blocks);
     result.add_uint("batch_uploads", counters.vulkan_batch_uploads);
     result.add_uint("batch_downloads", counters.vulkan_batch_downloads);
-    result.add_uint("weight_upload_bytes", counters.vulkan_weight_upload_bytes);
-    result.add_uint("weight_transfer_submissions", counters.vulkan_weight_transfer_submissions);
-    result.add_uint("weight_visibility_submissions", counters.vulkan_weight_visibility_submissions);
-    result.add_uint("weight_transfer_fence_waits", counters.vulkan_weight_transfer_fence_waits);
-    result.add_uint("weight_transfer_wait_microseconds", counters.vulkan_weight_transfer_wait_microseconds);
-    result.add_uint("resident_graph_submissions", counters.vulkan_resident_graph_submissions);
-    result.add_uint("resident_graph_activation_upload_bytes", counters.vulkan_resident_graph_activation_upload_bytes);
-    result.add_uint("resident_graph_activation_download_bytes", counters.vulkan_resident_graph_activation_download_bytes);
-    result.add_uint("resident_graph_route_download_bytes", counters.vulkan_resident_graph_route_download_bytes);
     result.add_uint("attention_qkv_rope_fusions", counters.vulkan_attention_qkv_rope_fusions);
     result.add_uint("attention_device_rope_fusions", counters.vulkan_attention_device_rope_fusions);
     result.add_uint("attention_qkv_ring_fusions", counters.vulkan_attention_qkv_ring_fusions);
-    result.add_uint("attention_cache_materializations", counters.vulkan_attention_cache_materializations);
     result.add_uint("attention_cpu_fallbacks", counters.vulkan_attention_cpu_fallbacks);
     return result.finish();
 }
@@ -269,7 +251,7 @@ static std::string gpu_resource_plan_json(const CompiledModel& model)
         device.add_uint("session_state_bytes", plan.admitted.session_state_size);
         device.add_uint("peak_workspace_bytes", plan.admitted.workspace_size);
         device.add_uint("expected_concurrency", plan.num_concurrent_sessions);
-        device.add_uint("execution_reserve_bytes", gpu_resource_execution_reserve(plan));
+        device.add_uint("execution_reserve_bytes", gpu_exec_reserve(plan));
         device.add_uint("allocated_execution_bytes", plan.allocated_execution_size);
         const auto physical = query_vulkan_graph_compute(model.vulkan_runtime, plan.initial.device_index, model.opt.optimization_flags);
         device.add_uint("arena_preparation_physical_bytes", physical.preparation_physical_size);
@@ -297,13 +279,13 @@ static std::string placement_json(const CompiledModel& compiled)
     uint64_t attention_cpu = 0;
     uint64_t gated_delta_gpu = 0;
     uint64_t gated_delta_cpu = 0;
-    for (const ExecutionNode& node : compiled.graph.nodes)
+    for (const Layer& node : compiled.net.layers)
     {
-        if (node.type != ExecutionNodeType::Attention || node.layer_plan_index >= compiled.graph.layer_plans.size())
+        if (node.kind != LayerKind::Attention || node.plan_index >= compiled.net.layer_plans.size())
             continue;
         const bool gpu = node.backend == ExecutionBackend::Vulkan;
         (gpu ? attention_gpu : attention_cpu)++;
-        if (compiled.graph.layer_plans[node.layer_plan_index].attention.kind == AttentionKind::GatedDeltaNet)
+        if (compiled.net.layer_plans[node.plan_index].attention.kind == AttentionKind::GatedDeltaNet)
             (gpu ? gated_delta_gpu : gated_delta_cpu)++;
     }
     result.add_uint("attention_gpu_layers", attention_gpu);
@@ -504,54 +486,75 @@ static std::string runtime_metrics_json(const SessionMetrics& metrics,
     return result.finish();
 }
 
-static uint64_t require_mebibytes(const char* value, const char* option)
+static uint64_t require_uint64(std::string_view value, std::string_view option)
 {
-    const uint64_t count = std::stoull(value);
+    uint64_t result = 0;
+    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result);
+    if (value.empty() || parsed.ec != std::errc() || parsed.ptr != value.data() + value.size())
+        throw std::invalid_argument(std::string(option) + " must be an unsigned integer");
+    return result;
+}
+
+static uint32_t require_uint32(std::string_view value, std::string_view option)
+{
+    const uint64_t result = require_uint64(value, option);
+    if (result > std::numeric_limits<uint32_t>::max())
+        throw std::out_of_range(std::string(option) + " is outside the uint32 range");
+    return static_cast<uint32_t>(result);
+}
+
+static uint64_t require_mebibytes(std::string_view value, std::string_view option)
+{
+    const uint64_t count = require_uint64(value, option);
     if (count > std::numeric_limits<uint64_t>::max() / (1024 * 1024))
         throw std::out_of_range(std::string(option) + " is too large");
     return count * 1024 * 1024;
 }
 
-static const char* require_value(int argc, char** argv, int& index, const char* option)
+static std::string_view require_value(int argc, char** argv, int& index, std::string_view option)
 {
     if (++index >= argc)
         throw std::invalid_argument(std::string(option) + " requires a value");
     return argv[index];
 }
 
-static std::vector<uint32_t> parse_device_indices(const char* value)
+static std::vector<uint32_t> parse_device_indices(std::string_view value)
 {
     std::vector<uint32_t> result;
-    std::stringstream input(value);
-    std::string item;
-    while (std::getline(input, item, ','))
+    std::size_t start = 0;
+    while (start <= value.size())
     {
+        const std::size_t comma = value.find(',', start);
+        const std::string_view item = value.substr(start, comma == std::string_view::npos ? value.size() - start : comma - start);
         if (item.empty())
             throw std::invalid_argument("--vulkan-devices contains an empty device index");
-        result.push_back(static_cast<uint32_t>(std::stoul(item)));
+        result.push_back(require_uint32(item, "--vulkan-devices"));
+        if (comma == std::string_view::npos)
+            break;
+        start = comma + 1;
     }
     if (result.empty())
         throw std::invalid_argument("--vulkan-devices requires at least one device index");
     return result;
 }
 
-static HybridMode parse_hybrid_mode(const std::string& value)
+static HybridMode parse_hybrid_mode(std::string_view value)
 {
     if (value == "auto") return HybridMode::Auto;
     if (value == "cpu") return HybridMode::CpuOnly;
     if (value == "hybrid") return HybridMode::HybridExperts;
-    throw std::invalid_argument("unknown backend: " + value);
+    throw std::invalid_argument("unknown backend: " + std::string(value));
 }
 
-static ExpertMemoryMode parse_expert_memory_mode(const std::string& value)
+static ExpertMemoryMode parse_expert_memory_mode(std::string_view value)
 {
     if (value == "auto") return ExpertMemoryMode::Auto;
     if (value == "eager") return ExpertMemoryMode::Eager;
     if (value == "on-demand") return ExpertMemoryMode::OnDemand;
-    throw std::invalid_argument("unknown Expert memory mode: " + value);
+    throw std::invalid_argument("unknown Expert memory mode: " + std::string(value));
 }
 
-static CpuPackedWeightMode parse_cpu_packed_weight_mode(const std::string& value)
+static CpuPackedWeightMode parse_cpu_packed_weight_mode(std::string_view value)
 {
     if (value == "on") return CpuPackedWeightMode::Enabled;
     if (value == "off") return CpuPackedWeightMode::Disabled;
@@ -579,9 +582,9 @@ static Option parse_options(int argc, char** argv, int first_argument)
         else if (argument == "--expert-gpu-victim-cache-mb")
             result.expert_gpu_victim_cache_size = require_mebibytes(require_value(argc, argv, index, "--expert-gpu-victim-cache-mb"), "--expert-gpu-victim-cache-mb");
         else if (argument == "--expert-gpu-victim-reuse-probe")
-            result.expert_gpu_victim_reuse_probe_interval = static_cast<uint32_t>(std::stoul(require_value(argc, argv, index, "--expert-gpu-victim-reuse-probe")));
+            result.expert_gpu_victim_reuse_probe_interval = require_uint32(require_value(argc, argv, index, "--expert-gpu-victim-reuse-probe"), "--expert-gpu-victim-reuse-probe");
         else if (argument == "--expert-io-workers")
-            result.num_expert_io_threads = static_cast<uint32_t>(std::stoul(require_value(argc, argv, index, "--expert-io-workers")));
+            result.num_expert_io_threads = require_uint32(require_value(argc, argv, index, "--expert-io-workers"), "--expert-io-workers");
         else if (argument == "--expert-memory")
             result.expert_memory_mode = parse_expert_memory_mode(require_value(argc, argv, index, "--expert-memory"));
         else if (argument == "--cpu-packed-weights")
@@ -595,11 +598,11 @@ static Option parse_options(int argc, char** argv, int first_argument)
                 result.optimization_flags &= ~OptimizationCpuQnkQ8;
         }
         else if (argument == "--vulkan-device")
-            result.vulkan_device_index = static_cast<uint32_t>(std::stoul(require_value(argc, argv, index, "--vulkan-device")));
+            result.vulkan_device_index = require_uint32(require_value(argc, argv, index, "--vulkan-device"), "--vulkan-device");
         else if (argument == "--vulkan-devices")
             result.vulkan_device_indices = parse_device_indices(require_value(argc, argv, index, "--vulkan-devices"));
         else if (argument == "--expected-concurrency")
-            result.num_concurrent_sessions = static_cast<uint32_t>(std::stoul(require_value(argc, argv, index, "--expected-concurrency")));
+            result.num_concurrent_sessions = require_uint32(require_value(argc, argv, index, "--expected-concurrency"), "--expected-concurrency");
         else if (argument == "--mmap-experts")
         {
             if (result.expert_io_mode != ExpertIoMode::Auto && result.expert_io_mode != ExpertIoMode::Mmap)
@@ -1256,46 +1259,8 @@ private:
         emit(result.finish());
     }
 
-    void handle_generate(std::string_view request)
+    void parse_generation_options(std::string_view request, bool messages, GenerateRequest& parsed) const
     {
-        if (generation_running.load())
-            throw std::invalid_argument("only one generation can run at a time; cancel it first");
-        if (generation_thread.joinable())
-            generation_thread.join();
-        GenerateRequest parsed;
-        parsed.request_id = json_string(request, "request_id").value_or("generate");
-        parsed.session_id = json_string(request, "session_id").value_or("main");
-        const auto messages = find_manifest_member(request, "messages");
-        const auto prompt = find_manifest_member(request, "prompt_tokens");
-        if (messages.has_value() == prompt.has_value())
-            throw std::invalid_argument("generate requires exactly one of messages or prompt_tokens");
-        std::vector<int32_t> full_prompt;
-        if (messages)
-        {
-            if (!native_text_supported)
-                throw std::invalid_argument("native message input is not supported for this model");
-            const bool thinking = request_bool(request, "enable_thinking", true);
-            auto encoded = model->encode(*messages, thinking);
-            if (!encoded)
-            {
-                if (encoded.error().code == ErrorCode::InvalidArgument)
-                    throw std::invalid_argument(encoded.error().message);
-                throw std::runtime_error(encoded.error().message);
-            }
-            full_prompt = std::move(encoded).value();
-            if (full_prompt.empty())
-                throw std::invalid_argument("chat template did not produce prompt tokens");
-        }
-        else
-        {
-            parsed.prompt_tokens = request_tokens(request, "prompt_tokens", true);
-            const uint32_t vocabulary_size = model->descriptor().vocabulary_size;
-            for (const int32_t token_id : parsed.prompt_tokens)
-            {
-                if (token_id < 0 || static_cast<uint32_t>(token_id) >= vocabulary_size)
-                    throw std::invalid_argument("prompt_tokens contains an ID outside the model vocabulary");
-            }
-        }
         parsed.options.max_new_tokens = request_uint(request, "max_new_tokens", parsed.options.max_new_tokens);
         parsed.options.use_speculative = request_bool(request, "enable_speculative", true);
         if (find_manifest_member(request, "stop_tokens"))
@@ -1352,12 +1317,13 @@ private:
         parsed.metrics_interval_ms = request_uint(request, "metrics_interval_ms", 1000);
         if (!request_bool(request, "metrics_enabled", true))
             parsed.metrics_interval_ms = 0;
-        const auto iterator = sessions.find(parsed.session_id);
-        if (iterator == sessions.end())
-            throw std::invalid_argument("unknown session: " + parsed.session_id);
-        WorkerSession& worker_session = iterator->second;
+    }
+
+    [[nodiscard]] bool prepare_generation(GenerateRequest& parsed, WorkerSession& worker_session,
+                                          std::vector<int32_t>& full_prompt, bool messages,
+                                          uint32_t requested_limit)
+    {
         const uint32_t model_limit = maximum_context_tokens();
-        const uint32_t requested_limit = request_uint(request, "context_tokens", 0);
         const uint32_t context_limit = model_limit == 0
                                            ? requested_limit
                                        : requested_limit == 0 ? model_limit
@@ -1378,7 +1344,7 @@ private:
                 if (context_limit != 0)
                 {
                     emit_context_overflow(parsed.request_id, parsed.prompt_count, context_limit);
-                    return;
+                    return false;
                 }
                 throw std::invalid_argument("unlimited generation requires a known remaining context");
             }
@@ -1389,40 +1355,91 @@ private:
                 || parsed.options.max_new_tokens > context_limit - parsed.prompt_count))
         {
             emit_context_overflow(parsed.request_id, parsed.prompt_count, context_limit);
-            return;
+            return false;
         }
-        if (messages)
+        if (!messages)
         {
-            const std::vector<int32_t>& committed = worker_session.committed_tokens;
-            const uint64_t sequence_length = worker_session.session->sequence_length();
-            parsed.prefix_reused = !committed.empty()
-                                   && committed.size() == sequence_length
-                                   && full_prompt.size() > committed.size()
-                                   && std::equal(committed.begin(), committed.end(), full_prompt.begin());
-            if (parsed.prefix_reused)
-            {
-                parsed.prompt_tokens.assign(full_prompt.begin() + static_cast<std::ptrdiff_t>(committed.size()),
-                                            full_prompt.end());
-            }
-            else
-            {
-                auto reset = worker_session.session->reset();
-                if (!reset)
-                {
-                    worker_session.committed_tokens.clear();
-                    emit_error(parsed.request_id, reset.error().message, error_code_name(reset.error().code));
-                    return;
-                }
-                worker_session.committed_tokens.clear();
-                parsed.prompt_tokens = std::move(full_prompt);
-            }
-            worker_session.committed_tokens.insert(worker_session.committed_tokens.end(),
-                                                   parsed.prompt_tokens.begin(),
-                                                   parsed.prompt_tokens.end());
-            parsed.track_prefix = true;
+            worker_session.committed_tokens.clear();
+            return true;
+        }
+
+        const std::vector<int32_t>& committed = worker_session.committed_tokens;
+        const uint64_t sequence_length = worker_session.session->sequence_length();
+        parsed.prefix_reused = !committed.empty()
+                               && committed.size() == sequence_length
+                               && full_prompt.size() > committed.size()
+                               && std::equal(committed.begin(), committed.end(), full_prompt.begin());
+        if (parsed.prefix_reused)
+        {
+            parsed.prompt_tokens.assign(full_prompt.begin() + static_cast<std::ptrdiff_t>(committed.size()),
+                                        full_prompt.end());
         }
         else
+        {
+            auto reset = worker_session.session->reset();
+            if (!reset)
+            {
+                worker_session.committed_tokens.clear();
+                emit_error(parsed.request_id, reset.error().message, error_code_name(reset.error().code));
+                return false;
+            }
             worker_session.committed_tokens.clear();
+            parsed.prompt_tokens = std::move(full_prompt);
+        }
+        worker_session.committed_tokens.insert(worker_session.committed_tokens.end(),
+                                               parsed.prompt_tokens.begin(), parsed.prompt_tokens.end());
+        parsed.track_prefix = true;
+        return true;
+    }
+
+    void handle_generate(std::string_view request)
+    {
+        if (generation_running.load())
+            throw std::invalid_argument("only one generation can run at a time; cancel it first");
+        if (generation_thread.joinable())
+            generation_thread.join();
+        GenerateRequest parsed;
+        parsed.request_id = json_string(request, "request_id").value_or("generate");
+        parsed.session_id = json_string(request, "session_id").value_or("main");
+        const auto messages = find_manifest_member(request, "messages");
+        const auto prompt = find_manifest_member(request, "prompt_tokens");
+        if (messages.has_value() == prompt.has_value())
+            throw std::invalid_argument("generate requires exactly one of messages or prompt_tokens");
+        std::vector<int32_t> full_prompt;
+        if (messages)
+        {
+            if (!native_text_supported)
+                throw std::invalid_argument("native message input is not supported for this model");
+            const bool thinking = request_bool(request, "enable_thinking", true);
+            auto encoded = model->encode(*messages, thinking);
+            if (!encoded)
+            {
+                if (encoded.error().code == ErrorCode::InvalidArgument)
+                    throw std::invalid_argument(encoded.error().message);
+                throw std::runtime_error(encoded.error().message);
+            }
+            full_prompt = std::move(encoded).value();
+            if (full_prompt.empty())
+                throw std::invalid_argument("chat template did not produce prompt tokens");
+        }
+        else
+        {
+            parsed.prompt_tokens = request_tokens(request, "prompt_tokens", true);
+            const uint32_t vocabulary_size = model->descriptor().vocabulary_size;
+            for (const int32_t token_id : parsed.prompt_tokens)
+            {
+                if (token_id < 0 || static_cast<uint32_t>(token_id) >= vocabulary_size)
+                    throw std::invalid_argument("prompt_tokens contains an ID outside the model vocabulary");
+            }
+        }
+        parse_generation_options(request, messages.has_value(), parsed);
+        const auto iterator = sessions.find(parsed.session_id);
+        if (iterator == sessions.end())
+            throw std::invalid_argument("unknown session: " + parsed.session_id);
+        WorkerSession& worker_session = iterator->second;
+        const uint32_t requested_limit = request_uint(request, "context_tokens", 0);
+        if (!prepare_generation(parsed, worker_session, full_prompt, messages.has_value(), requested_limit))
+            return;
         // Only the request loop owns the active ID; the worker publishes completion.
         active_request_id = parsed.request_id;
         const std::string request_id = parsed.request_id;

@@ -3,6 +3,7 @@
 #include "executor.h"
 #include "sessionstate.h"
 #include "expertbackend.h"
+#include "storage/expertcache.h"
 #include "graph/compiledmodel.h"
 #include "kernels/fastmath.h"
 #include "kernels/latentattention.h"
@@ -83,6 +84,99 @@ Session::Session(ModelPtr _model, const SessionOptions& opt)
 }
 
 Session::~Session() = default;
+
+static uint64_t counter_delta(uint64_t current, uint64_t baseline) noexcept
+{
+    return current >= baseline ? current - baseline : 0;
+}
+
+static RuntimeMetricCounters metric_counters(const SessionStatistics& stats,
+                                             const RuntimeMetricCounters* baseline)
+{
+    const RuntimeMetricCounters empty;
+    const RuntimeMetricCounters& start = baseline == nullptr ? empty : *baseline;
+    RuntimeMetricCounters result;
+    result.prefill_tokens = counter_delta(stats.prefill_tokens, start.prefill_tokens);
+    result.decode_tokens = counter_delta(stats.decode_tokens, start.decode_tokens);
+    result.expert_assignments = counter_delta(stats.expert_assignments, start.expert_assignments);
+    result.expert_batches = counter_delta(stats.expert_batches, start.expert_batches);
+    result.expert_cpu_batches = counter_delta(stats.expert_cpu_batches, start.expert_cpu_batches);
+    result.expert_cpu_routes = counter_delta(stats.expert_cpu_routes, start.expert_cpu_routes);
+    result.expert_gpu_routes = counter_delta(stats.expert_gpu_routes, start.expert_gpu_routes);
+    result.expert_cpu_fallbacks = counter_delta(stats.expert_cpu_fallbacks, start.expert_cpu_fallbacks);
+    result.speculative_proposals = counter_delta(stats.speculative_proposals, start.speculative_proposals);
+    result.speculative_draft_tokens = counter_delta(stats.speculative_draft_tokens, start.speculative_draft_tokens);
+    result.speculative_accepted_tokens = counter_delta(stats.speculative_accepted_tokens, start.speculative_accepted_tokens);
+    result.expert_cache_hits = counter_delta(stats.expert_cache_hits, start.expert_cache_hits);
+    result.expert_cache_misses = counter_delta(stats.expert_cache_misses, start.expert_cache_misses);
+    result.expert_io_bytes = counter_delta(stats.expert_cache_bytes_read, start.expert_io_bytes);
+    result.expert_cache_resident_size = stats.expert_cache_resident_size;
+    result.expert_gpu_cache_hits = counter_delta(stats.expert_gpu_cache_hits, start.expert_gpu_cache_hits);
+    result.expert_gpu_cache_misses = counter_delta(stats.expert_gpu_cache_misses, start.expert_gpu_cache_misses);
+    result.expert_gpu_cache_stores = counter_delta(stats.expert_gpu_cache_stores, start.expert_gpu_cache_stores);
+    result.expert_gpu_cache_evictions = counter_delta(stats.expert_gpu_cache_evictions, start.expert_gpu_cache_evictions);
+    result.expert_gpu_cache_resident_size = stats.expert_gpu_cache_resident_size;
+    result.expert_gpu_cache_pending_size = stats.expert_gpu_cache_pending_size;
+    result.expert_gpu_executions = counter_delta(stats.expert_gpu_executions, start.expert_gpu_executions);
+    result.expert_gpu_execution_failures = counter_delta(stats.expert_gpu_execution_failures, start.expert_gpu_execution_failures);
+    result.gpu_submit_count = counter_delta(stats.vulkan_compute_submissions, start.gpu_submit_count);
+    result.vulkan_linear_dispatches = counter_delta(stats.vulkan_linear_dispatches, start.vulkan_linear_dispatches);
+    result.vulkan_int4_dispatches = counter_delta(stats.vulkan_int4_dispatches, start.vulkan_int4_dispatches);
+    result.vulkan_attention_blocks = counter_delta(stats.vulkan_attention_blocks, start.vulkan_attention_blocks);
+    result.vulkan_batch_uploads = counter_delta(stats.vulkan_batch_uploads, start.vulkan_batch_uploads);
+    result.vulkan_batch_downloads = counter_delta(stats.vulkan_batch_downloads, start.vulkan_batch_downloads);
+    result.vulkan_attention_qkv_rope_fusions = counter_delta(stats.vulkan_attention_qkv_rope_fusions,
+                                                             start.vulkan_attention_qkv_rope_fusions);
+    result.vulkan_attention_device_rope_fusions = counter_delta(stats.vulkan_attention_device_rope_fusions,
+                                                                start.vulkan_attention_device_rope_fusions);
+    result.vulkan_attention_qkv_ring_fusions = counter_delta(stats.vulkan_attention_qkv_ring_fusions,
+                                                             start.vulkan_attention_qkv_ring_fusions);
+    result.vulkan_attention_cpu_fallbacks = counter_delta(stats.vulkan_attention_cpu_fallbacks,
+                                                          start.vulkan_attention_cpu_fallbacks);
+    result.vulkan_gated_delta_submissions = counter_delta(stats.vulkan_gated_delta_submissions,
+                                                          start.vulkan_gated_delta_submissions);
+    result.kv_cache_logical_size = stats.kv_cache_logical_size;
+    result.kv_cache_allocated_size = stats.kv_cache_allocated_size;
+    return result;
+}
+
+static void apply_cache_stats(SessionStatistics& stats, const ExpertCacheStatistics& cache)
+{
+    stats.expert_cache_hits = cache.hits;
+    stats.expert_cache_misses = cache.misses;
+    stats.expert_cache_evictions = cache.evictions;
+    stats.expert_cache_bytes_read = cache.bytes_read;
+    stats.expert_cache_resident_size = cache.resident_size;
+}
+
+static void apply_backend_stats(SessionStatistics& stats, const ExpertBackendStatistics& backend)
+{
+    stats.expert_gpu_cache_hits = backend.hits;
+    stats.expert_gpu_cache_misses = backend.misses;
+    stats.expert_gpu_cache_stores = backend.stores;
+    stats.expert_gpu_cache_evictions = backend.evictions;
+    stats.expert_gpu_cache_resident_size = backend.resident_size;
+    stats.expert_gpu_cache_pending_size = backend.pending_size;
+    stats.expert_gpu_executions = backend.executions;
+    stats.expert_gpu_execution_failures = backend.execution_failures;
+}
+
+SessionStatistics Session::snapshot_stats() const
+{
+    SessionStatistics result = stats;
+    const CompiledModel& compiled = model_compiled(*model);
+    if (compiled.expert_cache)
+        apply_cache_stats(result, compiled.expert_cache->statistics());
+    if (compiled.expert_backend)
+        apply_backend_stats(result, compiled.expert_backend->statistics());
+    return result;
+}
+
+SessionStatistics Session::statistics() const
+{
+    const std::lock_guard<std::mutex> lock(mutex);
+    return snapshot_stats();
+}
 
 void Session::commit_execution(uint64_t prefill_tokens, uint64_t decode_tokens)
 {
@@ -1135,6 +1229,77 @@ Result<SampledToken> Session::sample(std::span<const float> logits, const Sampli
 {
     const std::lock_guard<std::mutex> lock(mutex);
     return sample_unlocked(logits, opt);
+}
+
+void Session::begin_generation(uint64_t input_tokens)
+{
+    generation_active = true;
+    generation_input_tokens = input_tokens;
+    generation_output_tokens = 0;
+    generation_elapsed_microseconds = 0;
+    generation_start_time = std::chrono::steady_clock::now();
+    generation_first_token_time = {};
+    metrics_base = metric_counters(snapshot_stats(), nullptr);
+    metrics_valid = true;
+}
+
+void Session::finish_generation() noexcept
+{
+    if (!generation_active)
+        return;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - generation_start_time);
+    generation_elapsed_microseconds = static_cast<uint64_t>(elapsed.count());
+    generation_active = false;
+}
+
+SessionMetrics Session::metrics() const
+{
+    const std::lock_guard<std::mutex> lock(mutex);
+    SessionMetrics result;
+    const SessionStatistics current = snapshot_stats();
+    result.cumulative = metric_counters(current, nullptr);
+    const RuntimeMetricCounters& baseline = metrics_valid ? metrics_base : result.cumulative;
+    result.generation = metric_counters(current, &baseline);
+    result.gpu_available = model->hybrid_mode() != HybridMode::CpuOnly;
+    result.timing.active = generation_active;
+    result.timing.input_tokens = generation_input_tokens;
+    result.timing.output_tokens = generation_output_tokens;
+
+    uint64_t elapsed_microseconds = generation_elapsed_microseconds;
+    if (generation_active)
+    {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - generation_start_time);
+        elapsed_microseconds = static_cast<uint64_t>(elapsed.count());
+    }
+    result.timing.elapsed_microseconds = elapsed_microseconds;
+
+    uint64_t ttft_microseconds = 0;
+    if (generation_output_tokens != 0)
+    {
+        const auto ttft = std::chrono::duration_cast<std::chrono::microseconds>(generation_first_token_time - generation_start_time);
+        ttft_microseconds = static_cast<uint64_t>(ttft.count());
+        result.timing.prompt_elapsed_microseconds = ttft_microseconds;
+        result.timing.ttft_microseconds = ttft_microseconds;
+        if (generation_input_tokens != 0 && ttft_microseconds != 0)
+        {
+            result.timing.prompt_tokens_per_second = static_cast<double>(generation_input_tokens) * 1000000.0
+                                                     / static_cast<double>(ttft_microseconds);
+        }
+    }
+
+    if (generation_output_tokens != 0 && elapsed_microseconds >= ttft_microseconds)
+    {
+        const uint64_t decode_elapsed_microseconds = elapsed_microseconds - ttft_microseconds;
+        result.timing.generation_elapsed_microseconds = decode_elapsed_microseconds;
+        if (generation_output_tokens > 1 && decode_elapsed_microseconds != 0)
+        {
+            const uint64_t decode_tokens = generation_output_tokens - 1;
+            result.timing.tpot_microseconds = static_cast<double>(decode_elapsed_microseconds) / static_cast<double>(decode_tokens);
+            result.timing.generation_tokens_per_second = static_cast<double>(decode_tokens) * 1000000.0 / static_cast<double>(decode_elapsed_microseconds);
+            result.timing.decode_tokens_per_second = result.timing.generation_tokens_per_second;
+        }
+    }
+    return result;
 }
 
 } // namespace moe

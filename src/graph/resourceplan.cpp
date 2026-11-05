@@ -39,7 +39,7 @@ static uint64_t execution_reserve(const GpuResourcePlan& plan, GpuResourceReques
     return add_size(multiply_size(request.session_state_size, plan.num_concurrent_sessions), workspace);
 }
 
-uint64_t gpu_resource_execution_reserve(const GpuResourcePlan& plan) noexcept
+uint64_t gpu_exec_reserve(const GpuResourcePlan& plan) noexcept
 {
     return execution_reserve(plan, plan.admitted);
 }

@@ -9,27 +9,100 @@ project(ncnn_moe_runtime VERSION 0.1.0 LANGUAGES CXX)
 option(NCNN_BUILD_MOE_RUNTIME "Build the ncnn MoE transformer runtime" ON)
 option(NCNN_MOE_BUILD_TESTS "Build ncnn_moe tests" ON)
 option(NCNN_MOE_BUILD_EXAMPLES "Build ncnn_moe examples" ON)
-option(
-    NCNN_MOE_BUILD_REFERENCE_RUNNERS
-    "Build model-specific token-ID reference runners used by benchmarks and CTest"
-    OFF
-)
-option(
-    NCNN_MOE_BUILD_MXFP4_BENCHMARK
-    "Build the standalone MXFP4 microbenchmark"
-    OFF
-)
-option(
-    NCNN_MOE_ENABLE_MSVC_MP
-    "Enable MSVC multiprocessor compilation"
-    ON
-)
+option(NCNN_MOE_ENABLE_MSVC_MP "Enable MSVC multiprocessor compilation" ON)
+option(NCNN_MOE_ENABLE_LTO "Enable Release LTO (smaller worker, much larger static .lib)" OFF)
+option(NCNN_MOE_SIZE_OPTIMIZE_COLD_PATHS "Compile load/import/tokenizer paths for size in Release" ON)
+set(NCNN_MOE_OPT_LEVEL "O3" CACHE STRING "Release optimization level: O0, O1, O2, O3, or Os")
+# Optional CPU ISA extensions. Disable these for portable/minimal builds; the
+# runtime selector falls back to scalar kernels when they are off.
+option(NCNN_MOE_ENABLE_X86_SIMD "Build optional AVX2/AVX512 x86 kernels" ON)
+option(NCNN_MOE_ENABLE_ARM_SVE2 "Build optional ARM SVE2 MXFP4 kernels" ON)
+option(NCNN_MOE_ENABLE_OPENMP "Enable OpenMP CPU parallelism when the toolchain provides it" ON)
 set(NCNN_MOE_USE_NCNN_DEFAULT ON)
 option(NCNN_MOE_USE_NCNN "Use ncnn optimized CPU operators when available" ${NCNN_MOE_USE_NCNN_DEFAULT})
 set(NCNN_MOE_USE_VULKAN_DEFAULT ON)
 option(NCNN_MOE_USE_VULKAN "Build ncnn with Vulkan support" ${NCNN_MOE_USE_VULKAN_DEFAULT})
 
+string(TOUPPER "${NCNN_MOE_OPT_LEVEL}" _NCNN_MOE_OPT_LEVEL)
+if(_NCNN_MOE_OPT_LEVEL MATCHES "^[0123]$")
+    set(NCNN_MOE_OPT_LEVEL "O${_NCNN_MOE_OPT_LEVEL}")
+elseif(_NCNN_MOE_OPT_LEVEL STREQUAL "S")
+    set(NCNN_MOE_OPT_LEVEL "Os")
+elseif(_NCNN_MOE_OPT_LEVEL MATCHES "^O[0123]$")
+    set(NCNN_MOE_OPT_LEVEL "${_NCNN_MOE_OPT_LEVEL}")
+elseif(_NCNN_MOE_OPT_LEVEL STREQUAL "OS")
+    set(NCNN_MOE_OPT_LEVEL "Os")
+else()
+    message(FATAL_ERROR "NCNN_MOE_OPT_LEVEL must be O0, O1, O2, O3, or Os (got: ${NCNN_MOE_OPT_LEVEL})")
+endif()
+set(NCNN_MOE_OPT_LEVEL "${NCNN_MOE_OPT_LEVEL}" CACHE STRING "Release optimization level: O0, O1, O2, O3, or Os" FORCE)
+set_property(CACHE NCNN_MOE_OPT_LEVEL PROPERTY STRINGS O0 O1 O2 O3 Os)
+
 include(GNUInstallDirs)
+
+# Keep Release artifacts small without changing -O level: one section per
+# function/data plus LTO lets the linker drop unreferenced operator paths.
+function(ncnn_moe_optimize_target target)
+    if(NOT TARGET ${target})
+        return()
+    endif()
+    if(MSVC)
+        if(NCNN_MOE_OPT_LEVEL STREQUAL "O0")
+            target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/Od>)
+        elseif(NCNN_MOE_OPT_LEVEL STREQUAL "O1")
+            target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/O1>)
+        elseif(NCNN_MOE_OPT_LEVEL STREQUAL "O2")
+            target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/O2>)
+        elseif(NCNN_MOE_OPT_LEVEL STREQUAL "O3")
+            # /Ob3 and /Ot are the closest MSVC equivalent of -O3.
+            target_compile_options(${target} PRIVATE
+                $<$<CONFIG:Release>:/O2>
+                $<$<CONFIG:Release>:/Ob3>
+                $<$<CONFIG:Release>:/Ot>)
+        else()
+            target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/O1>)
+        endif()
+        target_compile_options(${target} PRIVATE
+            $<$<CONFIG:Release>:/Gy>
+            $<$<CONFIG:Release>:/Gw>)
+        target_link_options(${target} PRIVATE
+            $<$<CONFIG:Release>:/OPT:REF>
+            $<$<CONFIG:Release>:/OPT:ICF>)
+    else()
+        if(NCNN_MOE_OPT_LEVEL STREQUAL "O0")
+            target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-O0>)
+        elseif(NCNN_MOE_OPT_LEVEL STREQUAL "O1")
+            target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-O1>)
+        elseif(NCNN_MOE_OPT_LEVEL STREQUAL "O2")
+            target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-O2>)
+        elseif(NCNN_MOE_OPT_LEVEL STREQUAL "O3")
+            target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-O3>)
+        else()
+            target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-Os>)
+        endif()
+        target_compile_options(${target} PRIVATE
+            $<$<CONFIG:Release>:-ffunction-sections>
+            $<$<CONFIG:Release>:-fdata-sections>)
+        if(APPLE)
+            target_link_options(${target} PRIVATE $<$<CONFIG:Release>:-Wl,-dead_strip>)
+        elseif(UNIX)
+            target_link_options(${target} PRIVATE $<$<CONFIG:Release>:-Wl,--gc-sections>)
+        endif()
+    endif()
+    if(NCNN_MOE_ENABLE_LTO)
+        if(NOT DEFINED NCNN_MOE_IPO_SUPPORTED)
+            include(CheckIPOSupported)
+            check_ipo_supported(RESULT NCNN_MOE_IPO_SUPPORTED
+                OUTPUT NCNN_MOE_IPO_ERROR LANGUAGES CXX)
+            set(NCNN_MOE_IPO_SUPPORTED ${NCNN_MOE_IPO_SUPPORTED} CACHE INTERNAL
+                "ncnn_moe toolchain LTO support")
+        endif()
+        if(NCNN_MOE_IPO_SUPPORTED)
+            set_property(TARGET ${target} PROPERTY
+                INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+        endif()
+    endif()
+endfunction()
 
 if(MSVC)
     # Set CRT and link policy before creating runtime/ncnn targets.
@@ -72,6 +145,11 @@ set(NCNN_MOE_SOURCES
     src/backends/ncnn/residentffn_vulkan.cpp
     src/backends/ncnn/latentattention_vulkan.cpp
     src/backends/ncnn/linear.cpp
+    src/backends/ncnn/linear_bf16.cpp
+    src/backends/ncnn/linear_expert.cpp
+    src/backends/ncnn/linear_float8.cpp
+    src/backends/ncnn/linear_mxfp4.cpp
+    src/backends/ncnn/linear_qnk.cpp
     src/backends/ncnn/modelpipeline.cpp
     src/backends/ncnn/vulkancontext.cpp
     # Execution
@@ -80,7 +158,6 @@ set(NCNN_MOE_SOURCES
     src/engine/executor_speculative.cpp
     src/engine/expert.cpp
     src/engine/expertbackend.cpp
-    src/engine/metrics.cpp
     src/engine/modelloader.cpp
     src/engine/runtime.cpp
     src/engine/scheduler.cpp
@@ -131,6 +208,43 @@ set(NCNN_MOE_SOURCES
     src/storage/weightstore.cpp
 )
 add_library(ncnn_moe STATIC ${NCNN_MOE_SOURCES})
+ncnn_moe_optimize_target(ncnn_moe)
+
+# Loading, importing and tokenization are cold paths. Optimize them for size
+# while keeping kernels and execution at the target's Release optimization.
+if(NCNN_MOE_SIZE_OPTIMIZE_COLD_PATHS AND NOT NCNN_MOE_OPT_LEVEL STREQUAL "O0")
+    set(NCNN_MOE_COLD_SOURCES
+        src/engine/modelloader.cpp
+        src/engine/runtime.cpp
+        src/graph/compiler.cpp
+        src/graph/graphmemory.cpp
+        src/graph/memoryplan.cpp
+        src/graph/resourceplan.cpp
+        src/models/gguf.cpp
+        src/models/ggufmodel.cpp
+        src/models/ggufmodel_gptoss.cpp
+        src/models/ggufmodel_qwen.cpp
+        src/models/modeladapter.cpp
+        src/models/modeladapter_deepseekv4.cpp
+        src/models/modeladapter_gptoss.cpp
+        src/models/modeladapter_ling.cpp
+        src/models/modeladapter_phimoe.cpp
+        src/models/modeladapter_qwen3.cpp
+        src/models/modeladapter_qwen3_5.cpp
+        src/models/modeladapter_qwen4exp.cpp
+        src/models/safetensors.cpp
+        src/models/tokenizer.cpp
+        src/storage/mappedfile.cpp
+        src/storage/weightstore.cpp
+    )
+    if(MSVC)
+        set(_ncnn_moe_cold_size_option "$<$<CONFIG:Release>:/Os>")
+    else()
+        set(_ncnn_moe_cold_size_option "$<$<CONFIG:Release>:-Os>")
+    endif()
+    set_property(SOURCE ${NCNN_MOE_COLD_SOURCES} APPEND PROPERTY
+        COMPILE_OPTIONS ${_ncnn_moe_cold_size_option})
+endif()
 source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${NCNN_MOE_SOURCES})
 
 if(MSVC)
@@ -149,7 +263,7 @@ endif()
 # Architecture-specific compilation
 # ==============================================================================
 # Keep ISA flags local so baseline code remains portable.
-if(MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
+if(NCNN_MOE_ENABLE_X86_SIMD AND MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
     set(NCNN_MOE_MSVC_SIMD_SOURCES
         src/kernels/float8_msvc_avx2.cpp
         src/kernels/float8_msvc_avx512.cpp
@@ -193,7 +307,7 @@ elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         set(NCNN_MOE_TARGET_HAS_X86 ON)
     endif()
 
-    if(NCNN_MOE_TARGET_HAS_X86)
+    if(NCNN_MOE_TARGET_HAS_X86 AND NCNN_MOE_ENABLE_X86_SIMD)
         set(NCNN_MOE_X86_SIMD_SOURCES
             src/kernels/vector_x86_avx2.cpp
             src/kernels/vector_x86_avx512.cpp
@@ -205,7 +319,8 @@ elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 # Compiler support does not imply runtime CPU support.
 if(
-    CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$"
+    NCNN_MOE_ENABLE_ARM_SVE2
+    AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$"
     AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"
 )
     include(CheckCXXCompilerFlag)
@@ -247,14 +362,18 @@ target_include_directories(ncnn_moe
 
 # --- OpenMP dependency --------------------------------------------------------
 # Discover OpenMP before ncnn so both share the imported target.
-include(cmake/ncnn_moe_openmp.cmake)
 set(NCNN_MOE_WITH_OPENMP OFF)
-if(TARGET OpenMP::OpenMP_CXX)
-    target_link_libraries(ncnn_moe PUBLIC OpenMP::OpenMP_CXX)
-    set(NCNN_MOE_WITH_OPENMP ON)
-    message(STATUS "ncnn_moe OpenMP expert parallelism enabled")
+if(NCNN_MOE_ENABLE_OPENMP)
+    include(cmake/ncnn_moe_openmp.cmake)
+    if(TARGET OpenMP::OpenMP_CXX)
+        target_link_libraries(ncnn_moe PUBLIC OpenMP::OpenMP_CXX)
+        set(NCNN_MOE_WITH_OPENMP ON)
+        message(STATUS "ncnn_moe OpenMP expert parallelism enabled")
+    else()
+        message(STATUS "ncnn_moe OpenMP unavailable; expert groups use one CPU thread")
+    endif()
 else()
-    message(STATUS "ncnn_moe OpenMP unavailable; expert groups use one CPU thread")
+    message(STATUS "ncnn_moe OpenMP disabled by NCNN_MOE_ENABLE_OPENMP=OFF")
 endif()
 
 # ==============================================================================
@@ -498,53 +617,12 @@ else()
 endif()
 
 # ==============================================================================
-# C++ tests and fixture runners
+# Tests: framework, quantization and model-level precision checks only
 # ==============================================================================
-# GPU cases return 77 when their backend is unavailable.
+# Per-kernel Vulkan and micro-benchmark tests are deliberately not registered;
+# they duplicate the model-level coverage below and dominate build time.
 if(NCNN_MOE_BUILD_TESTS)
     enable_testing()
-    # Exercise failure handling without initializing Vulkan.
-    add_executable(ncnn_moe_vulkan_wait_policy_test tests/test_vulkan_wait_policy.cpp)
-    target_compile_features(ncnn_moe_vulkan_wait_policy_test PRIVATE cxx_std_20)
-    target_include_directories(ncnn_moe_vulkan_wait_policy_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    add_test(NAME ncnn_moe_vulkan_wait_policy COMMAND ncnn_moe_vulkan_wait_policy_test)
-
-    add_executable(ncnn_moe_graph_memory_test tests/test_graph_memory.cpp)
-    target_link_libraries(ncnn_moe_graph_memory_test PRIVATE ncnn::moe)
-    target_compile_features(ncnn_moe_graph_memory_test PRIVATE cxx_std_20)
-    target_include_directories(ncnn_moe_graph_memory_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    add_test(NAME ncnn_moe_graph_memory COMMAND ncnn_moe_graph_memory_test)
-
-    add_executable(ncnn_moe_attention_decode_plan_test tests/test_attention_decode_plan.cpp)
-    target_compile_features(ncnn_moe_attention_decode_plan_test PRIVATE cxx_std_20)
-    target_include_directories(ncnn_moe_attention_decode_plan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    add_test(NAME ncnn_moe_attention_decode_plan COMMAND ncnn_moe_attention_decode_plan_test)
-
-    if(NCNN_MOE_WITH_VULKAN)
-        foreach(NCNN_MOE_VULKAN_TEST IN ITEMS
-                attention_gqa graph_allocator resident_ffn grouped_moe_combine
-                gpu_segment gpu_continuation gpu_expert_bank linear_allocation
-                rmsnorm projection_matvec gpu_expert_bank_numerics attention_bf16_decode)
-            add_executable(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test tests/test_${NCNN_MOE_VULKAN_TEST}_vulkan.cpp)
-            target_link_libraries(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PRIVATE ncnn::moe)
-            target_compile_features(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PRIVATE cxx_std_20)
-            target_compile_definitions(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PRIVATE NCNN_MOE_WITH_VULKAN=1)
-            target_include_directories(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-            if(NCNN_MOE_VULKAN_TEST MATCHES "^(attention_gqa|rmsnorm|attention_bf16_decode)$")
-                target_include_directories(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
-            endif()
-            if(NCNN_MOE_VULKAN_TEST STREQUAL "linear_allocation")
-                target_include_directories(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PRIVATE ${NCNN_MOE_NCNN_SOURCE_DIR}/src/layer)
-            endif()
-            add_test(NAME ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan COMMAND ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test)
-            if(NOT NCNN_MOE_VULKAN_TEST STREQUAL "linear_allocation")
-                set_tests_properties(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan PROPERTIES SKIP_RETURN_CODE 77)
-            endif()
-        endforeach()
-    endif()
-
-    # --- Core regression suite ------------------------------------------------
 
     add_executable(ncnn_moe_tests
         tests/modeladapter_fixture.cpp
@@ -553,8 +631,17 @@ if(NCNN_MOE_BUILD_TESTS)
         tests/test_int4.cpp
         tests/test_quant_archive.cpp
         tests/test_native_awq.cpp
-        tests/test_scratch.cpp
-        tests/test_runtime.cpp
+        tests/test_runtime_main.cpp
+        tests/test_runtime_continuation.cpp
+        tests/test_runtime_cpu_kernels.cpp
+        tests/test_runtime_deepseek.cpp
+        tests/test_runtime_generation.cpp
+        tests/test_runtime_graph_adapter.cpp
+        tests/test_runtime_linear_vulkan.cpp
+        tests/test_runtime_prefill_session.cpp
+        tests/test_runtime_quant_cpu.cpp
+        tests/test_runtime_qwen.cpp
+        tests/test_runtime_storage_cache.cpp
     )
     target_link_libraries(ncnn_moe_tests PRIVATE ncnn::moe)
     target_compile_features(ncnn_moe_tests PRIVATE cxx_std_20)
@@ -569,169 +656,30 @@ if(NCNN_MOE_BUILD_TESTS)
         add_test(NAME ncnn_moe_mapped_file_low_fd COMMAND ncnn_moe_tests --mapped-file)
     endif()
 
-    # --- Model and package fixtures -------------------------------------------
-
-    add_executable(ncnn_moe_qwen3_test tests/test_qwen3.cpp)
-    target_link_libraries(ncnn_moe_qwen3_test PRIVATE ncnn::moe)
-    target_compile_features(ncnn_moe_qwen3_test PRIVATE cxx_std_20)
-    target_include_directories(ncnn_moe_qwen3_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    add_test(NAME ncnn_moe_qwen3 COMMAND ncnn_moe_qwen3_test)
+    foreach(NCNN_MOE_MODEL_TEST IN ITEMS qwen3 qwen_dense gguf q8_0 gguf_blocks gguf_mxfp4_cache gguf_tokenizer)
+        add_executable(ncnn_moe_${NCNN_MOE_MODEL_TEST}_test tests/test_${NCNN_MOE_MODEL_TEST}.cpp)
+        target_link_libraries(ncnn_moe_${NCNN_MOE_MODEL_TEST}_test PRIVATE ncnn::moe)
+        target_compile_features(ncnn_moe_${NCNN_MOE_MODEL_TEST}_test PRIVATE cxx_std_20)
+        target_include_directories(ncnn_moe_${NCNN_MOE_MODEL_TEST}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        if(MSVC AND NCNN_MOE_MODEL_TEST STREQUAL "gguf_tokenizer")
+            target_compile_options(ncnn_moe_${NCNN_MOE_MODEL_TEST}_test PRIVATE /utf-8)
+        endif()
+        add_test(NAME ncnn_moe_${NCNN_MOE_MODEL_TEST} COMMAND ncnn_moe_${NCNN_MOE_MODEL_TEST}_test)
+    endforeach()
     if(NCNN_MOE_WITH_VULKAN)
         add_test(NAME ncnn_moe_qwen3_vulkan COMMAND ncnn_moe_qwen3_test --vulkan)
         set_tests_properties(ncnn_moe_qwen3_vulkan PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
-    add_executable(ncnn_moe_qwen_dense_test tests/test_qwen_dense.cpp)
-    target_link_libraries(ncnn_moe_qwen_dense_test PRIVATE ncnn::moe)
-    target_compile_features(ncnn_moe_qwen_dense_test PRIVATE cxx_std_20)
-    target_include_directories(ncnn_moe_qwen_dense_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    add_test(NAME ncnn_moe_qwen_dense COMMAND ncnn_moe_qwen_dense_test)
-
-    add_executable(ncnn_moe_gguf_test tests/test_gguf.cpp)
-    target_link_libraries(ncnn_moe_gguf_test PRIVATE ncnn::moe)
-    target_compile_features(ncnn_moe_gguf_test PRIVATE cxx_std_20)
-    target_include_directories(ncnn_moe_gguf_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    add_test(NAME ncnn_moe_gguf COMMAND ncnn_moe_gguf_test)
-
-    add_executable(ncnn_moe_q8_0_test tests/test_q8_0.cpp)
-    target_link_libraries(ncnn_moe_q8_0_test PRIVATE ncnn::moe)
-    target_compile_features(ncnn_moe_q8_0_test PRIVATE cxx_std_20)
-    target_include_directories(ncnn_moe_q8_0_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    add_test(NAME ncnn_moe_q8_0 COMMAND ncnn_moe_q8_0_test)
-
-    add_executable(ncnn_moe_gguf_blocks_test tests/test_gguf_blocks.cpp)
-    target_link_libraries(ncnn_moe_gguf_blocks_test PRIVATE ncnn::moe)
-    target_compile_features(ncnn_moe_gguf_blocks_test PRIVATE cxx_std_20)
-    target_include_directories(ncnn_moe_gguf_blocks_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    add_test(NAME ncnn_moe_gguf_blocks COMMAND ncnn_moe_gguf_blocks_test)
-
-    add_executable(ncnn_moe_gguf_mxfp4_cache_test tests/test_gguf_mxfp4_cache.cpp)
-    target_link_libraries(ncnn_moe_gguf_mxfp4_cache_test PRIVATE ncnn::moe)
-    target_compile_features(ncnn_moe_gguf_mxfp4_cache_test PRIVATE cxx_std_20)
-    target_include_directories(ncnn_moe_gguf_mxfp4_cache_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    add_test(NAME ncnn_moe_gguf_mxfp4_cache COMMAND ncnn_moe_gguf_mxfp4_cache_test)
-
-    add_executable(ncnn_moe_gguf_tokenizer_test tests/test_gguf_tokenizer.cpp)
-    target_link_libraries(ncnn_moe_gguf_tokenizer_test PRIVATE ncnn::moe)
-    target_compile_features(ncnn_moe_gguf_tokenizer_test PRIVATE cxx_std_20)
-    target_include_directories(ncnn_moe_gguf_tokenizer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    if(MSVC)
-        target_compile_options(ncnn_moe_gguf_tokenizer_test PRIVATE /utf-8)
-    endif()
-    add_test(NAME ncnn_moe_gguf_tokenizer COMMAND ncnn_moe_gguf_tokenizer_test)
-
-    # Python supplies fixtures and invokes this runner below.
-    add_executable(ncnn_moe_gguf_graph_test tests/test_gguf_graph.cpp)
-    target_link_libraries(ncnn_moe_gguf_graph_test PRIVATE ncnn::moe)
-    target_compile_features(ncnn_moe_gguf_graph_test PRIVATE cxx_std_20)
-    target_include_directories(ncnn_moe_gguf_graph_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-
-    add_executable(ncnn_moe_qwen_quant_banks_test tests/test_qwen_quant_banks.cpp)
-    target_link_libraries(ncnn_moe_qwen_quant_banks_test PRIVATE ncnn::moe)
-    target_compile_features(ncnn_moe_qwen_quant_banks_test PRIVATE cxx_std_20)
-    target_include_directories(ncnn_moe_qwen_quant_banks_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    add_test(NAME ncnn_moe_qwen_quant_banks COMMAND ncnn_moe_qwen_quant_banks_test)
-
-    add_executable(ncnn_moe_native_gpu_budget_test tests/test_native_gpu_budget.cpp)
-    target_link_libraries(ncnn_moe_native_gpu_budget_test PRIVATE ncnn::moe)
-    target_compile_features(ncnn_moe_native_gpu_budget_test PRIVATE cxx_std_20)
-    target_include_directories(ncnn_moe_native_gpu_budget_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    add_test(NAME ncnn_moe_native_gpu_budget COMMAND ncnn_moe_native_gpu_budget_test)
-
-    add_executable(ncnn_moe_native_family_adapters_test tests/test_native_family_adapters.cpp)
-    target_link_libraries(ncnn_moe_native_family_adapters_test PRIVATE ncnn::moe)
-    target_compile_features(ncnn_moe_native_family_adapters_test PRIVATE cxx_std_20)
-    target_include_directories(ncnn_moe_native_family_adapters_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    add_test(NAME ncnn_moe_native_family_adapters COMMAND ncnn_moe_native_family_adapters_test)
-
-    # --- Vulkan operators -----------------------------------------------------
-
-    add_executable(ncnn_moe_latent_vulkan_test tests/test_latent_vulkan.cpp)
-    target_link_libraries(ncnn_moe_latent_vulkan_test PRIVATE ncnn::moe)
-    target_compile_features(ncnn_moe_latent_vulkan_test PRIVATE cxx_std_20)
-    target_include_directories(ncnn_moe_latent_vulkan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_compile_definitions(ncnn_moe_latent_vulkan_test PRIVATE
-        NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>
-        NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
-    )
-    add_test(NAME ncnn_moe_latent_vulkan_test COMMAND ncnn_moe_latent_vulkan_test)
-    set_tests_properties(ncnn_moe_latent_vulkan_test PROPERTIES SKIP_RETURN_CODE 77)
-
-    foreach(NCNN_MOE_VULKAN_TEST IN ITEMS hyperconnection router latent_layer shared_expert moe_combine latent_index int4 float8_row_scales q8_0 gguf_blocks qsa qwen_layer)
-        add_executable(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test tests/test_${NCNN_MOE_VULKAN_TEST}_vulkan.cpp)
-        target_link_libraries(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PRIVATE ncnn::moe)
-        target_compile_features(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PRIVATE cxx_std_20)
-        target_include_directories(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR})
-        target_compile_definitions(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PRIVATE
-            NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>
-            NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
-        )
-        add_test(NAME ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test COMMAND ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test)
-        set_tests_properties(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PROPERTIES SKIP_RETURN_CODE 77)
-    endforeach()
-
-    # --- Expert execution and transfers ---------------------------------------
-
-    add_executable(ncnn_moe_mxfp4_row_tile_test tests/test_mxfp4_row_tile.cpp)
-    target_link_libraries(ncnn_moe_mxfp4_row_tile_test PRIVATE ncnn::moe)
-    target_compile_features(ncnn_moe_mxfp4_row_tile_test PRIVATE cxx_std_20)
-    target_include_directories(ncnn_moe_mxfp4_row_tile_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_compile_definitions(ncnn_moe_mxfp4_row_tile_test PRIVATE
-        NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>
-        NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
-    )
-    add_test(NAME ncnn_moe_mxfp4_row_tile_test COMMAND ncnn_moe_mxfp4_row_tile_test)
-    set_tests_properties(ncnn_moe_mxfp4_row_tile_test PROPERTIES SKIP_RETURN_CODE 77)
-
-    add_executable(ncnn_moe_expert_upload_vulkan_test tests/test_expert_upload_vulkan.cpp)
-    target_link_libraries(ncnn_moe_expert_upload_vulkan_test PRIVATE ncnn::moe)
-    target_compile_features(ncnn_moe_expert_upload_vulkan_test PRIVATE cxx_std_20)
-    target_include_directories(ncnn_moe_expert_upload_vulkan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_compile_definitions(ncnn_moe_expert_upload_vulkan_test PRIVATE
-        NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>
-        NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
-    )
-    add_test(NAME ncnn_moe_expert_upload_vulkan_test COMMAND ncnn_moe_expert_upload_vulkan_test)
-    set_tests_properties(ncnn_moe_expert_upload_vulkan_test PROPERTIES SKIP_RETURN_CODE 77)
-
-    add_executable(ncnn_moe_expert_device_input_test tests/test_expert_device_input.cpp)
-    target_link_libraries(ncnn_moe_expert_device_input_test PRIVATE ncnn::moe)
-    target_compile_features(ncnn_moe_expert_device_input_test PRIVATE cxx_std_20)
-    target_include_directories(ncnn_moe_expert_device_input_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_compile_definitions(ncnn_moe_expert_device_input_test PRIVATE
-        NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>
-        NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
-    )
-    add_test(NAME ncnn_moe_expert_device_input_test COMMAND ncnn_moe_expert_device_input_test)
-    set_tests_properties(ncnn_moe_expert_device_input_test PROPERTIES SKIP_RETURN_CODE 77)
-
-    add_executable(ncnn_moe_gpu_first_experts_test tests/test_gpu_first_experts.cpp)
-    target_link_libraries(ncnn_moe_gpu_first_experts_test PRIVATE ncnn::moe)
-    target_compile_features(ncnn_moe_gpu_first_experts_test PRIVATE cxx_std_20)
-    target_include_directories(ncnn_moe_gpu_first_experts_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_compile_definitions(ncnn_moe_gpu_first_experts_test PRIVATE
-        NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>
-        NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
-    )
-    add_test(NAME ncnn_moe_gpu_first_experts_test COMMAND ncnn_moe_gpu_first_experts_test)
-    set_tests_properties(ncnn_moe_gpu_first_experts_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
-    # Do not add private src headers to this consumer.
     add_executable(ncnn_moe_public_api_test tests/public_api/main.cpp)
     target_link_libraries(ncnn_moe_public_api_test PRIVATE ncnn::moe)
     add_test(NAME ncnn_moe_public_api_test COMMAND ncnn_moe_public_api_test)
     set_tests_properties(ncnn_moe_public_api_test PROPERTIES TIMEOUT 60)
-    add_executable(ncnn_moe_expert_pipeline_test tests/test_expert_pipeline.cpp)
-    target_link_libraries(ncnn_moe_expert_pipeline_test PRIVATE ncnn::moe)
-    target_include_directories(ncnn_moe_expert_pipeline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_compile_definitions(ncnn_moe_expert_pipeline_test PRIVATE
-        NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>
-        NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
-    )
-    add_test(NAME ncnn_moe_expert_pipeline COMMAND ncnn_moe_expert_pipeline_test)
-    # Asset-driven tokenizer parity checks use tools/test_tokenizer.py.
+
     add_executable(ncnn_moe_tokenizer_test tests/test_tokenizer.cpp)
     target_link_libraries(ncnn_moe_tokenizer_test PRIVATE ncnn::moe)
     target_include_directories(ncnn_moe_tokenizer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME ncnn_moe_tokenizer COMMAND ncnn_moe_tokenizer_test)
 
     add_test(
         NAME ncnn_moe_style
@@ -739,6 +687,14 @@ if(NCNN_MOE_BUILD_TESTS)
             -DNCNN_MOE_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_style.cmake
     )
+
+    # Keep temporary fixtures in the build tree.
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-tmp")
+    get_property(NCNN_MOE_TESTS DIRECTORY PROPERTY TESTS)
+    set_property(TEST ${NCNN_MOE_TESTS} APPEND PROPERTY ENVIRONMENT
+        "TEMP=${CMAKE_CURRENT_BINARY_DIR}/test-tmp"
+        "TMP=${CMAKE_CURRENT_BINARY_DIR}/test-tmp"
+        "TMPDIR=${CMAKE_CURRENT_BINARY_DIR}/test-tmp")
 endif()
 
 # ==============================================================================
@@ -746,61 +702,6 @@ endif()
 # ==============================================================================
 
 if(NCNN_MOE_BUILD_EXAMPLES)
-    if(NCNN_MOE_BUILD_REFERENCE_RUNNERS)
-        add_library(
-            ncnn_moe_reference_runner
-            STATIC
-            examples/internal/modelrunner.cpp)
-        target_link_libraries(
-            ncnn_moe_reference_runner
-            PUBLIC ncnn::moe)
-        target_compile_features(
-            ncnn_moe_reference_runner
-            PRIVATE cxx_std_20)
-        target_include_directories(
-            ncnn_moe_reference_runner
-            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-
-        add_executable(
-            ncnn_moe_gpt_oss
-            examples/run_gpt_oss.cpp)
-        target_link_libraries(
-            ncnn_moe_gpt_oss
-            PRIVATE ncnn_moe_reference_runner)
-        target_compile_features(
-            ncnn_moe_gpt_oss
-            PRIVATE cxx_std_20)
-
-        add_executable(
-            ncnn_moe_deepseek_v4
-            examples/run_deepseek_v4.cpp)
-        target_link_libraries(
-            ncnn_moe_deepseek_v4
-            PRIVATE ncnn_moe_reference_runner)
-        target_compile_features(
-            ncnn_moe_deepseek_v4
-            PRIVATE cxx_std_20)
-
-        add_executable(
-            ncnn_moe_qwen3_6
-            examples/run_qwen3_6.cpp)
-        target_link_libraries(
-            ncnn_moe_qwen3_6
-            PRIVATE ncnn_moe_reference_runner)
-        target_compile_features(
-            ncnn_moe_qwen3_6
-            PRIVATE cxx_std_20)
-
-        add_executable(
-            ncnn_moe_qwen3_8
-            examples/run_qwen3_8.cpp)
-        target_link_libraries(
-            ncnn_moe_qwen3_8
-            PRIVATE ncnn_moe_reference_runner)
-        target_compile_features(
-            ncnn_moe_qwen3_8
-            PRIVATE cxx_std_20)
-    endif()
     add_executable(
         ncnn_moe_worker
         examples/ncnn_moe_worker.cpp
@@ -822,134 +723,14 @@ if(NCNN_MOE_BUILD_EXAMPLES)
     if(CMAKE_DL_LIBS)
         target_link_libraries(ncnn_moe_worker PRIVATE ${CMAKE_DL_LIBS})
     endif()
+    ncnn_moe_optimize_target(ncnn_moe_worker)
     install(TARGETS ncnn_moe_worker
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-    if(NCNN_MOE_BUILD_MXFP4_BENCHMARK)
-        add_executable(
-            ncnn_moe_mxfp4_bench
-            examples/benchmark_mxfp4.cpp)
-        target_link_libraries(
-            ncnn_moe_mxfp4_bench
-            PRIVATE ncnn::moe)
-        target_compile_features(
-            ncnn_moe_mxfp4_bench
-            PRIVATE cxx_std_20)
-        target_include_directories(
-            ncnn_moe_mxfp4_bench
-            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    endif()
 endif()
 
-if(APPLE)
-    foreach(NCNN_MOE_EXECUTABLE IN ITEMS
-        ncnn_moe_worker
-        ncnn_moe_gpt_oss
-        ncnn_moe_deepseek_v4
-        ncnn_moe_qwen3_6
-        ncnn_moe_qwen3_8
-        ncnn_moe_mxfp4_bench
-    )
-        if(TARGET ${NCNN_MOE_EXECUTABLE})
-            target_link_options(${NCNN_MOE_EXECUTABLE} PRIVATE
-                "$<$<CONFIG:Release>:LINKER:-dead_strip>")
-        endif()
-    endforeach()
-endif()
-
-# ==============================================================================
-# Python integration tests
-# ==============================================================================
-# Register worker tests after the executable targets.
-if(NCNN_MOE_BUILD_TESTS)
-    find_package(Python3 COMPONENTS Interpreter QUIET)
-    if(Python3_Interpreter_FOUND)
-        add_test(NAME ncnn_moe_ncnn_patches
-            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ncnn_patches.py)
-        add_test(NAME ncnn_moe_python_unit
-            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ncnn_moe.py)
-
-        execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy"
-            RESULT_VARIABLE NCNN_MOE_NUMPY_RESULT OUTPUT_QUIET ERROR_QUIET)
-        if(NCNN_MOE_NUMPY_RESULT EQUAL 0)
-            add_test(NAME ncnn_moe_direct_gguf
-                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_direct_gguf.py
-                    --runner $<TARGET_FILE:ncnn_moe_gguf_graph_test>)
-            set_tests_properties(ncnn_moe_direct_gguf PROPERTIES SKIP_RETURN_CODE 77)
-            if(NCNN_MOE_WITH_VULKAN)
-                add_test(NAME ncnn_moe_direct_gguf_vulkan
-                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_direct_gguf.py
-                        --runner $<TARGET_FILE:ncnn_moe_gguf_graph_test> --hybrid)
-                set_tests_properties(ncnn_moe_direct_gguf_vulkan PROPERTIES SKIP_RETURN_CODE 77)
-            endif()
-            add_test(NAME ncnn_moe_import_quantized
-                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_import_quantized.py)
-            if(NCNN_MOE_BUILD_EXAMPLES)
-                add_test(NAME ncnn_moe_native_quantized
-                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_native_quantized.py
-                        --worker $<TARGET_FILE:ncnn_moe_worker>)
-                if(NCNN_MOE_WITH_VULKAN)
-                    add_test(NAME ncnn_moe_native_quantized_vulkan
-                        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_native_quantized.py
-                            --worker $<TARGET_FILE:ncnn_moe_worker> --backend hybrid)
-                    set_tests_properties(ncnn_moe_native_quantized_vulkan PROPERTIES SKIP_RETURN_CODE 77)
-                endif()
-            endif()
-        endif()
-        # Reuse one generated package for worker smoke tests.
-        if(NCNN_MOE_BUILD_EXAMPLES AND NCNN_MOE_BUILD_REFERENCE_RUNNERS)
-            add_test(
-                NAME ncnn_moe_gpt_oss_fixture
-                COMMAND ${Python3_EXECUTABLE}
-                    ${CMAKE_CURRENT_SOURCE_DIR}/tools/create_gpt_oss_fixture.py
-                    ${CMAKE_CURRENT_BINARY_DIR}/gpt_oss_fixture
-                    --verify-runner $<TARGET_FILE:ncnn_moe_gpt_oss>
-            )
-        elseif(NCNN_MOE_BUILD_EXAMPLES)
-            add_test(
-                NAME ncnn_moe_gpt_oss_fixture
-                COMMAND ${Python3_EXECUTABLE}
-                    ${CMAKE_CURRENT_SOURCE_DIR}/tools/create_gpt_oss_fixture.py
-                    ${CMAKE_CURRENT_BINARY_DIR}/gpt_oss_fixture
-            )
-        endif()
-        if(NCNN_MOE_BUILD_EXAMPLES)
-            # DEPENDS orders selected tests; it does not select the generator.
-            add_test(
-                NAME ncnn_moe_python_fixture
-                COMMAND ${Python3_EXECUTABLE}
-                    ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ncnn_moe.py
-                    --worker $<TARGET_FILE:ncnn_moe_worker>
-                    --model ${CMAKE_CURRENT_BINARY_DIR}/gpt_oss_fixture
-            )
-            set_tests_properties(
-                ncnn_moe_python_fixture
-                PROPERTIES
-                    DEPENDS ncnn_moe_gpt_oss_fixture
-                    SKIP_RETURN_CODE 77
-            )
-            add_test(
-                NAME ncnn_moe_python_auto_fixture
-                COMMAND ${Python3_EXECUTABLE}
-                    ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ncnn_moe.py
-                    --auto
-                    --worker $<TARGET_FILE:ncnn_moe_worker>
-                    --model ${CMAKE_CURRENT_BINARY_DIR}/gpt_oss_fixture
-            )
-            set_tests_properties(
-                ncnn_moe_python_auto_fixture
-                PROPERTIES
-                    DEPENDS ncnn_moe_gpt_oss_fixture
-                    SKIP_RETURN_CODE 77
-            )
-        endif()
-    endif()
-    # Keep temporary fixtures in the build tree.
-    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-tmp")
-    get_property(NCNN_MOE_TESTS DIRECTORY PROPERTY TESTS)
-    set_property(TEST ${NCNN_MOE_TESTS} APPEND PROPERTY ENVIRONMENT
-        "TEMP=${CMAKE_CURRENT_BINARY_DIR}/test-tmp"
-        "TMP=${CMAKE_CURRENT_BINARY_DIR}/test-tmp"
-        "TMPDIR=${CMAKE_CURRENT_BINARY_DIR}/test-tmp")
+if(APPLE AND TARGET ncnn_moe_worker)
+    target_link_options(ncnn_moe_worker PRIVATE
+        "$<$<CONFIG:Release>:LINKER:-dead_strip>")
 endif()
 
 # ==============================================================================

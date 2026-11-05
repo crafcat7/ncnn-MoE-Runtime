@@ -46,7 +46,7 @@ LayerNorm_vulkan::create(const TensorData& weight,
         || weight.shape.size() != 1 || weight.shape[0] == 0
         || weight.shape[0] > static_cast<uint32_t>(std::numeric_limits<int>::max())
         || bias.shape != weight.shape || bias.dtype != weight.dtype
-        || vulkan_activation_storage_variant(opt) != 0)
+        || activation_variant(opt) != 0)
         return {};
 
     ncnn::Mat gamma;

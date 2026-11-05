@@ -1,13 +1,11 @@
 #include "executor.h"
 
 #include "sessionstate.h"
-#include "metrics.h"
 #include "expertbackend.h"
 #include "expert.h"
 #include "graph/router.h"
 #include "graph/compiledmodel.h"
 #include "kernels/attention.h"
-#include "kernels/bfloat16.h"
 #include "kernels/hyperconnection.h"
 #include "kernels/latentattention.h"
 #include "kernels/ops.h"
@@ -28,11 +26,11 @@ static ExecutionBackend shared_lm_head_backend(const CompiledModel& model)
     // The draft shares the target head, including its selected backend and
     // device-only weight lifetime. Other draft projections keep their own
     // placement; Hybrid mode alone does not imply that the head uses Vulkan.
-    for (const ExecutionNode& node : model.graph.nodes)
+    for (const Layer& node : model.net.layers)
     {
-        if (node.type == ExecutionNodeType::LmHead
-            && !node.weight_inputs.empty()
-            && node.weight_inputs.front() == model.lm_head_weight)
+        if (node.kind == LayerKind::LmHead
+            && !node.weights.empty()
+            && node.weights.front() == model.lm_head_weight)
             return node.backend;
     }
     return ExecutionBackend::Cpu;
@@ -40,7 +38,7 @@ static ExecutionBackend shared_lm_head_backend(const CompiledModel& model)
 
 static Result<void> forward_speculative_layer(const CompiledModel& model,
                                               const SpeculativeModelPlan::LayerNodes& execution,
-                                              size_t layer_plan_index,
+                                              size_t plan_index,
                                               uint64_t position_offset,
                                               LayerCache& cache,
                                               ActivationBuffer& hidden,
@@ -50,24 +48,24 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
                                               HyperConnectionScratch& hyper_connection_scratch,
                                               AttentionScratch& attention_scratch)
 {
-    const ExecutionGraph& graph = model.speculative.graph;
-    if (layer_plan_index >= graph.layer_plans.size()
-        || execution.attention >= graph.nodes.size()
-        || execution.router >= graph.nodes.size()
-        || execution.expert_dispatch >= graph.nodes.size()
-        || execution.expert_group >= graph.nodes.size()
-        || execution.combine >= graph.nodes.size())
+    const Net& graph = model.speculative.net;
+    if (plan_index >= graph.layer_plans.size()
+        || execution.attention >= graph.layers.size()
+        || execution.router >= graph.layers.size()
+        || execution.expert_dispatch >= graph.layers.size()
+        || execution.expert_group >= graph.layers.size()
+        || execution.combine >= graph.layers.size())
     {
         return Error{
             ErrorCode::InternalError,
             "speculative execution graph has an incomplete layer binding"};
     }
-    const CompiledLayerPlan& layer = graph.layer_plans[layer_plan_index];
-    const ExecutionNode& attention_node = graph.nodes[execution.attention];
-    const ExecutionNode& expert_group_node = graph.nodes[execution.expert_group];
+    const CompiledLayerPlan& layer = graph.layer_plans[plan_index];
+    const Layer& attention_node = graph.layers[execution.attention];
+    const Layer& expert_group_node = graph.layers[execution.expert_group];
     const ExecutionBackend attention_backend = attention_node.backend;
     const ExecutionBackend expert_backend = expert_group_node.backend;
-    const bool cpu_prefetch = has_flag(expert_group_node.flags, ExecutionNodeCpuPrefetch);
+    const bool cpu_prefetch = has_flag(expert_group_node.flags, LayerCpuPrefetch);
 
     // Target and draft layers execute sequentially with the same FFN workspace.
     layer_state.reset();
@@ -76,17 +74,17 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
     const ActivationBuffer* attention_input = &hidden;
     if (multiplier > 1)
     {
-        auto mixed = forward_hyper_connection_pre(hidden,
-                                                  model.weights.at(layer.hyper_connection.attention_function),
-                                                  model.weights.at(layer.hyper_connection.attention_scale),
-                                                  model.weights.at(layer.hyper_connection.attention_base),
-                                                  multiplier,
-                                                  model.descriptor.hyper_connection_iterations,
-                                                  model.descriptor.norm_epsilon,
-                                                  model.descriptor.hyper_connection_epsilon,
-                                                  attention_mix,
-                                                  hyper_connection_scratch,
-                                                  model.opt.optimization_flags);
+        auto mixed = hc_pre(hidden,
+                            model.weights.at(layer.hyper_connection.attention_function),
+                            model.weights.at(layer.hyper_connection.attention_scale),
+                            model.weights.at(layer.hyper_connection.attention_base),
+                            multiplier,
+                            model.descriptor.hyper_connection_iterations,
+                            model.descriptor.norm_epsilon,
+                            model.descriptor.hyper_connection_epsilon,
+                            attention_mix,
+                            hyper_connection_scratch,
+                            model.opt.optimization_flags);
         if (!mixed)
             return mixed.error();
         attention_input = &attention_mix.reduced;
@@ -123,11 +121,11 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
             return attention.error();
         if (multiplier > 1)
         {
-            auto connected = forward_hyper_connection_post(attention_scratch.output,
-                                                           hidden,
-                                                           attention_mix,
-                                                           multiplier,
-                                                           scratch.staged_output);
+            auto connected = hc_post(attention_scratch.output,
+                                     hidden,
+                                     attention_mix,
+                                     multiplier,
+                                     scratch.staged_output);
             if (!connected)
                 return connected.error();
             hidden.swap(scratch.staged_output);
@@ -141,17 +139,17 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
     const MoeBlockPlan& moe = layer.moe;
     if (multiplier > 1)
     {
-        auto mixed = forward_hyper_connection_pre(hidden,
-                                                  model.weights.at(layer.hyper_connection.ffn_function),
-                                                  model.weights.at(layer.hyper_connection.ffn_scale),
-                                                  model.weights.at(layer.hyper_connection.ffn_base),
-                                                  multiplier,
-                                                  model.descriptor.hyper_connection_iterations,
-                                                  model.descriptor.norm_epsilon,
-                                                  model.descriptor.hyper_connection_epsilon,
-                                                  layer_state.ffn_hyper_mix,
-                                                  hyper_connection_scratch,
-                                                  model.opt.optimization_flags);
+        auto mixed = hc_pre(hidden,
+                            model.weights.at(layer.hyper_connection.ffn_function),
+                            model.weights.at(layer.hyper_connection.ffn_scale),
+                            model.weights.at(layer.hyper_connection.ffn_base),
+                            multiplier,
+                            model.descriptor.hyper_connection_iterations,
+                            model.descriptor.norm_epsilon,
+                            model.descriptor.hyper_connection_epsilon,
+                            layer_state.ffn_hyper_mix,
+                            hyper_connection_scratch,
+                            model.opt.optimization_flags);
         if (!mixed)
             return mixed.error();
         forward_rms_norm(layer_state.ffn_hyper_mix.reduced, model.weights.at(moe.pre_ffn_norm_weight), model.descriptor.norm_epsilon, layer_state.normalized, model.descriptor.norm_weight_offset);
@@ -181,11 +179,11 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
                                      layer_state.dispatch_plan);
     if (!dispatched)
         return dispatched.error();
-    prepare_experts(moe, layer_state, statistics);
+    prepare_experts(moe, layer_state, &statistics);
     const auto execute_shared = [&]() -> Result<void> {
-        if (execution.shared_expert_group >= graph.nodes.size())
+        if (execution.shared_expert_group >= graph.layers.size())
             return Error{ErrorCode::InternalError, "speculative execution graph has no shared Expert binding"};
-        const bool require_gpu = graph.nodes[execution.shared_expert_group].backend == ExecutionBackend::Vulkan
+        const bool require_gpu = graph.layers[execution.shared_expert_group].backend == ExecutionBackend::Vulkan
                                  && model.opt.hybrid_mode == HybridMode::HybridExperts;
         try
         {
@@ -199,9 +197,9 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
         return {};
     };
 
-    if (has_flag(graph.nodes[execution.expert_dispatch].flags, ExecutionNodeRequestExperts))
+    if (has_flag(graph.layers[execution.expert_dispatch].flags, LayerRequestExperts))
     {
-        if (!moe.has_shared_expert || execution.shared_expert_group >= graph.nodes.size())
+        if (!moe.has_shared_expert || execution.shared_expert_group >= graph.layers.size())
             return Error{ErrorCode::InternalError, "speculative execution graph has no shared Expert binding"};
         auto requested = request_experts(model,
                                          moe,
@@ -258,11 +256,11 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
         add_batch_inplace(moe_output, layer_state.shared_expert_output);
     if (multiplier > 1)
     {
-        auto connected = forward_hyper_connection_post(moe_output,
-                                                       hidden,
-                                                       layer_state.ffn_hyper_mix,
-                                                       multiplier,
-                                                       scratch.staged_output);
+        auto connected = hc_post(moe_output,
+                                 hidden,
+                                 layer_state.ffn_hyper_mix,
+                                 multiplier,
+                                 scratch.staged_output);
         if (!connected)
             return connected.error();
         hidden.swap(scratch.staged_output);
@@ -370,7 +368,7 @@ static Result<void> append_mtp_context(const CompiledModel& model,
                                        SessionState& state)
 {
     const std::vector<SpeculativeModelPlan::LayerNodes>& layer_nodes = model.speculative.layer_nodes;
-    const ExecutionGraph& graph = model.speculative.graph;
+    const Net& graph = model.speculative.net;
     if (layer_nodes.size() != graph.layer_plans.size())
     {
         return Error{
@@ -391,7 +389,7 @@ static Result<void> append_mtp_context(const CompiledModel& model,
     if (!prepared)
         return prepared.error();
     const SpeculativeModelPlan::LayerNodes& execution = layer_nodes.front();
-    if (execution.attention >= graph.nodes.size())
+    if (execution.attention >= graph.layers.size())
     {
         return Error{
             ErrorCode::InternalError,
@@ -401,7 +399,7 @@ static Result<void> append_mtp_context(const CompiledModel& model,
     auto appended = append_attention_context(model.weights,
                                              model.operators,
                                              layer.attention,
-                                             graph.nodes[execution.attention].backend,
+                                             graph.layers[execution.attention].backend,
                                              position_offset,
                                              state.speculative_layers.front(),
                                              state.attention_scratch,
@@ -508,8 +506,6 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
     if (!model.speculative.enabled()
         || !state.use_speculative_context)
         return {};
-    Bf16Counter bf16;
-    const Bf16Scope bf16_scope(&bf16);
     VulkanStatistics vulkan_before;
     if (model.vulkan_runtime)
         vulkan_before = get_vulkan_statistics(model.vulkan_runtime);
@@ -524,7 +520,6 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
             const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
             record_vulkan_delta(statistics, vulkan_before, vulkan_after);
         }
-        statistics.cpu_bfloat16_batched_linear_dispatches += bf16.dispatches();
         return {};
     }
     const uint32_t expected_columns = model.descriptor.hidden_size
@@ -551,7 +546,7 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
                      projected,
                      model.descriptor.norm_weight_offset);
     const std::vector<SpeculativeModelPlan::LayerNodes>& layer_nodes = model.speculative.layer_nodes;
-    const ExecutionGraph& graph = model.speculative.graph;
+    const Net& graph = model.speculative.net;
     if (layer_nodes.size() != graph.layer_plans.size())
     {
         return Error{
@@ -563,7 +558,7 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
     for (size_t layer_index = 0; layer_index < layer_nodes.size(); ++layer_index)
     {
         const SpeculativeModelPlan::LayerNodes& execution = layer_nodes[layer_index];
-        if (execution.attention >= graph.nodes.size())
+        if (execution.attention >= graph.layers.size())
         {
             return Error{
                 ErrorCode::InternalError,
@@ -573,7 +568,7 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
         auto appended = append_dspark_attention_context(model.weights,
                                                         model.operators,
                                                         layer.attention,
-                                                        graph.nodes[execution.attention].backend,
+                                                        graph.layers[execution.attention].backend,
                                                         state.speculative_main_hidden_position,
                                                         state.speculative_layers[layer_index],
                                                         attention_scratch,
@@ -587,7 +582,6 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
         const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
         record_vulkan_delta(statistics, vulkan_before, vulkan_after);
     }
-    statistics.cpu_bfloat16_batched_linear_dispatches += bf16.dispatches();
     return {};
 }
 
@@ -624,14 +618,8 @@ static Result<void> propose_mtp(const CompiledModel& model,
     VulkanStatistics vulkan_before;
     if (model.vulkan_runtime)
         vulkan_before = get_vulkan_statistics(model.vulkan_runtime);
-    ExpertCacheStatistics cache_before;
-    if (model.expert_cache)
-        cache_before = model.expert_cache->statistics();
-    ExpertBackendStatistics backend_before;
-    if (model.expert_backend)
-        backend_before = model.expert_backend->statistics();
     const std::vector<SpeculativeModelPlan::LayerNodes>& layer_nodes = model.speculative.layer_nodes;
-    if (layer_nodes.size() != model.speculative.graph.layer_plans.size())
+    if (layer_nodes.size() != model.speculative.net.layer_plans.size())
     {
         return Error{
             ErrorCode::InternalError,
@@ -683,7 +671,6 @@ static Result<void> propose_mtp(const CompiledModel& model,
     }
     state.mtp_pending_target_hidden.clear();
 
-    record_resource_delta(model, statistics, cache_before, backend_before);
     if (model.vulkan_runtime)
     {
         const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
@@ -706,8 +693,6 @@ Result<void> propose_speculative(const CompiledModel& model, int32_t input_id, S
             ErrorCode::UnsupportedModel,
             "the model does not provide a speculative execution plan"};
     }
-    Bf16Counter bf16;
-    const Bf16Scope bf16_scope(&bf16);
     if (model.speculative.kind == SpeculativeModelKind::Mtp)
     {
         auto proposed = propose_mtp(model,
@@ -717,10 +702,6 @@ Result<void> propose_speculative(const CompiledModel& model, int32_t input_id, S
                                     position_offset,
                                     proposal,
                                     sampler);
-        if (proposed)
-        {
-            statistics.cpu_bfloat16_batched_linear_dispatches += bf16.dispatches();
-        }
         return proposed;
     }
     if (!sampler)
@@ -730,7 +711,7 @@ Result<void> propose_speculative(const CompiledModel& model, int32_t input_id, S
             "DSpark proposal requires a token sampler"};
     }
     const std::vector<SpeculativeModelPlan::LayerNodes>& layer_nodes = model.speculative.layer_nodes;
-    if (layer_nodes.size() != model.speculative.graph.layer_plans.size())
+    if (layer_nodes.size() != model.speculative.net.layer_plans.size())
     {
         return Error{
             ErrorCode::InternalError,
@@ -759,12 +740,6 @@ Result<void> propose_speculative(const CompiledModel& model, int32_t input_id, S
     VulkanStatistics vulkan_before;
     if (model.vulkan_runtime)
         vulkan_before = get_vulkan_statistics(model.vulkan_runtime);
-    ExpertCacheStatistics cache_before;
-    if (model.expert_cache)
-        cache_before = model.expert_cache->statistics();
-    ExpertBackendStatistics backend_before;
-    if (model.expert_backend)
-        backend_before = model.expert_backend->statistics();
 
     std::vector<int32_t> draft_input_ids(model.speculative.block_size, static_cast<int32_t>(model.speculative.noise_token_id));
     draft_input_ids.front() = input_id;
@@ -789,16 +764,16 @@ Result<void> propose_speculative(const CompiledModel& model, int32_t input_id, S
             return executed.error();
     }
 
-    auto headed = forward_hyper_connection_head(hidden,
-                                                model.weights.at(model.speculative.hyper_head_function),
-                                                model.weights.at(model.speculative.hyper_head_scale),
-                                                model.weights.at(model.speculative.hyper_head_base),
-                                                model.descriptor.hyper_connection_multiplier,
-                                                model.descriptor.norm_epsilon,
-                                                model.descriptor.hyper_connection_epsilon,
-                                                state.expert_scratch.staged_output,
-                                                state.hyper_connection_scratch,
-                                                model.opt.optimization_flags);
+    auto headed = hc_head(hidden,
+                          model.weights.at(model.speculative.hyper_head_function),
+                          model.weights.at(model.speculative.hyper_head_scale),
+                          model.weights.at(model.speculative.hyper_head_base),
+                          model.descriptor.hyper_connection_multiplier,
+                          model.descriptor.norm_epsilon,
+                          model.descriptor.hyper_connection_epsilon,
+                          state.expert_scratch.staged_output,
+                          state.hyper_connection_scratch,
+                          model.opt.optimization_flags);
     if (!headed)
         return headed.error();
     forward_rms_norm(state.expert_scratch.staged_output,
@@ -862,13 +837,11 @@ Result<void> propose_speculative(const CompiledModel& model, int32_t input_id, S
         proposal.confidence_logits.push_back(confidence_output.row(0)[0]);
     }
 
-    record_resource_delta(model, statistics, cache_before, backend_before);
     if (model.vulkan_runtime)
     {
         const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
         record_vulkan_delta(statistics, vulkan_before, vulkan_after);
     }
-    statistics.cpu_bfloat16_batched_linear_dispatches += bf16.dispatches();
     ++statistics.speculative_proposals;
     statistics.speculative_draft_tokens += proposal.token_ids.size();
     return {};

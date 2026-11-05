@@ -23,7 +23,7 @@ public:
     std::vector<std::shared_ptr<void>> contexts;
 };
 
-[[nodiscard]] Result<void> prepare_model_graph_resources(CompiledModel& model, uint32_t prefill_rows);
+[[nodiscard]] Result<void> prepare_graph(CompiledModel& model, uint32_t prefill_rows);
 
 // Static capability/capacity rejection retains the existing GPU streaming
 // plan. Once full banks are selected, allocation/upload failures are errors.
@@ -31,8 +31,8 @@ public:
                                                       uint64_t expert_budget);
 
 // Returns the admitted host output slot size.
-[[nodiscard]] Result<uint64_t> ensure_model_graph_resources(const CompiledModel& model,
-                                                            uint64_t rows, uint64_t context_tokens, uint32_t sequence_count = 1);
+[[nodiscard]] Result<uint64_t> ensure_graph(const CompiledModel& model,
+                                            uint64_t rows, uint64_t context_tokens, uint32_t sequence_count = 1);
 
 } // namespace moe
 } // namespace ncnn

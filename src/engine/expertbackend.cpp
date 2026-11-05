@@ -631,7 +631,7 @@ size_t MultiDeviceExpertBackend::fallback_backend(std::string_view key) const
     return std::hash<std::string_view>{}(key) % backends.size();
 }
 
-std::shared_ptr<ExpertBackend> create_multi_device_expert_backend(std::vector<std::shared_ptr<ExpertBackend>> backends, std::vector<uint32_t> device_indices, std::vector<uint32_t> residency_group_devices)
+std::shared_ptr<ExpertBackend> create_multi_device(std::vector<std::shared_ptr<ExpertBackend>> backends, std::vector<uint32_t> device_indices, std::vector<uint32_t> residency_group_devices)
 {
     if (backends.empty() || backends.size() != device_indices.size())
     {
@@ -650,7 +650,7 @@ std::shared_ptr<ExpertBackend> create_multi_device_expert_backend(std::vector<st
     return std::make_shared<MultiDeviceExpertBackend>(std::move(backends), std::move(device_indices), std::move(residency_group_devices), false);
 }
 
-std::shared_ptr<ExpertBackend> create_key_sharded_expert_backend(std::vector<std::shared_ptr<ExpertBackend>> backends, std::vector<uint32_t> device_indices)
+std::shared_ptr<ExpertBackend> create_key_sharded(std::vector<std::shared_ptr<ExpertBackend>> backends, std::vector<uint32_t> device_indices)
 {
     if (backends.empty() || backends.size() != device_indices.size())
     {

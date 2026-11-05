@@ -14,6 +14,7 @@ namespace ncnn {
 namespace moe {
 
 struct SessionStatistics;
+struct VulkanStatistics;
 struct CompiledModel;
 struct BatchWorkspace;
 class SessionState;
@@ -45,6 +46,11 @@ struct SpeculativeProposal
 };
 
 using SpeculativeSampler = std::function<Result<int32_t>(std::span<const float> logits)>;
+
+// Publish the Vulkan interval delta into the session counters.
+void record_vulkan_delta(SessionStatistics& stats,
+                         const VulkanStatistics& before,
+                         const VulkanStatistics& after);
 
 // Execute the model into the session's reusable logits buffer.  Callers must
 // consume state.logits before another execution on the same session.

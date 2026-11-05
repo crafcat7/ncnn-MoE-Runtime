@@ -309,7 +309,7 @@ static Result<uint64_t> latent_dense_size(const MoeModelDescriptor& descriptor)
     return total;
 }
 
-static Result<uint64_t> latent_vulkan_releasable_dense_size(const MoeModelDescriptor& descriptor)
+static Result<uint64_t> latent_release_size(const MoeModelDescriptor& descriptor)
 {
     if (descriptor.layers.empty()
         || descriptor.hyper_connection_multiplier <= 1
@@ -935,8 +935,8 @@ static bool mapped_ple_embedding_shard(const std::string& name, const TensorData
     return ple.embedding_dimension % heads == 0 && tensor.shape[1] == ple.embedding_dimension / heads;
 }
 
-static Result<uint64_t> gated_residual_vulkan_releasable_dense_size(const MoeModelDescriptor& descriptor,
-                                                                    const Option& opt, const WeightMapping& weights)
+static Result<uint64_t> gr_release_size(const MoeModelDescriptor& descriptor,
+                                        const Option& opt, const WeightMapping& weights)
 {
     const uint64_t required_flags = OptimizationVulkanAttention | OptimizationVulkanQnK
                                     | OptimizationVulkanExpertGpuPriority | OptimizationVulkanCommandGraph;
@@ -1373,14 +1373,14 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& input_descri
     {
         eager_capacity = plan.host_memory_budget - plan.estimated_dense_size - safety_reserve;
     }
-    const auto supports_file_backed_experts = [weights](const MoeDescriptor& moe) {
+    const auto file_experts = [weights](const MoeDescriptor& moe) {
         if (weights)
             return has_flag(moe.flags, MoeDescriptorFileBackedExperts);
         return moe.expert_weight_dtype == DType::MxFp4
                || (moe.expert_weight_dtype == DType::BFloat16
                    && has_flag(moe.flags, MoeDescriptorFileBackedExperts));
     };
-    if (!supports_file_backed_experts(moe))
+    if (!file_experts(moe))
     {
         plan.selected_mode = ExpertMemoryMode::Eager;
         if (opt.expert_memory_mode == ExpertMemoryMode::OnDemand || opt.expert_cache_size != 0)
@@ -1447,7 +1447,7 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& input_descri
     {
         if (layer.dense.enabled())
             continue;
-        if (!supports_file_backed_experts(layer.moe))
+        if (!file_experts(layer.moe))
         {
             return Error{ErrorCode::UnsupportedModel, "on-demand mode requires a file-backed Expert encoding"};
         }
@@ -1459,10 +1459,10 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& input_descri
         if (weights && descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
         {
             if (use_vulkan_attention)
-                releasable = gated_residual_vulkan_releasable_dense_size(descriptor, opt, *weights);
+                releasable = gr_release_size(descriptor, opt, *weights);
         }
         else
-            releasable = latent_vulkan_releasable_dense_size(descriptor);
+            releasable = latent_release_size(descriptor);
         if (!releasable)
             return releasable.error();
         plan.estimated_vulkan_dense_host_release_size = std::min(releasable.value(), plan.estimated_dense_size);
