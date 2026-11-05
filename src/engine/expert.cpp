@@ -1345,7 +1345,7 @@ Result<void> forward_moe(const CompiledModel& model,
                          uint32_t residency_group,
                          ExecutionBackend backend,
                          bool prefetch,
-                         const std::function<void()>& independent_work)
+                         MoEOverlap overlap)
 try
 {
     // Declare before submission owners so exception/early-return cleanup
@@ -1371,11 +1371,11 @@ try
             scratch.prepared_pins.clear();
         }
     } wave_cleanup{scratch, layer_state};
-    bool independent_work_started = false;
-    const auto run_independent_work = [&] {
-        if (!independent_work || independent_work_started) return;
-        independent_work_started = true;
-        independent_work();
+    bool overlap_started = false;
+    const auto run_overlap = [&] {
+        if (!overlap.run || overlap_started) return;
+        overlap_started = true;
+        overlap.run(overlap.context);
     };
     const bool require_gpu_execution = backend == ExecutionBackend::Vulkan
                                        && model.opt.hybrid_mode == HybridMode::HybridExperts;
@@ -1846,7 +1846,7 @@ try
             // Shared computation depends only on normalized input. Start it
             // after cold transfer work exists, while resident requests and
             // the upload still own their independent bounded reservations.
-            if (prestaged_upload) run_independent_work();
+            if (prestaged_upload) run_overlap();
         }
     }
     if (gpu_priority)
@@ -2107,7 +2107,7 @@ try
                 upload = model.expert_backend->begin_demand_batch(wave_demands);
                 // Do not move Shared ahead of cold demand: its compute CB
                 // overlaps the already-started upload and preparation lane.
-                if (upload) run_independent_work();
+                if (upload) run_overlap();
                 prepared = upload ? upload->wait(prepared_pins) : 0;
             }
             bool valid_prefix = prepared <= attempt_count;

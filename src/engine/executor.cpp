@@ -336,6 +336,27 @@ static void router_linear(const CompiledModel& model,
     return {};
 }
 
+struct SharedOverlap
+{
+    const CompiledModel* model = nullptr;
+    const MoeBlockPlan* moe = nullptr;
+    LayerState* layer = nullptr;
+    bool retain_device_output = false;
+    ExecutionBackend backend = ExecutionBackend::Cpu;
+    Result<void> result;
+};
+
+static void run_shared_overlap(void* raw)
+{
+    SharedOverlap& work = *static_cast<SharedOverlap*>(raw);
+    work.result = fwd_shared(*work.model,
+                             *work.moe,
+                             work.layer->normalized.rows(),
+                             *work.layer,
+                             work.retain_device_output,
+                             work.backend);
+}
+
 static Result<void> fwd_dense(const CompiledModel& model,
                               const CompiledLayerPlan& layer,
                               ActivationBuffer& hidden,
@@ -1287,18 +1308,13 @@ Result<void> forward_model(const CompiledModel& model,
                 continuation_target = target_id;
             }
         }
-        Result<void> shared_result;
-        std::function<void()> shared_work;
         // Both host-normalized and resident inputs are independent of
         // routed weight supply; capability, rather than MLA, selects GPU work.
-        if (!layer_state.gpu_segment && moe.has_shared_expert && node->backend == ExecutionBackend::Vulkan
-            && has_flag(model.opt.optimization_flags, OptimizationVulkanSharedExpertOverlap)
-            && support_vulkan_shared_experts(model.operators, moe))
-        {
-            shared_work = [&] {
-                shared_result = fwd_shared(model, moe, layer_state.normalized.rows(), layer_state, router_fused, ExecutionBackend::Vulkan);
-            };
-        }
+        const bool overlap = !layer_state.gpu_segment && moe.has_shared_expert
+                             && node->backend == ExecutionBackend::Vulkan
+                             && has_flag(model.opt.optimization_flags, OptimizationVulkanSharedExpertOverlap)
+                             && support_vulkan_shared_experts(model.operators, moe);
+        SharedOverlap shared{&model, &moe, &layer_state, router_fused, ExecutionBackend::Vulkan};
         auto executed = forward_moe(model,
                                     moe,
                                     layer_state,
@@ -1306,8 +1322,9 @@ Result<void> forward_model(const CompiledModel& model,
                                     state.expert_scratch,
                                     layer.layer_id,
                                     node->backend,
-                                    has_flag(node->flags, ExecutionNodeCpuPrefetch), shared_work);
-        if (!shared_result) return shared_result.error();
+                                    has_flag(node->flags, ExecutionNodeCpuPrefetch),
+                                    overlap ? MoEOverlap{&shared, run_shared_overlap} : MoEOverlap{});
+        if (overlap && !shared.result) return shared.result.error();
         if (!executed)
             return executed.error();
         return {};
@@ -2357,16 +2374,11 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                 continuation_target = target_id;
             }
         }
-        Result<void> shared_result;
-        std::function<void()> shared_work;
-        if (!combined.gpu_segment && moe.has_shared_expert && node->backend == ExecutionBackend::Vulkan
-            && has_flag(model.opt.optimization_flags, OptimizationVulkanSharedExpertOverlap)
-            && support_vulkan_shared_experts(model.operators, moe))
-        {
-            shared_work = [&] {
-                shared_result = fwd_shared(model, moe, session_count, workspace.staged_state, router_fused, ExecutionBackend::Vulkan);
-            };
-        }
+        const bool overlap = !combined.gpu_segment && moe.has_shared_expert
+                             && node->backend == ExecutionBackend::Vulkan
+                             && has_flag(model.opt.optimization_flags, OptimizationVulkanSharedExpertOverlap)
+                             && support_vulkan_shared_experts(model.operators, moe);
+        SharedOverlap shared{&model, &moe, &combined, router_fused, ExecutionBackend::Vulkan};
         auto executed = forward_moe(model,
                                     moe,
                                     combined,
@@ -2374,8 +2386,9 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                                     workspace.expert,
                                     layer.layer_id,
                                     node->backend,
-                                    has_flag(node->flags, ExecutionNodeCpuPrefetch), shared_work);
-        if (!shared_result) return shared_result.error();
+                                    has_flag(node->flags, ExecutionNodeCpuPrefetch),
+                                    overlap ? MoEOverlap{&shared, run_shared_overlap} : MoEOverlap{});
+        if (overlap && !shared.result) return shared.result.error();
         if (!executed)
         {
             combined.reset();
