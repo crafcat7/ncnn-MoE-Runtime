@@ -1,0 +1,84 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "worker-release",
+      "displayName": "Release worker",
+      "binaryDir": "${sourceDir}/build-worker",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "NCNN_MOE_BUILD_TESTS": "OFF",
+        "NCNN_MOE_BUILD_EXAMPLES": "ON",
+        "NCNN_MOE_BUILD_REFERENCE_RUNNERS": "OFF",
+        "NCNN_MOE_BUILD_MXFP4_BENCHMARK": "OFF"
+      }
+    },
+    {
+      "name": "worker-release-cpu",
+      "displayName": "Release worker (CPU only)",
+      "inherits": "worker-release",
+      "binaryDir": "${sourceDir}/build-worker-cpu",
+      "cacheVariables": {
+        "NCNN_MOE_USE_VULKAN": "OFF"
+      }
+    },
+    {
+      "name": "dev-tests",
+      "displayName": "Development build with tests",
+      "binaryDir": "${sourceDir}/build-test",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "NCNN_MOE_BUILD_TESTS": "ON",
+        "NCNN_MOE_BUILD_EXAMPLES": "ON",
+        "NCNN_MOE_BUILD_REFERENCE_RUNNERS": "OFF"
+      }
+    },
+    {
+      "name": "sdk-release",
+      "displayName": "SDK library only",
+      "binaryDir": "${sourceDir}/build-sdk",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "NCNN_MOE_BUILD_TESTS": "OFF",
+        "NCNN_MOE_BUILD_EXAMPLES": "OFF",
+        "NCNN_MOE_BUILD_REFERENCE_RUNNERS": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "worker-release",
+      "configurePreset": "worker-release",
+      "configuration": "Release",
+      "targets": [
+        "ncnn_moe_worker"
+      ]
+    },
+    {
+      "name": "worker-release-cpu",
+      "configurePreset": "worker-release-cpu",
+      "configuration": "Release",
+      "targets": [
+        "ncnn_moe_worker"
+      ]
+    },
+    {
+      "name": "dev-tests",
+      "configurePreset": "dev-tests",
+      "configuration": "Release"
+    },
+    {
+      "name": "sdk-release",
+      "configurePreset": "sdk-release",
+      "configuration": "Release",
+      "targets": [
+        "ncnn_moe"
+      ]
+    }
+  ]
+}
