@@ -473,7 +473,7 @@ consume that state through explicit contracts.
 | --- | --- |
 | MoE Runtime API | Hardware capabilities, model loading, shared text encoding/decoding, immutable `Model` lifetime, mutable `Session` state, generation, sampling, cache synchronization, and `BatchScheduler` creation |
 | Adapter and compiler | Model-package parsing through `ModelAdapter` into `MoeModelDescriptor`, descriptor validation, weight resolution, memory planning, backend placement, and `CompiledModel` construction |
-| Execution | `ExecutionGraph` dependencies and Tensor locations, dependency-ordered backend runs, routing, and Expert dispatch |
+| Execution | `Net` blob edges and locations, dependency-ordered backend runs, routing, and Expert dispatch |
 | Memory | `ModelMemoryPlan`, per-Session KV/recurrent state, host ARC residency, and optional Vulkan cache tiers |
 | Backends | Runtime-dispatched CPU kernels, ncnn Vulkan Dense and Attention blocks, CPU Expert execution, and the optional native Vulkan MXFP4 Expert backend |
 | Model storage | Package metadata and mappings, asynchronous range I/O, packed Expert storage, and cache lifetime ownership |
@@ -492,7 +492,7 @@ Model Adapter -> MoeModelDescriptor -> ModelLoader -> compile_model
                                                 |
                          +----------------------+----------------------+
                          |                                             |
-             ExecutionGraph + ExecutionSchedule           Memory plan + runtime caches
+             Net (Layer[] + Blob[] + order)                 Memory plan + runtime caches
                          |                                Host ARC + Vulkan caches
                          +----------------------+----------------------+
                                                 |
@@ -510,9 +510,9 @@ maps package storage, and plans memory before calling the free `compile_model`
 function. The compiler binds model semantics and tensor handles, delegates
 concrete ncnn operator construction to backend preparers, and calls
 `build_graph` to materialize the immutable execution graph
-and compile-time schedule. `ExecutionGraph` records data dependencies and
-placement; `ExecutionSchedule` records the dependency-ordered CPU/Vulkan
-backend runs consumed by execution. `BatchScheduler` coordinates Session
+and compile-time order. `Net` records data dependencies through `Blob` edges,
+owns layer placement, and stores the dependency-ordered CPU/Vulkan `order`
+consumed by execution. `BatchScheduler` coordinates Session
 requests.
 `Session` owns mutable KV cache, recurrent state, sampling state,
 reusable execution scratch, and statistics. The byte-bounded Expert cache
