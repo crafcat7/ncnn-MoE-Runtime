@@ -111,10 +111,10 @@ Result<void> prepare_graph(CompiledModel& model, uint32_t prefill_rows)
 #if NCNN_MOE_WITH_VULKAN
 static bool bank_chain_supported(const CompiledModel& model)
 {
-    const size_t layers = model.graph.layer_plans.size();
+    const size_t layers = model.net.layer_plans.size();
     if (model.opt.hybrid_mode != HybridMode::HybridExperts || !model.gpu_head || layers == 0
         || model.gpu_segments.size() != layers || model.speculative.enabled()
-        || !model.speculative.graph.layers.empty() || has_flag(model.opt.flags, OptionRouterPrediction)
+        || !model.speculative.net.layers.empty() || has_flag(model.opt.flags, OptionRouterPrediction)
         || has_flag(model.opt.flags, OptionDisableGpuExpertExecution)) return false;
     const auto context = model.gpu_head ? model.gpu_head->context() : nullptr;
     if (!context || std::any_of(model.gpu_segments.begin(), model.gpu_segments.end(), [&](const auto& segment) {
@@ -124,8 +124,8 @@ static bool bank_chain_supported(const CompiledModel& model)
     // host consumer or a different ordering keeps explicit GPU streaming.
     size_t position = 0;
     const auto next = [&](LayerKind type, size_t layer, bool gpu) {
-        if (position >= model.schedule.node_order.size()) return false;
-        const Layer& node = model.graph.layers[model.schedule.node_order[position]];
+        if (position >= model.net.order.size()) return false;
+        const Layer& node = model.net.layers[model.net.order[position]];
         const bool ok = node.kind == type && (layer >= layers || node.plan_index == layer)
                         && (!gpu || node.backend == ExecutionBackend::Vulkan);
         if (!ok) return false;
@@ -135,7 +135,7 @@ static bool bank_chain_supported(const CompiledModel& model)
     if (!next(LayerKind::TokenEmbedding, layers, false)) return false;
     for (size_t layer = 0; layer < layers; ++layer)
     {
-        const CompiledLayerPlan& plan = model.graph.layer_plans[layer];
+        const CompiledLayerPlan& plan = model.net.layer_plans[layer];
         if (plan.dense_ffn.down_weight != invalid_tensor_handle)
         {
             if (!next(LayerKind::Attention, layer, true)
@@ -152,7 +152,7 @@ static bool bank_chain_supported(const CompiledModel& model)
             || !next(LayerKind::Combine, layer, true)) return false;
     }
     return next(LayerKind::FinalNorm, layers, true) && next(LayerKind::LmHead, layers, true)
-           && position == model.schedule.node_order.size();
+           && position == model.net.order.size();
 }
 
 static ExpertBankWeights_vulkan bank_expert_weights(const CompiledModel& model, const ExpertPlan& expert)
@@ -224,16 +224,16 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
     if (!model.gpu_expert_banks.empty())
         return Error{ErrorCode::InvalidArgument, "resident Expert banks have already been prepared"};
 #if NCNN_MOE_WITH_VULKAN
-    auto valid = model.schedule.validate(model.graph);
+    auto valid = model.net.validate_order();
     if (!valid) return valid.error();
     if (bank_chain_supported(model))
     {
         const auto context = model.gpu_head->context();
-        const uint32_t device = model.graph.layer_plans.front().vulkan_device_index;
+        const uint32_t device = model.net.layer_plans.front().vulkan_device_index;
         uint64_t total = 0, lease_capacity = 1;
         std::vector<ExpertBankPlan_vulkan> plans;
         bool supported = true;
-        for (const CompiledLayerPlan& layer : model.graph.layer_plans)
+        for (const CompiledLayerPlan& layer : model.net.layer_plans)
         {
             if (layer.dense_ffn.down_weight != invalid_tensor_handle)
             {
@@ -340,7 +340,7 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
                     // The ordinary tail path owns dense FFNs. A bank can only
                     // cover a prefix, so keep partial banks dense-free after it.
                     for (size_t index = prefix_layers; index < plans.size(); ++index)
-                        if (model.graph.layer_plans[index].dense_ffn.down_weight != invalid_tensor_handle)
+                        if (model.net.layer_plans[index].dense_ffn.down_weight != invalid_tensor_handle)
                         {
                             prefix = 0;
                             prefix_layers = 0;
@@ -374,9 +374,9 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
                 ExpertCache cache(lease_capacity, 1, {}, model.opt.expert_io_mode);
                 std::vector<std::shared_ptr<ExpertBank_vulkan>> banks;
                 uint64_t physical = 0;
-                for (size_t index = 0; index < model.graph.layer_plans.size(); ++index)
+                for (size_t index = 0; index < model.net.layer_plans.size(); ++index)
                 {
-                    const auto& layer = model.graph.layer_plans[index];
+                    const auto& layer = model.net.layer_plans[index];
                     if (index >= bank_layers || layer.dense_ffn.down_weight != invalid_tensor_handle)
                     {
                         banks.push_back({});

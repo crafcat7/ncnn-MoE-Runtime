@@ -344,7 +344,7 @@ static CompiledModel make_backend_model(const CompiledModel& cpu_model)
     CompiledModel model = cpu_model;
     model.opt.hybrid_mode = HybridMode::HybridExperts;
     size_t expert_group_nodes = 0;
-    for (Layer& node : model.graph.layers)
+    for (Layer& node : model.net.layers)
     {
         if (node.kind == LayerKind::ExpertGroup)
         {
@@ -354,9 +354,9 @@ static CompiledModel make_backend_model(const CompiledModel& cpu_model)
         }
     }
     require(expert_group_nodes == 1, "batch combine test expected one dynamic ExpertGroup node");
-    require(static_cast<bool>(model.schedule.validate(model.graph)), "batch combine backend schedule is invalid");
+    require(static_cast<bool>(model.net.validate_order()), "batch combine backend schedule is invalid");
 
-    MoeBlockPlan& moe = model.graph.layer_plans.front().moe;
+    MoeBlockPlan& moe = model.net.layer_plans.front().moe;
     for (uint32_t expert_id = 0; expert_id < moe.experts.size(); ++expert_id)
     {
         ExpertPlan& expert = moe.experts[expert_id];
@@ -395,7 +395,7 @@ static void run_batch_case(const CompiledModel& cpu_model,
 {
     CompiledModel backend_model = backend_template;
     std::unordered_map<std::string, ExpertMatrices> matrices;
-    for (const ExpertPlan& expert : backend_model.graph.layer_plans.front().moe.experts)
+    for (const ExpertPlan& expert : backend_model.net.layer_plans.front().moe.experts)
     {
         matrices.emplace(expert.cache_key,
                          ExpertMatrices{&backend_model.weights.at(expert.gate_up_weight),

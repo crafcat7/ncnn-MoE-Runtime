@@ -858,8 +858,8 @@ void test_prefill_decode_and_reset()
     check(owned_logits == all_output);
 
     CompiledModel missing_logits_model = compiled;
-    check(missing_logits_model.graph.layers[missing_logits_model.schedule.node_order.back()].kind == LayerKind::LmHead);
-    missing_logits_model.schedule.node_order.pop_back();
+    check(missing_logits_model.net.layers[missing_logits_model.net.order.back()].kind == LayerKind::LmHead);
+    missing_logits_model.net.order.pop_back();
     auto missing_logits = forward_model(missing_logits_model, direct_prompt, reused_statistics,
                                         reused_state, 0, LogitsOutput::Last);
     check(!missing_logits);
@@ -869,8 +869,8 @@ void test_prefill_decode_and_reset()
     CompiledModel layered_model = compiled;
     layered_model.opt.hybrid_mode = HybridMode::CpuOnly;
     layered_model.descriptor.layers.push_back(compiled.descriptor.layers.front());
-    layered_model.graph.layer_plans.push_back(compiled.graph.layer_plans.front());
-    layered_model.graph.layer_plans.back().layer_id = 1;
+    layered_model.net.layer_plans.push_back(compiled.net.layer_plans.front());
+    layered_model.net.layer_plans.back().layer_id = 1;
     check(static_cast<bool>(build_graph(layered_model, false)));
     auto layered_status = forward_model(layered_model, direct_prompt, reused_statistics, reused_state, 0, LogitsOutput::All);
     check(static_cast<bool>(layered_status));
@@ -915,25 +915,25 @@ void test_prefill_decode_and_reset()
 
     // A schedule must still finish the live FFN workspace before starting
     // another layer's router.
-    ExecutionSchedule overlapping_schedule = layered_model.schedule;
-    const auto router = std::find_if(overlapping_schedule.node_order.begin(),
-                                     overlapping_schedule.node_order.end(),
+    Net overlapping_net = layered_model.net;
+    const auto router = std::find_if(overlapping_net.order.begin(),
+                                     overlapping_net.order.end(),
                                      [&](LayerId id) {
-                                         return layered_model.graph.layers[id].kind == LayerKind::Router
-                                                && layered_model.graph.layers[id].plan_index == 1;
+                                         return layered_model.net.layers[id].kind == LayerKind::Router
+                                                && layered_model.net.layers[id].plan_index == 1;
                                      });
-    check(router != overlapping_schedule.node_order.end());
+    check(router != overlapping_net.order.end());
     const LayerId router_id = *router;
-    overlapping_schedule.node_order.erase(router);
-    const auto router_zero = std::find_if(overlapping_schedule.node_order.begin(),
-                                          overlapping_schedule.node_order.end(),
+    overlapping_net.order.erase(router);
+    const auto router_zero = std::find_if(overlapping_net.order.begin(),
+                                          overlapping_net.order.end(),
                                           [&](LayerId id) {
-                                              return layered_model.graph.layers[id].kind == LayerKind::Router
-                                                     && layered_model.graph.layers[id].plan_index == 0;
+                                              return layered_model.net.layers[id].kind == LayerKind::Router
+                                                     && layered_model.net.layers[id].plan_index == 0;
                                           });
-    check(router_zero != overlapping_schedule.node_order.end());
-    overlapping_schedule.node_order.insert(router_zero + 1, router_id);
-    auto overlapping_status = overlapping_schedule.validate(layered_model.graph);
+    check(router_zero != overlapping_net.order.end());
+    overlapping_net.order.insert(router_zero + 1, router_id);
+    auto overlapping_status = overlapping_net.validate_order();
     check(!overlapping_status);
     check(overlapping_status.error().message == "execution schedule overlaps an unfinished FFN layer");
 
@@ -942,7 +942,7 @@ void test_prefill_decode_and_reset()
     capture_model.speculative.kind = SpeculativeModelKind::DSpark;
     capture_model.speculative.block_size = 1;
     capture_model.speculative.target_layer_ids = {0};
-    capture_model.speculative.graph.layer_plans = compiled.graph.layer_plans;
+    capture_model.speculative.net.layer_plans = compiled.net.layer_plans;
     SessionState disabled_state;
     disabled_state.use_speculative_context = false;
     SessionStatistics disabled_statistics;
@@ -2019,11 +2019,11 @@ void test_ncnn_vulkan_float8_operator()
     shared_model.opt.hybrid_mode = HybridMode::HybridExperts;
     shared_model.opt.vulkan_device_index = automatic_vulkan_device_index;
     shared_model.opt.optimization_flags = g_test_optimization_flags;
-    shared_model.graph.layer_plans.resize(2);
-    for (CompiledLayerPlan& layer_plan : shared_model.graph.layer_plans)
+    shared_model.net.layer_plans.resize(2);
+    for (CompiledLayerPlan& layer_plan : shared_model.net.layer_plans)
         layer_plan.vulkan_device_index = automatic_vulkan_device_index;
-    MoeBlockPlan& shared_moe = shared_model.graph.layer_plans[0].moe;
-    MoeBlockPlan& routed_shared_moe = shared_model.graph.layer_plans[1].moe;
+    MoeBlockPlan& shared_moe = shared_model.net.layer_plans[0].moe;
+    MoeBlockPlan& routed_shared_moe = shared_model.net.layer_plans[1].moe;
     shared_moe.has_shared_expert = true;
     routed_shared_moe.has_shared_expert = true;
     auto add_shared_weight = [&](const char* name, TensorData tensor) {
@@ -5223,8 +5223,8 @@ void test_qnk_graph_cpu_projections()
         check(model.opt.flags == 0);
         check(model.opt.optimization_flags == compiler_opt.optimization_flags);
         check(model.opt.num_concurrent_sessions == compiler_opt.num_concurrent_sessions);
-        check(static_cast<bool>(model.graph.layer_plans.size() == 1));
-        const ExpertPlan& expert = model.graph.layer_plans.front().moe.experts.front();
+        check(static_cast<bool>(model.net.layer_plans.size() == 1));
+        const ExpertPlan& expert = model.net.layer_plans.front().moe.experts.front();
         check(expert.gate_up_weight == invalid_tensor_handle);
         check(expert.gate_weight != invalid_tensor_handle);
         check(expert.up_weight != invalid_tensor_handle);
@@ -5251,15 +5251,15 @@ void test_qnk_graph_cpu_projections()
                                             hybrid_opt);
             if (!hybrid_ret)
                 throw std::runtime_error("Qn_K hybrid graph compilation failed: " + hybrid_ret.error().message);
-            const ExpertPlan& hybrid_expert = hybrid_model.graph.layer_plans.front().moe.experts.front();
+            const ExpertPlan& hybrid_expert = hybrid_model.net.layer_plans.front().moe.experts.front();
             check(hybrid_expert.layout == ExpertLayout::GateUpDown);
             check(hybrid_expert.gate_up_weight == invalid_tensor_handle);
             check(hybrid_expert.gate_weight != invalid_tensor_handle);
             check(hybrid_expert.up_weight != invalid_tensor_handle);
             for (const MappedQnkTensor& source : mapped_qnk)
             {
-                const ExpertPlan& hybrid_plan = hybrid_model.graph.layer_plans.front().moe.experts[source.expert_id];
-                const ExpertPlan& cpu_plan = model.graph.layer_plans.front().moe.experts[source.expert_id];
+                const ExpertPlan& hybrid_plan = hybrid_model.net.layer_plans.front().moe.experts[source.expert_id];
+                const ExpertPlan& cpu_plan = model.net.layer_plans.front().moe.experts[source.expert_id];
                 const std::array<TensorHandle, 3> hybrid_handles = {
                     hybrid_plan.gate_weight,
                     hybrid_plan.up_weight,
@@ -9607,7 +9607,7 @@ public:
         : compiled(const_cast<CompiledModel&>(model_compiled(model))),
           throw_exception(exception)
     {
-        for (Layer& candidate : compiled.graph.layers)
+        for (Layer& candidate : compiled.net.layers)
         {
             if (candidate.kind == LayerKind::LmHead)
             {
@@ -9819,7 +9819,7 @@ void test_speculative_generation()
     check(static_cast<bool>(projection_handle));
     compiled.speculative.kind = SpeculativeModelKind::Mtp;
     compiled.speculative.block_size = 2;
-    compiled.speculative.graph.layer_plans = compiled.graph.layer_plans;
+    compiled.speculative.net.layer_plans = compiled.net.layer_plans;
     compiled.speculative.mtp_embedding_norm_weight = compiled.final_norm_weight;
     compiled.speculative.mtp_hidden_norm_weight = compiled.final_norm_weight;
     compiled.speculative.final_norm_weight = compiled.final_norm_weight;
@@ -10000,7 +10000,7 @@ void test_speculative_generation()
             check(static_cast<bool>(build_graph(compiled, false)));
             const auto check_head_backend = [&](ExecutionBackend backend) {
                 bool found = false;
-                for (const Layer& node : compiled.graph.layers)
+                for (const Layer& node : compiled.net.layers)
                 {
                     if (node.kind == LayerKind::LmHead)
                     {
@@ -10179,12 +10179,12 @@ void test_speculative_generation()
             check(static_cast<bool>(output_a_handle));
             latent.output_a_weight = output_a_handle.value();
             latent.output_b_weight = add_float("test_dspark_output_b", {2, 1}, {0.0f, 0.0f});
-            for (const ExpertPlan& expert : compiled.graph.layer_plans.front().moe.experts)
+            for (const ExpertPlan& expert : compiled.net.layer_plans.front().moe.experts)
             {
                 TensorData& down = compiled.weights.at_mutable(expert.down_weight);
                 std::fill(down.float32_data.begin(), down.float32_data.end(), 0.0f);
             }
-            compiled.graph.layer_plans.front().attention = latent;
+            compiled.net.layer_plans.front().attention = latent;
 
             AttentionDescriptor& descriptor_attention = compiled.descriptor.layers.front().attention;
             descriptor_attention.kind = AttentionKind::MultiHeadLatent;
@@ -10204,7 +10204,7 @@ void test_speculative_generation()
             compiled.speculative.noise_token_id = 0;
             compiled.speculative.markov_rank = 1;
             compiled.speculative.target_layer_ids = {0};
-            compiled.speculative.graph.layer_plans = compiled.graph.layer_plans;
+            compiled.speculative.net.layer_plans = compiled.net.layer_plans;
             compiled.speculative.main_projection_weight = latent.key_value_weight;
             compiled.speculative.main_norm_weight = latent.key_value_norm_weight;
             compiled.speculative.final_norm_weight = compiled.final_norm_weight;
@@ -10261,8 +10261,8 @@ void test_speculative_generation()
                 };
                 const auto speculative_shared_node = [](const CompiledModel& candidate) -> const Layer& {
                     const LayerId id = candidate.speculative.layer_nodes.front().shared_expert_group;
-                    check(id < candidate.speculative.graph.layers.size());
-                    return candidate.speculative.graph.layers[id];
+                    check(id < candidate.speculative.net.layers.size());
+                    return candidate.speculative.net.layers[id];
                 };
                 CompiledModel no_shared_dspark = compiled;
                 prepare_hybrid_dspark(no_shared_dspark);
@@ -10295,8 +10295,8 @@ void test_speculative_generation()
                         moe.shared_expert.up_weight = add_weight(prefix + "up", false);
                         moe.shared_expert.down_weight = add_weight(prefix + "down", true);
                     };
-                    configure(candidate.graph.layer_plans.front().moe, "test_target_shared_");
-                    configure(candidate.speculative.graph.layer_plans.front().moe, "test_dspark_shared_");
+                    configure(candidate.net.layer_plans.front().moe, "test_target_shared_");
+                    configure(candidate.speculative.net.layer_plans.front().moe, "test_dspark_shared_");
                     candidate.descriptor.layers.front().moe.shared_expert_count = 1;
                     candidate.descriptor.layers.front().moe.shared_expert_weight_dtype = dtype;
                     candidate.operators.bind_weight_count(candidate.weights.size());
@@ -10305,7 +10305,7 @@ void test_speculative_generation()
                 add_dspark_shared(cpu_int4_dspark, DType::Int4);
                 CompiledModel gpu_int4_dspark = cpu_int4_dspark;
                 prepare_hybrid_dspark(gpu_int4_dspark);
-                const MoeBlockPlan& gpu_shared_plan = gpu_int4_dspark.speculative.graph.layer_plans.front().moe;
+                const MoeBlockPlan& gpu_shared_plan = gpu_int4_dspark.speculative.net.layer_plans.front().moe;
                 check(support_vulkan_shared_experts(gpu_int4_dspark.operators, gpu_shared_plan));
                 check(speculative_shared_node(gpu_int4_dspark).backend == ExecutionBackend::Vulkan);
 
@@ -10318,7 +10318,7 @@ void test_speculative_generation()
                 ActivationBuffer gpu_shared_output;
                 ExpertWorkspace cpu_shared_workspace;
                 ExpertWorkspace gpu_shared_workspace;
-                forward_shared_expert(cpu_int4_dspark, cpu_int4_dspark.speculative.graph.layer_plans.front().moe,
+                forward_shared_expert(cpu_int4_dspark, cpu_int4_dspark.speculative.net.layer_plans.front().moe,
                                       shared_input, cpu_shared_output, cpu_shared_workspace);
                 const VulkanStatistics shared_before = get_vulkan_statistics(dspark_vulkan_runtime);
                 forward_shared_expert(gpu_int4_dspark, gpu_shared_plan, shared_input, gpu_shared_output, gpu_shared_workspace);
@@ -10339,7 +10339,7 @@ void test_speculative_generation()
                 add_dspark_shared(unsupported_dspark, DType::Float32);
                 prepare_hybrid_dspark(unsupported_dspark);
                 check(!support_vulkan_shared_experts(unsupported_dspark.operators,
-                                                     unsupported_dspark.speculative.graph.layer_plans.front().moe));
+                                                     unsupported_dspark.speculative.net.layer_plans.front().moe));
                 check(speculative_shared_node(unsupported_dspark).backend == ExecutionBackend::Cpu);
             }
 #endif
@@ -10363,7 +10363,7 @@ void test_speculative_generation()
                  layer_index < proposal_state.speculative_layers.size();
                  ++layer_index)
             {
-                const AttentionBlockPlan& attention = compiled.speculative.graph.layer_plans[layer_index].attention;
+                const AttentionBlockPlan& attention = compiled.speculative.net.layer_plans[layer_index].attention;
                 proposal_state.speculative_layers[layer_index].latent_window.assign(static_cast<size_t>(attention.sliding_window) * attention.head_dimension,
                                                                                     0.0f);
             }
@@ -10861,14 +10861,14 @@ void test_generic_mtp_int4_cache_key()
                                 HybridMode::CpuOnly);
     if (!status)
         throw std::runtime_error("generic INT4 MTP compilation failed: " + status.error().message);
-    const ExpertPlan& expert = compiled.speculative.graph.layer_plans.back().moe.experts.front();
+    const ExpertPlan& expert = compiled.speculative.net.layer_plans.back().moe.experts.front();
     check(expert.cache_key == "quantized:speculative.layers.0.experts.0.");
     check(support_vulkan_expert(expert,
                                 compiled.weights.at(expert.gate_up_weight),
                                 compiled.weights.at(expert.down_weight),
                                 compiled.opt.optimization_flags));
     check(support_vulkan_experts(compiled.weights,
-                                 compiled.speculative.graph.layer_plans.back().moe,
+                                 compiled.speculative.net.layer_plans.back().moe,
                                  compiled.opt.optimization_flags));
 
     TestRuntime runtime;
@@ -10889,8 +10889,8 @@ void test_generic_mtp_int4_cache_key()
             throw std::runtime_error("generic INT4 MTP Vulkan attention compilation failed: "
                                      + hybrid_status.error().message);
 
-        const AttentionBlockPlan& cpu_attention = compiled.speculative.graph.layer_plans.front().attention;
-        const AttentionBlockPlan& gpu_attention = hybrid.speculative.graph.layer_plans.front().attention;
+        const AttentionBlockPlan& cpu_attention = compiled.speculative.net.layer_plans.front().attention;
+        const AttentionBlockPlan& gpu_attention = hybrid.speculative.net.layer_plans.front().attention;
         check(cpu_attention.kind == AttentionKind::Standard);
         check(gpu_attention.kind == AttentionKind::Standard);
         check(gpu_attention.vulkan_attention_operator != invalid_compiled_operator_handle);
@@ -10898,8 +10898,8 @@ void test_generic_mtp_int4_cache_key()
         check(support_vulkan_attention(hybrid.operators, gpu_attention));
         check(hybrid.speculative.layer_nodes.size() == 1);
         const uint32_t attention_node_id = hybrid.speculative.layer_nodes.front().attention;
-        check(attention_node_id < hybrid.speculative.graph.layers.size());
-        const Layer& attention_node = hybrid.speculative.graph.layers[attention_node_id];
+        check(attention_node_id < hybrid.speculative.net.layers.size());
+        const Layer& attention_node = hybrid.speculative.net.layers[attention_node_id];
         check(attention_node.kind == LayerKind::Attention);
         check(attention_node.backend == ExecutionBackend::Vulkan);
 
@@ -10927,7 +10927,7 @@ void test_generic_mtp_int4_cache_key()
                                        uint64_t position) {
             return append_attention_context(model.weights,
                                             model.operators,
-                                            model.speculative.graph.layer_plans.front().attention,
+                                            model.speculative.net.layer_plans.front().attention,
                                             backend,
                                             position,
                                             state.speculative_layers.front(),
@@ -11040,7 +11040,7 @@ void test_attention_graph_without_bias_or_sink()
     {
         throw std::runtime_error("graph-driven model compilation failed: " + graph_driven_status.error().message);
     }
-    check(graph_driven_model.graph.layer_plans[0].attention.kind
+    check(graph_driven_model.net.layer_plans[0].attention.kind
           == AttentionKind::Standard);
     ActivationBuffer context_hidden(3, 2);
     context_hidden.row(0)[0] = 1.0f;
@@ -11055,12 +11055,12 @@ void test_attention_graph_without_bias_or_sink()
     AttentionScratch context_scratch;
     ActivationBuffer full_output;
     const CompiledModel& compiled = graph_driven_model;
-    const AttentionBlockPlan& attention = compiled.graph.layer_plans.front().attention;
+    const AttentionBlockPlan& attention = compiled.net.layer_plans.front().attention;
     const CompiledOperator& query_operator = compiled.operators.at_weight(attention.query_weight);
     check(compiled.operators.size() == compiled.weights.size());
     check(compiled.operators.find_weight(attention.query_weight) != nullptr);
     check(!query_operator.linear);
-    check(!support_vulkan_attention(compiled.operators, compiled.graph.layer_plans.front().attention));
+    check(!support_vulkan_attention(compiled.operators, compiled.net.layer_plans.front().attention));
 
     // Hybrid models can keep QSA or gated-residual attention on the CPU.
     CompiledModel hybrid_compiled = compiled;
@@ -11069,7 +11069,7 @@ void test_attention_graph_without_bias_or_sink()
     auto rebuilt_graph = build_graph(hybrid_compiled, false);
     check(static_cast<bool>(rebuilt_graph));
     const Layer* attention_node = nullptr;
-    for (const Layer& node : hybrid_compiled.graph.layers)
+    for (const Layer& node : hybrid_compiled.net.layers)
     {
         if (node.kind == LayerKind::Attention)
         {
@@ -11086,7 +11086,7 @@ void test_attention_graph_without_bias_or_sink()
     CompiledModel speculative_compiled = compiled;
     speculative_compiled.speculative.kind = SpeculativeModelKind::Mtp;
     speculative_compiled.speculative.block_size = 1;
-    speculative_compiled.speculative.graph.layer_plans = compiled.graph.layer_plans;
+    speculative_compiled.speculative.net.layer_plans = compiled.net.layer_plans;
     auto speculative_graph = build_graph(speculative_compiled, false);
     check(static_cast<bool>(speculative_graph));
     check(speculative_compiled.speculative.layer_nodes.size() == 1);
@@ -11097,26 +11097,26 @@ void test_attention_graph_without_bias_or_sink()
     check(speculative_nodes.expert_group != invalid_layer_id);
     check(speculative_nodes.shared_expert_group == invalid_layer_id);
     check(speculative_nodes.combine != invalid_layer_id);
-    check(speculative_compiled.speculative.graph.layers[speculative_nodes.attention].kind
+    check(speculative_compiled.speculative.net.layers[speculative_nodes.attention].kind
           == LayerKind::Attention);
-    check(speculative_compiled.speculative.graph.layers[speculative_nodes.router].kind
+    check(speculative_compiled.speculative.net.layers[speculative_nodes.router].kind
           == LayerKind::Router);
-    check(speculative_compiled.speculative.graph.layers[speculative_nodes.expert_dispatch].kind
+    check(speculative_compiled.speculative.net.layers[speculative_nodes.expert_dispatch].kind
           == LayerKind::ExpertDispatch);
-    check(speculative_compiled.speculative.graph.layers[speculative_nodes.expert_group].kind
+    check(speculative_compiled.speculative.net.layers[speculative_nodes.expert_group].kind
           == LayerKind::ExpertGroup);
-    check(speculative_compiled.speculative.graph.layers[speculative_nodes.combine].kind
+    check(speculative_compiled.speculative.net.layers[speculative_nodes.combine].kind
           == LayerKind::Combine);
 
     CompiledModel copied_speculative = speculative_compiled;
     const SpeculativeModelPlan::LayerNodes& copied_nodes = copied_speculative.speculative.layer_nodes.front();
-    check(&copied_speculative.speculative.graph.layers[copied_nodes.attention]
-          != &speculative_compiled.speculative.graph.layers[speculative_nodes.attention]);
-    check(copied_speculative.speculative.graph.layers[copied_nodes.attention].kind
+    check(&copied_speculative.speculative.net.layers[copied_nodes.attention]
+          != &speculative_compiled.speculative.net.layers[speculative_nodes.attention]);
+    check(copied_speculative.speculative.net.layers[copied_nodes.attention].kind
           == LayerKind::Attention);
 
     CompiledModel missing_attention_speculative = speculative_compiled;
-    missing_attention_speculative.speculative.graph.layer_plans.front().attention.kind = AttentionKind::None;
+    missing_attention_speculative.speculative.net.layer_plans.front().attention.kind = AttentionKind::None;
     auto missing_attention_graph = build_graph(missing_attention_speculative,
                                                false);
     check(!missing_attention_graph);
@@ -11126,17 +11126,14 @@ void test_attention_graph_without_bias_or_sink()
 
     CompiledModel moved_speculative = std::move(copied_speculative);
     const SpeculativeModelPlan::LayerNodes& moved_nodes = moved_speculative.speculative.layer_nodes.front();
-    check(moved_speculative.speculative.graph.layers[moved_nodes.expert_group].kind
+    check(moved_speculative.speculative.net.layers[moved_nodes.expert_group].kind
           == LayerKind::ExpertGroup);
 
-    ExecutionGraph rescheduled_speculative_graph = moved_speculative.speculative.graph;
-    ExecutionSchedule rescheduled_speculative_schedule;
+    Net rescheduled_speculative_graph = moved_speculative.speculative.net;
     auto rescheduled_speculative_status = schedule_graph(rescheduled_speculative_graph,
-                                                         rescheduled_speculative_schedule,
                                                          ExecutionBackendCpu);
     check(static_cast<bool>(rescheduled_speculative_status));
-    check(rescheduled_speculative_schedule.node_order
-          == moved_speculative.speculative.schedule.node_order);
+    check(rescheduled_speculative_graph.order == moved_speculative.speculative.net.order);
     check(rescheduled_speculative_graph.layers[moved_nodes.attention].kind
           == LayerKind::Attention);
     check(rescheduled_speculative_graph.layers[moved_nodes.expert_group].kind
@@ -11148,12 +11145,12 @@ void test_attention_graph_without_bias_or_sink()
     check(moved_speculative.speculative.layer_nodes.size() == 1);
     const SpeculativeModelPlan::LayerNodes& rebuilt_nodes = moved_speculative.speculative.layer_nodes.front();
     check(rebuilt_nodes.attention != invalid_layer_id);
-    check(moved_speculative.speculative.graph.layers[rebuilt_nodes.attention].kind
+    check(moved_speculative.speculative.net.layers[rebuilt_nodes.attention].kind
           == LayerKind::Attention);
 
     auto full_attention = forward_attention(compiled.weights,
                                             compiled.operators,
-                                            compiled.graph.layer_plans.front().attention,
+                                            compiled.net.layer_plans.front().attention,
                                             ExecutionBackend::Cpu,
                                             7,
                                             full_cache,
@@ -11164,7 +11161,7 @@ void test_attention_graph_without_bias_or_sink()
     check(static_cast<bool>(full_attention));
     auto appended_context = append_attention_context(compiled.weights,
                                                      compiled.operators,
-                                                     compiled.graph.layer_plans.front().attention,
+                                                     compiled.net.layer_plans.front().attention,
                                                      ExecutionBackend::Cpu,
                                                      7,
                                                      context_cache,
@@ -11195,7 +11192,7 @@ void test_attention_graph_without_bias_or_sink()
     ActivationBuffer flash_long_output;
     auto reference_long = forward_attention(compiled.weights,
                                             compiled.operators,
-                                            compiled.graph.layer_plans.front().attention,
+                                            compiled.net.layer_plans.front().attention,
                                             ExecutionBackend::Cpu,
                                             0,
                                             reference_long_cache,
@@ -11205,7 +11202,7 @@ void test_attention_graph_without_bias_or_sink()
                                             attention_reference_flags);
     auto flash_long = forward_attention(compiled.weights,
                                         compiled.operators,
-                                        compiled.graph.layer_plans.front().attention,
+                                        compiled.net.layer_plans.front().attention,
                                         ExecutionBackend::Cpu,
                                         0,
                                         flash_long_cache,
@@ -11233,7 +11230,7 @@ void test_attention_graph_without_bias_or_sink()
     AttentionScratch split_kv_scratch;
     auto reference_context = append_attention_context(compiled.weights,
                                                       compiled.operators,
-                                                      compiled.graph.layer_plans.front().attention,
+                                                      compiled.net.layer_plans.front().attention,
                                                       ExecutionBackend::Cpu,
                                                       0,
                                                       reference_split_cache,
@@ -11242,7 +11239,7 @@ void test_attention_graph_without_bias_or_sink()
                                                       attention_reference_flags);
     auto split_context = append_attention_context(compiled.weights,
                                                   compiled.operators,
-                                                  compiled.graph.layer_plans.front().attention,
+                                                  compiled.net.layer_plans.front().attention,
                                                   ExecutionBackend::Cpu,
                                                   0,
                                                   split_kv_cache,
@@ -11258,7 +11255,7 @@ void test_attention_graph_without_bias_or_sink()
     ActivationBuffer split_kv_output;
     auto reference_decode = forward_attention(compiled.weights,
                                               compiled.operators,
-                                              compiled.graph.layer_plans.front().attention,
+                                              compiled.net.layer_plans.front().attention,
                                               ExecutionBackend::Cpu,
                                               512,
                                               reference_split_cache,
@@ -11268,7 +11265,7 @@ void test_attention_graph_without_bias_or_sink()
                                               attention_reference_flags);
     auto split_decode = forward_attention(compiled.weights,
                                           compiled.operators,
-                                          compiled.graph.layer_plans.front().attention,
+                                          compiled.net.layer_plans.front().attention,
                                           ExecutionBackend::Cpu,
                                           512,
                                           split_kv_cache,
@@ -11281,7 +11278,7 @@ void test_attention_graph_without_bias_or_sink()
     for (uint32_t column = 0; column < reference_split_output.columns(); ++column)
         check_near(split_kv_output.row(0)[column], reference_split_output.row(0)[column], 1e-4f);
 
-    AttentionBlockPlan sliding_plan = compiled.graph.layer_plans.front().attention;
+    AttentionBlockPlan sliding_plan = compiled.net.layer_plans.front().attention;
     sliding_plan.sliding_window = 2;
     std::array<LayerCache, 1> sliding_context_cache;
     check(static_cast<bool>(begin_state_cache_transaction(sliding_context_cache,
@@ -11312,7 +11309,7 @@ void test_attention_graph_without_bias_or_sink()
     const LayerDescriptor& layer = cpu_model.value()->descriptor().layers[0];
     check(static_cast<bool>(!has_flag(layer.attention.flags, AttentionDescriptorBias)));
     check(static_cast<bool>(!has_flag(layer.attention.flags, AttentionDescriptorSinks)));
-    for (const Layer& node : cpu_compiled.graph.layers)
+    for (const Layer& node : cpu_compiled.net.layers)
         check(static_cast<bool>(node.backend == ExecutionBackend::Cpu));
 
     auto cpu_session = runtime.create_session(cpu_model.value());
@@ -11327,7 +11324,7 @@ void test_attention_graph_without_bias_or_sink()
         hybrid_options.hybrid_mode = HybridMode::HybridExperts;
         auto hybrid_model = runtime.load_model(package.path(), hybrid_options);
         check(static_cast<bool>(hybrid_model));
-        const ExecutionGraph& hybrid_graph = model_compiled(*hybrid_model.value()).graph;
+        const Net& hybrid_graph = model_compiled(*hybrid_model.value()).net;
         size_t vulkan_attention_nodes = 0;
         size_t vulkan_lm_head_nodes = 0;
         for (const Layer& node : hybrid_graph.layers)
@@ -11600,7 +11597,7 @@ void test_shared_expert_descriptor()
     check(static_cast<bool>(model));
     const CompiledModel& compiled = model_compiled(*model.value());
     check(compiled.descriptor.layers.front().moe.shared_expert_count == 0);
-    check(!compiled.graph.layer_plans.front().moe.has_shared_expert);
+    check(!compiled.net.layer_plans.front().moe.has_shared_expert);
     MoeModelDescriptor baseline_descriptor = compiled.descriptor;
     check(static_cast<bool>(validate_model_descriptor(baseline_descriptor)));
 
@@ -11628,7 +11625,7 @@ void test_shared_expert_descriptor()
     auto shared_status = compile_model(shared_descriptor, std::move(mapping).value(), shared_model);
     check(static_cast<bool>(shared_status));
     shared_model.opt.optimization_flags = g_test_optimization_flags;
-    const MoeBlockPlan& shared_plan = shared_model.graph.layer_plans.front().moe;
+    const MoeBlockPlan& shared_plan = shared_model.net.layer_plans.front().moe;
     check(shared_plan.has_shared_expert);
     check(shared_plan.shared_expert.gate_weight != invalid_tensor_handle);
     check(shared_plan.shared_expert.up_weight != invalid_tensor_handle);
@@ -11700,7 +11697,7 @@ void test_shared_expert_descriptor()
     nonzero_shared_model.opt.optimization_flags = g_test_optimization_flags;
     // Keep the previous routed-then-shared schedule as an independent
     // numerical reference for both ordinary and staged execution.
-    const auto restore_serial_shared_schedule = [](ExecutionGraph& graph, ExecutionSchedule& schedule) {
+    const auto restore_serial_shared_schedule = [](Net& graph) {
         Layer* dispatch = nullptr;
         Layer* routed = nullptr;
         Layer* shared = nullptr;
@@ -11715,13 +11712,13 @@ void test_shared_expert_descriptor()
         }
         check(dispatch != nullptr && routed != nullptr && shared != nullptr);
         check(has_flag(dispatch->flags, LayerRequestExperts));
-        check(std::find(schedule.node_order.begin(), schedule.node_order.end(), shared->id)
-              < std::find(schedule.node_order.begin(), schedule.node_order.end(), routed->id));
+        check(std::find(graph.order.begin(), graph.order.end(), shared->id)
+              < std::find(graph.order.begin(), graph.order.end(), routed->id));
         dispatch->flags &= ~LayerRequestExperts;
         const auto retarget_control = [&](LayerId from, LayerId to, LayerId new_from, LayerId new_to) {
-            for (ExecutionTensor& tensor : graph.tensors)
+            for (Blob& tensor : graph.blobs)
             {
-                if (tensor.lifetime == TensorLifetime::Control && tensor.producer == from
+                if (tensor.lifetime == BlobLifetime::Control && tensor.producer == from
                     && tensor.consumers.size() == 1 && tensor.consumers.front() == to)
                 {
                     tensor.producer = new_from;
@@ -11733,10 +11730,10 @@ void test_shared_expert_descriptor()
         };
         check(retarget_control(dispatch->id, shared->id, routed->id, shared->id));
         check(retarget_control(shared->id, routed->id, dispatch->id, routed->id));
-        check(static_cast<bool>(schedule_graph(graph, schedule, ExecutionBackendCpu)));
+        check(static_cast<bool>(schedule_graph(graph, ExecutionBackendCpu)));
     };
     CompiledModel serial_shared_model = nonzero_shared_model;
-    restore_serial_shared_schedule(serial_shared_model.graph, serial_shared_model.schedule);
+    restore_serial_shared_schedule(serial_shared_model.net);
     SessionState reordered_state;
     SessionState serial_state;
     SessionStatistics reordered_statistics;
@@ -11760,15 +11757,15 @@ void test_shared_expert_descriptor()
     SpeculativeModelPlan& mtp = mtp_shared_model.speculative;
     mtp.kind = SpeculativeModelKind::Mtp;
     mtp.block_size = 2;
-    mtp.graph.layer_plans = mtp_shared_model.graph.layer_plans;
-    AttentionBlockPlan& mtp_attention = mtp.graph.layer_plans.front().attention;
+    mtp.net.layer_plans = mtp_shared_model.net.layer_plans;
+    AttentionBlockPlan& mtp_attention = mtp.net.layer_plans.front().attention;
     mtp_attention.kind = AttentionKind::Standard;
     mtp_attention.head_count = 1;
     mtp_attention.kv_head_count = 1;
     mtp_attention.head_dimension = 2;
     mtp_attention.value_head_dimension = 2;
     mtp_attention.pre_attention_norm_weight = mtp_shared_model.final_norm_weight;
-    mtp_attention.query_weight = mtp.graph.layer_plans.front().moe.shared_expert.up_weight;
+    mtp_attention.query_weight = mtp.net.layer_plans.front().moe.shared_expert.up_weight;
     mtp_attention.key_weight = mtp_attention.query_weight;
     mtp_attention.value_weight = mtp_attention.query_weight;
     mtp_attention.output_weight = mtp_attention.query_weight;
@@ -11786,7 +11783,7 @@ void test_shared_expert_descriptor()
     if (!mtp_graph)
         throw std::runtime_error("shared MTP graph failed: " + mtp_graph.error().message);
     CompiledModel serial_mtp_model = mtp_shared_model;
-    restore_serial_shared_schedule(serial_mtp_model.speculative.graph, serial_mtp_model.speculative.schedule);
+    restore_serial_shared_schedule(serial_mtp_model.speculative.net);
     std::array<SessionState, 2> mtp_states;
     std::array<SessionStatistics, 2> mtp_statistics;
     for (size_t index = 0; index < mtp_states.size(); ++index)
@@ -11894,7 +11891,7 @@ void test_shared_expert_descriptor()
                          mtp_expected.logits[row].values().begin(), mtp_expected.logits[row].values().end()));
     }
 
-    const MoeBlockPlan& nonzero_shared_plan = nonzero_shared_model.graph.layer_plans.front().moe;
+    const MoeBlockPlan& nonzero_shared_plan = nonzero_shared_model.net.layer_plans.front().moe;
     ActivationBuffer nonzero_shared_input(2, shared_descriptor.hidden_size);
     nonzero_shared_input.row(0)[0] = 1.0f;
     nonzero_shared_input.row(0)[1] = 0.0f;
@@ -12358,10 +12355,10 @@ void test_execution_graph_and_scheduler()
     check(!invalid_normalization_compile_status);
     check(invalid_normalization_compile_status.error().code == ErrorCode::InvalidModel);
     check(invalid_normalization_compile_status.error().message == "model descriptor layer has an invalid router normalization");
-    const ExecutionGraph& graph = compiled.graph;
-    check(compiled.graph.layer_plans.front().attention.kind == AttentionKind::None);
+    const Net& graph = compiled.net;
+    check(compiled.net.layer_plans.front().attention.kind == AttentionKind::None);
     check(static_cast<bool>(graph.layers.size() == 7));
-    check(static_cast<bool>(!graph.tensors.empty()));
+    check(static_cast<bool>(!graph.blobs.empty()));
     const std::vector<LayerKind> expected_types = {
         LayerKind::TokenEmbedding,
         LayerKind::Router,
@@ -12379,25 +12376,24 @@ void test_execution_graph_and_scheduler()
     }
     check(static_cast<bool>(graph.layers[3].flags == 0));
     check(static_cast<bool>(graph.layers[3].plan_index == 0));
-    const auto assignments = std::find_if(graph.tensors.begin(), graph.tensors.end(), [](const ExecutionTensor& tensor) {
+    const auto assignments = std::find_if(graph.blobs.begin(), graph.blobs.end(), [](const Blob& tensor) {
         return tensor.name.find("expert_dispatch.assignments") != std::string::npos;
     });
-    check(assignments != graph.tensors.end());
-    check(assignments->lifetime == TensorLifetime::Control);
+    check(assignments != graph.blobs.end());
+    check(assignments->lifetime == BlobLifetime::Control);
     check(assignments->producer == 2);
     check(assignments->consumers == std::vector<LayerId>{3});
-    const auto experts_output = std::find_if(graph.tensors.begin(), graph.tensors.end(), [](const ExecutionTensor& tensor) {
+    const auto experts_output = std::find_if(graph.blobs.begin(), graph.blobs.end(), [](const Blob& tensor) {
         return tensor.name.find("experts.output") != std::string::npos;
     });
-    check(experts_output != graph.tensors.end());
+    check(experts_output != graph.blobs.end());
     check(experts_output->producer == 3);
     check(std::find(experts_output->consumers.begin(), experts_output->consumers.end(), LayerId{4})
           != experts_output->consumers.end());
 
-    const ExecutionSchedule& compiled_schedule = compiled.schedule;
-    check(static_cast<bool>(compiled_schedule.validate(graph)));
-    check(static_cast<bool>(compiled_schedule.node_order.size() == graph.layers.size()));
-    for (LayerId node_id : compiled_schedule.node_order)
+    check(static_cast<bool>(graph.validate_order()));
+    check(static_cast<bool>(graph.order.size() == graph.layers.size()));
+    for (LayerId node_id : graph.order)
         check(static_cast<bool>(graph.layers[node_id].backend == ExecutionBackend::Cpu));
 
     auto session = runtime.create_session(model.value());
@@ -12408,42 +12404,40 @@ void test_execution_graph_and_scheduler()
     const SessionStatistics session_statistics = session.value()->statistics();
     check(static_cast<bool>(session_statistics.expert_batch_weight_bytes > 0));
     check(static_cast<bool>(session_statistics.expert_route_weight_bytes >= session_statistics.expert_batch_weight_bytes));
-    ExecutionGraph rescheduled_graph = graph;
-    ExecutionSchedule rescheduled_schedule;
-    auto rescheduled_status = schedule_graph(rescheduled_graph, rescheduled_schedule, ExecutionBackendCpu);
+    Net rescheduled_graph = graph;
+    auto rescheduled_status = schedule_graph(rescheduled_graph, ExecutionBackendCpu);
     check(static_cast<bool>(rescheduled_status));
-    check(static_cast<bool>(rescheduled_schedule.node_order == compiled_schedule.node_order));
-    auto repeated_rescheduled_status = schedule_graph(rescheduled_graph, rescheduled_schedule, ExecutionBackendCpu);
+    check(static_cast<bool>(rescheduled_graph.order == graph.order));
+    auto repeated_rescheduled_status = schedule_graph(rescheduled_graph, ExecutionBackendCpu);
     check(static_cast<bool>(repeated_rescheduled_status));
-    check(static_cast<bool>(rescheduled_schedule.node_order == compiled_schedule.node_order));
+    check(static_cast<bool>(rescheduled_graph.order == graph.order));
 
     for (LayerKind type : {LayerKind::ExpertGroup, LayerKind::SharedExpertGroup})
     {
-        for (uint32_t binding : {invalid_execution_layer_id, static_cast<uint32_t>(graph.layer_plans.size())})
+        for (uint32_t binding : {invalid_plan_index, static_cast<uint32_t>(graph.layer_plans.size())})
         {
-            ExecutionGraph invalid_graph = graph;
+            Net invalid_graph = graph;
             invalid_graph.layers[3].kind = type;
             invalid_graph.layers[3].plan_index = binding;
-            ExecutionSchedule invalid_schedule;
-            auto ret = schedule_graph(invalid_graph, invalid_schedule, ExecutionBackendCpu);
+            auto ret = schedule_graph(invalid_graph, ExecutionBackendCpu);
             check(!ret && ret.error().code == ErrorCode::InvalidModel);
-            check(ret.error().message == (binding == invalid_execution_layer_id ? "execution graph node has an invalid layer plan binding" : "execution graph node layer plan is out of range"));
+            check(ret.error().message == (binding == invalid_plan_index ? "execution graph node has an invalid layer plan binding" : "execution graph node layer plan is out of range"));
         }
     }
 
-    const auto add_test_edge = [](ExecutionGraph& graph, LayerId producer, LayerId consumer) {
-        ExecutionTensor tensor;
-        tensor.id = static_cast<ExecutionTensorId>(graph.tensors.size());
+    const auto add_test_edge = [](Net& graph, LayerId producer, LayerId consumer) {
+        Blob tensor;
+        tensor.id = static_cast<BlobId>(graph.blobs.size());
         tensor.name = "test.edge." + std::to_string(tensor.id);
         tensor.dtype = DType::Int32;
         tensor.shape = {1};
-        tensor.lifetime = TensorLifetime::Control;
+        tensor.lifetime = BlobLifetime::Control;
         tensor.producer = producer;
         tensor.consumers = {consumer};
-        graph.tensors.push_back(std::move(tensor));
+        graph.blobs.push_back(std::move(tensor));
     };
 
-    ExecutionGraph branch_graph;
+    Net branch_graph;
     for (LayerId node_id = 0; node_id < 5; ++node_id)
     {
         Layer node;
@@ -12458,39 +12452,35 @@ void test_execution_graph_and_scheduler()
     add_test_edge(branch_graph, 1, 2);
     add_test_edge(branch_graph, 0, 4);
     add_test_edge(branch_graph, 2, 4);
-    ExecutionSchedule branch_schedule;
-    auto branch_status = schedule_graph(branch_graph, branch_schedule, ExecutionBackendCpu);
+    auto branch_status = schedule_graph(branch_graph, ExecutionBackendCpu);
     check(static_cast<bool>(branch_status));
-    check(static_cast<bool>(branch_schedule.node_order == std::vector<LayerId>{1, 3, 2, 0, 4}));
+    check(static_cast<bool>(branch_graph.order == std::vector<LayerId>{1, 3, 2, 0, 4}));
 
-    ExecutionGraph duplicate_dependency_graph = branch_graph;
-    duplicate_dependency_graph.tensors.back().consumers.push_back(duplicate_dependency_graph.tensors.back().consumers.front());
-    ExecutionSchedule duplicate_schedule;
-    auto duplicate_schedule_status = schedule_graph(duplicate_dependency_graph, duplicate_schedule, ExecutionBackendCpu);
+    Net duplicate_dependency_graph = branch_graph;
+    duplicate_dependency_graph.blobs.back().consumers.push_back(duplicate_dependency_graph.blobs.back().consumers.front());
+    auto duplicate_schedule_status = schedule_graph(duplicate_dependency_graph, ExecutionBackendCpu);
     check(!duplicate_schedule_status);
     check(duplicate_schedule_status.error().message == "execution tensor contains a duplicate consumer");
 
-    ExecutionGraph cpu_only_graph = graph;
+    Net cpu_only_graph = graph;
     cpu_only_graph.layers.back().backend = ExecutionBackend::Vulkan;
     cpu_only_graph.layers.back().backend_mask |= ExecutionBackendVulkan;
-    ExecutionSchedule cpu_only_schedule;
-    auto cpu_only_status = schedule_graph(cpu_only_graph, cpu_only_schedule, ExecutionBackendCpu);
+    auto cpu_only_status = schedule_graph(cpu_only_graph, ExecutionBackendCpu);
     check(static_cast<bool>(cpu_only_status));
     check(static_cast<bool>(cpu_only_graph.layers.back().backend == ExecutionBackend::Cpu));
-    check(static_cast<bool>(cpu_only_schedule.node_order.size() == cpu_only_graph.layers.size()));
+    check(static_cast<bool>(cpu_only_graph.order.size() == cpu_only_graph.layers.size()));
 
-    ExecutionGraph hybrid_graph = graph;
+    Net hybrid_graph = graph;
     hybrid_graph.layers.back().backend_mask |= ExecutionBackendVulkan;
     constexpr uint32_t scheduling_backends = ExecutionBackendCpu | ExecutionBackendVulkan;
-    ExecutionSchedule hybrid_schedule;
-    auto hybrid_status = schedule_graph(hybrid_graph, hybrid_schedule, scheduling_backends);
+    auto hybrid_status = schedule_graph(hybrid_graph, scheduling_backends);
     check(static_cast<bool>(hybrid_status));
-    check(static_cast<bool>(hybrid_schedule.validate(hybrid_graph)));
-    check(static_cast<bool>(hybrid_schedule.node_order.size() == hybrid_graph.layers.size()));
+    check(static_cast<bool>(hybrid_graph.validate_order()));
+    check(static_cast<bool>(hybrid_graph.order.size() == hybrid_graph.layers.size()));
     check(static_cast<bool>(hybrid_graph.layers.back().backend == ExecutionBackend::Vulkan));
-    for (size_t index = 0; index + 1 < hybrid_schedule.node_order.size(); ++index)
-        check(static_cast<bool>(hybrid_graph.layers[hybrid_schedule.node_order[index]].backend == ExecutionBackend::Cpu));
-    check(static_cast<bool>(hybrid_graph.layers[hybrid_schedule.node_order.back()].backend == ExecutionBackend::Vulkan));
+    for (size_t index = 0; index + 1 < hybrid_graph.order.size(); ++index)
+        check(static_cast<bool>(hybrid_graph.layers[hybrid_graph.order[index]].backend == ExecutionBackend::Cpu));
+    check(static_cast<bool>(hybrid_graph.layers[hybrid_graph.order.back()].backend == ExecutionBackend::Vulkan));
 
     for (LayerKind type : {
              LayerKind::Attention,
@@ -12498,15 +12488,14 @@ void test_execution_graph_and_scheduler()
              LayerKind::SharedExpertGroup,
              LayerKind::DenseFfn})
     {
-        ExecutionGraph eligible_graph = graph;
+        Net eligible_graph = graph;
         Layer& eligible_node = eligible_graph.layers[3];
         eligible_node.kind = type;
         eligible_node.backend = ExecutionBackend::Cpu;
         eligible_node.backend_mask |= ExecutionBackendVulkan;
         eligible_graph.layers.front().backend = ExecutionBackend::Vulkan;
 
-        ExecutionSchedule eligible_schedule;
-        auto cpu_status = schedule_graph(eligible_graph, eligible_schedule, ExecutionBackendCpu);
+        auto cpu_status = schedule_graph(eligible_graph, ExecutionBackendCpu);
         check(static_cast<bool>(cpu_status));
         check(static_cast<bool>(eligible_node.backend == ExecutionBackend::Cpu));
         for (const Layer& node : eligible_graph.layers)
@@ -12516,7 +12505,7 @@ void test_execution_graph_and_scheduler()
         }
 
         eligible_graph.layers.front().backend = ExecutionBackend::Vulkan;
-        auto hybrid_status = schedule_graph(eligible_graph, eligible_schedule, scheduling_backends);
+        auto hybrid_status = schedule_graph(eligible_graph, scheduling_backends);
         check(static_cast<bool>(hybrid_status));
         check(static_cast<bool>(eligible_node.backend == ExecutionBackend::Vulkan));
         for (const Layer& node : eligible_graph.layers)
@@ -12525,12 +12514,12 @@ void test_execution_graph_and_scheduler()
                 check(static_cast<bool>(node.backend == ExecutionBackend::Cpu));
         }
 
-        auto rescheduled_cpu_status = schedule_graph(eligible_graph, eligible_schedule, ExecutionBackendCpu);
+        auto rescheduled_cpu_status = schedule_graph(eligible_graph, ExecutionBackendCpu);
         check(static_cast<bool>(rescheduled_cpu_status));
         check(static_cast<bool>(eligible_node.backend == ExecutionBackend::Cpu));
     }
 
-    ExecutionGraph vulkan_only_graph;
+    Net vulkan_only_graph;
     Layer vulkan_dense_node;
     vulkan_dense_node.id = 0;
     vulkan_dense_node.kind = LayerKind::LmHead;
@@ -12538,64 +12527,57 @@ void test_execution_graph_and_scheduler()
     vulkan_dense_node.backend_mask = scheduling_backends;
     vulkan_dense_node.weights = {0};
     vulkan_only_graph.layers.push_back(std::move(vulkan_dense_node));
-    ExecutionSchedule vulkan_only_schedule;
-    auto vulkan_only_status = schedule_graph(vulkan_only_graph,
-                                             vulkan_only_schedule,
-                                             ExecutionBackendVulkan);
+    auto vulkan_only_status = schedule_graph(vulkan_only_graph, ExecutionBackendVulkan);
     check(static_cast<bool>(vulkan_only_status));
     check(static_cast<bool>(vulkan_only_graph.layers.front().backend == ExecutionBackend::Vulkan));
 
-    ExecutionSchedule no_backend_schedule;
-    auto no_backend_status = schedule_graph(vulkan_only_graph, no_backend_schedule, 0);
+    auto no_backend_status = schedule_graph(vulkan_only_graph, 0);
     check(!no_backend_status);
     check(no_backend_status.error().code == ErrorCode::InvalidArgument);
     check(no_backend_status.error().message == "runtime scheduler requires at least one backend");
 
-    ExecutionSchedule invalid_node_order_schedule = hybrid_schedule;
-    const LayerId delayed_token_node = invalid_node_order_schedule.node_order.front();
-    invalid_node_order_schedule.node_order.erase(invalid_node_order_schedule.node_order.begin());
-    invalid_node_order_schedule.node_order.push_back(delayed_token_node);
-    auto invalid_node_order_status = invalid_node_order_schedule.validate(hybrid_graph);
-    check(!invalid_node_order_status);
-    check(static_cast<bool>(invalid_node_order_status.error().code == ErrorCode::InvalidModel));
-    check(static_cast<bool>(invalid_node_order_status.error().message == "execution schedule violates a tensor dependency"));
+    Net invalid_order_net = hybrid_graph;
+    const LayerId delayed_token_node = invalid_order_net.order.front();
+    invalid_order_net.order.erase(invalid_order_net.order.begin());
+    invalid_order_net.order.push_back(delayed_token_node);
+    auto invalid_order_status = invalid_order_net.validate_order();
+    check(!invalid_order_status);
+    check(static_cast<bool>(invalid_order_status.error().code == ErrorCode::InvalidModel));
+    check(static_cast<bool>(invalid_order_status.error().message == "execution schedule violates a tensor dependency"));
 
-    ExecutionGraph invalid_backend_graph = hybrid_graph;
+    Net invalid_backend_graph = hybrid_graph;
     invalid_backend_graph.layers.back().backend_mask = ExecutionBackendCpu;
-    auto invalid_backend_status = hybrid_schedule.validate(invalid_backend_graph);
+    auto invalid_backend_status = invalid_backend_graph.validate_order();
     check(!invalid_backend_status);
     check(static_cast<bool>(invalid_backend_status.error().code == ErrorCode::InvalidModel));
     check(static_cast<bool>(invalid_backend_status.error().message == "execution schedule node backend is not allowed by its backend mask"));
 
-    ExecutionGraph invalid_dependency_graph = hybrid_graph;
-    invalid_dependency_graph.tensors.back().consumers.push_back(invalid_layer_id);
-    ExecutionSchedule invalid_dependency_schedule;
-    auto invalid_dependency_status = schedule_graph(invalid_dependency_graph, invalid_dependency_schedule, scheduling_backends);
+    Net invalid_dependency_graph = hybrid_graph;
+    invalid_dependency_graph.blobs.back().consumers.push_back(invalid_layer_id);
+    auto invalid_dependency_status = schedule_graph(invalid_dependency_graph, scheduling_backends);
     check(!invalid_dependency_status);
     check(static_cast<bool>(invalid_dependency_status.error().code == ErrorCode::InvalidModel));
     check(static_cast<bool>(invalid_dependency_status.error().message == "execution tensor consumer is out of range"));
 
     for (LayerId invalid_id : {static_cast<LayerId>(graph.layers.size()), invalid_layer_id, LayerId{0}})
     {
-        ExecutionGraph invalid_graph = hybrid_graph;
+        Net invalid_graph = hybrid_graph;
         invalid_graph.layers.back().id = invalid_id;
-        ExecutionSchedule invalid_schedule;
-        auto invalid_schedule_status = schedule_graph(invalid_graph, invalid_schedule, scheduling_backends);
+        auto invalid_schedule_status = schedule_graph(invalid_graph, scheduling_backends);
         check(!invalid_schedule_status);
         check(invalid_schedule_status.error().code == ErrorCode::InvalidModel);
         check(invalid_schedule_status.error().message == "execution graph node ids must be contiguous and index-aligned");
     }
 
-    ExecutionGraph unavailable_graph = hybrid_graph;
+    Net unavailable_graph = hybrid_graph;
     unavailable_graph.layers.back().id = invalid_layer_id;
     unavailable_graph.layers.front().backend_mask = 0;
-    ExecutionSchedule unavailable_schedule;
-    auto unavailable_schedule_status = schedule_graph(unavailable_graph, unavailable_schedule, scheduling_backends);
+    auto unavailable_schedule_status = schedule_graph(unavailable_graph, scheduling_backends);
     check(!unavailable_schedule_status);
     check(unavailable_schedule_status.error().code == ErrorCode::UnsupportedModel);
     check(unavailable_schedule_status.error().message == "execution node has no available backend: TokenEmbedding #0");
 
-    ExecutionGraph cyclic;
+    Net cyclic;
     Layer cyclic_router;
     cyclic_router.id = 0;
     cyclic_router.kind = LayerKind::Router;
@@ -12615,8 +12597,7 @@ void test_execution_graph_and_scheduler()
     cyclic.layer_plans.resize(1);
     add_test_edge(cyclic, 0, 1);
     add_test_edge(cyclic, 1, 0);
-    ExecutionSchedule invalid_schedule;
-    auto invalid_schedule_status = schedule_graph(cyclic, invalid_schedule, ExecutionBackendCpu);
+    auto invalid_schedule_status = schedule_graph(cyclic, ExecutionBackendCpu);
     check(static_cast<bool>(!invalid_schedule_status));
     check(static_cast<bool>(invalid_schedule_status.error().code == ErrorCode::InvalidModel));
     check(invalid_schedule_status.error().message == "execution graph contains a dependency cycle");
@@ -15373,13 +15354,13 @@ void test_latent_attention_scratch_reuse()
     dspark_model.speculative.target_layer_ids = {0};
     dspark_model.speculative.main_projection_weight = dspark_plan.key_value_weight;
     dspark_model.speculative.main_norm_weight = dspark_plan.key_value_norm_weight;
-    dspark_model.speculative.graph.layer_plans.resize(2);
-    dspark_model.speculative.graph.layers.resize(2);
+    dspark_model.speculative.net.layer_plans.resize(2);
+    dspark_model.speculative.net.layers.resize(2);
     dspark_model.speculative.layer_nodes.resize(2);
     for (size_t layer = 0; layer < 2; ++layer)
     {
-        dspark_model.speculative.graph.layer_plans[layer].attention = dspark_plan;
-        Layer& node = dspark_model.speculative.graph.layers[layer];
+        dspark_model.speculative.net.layer_plans[layer].attention = dspark_plan;
+        Layer& node = dspark_model.speculative.net.layers[layer];
         node.id = static_cast<LayerId>(layer);
         node.kind = LayerKind::Attention;
         node.backend = ExecutionBackend::Cpu;
@@ -16505,17 +16486,17 @@ void test_qwen4_exp_compile_and_execute()
         throw std::runtime_error("Qwen4 Exp test compilation failed: "
                                  + compile_status.error().message);
     }
-    check(compiled.graph.layer_plans.size() == parsed.value().layers.size());
-    for (size_t layer_id = 0; layer_id < compiled.graph.layer_plans.size(); ++layer_id)
+    check(compiled.net.layer_plans.size() == parsed.value().layers.size());
+    for (size_t layer_id = 0; layer_id < compiled.net.layer_plans.size(); ++layer_id)
     {
-        const CompiledLayerPlan& layer = compiled.graph.layer_plans[layer_id];
+        const CompiledLayerPlan& layer = compiled.net.layer_plans[layer_id];
         check(layer.layer_id == layer_id);
         check(layer.attention.norm_epsilon == compiled.descriptor.norm_epsilon);
         check(layer.attention.kv_cache_dtype == compiled.descriptor.kv_cache_dtype);
     }
-    const ExecutionTensor* delta_cache = nullptr;
-    const ExecutionTensor* full_attention_cache = nullptr;
-    for (const ExecutionTensor& tensor : compiled.graph.tensors)
+    const Blob* delta_cache = nullptr;
+    const Blob* full_attention_cache = nullptr;
+    for (const Blob& tensor : compiled.net.blobs)
     {
         if (tensor.name == "layers.0.kv_cache")
             delta_cache = &tensor;
@@ -16531,23 +16512,23 @@ void test_qwen4_exp_compile_and_execute()
     check(compiled.final_norm_weight == invalid_tensor_handle);
     check(compiled.gated_residual_head.norm_weight
           != invalid_tensor_handle);
-    check(compiled.graph.layer_plans[1].ple.enabled());
-    check(has_flag(compiled.graph.layer_plans[3].attention.flags,
+    check(compiled.net.layer_plans[1].ple.enabled());
+    check(has_flag(compiled.net.layer_plans[3].attention.flags,
                    AttentionBlockQsa));
-    check(compiled.graph.layer_plans[3].attention.kind
+    check(compiled.net.layer_plans[3].attention.kind
           == AttentionKind::Standard);
-    check(compiled.graph.layer_plans[0].attention.kind
+    check(compiled.net.layer_plans[0].attention.kind
           == AttentionKind::GatedDeltaNet);
-    const AttentionBlockPlan& gdn_attention = compiled.graph.layer_plans[0].attention;
+    const AttentionBlockPlan& gdn_attention = compiled.net.layer_plans[0].attention;
     check(gdn_attention.fused_delta_input_operator
           == invalid_compiled_operator_handle);
     check(gdn_attention.gated_delta_vulkan_operator
           == invalid_compiled_operator_handle);
     check(!compiled.operators.at_weight(gdn_attention.output_weight).bfloat16);
     check(!compiled.operators.at_weight(gdn_attention.output_weight).linear);
-    check(has_flag(compiled.graph.layer_plans[0].attention.flags,
+    check(has_flag(compiled.net.layer_plans[0].attention.flags,
                    AttentionBlockSigmoidGate));
-    check(has_flag(compiled.graph.layer_plans[0].attention.flags,
+    check(has_flag(compiled.net.layer_plans[0].attention.flags,
                    AttentionBlockExternalResidual));
     const uint64_t expert_pair_size = UINT64_C(3) * parsed.value().intermediate_size
                                       * parsed.value().hidden_size * sizeof(uint16_t);
@@ -16571,7 +16552,7 @@ void test_qwen4_exp_compile_and_execute()
     }
     check(state.layers[1].ple_token_history
           == std::vector<int32_t>({9, 3}));
-    const AttentionBlockPlan& qsa_layer_plan = compiled.graph.layer_plans[3].attention;
+    const AttentionBlockPlan& qsa_layer_plan = compiled.net.layer_plans[3].attention;
     check(state.layers[3].qsa_block_keys.size()
           == (prompt.size() / qsa_layer_plan.compression_ratio)
                  * qsa_layer_plan.index_head_dimension);
@@ -16676,7 +16657,7 @@ void test_qwen4_exp_vulkan_projections()
         }
         CompiledModel cpu_model;
         check(static_cast<bool>(compile_model(descriptor, mapping, cpu_model, HybridMode::CpuOnly)));
-        const AttentionBlockPlan& cpu_plan = cpu_model.graph.layer_plans[3].attention;
+        const AttentionBlockPlan& cpu_plan = cpu_model.net.layer_plans[3].attention;
         ActivationBuffer input(13, descriptor.hidden_size);
         for (size_t row = 0; row < input.rows(); ++row)
             for (uint32_t column = 0; column < input.columns(); ++column)
@@ -16701,13 +16682,13 @@ void test_qwen4_exp_vulkan_projections()
         auto compiled = compile_model(descriptor, mapping, hybrid_model, HybridMode::HybridExperts, opt);
         if (!compiled)
             throw std::runtime_error("projection-only Qwen preparation failed: " + compiled.error().message);
-        const AttentionBlockPlan& selected_plan = hybrid_model.graph.layer_plans[3].attention;
+        const AttentionBlockPlan& selected_plan = hybrid_model.net.layer_plans[3].attention;
         check(has_flag(selected_plan.flags, AttentionBlockExternalResidual));
         check(!support_vulkan_attention(hybrid_model.operators, selected_plan));
-        const auto attention_node = std::find_if(hybrid_model.graph.layers.begin(), hybrid_model.graph.layers.end(), [](const Layer& node) {
+        const auto attention_node = std::find_if(hybrid_model.net.layers.begin(), hybrid_model.net.layers.end(), [](const Layer& node) {
             return node.kind == LayerKind::Attention && node.plan_index == 3;
         });
-        if (attention_node == hybrid_model.graph.layers.end() || attention_node->backend != ExecutionBackend::Cpu)
+        if (attention_node == hybrid_model.net.layers.end() || attention_node->backend != ExecutionBackend::Cpu)
             throw std::runtime_error("projection-only Qwen Attention must have explicit CPU placement (QSA="
                                      + std::to_string(qsa_attention) + ", flags=" + std::to_string(selected_plan.flags) + ")");
         const VulkanStatistics before = get_vulkan_statistics(hybrid_model.vulkan_runtime);
@@ -16901,7 +16882,7 @@ void test_gated_delta_vulkan_budget_admission()
             check(execution_reserve == gpu_exec_reserve(*resource_plan));
             uint32_t gated_delta_layers = 0;
             uint32_t qsa_layers = 0;
-            for (const CompiledLayerPlan& layer : model.graph.layer_plans)
+            for (const CompiledLayerPlan& layer : model.net.layer_plans)
             {
                 const AttentionBlockPlan& attention = layer.attention;
                 check(static_cast<bool>(model.operators.at_weight(attention.output_weight).gated_residual_layer));
@@ -16921,7 +16902,7 @@ void test_gated_delta_vulkan_budget_admission()
             }
             check(gated_delta_layers == 3 && qsa_layers == 1);
             uint32_t gpu_expert_nodes = 0;
-            for (const Layer& node : model.graph.layers)
+            for (const Layer& node : model.net.layers)
                 if (node.kind == LayerKind::ExpertGroup && node.backend == ExecutionBackend::Vulkan)
                     ++gpu_expert_nodes;
             check(gpu_expert_nodes == full_descriptor.layers.size());
@@ -16992,17 +16973,17 @@ void test_gated_delta_vulkan_budget_admission()
         check(!model.gated_residual_chain);
 
         uint32_t admitted_layers = 0;
-        for (const CompiledLayerPlan& layer : model.graph.layer_plans)
+        for (const CompiledLayerPlan& layer : model.net.layer_plans)
         {
             const AttentionBlockPlan& attention = layer.attention;
             const bool admitted = static_cast<bool>(model.operators.at(attention.gated_delta_vulkan_operator).gated_delta);
             admitted_layers += admitted;
             check((attention.fused_delta_input_operator != invalid_compiled_operator_handle) == admitted);
             check(static_cast<bool>(model.operators.at_weight(attention.output_weight).bfloat16) == admitted);
-            const auto node = std::find_if(model.graph.layers.begin(), model.graph.layers.end(), [&](const Layer& candidate) {
+            const auto node = std::find_if(model.net.layers.begin(), model.net.layers.end(), [&](const Layer& candidate) {
                 return candidate.kind == LayerKind::Attention && candidate.plan_index == layer.layer_id;
             });
-            check(node != model.graph.layers.end());
+            check(node != model.net.layers.end());
             check((node->backend == ExecutionBackend::Vulkan) == admitted);
             for (const ExpertPlan& expert : layer.moe.experts)
                 check(static_cast<bool>(model.weights.at(expert.gate_up_weight).mxfp4_file_storage));
@@ -17016,7 +16997,7 @@ void test_gated_delta_vulkan_budget_admission()
             check(resources.expert_cache_reserve >= test_case.cache_reserve);
         }
         uint32_t gpu_expert_nodes = 0;
-        for (const Layer& node : model.graph.layers)
+        for (const Layer& node : model.net.layers)
             if (node.kind == LayerKind::ExpertGroup && node.backend == ExecutionBackend::Vulkan)
                 ++gpu_expert_nodes;
         check(gpu_expert_nodes == (test_case.gpu_experts ? descriptor.layers.size() : 0));
@@ -17037,10 +17018,10 @@ void test_gated_delta_vulkan_budget_admission()
                     input.row(0)[column] = static_cast<float>(static_cast<int>((column * 5 + token * 3 + layer_id * 7) % 19) - 9) / 16.0f;
                 ActivationBuffer expected;
                 ActivationBuffer actual;
-                check(static_cast<bool>(forward_gated_delta(cpu_model.weights, cpu_model.operators, cpu_model.graph.layer_plans[layer_id].attention,
+                check(static_cast<bool>(forward_gated_delta(cpu_model.weights, cpu_model.operators, cpu_model.net.layer_plans[layer_id].attention,
                                                             ExecutionBackend::Cpu, cpu_caches[layer_id], cpu_scratches[layer_id], input, expected,
                                                             cpu_model.opt.optimization_flags)));
-                const AttentionBlockPlan& selected_attention = model.graph.layer_plans[layer_id].attention;
+                const AttentionBlockPlan& selected_attention = model.net.layer_plans[layer_id].attention;
                 const ExecutionBackend selected_backend = model.operators.at(selected_attention.gated_delta_vulkan_operator).gated_delta
                                                               ? ExecutionBackend::Vulkan
                                                               : ExecutionBackend::Cpu;
@@ -19057,7 +19038,7 @@ void test_gated_delta_net_continuation()
     cpu_gdn_layer.attention.delta_z_weight = cpu_gdn_input_weights[1];
     cpu_gdn_layer.attention.delta_beta_weight = cpu_gdn_input_weights[2];
     cpu_gdn_layer.attention.delta_alpha_weight = cpu_gdn_input_weights[3];
-    cpu_gdn_release_model.graph.layer_plans.push_back(std::move(cpu_gdn_layer));
+    cpu_gdn_release_model.net.layer_plans.push_back(std::move(cpu_gdn_layer));
     release_host_copies(cpu_gdn_release_model);
     for (TensorHandle handle : cpu_gdn_input_weights)
         check(!cpu_gdn_release_model.weights.at(handle).float32_data.empty());
@@ -19977,7 +19958,7 @@ void test_batch_workspace_reuse()
         if (force_cpu_prefetch)
         {
             bool found_expert_group = false;
-            for (Layer& node : execution_model.graph.layers)
+            for (Layer& node : execution_model.net.layers)
             {
                 if (node.kind != LayerKind::ExpertGroup)
                     continue;
@@ -20033,8 +20014,8 @@ void test_batch_workspace_reuse()
             }
             check_released();
         }
-        check(execution_model.graph.layers[execution_model.schedule.node_order.back()].kind == LayerKind::LmHead);
-        execution_model.schedule.node_order.pop_back();
+        check(execution_model.net.layers[execution_model.net.order.back()].kind == LayerKind::LmHead);
+        execution_model.net.order.pop_back();
         auto missing_logits = forward_decode_batch(execution_model, entries, workspace);
         check(!missing_logits);
         check(missing_logits.error().message == "staged execution graph did not produce logits");
@@ -20767,7 +20748,7 @@ void test_backend_capabilities_and_hybrid_execution()
                 check(device_index == usable_device_indices[0] || device_index == usable_device_indices[1]);
             const CompiledModel& compiled = model_compiled(*multi_device_model.value());
             check(std::find(selected_devices.begin(), selected_devices.end(),
-                            compiled.graph.layer_plans.front().vulkan_device_index)
+                            compiled.net.layer_plans.front().vulkan_device_index)
                   != selected_devices.end());
         }
 
@@ -21089,8 +21070,8 @@ void test_backend_capabilities_and_hybrid_execution()
             {
                 const CompiledModel& gqa_compiled = model_compiled(*gqa_model.value());
                 const CompiledModel& gqa_cpu_compiled = model_compiled(*gqa_cpu_model.value());
-                const AttentionBlockPlan& gqa_plan = gqa_compiled.graph.layer_plans.front().attention;
-                const AttentionBlockPlan& gqa_cpu_plan = gqa_cpu_compiled.graph.layer_plans.front().attention;
+                const AttentionBlockPlan& gqa_plan = gqa_compiled.net.layer_plans.front().attention;
+                const AttentionBlockPlan& gqa_cpu_plan = gqa_cpu_compiled.net.layer_plans.front().attention;
                 const uint32_t hidden_size = gqa_compiled.descriptor.hidden_size;
                 ActivationBuffer prefix(2, hidden_size);
                 ActivationBuffer transaction_input(3, hidden_size);
@@ -21176,7 +21157,7 @@ void test_backend_capabilities_and_hybrid_execution()
                 }
 
                 CompiledModel isolated_compiled = gqa_compiled;
-                AttentionBlockPlan& isolated_plan = isolated_compiled.graph.layer_plans.front().attention;
+                AttentionBlockPlan& isolated_plan = isolated_compiled.net.layer_plans.front().attention;
                 const CompiledOperatorHandle attention_handle = isolated_plan.vulkan_attention_operator;
                 check(attention_handle != invalid_compiled_operator_handle);
                 const auto saved_attention_operator = isolated_compiled.operators.at(attention_handle).attention;

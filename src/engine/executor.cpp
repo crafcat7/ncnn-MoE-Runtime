@@ -220,8 +220,8 @@ static bool attn_state_unknown(const SessionState& state) noexcept
 static void reset_state(const CompiledModel& model,
                         SessionState& state)
 {
-    if (state.layers.size() != model.graph.layer_plans.size())
-        state.layers.resize(model.graph.layer_plans.size());
+    if (state.layers.size() != model.net.layer_plans.size())
+        state.layers.resize(model.net.layer_plans.size());
     state.execution_state.reset();
 }
 
@@ -736,8 +736,8 @@ Result<void> forward_model(const CompiledModel& model,
                                             speculative_hidden_columns,
                                             true);
         state.speculative_main_hidden_position = position_offset;
-        if (state.speculative_layers.size() != model.speculative.graph.layer_plans.size())
-            state.speculative_layers.resize(model.speculative.graph.layer_plans.size());
+        if (state.speculative_layers.size() != model.speculative.net.layer_plans.size())
+            state.speculative_layers.resize(model.speculative.net.layer_plans.size());
         if (model.speculative.kind == SpeculativeModelKind::Mtp)
         {
             state.speculative_input_ids.assign(input_ids.begin(),
@@ -792,7 +792,7 @@ Result<void> forward_model(const CompiledModel& model,
             caches.clear();
             auto& options = state.expert_scratch.bank_options;
             auto& bank_ids = state.expert_scratch.bank_ids;
-            const size_t layer_count = model.graph.layer_plans.size();
+            const size_t layer_count = model.net.layer_plans.size();
             const uint32_t bank_layers = model.resident_bank_layers == 0
                                              ? static_cast<uint32_t>(layer_count)
                                              : model.resident_bank_layers;
@@ -803,7 +803,7 @@ Result<void> forward_model(const CompiledModel& model,
             uint64_t assignments = 0;
             for (size_t index = 0; index < layer_count; ++index)
             {
-                const auto& layer = model.graph.layer_plans[index];
+                const auto& layer = model.net.layer_plans[index];
                 if (layer.layer_id >= state.layers.size())
                     return Error{ErrorCode::InternalError, "resident graph layer cache is out of range"};
                 caches.insert(caches.end(), input_ids.size(), &state.layers[layer.layer_id]);
@@ -1279,18 +1279,18 @@ Result<void> forward_model(const CompiledModel& model,
                 target_id = resolved.value();
             }
             if (target_id != invalid_layer_id && needs_mtp_final_hidden
-                && model.graph.layers[target_id].kind == LayerKind::FinalNorm)
+                && model.net.layers[target_id].kind == LayerKind::FinalNorm)
                 target_id = invalid_layer_id;
             if (target_id != invalid_layer_id)
             {
-                const auto& target = model.graph.layers[target_id];
+                const auto& target = model.net.layers[target_id];
                 std::string error;
                 if (target.kind == LayerKind::FinalNorm)
                     pending_continuation = model.gpu_head->prepare_head_continuation(logits_output != LogitsOutput::None,
                                                                                      logits_output == LogitsOutput::Last, state.gpu_segment, error);
                 else
                 {
-                    const auto& next_layer = model.graph.layer_plans[target.plan_index];
+                    const auto& next_layer = model.net.layer_plans[target.plan_index];
                     if (next_layer.layer_id >= state.layers.size())
                         return Error{ErrorCode::InternalError, "resident Vulkan continuation layer cache is out of range"};
                     auto& positions = state.attention_positions;
@@ -1455,11 +1455,11 @@ Result<void> forward_model(const CompiledModel& model,
         layer_state.reset();
         return {};
     };
-    for (const LayerId node_id : model.schedule.node_order)
+    for (const LayerId node_id : model.net.order)
     {
-        if (node_id >= model.graph.layers.size())
+        if (node_id >= model.net.layers.size())
             return Error{ErrorCode::InternalError, "execution schedule references an invalid node"};
-        const Layer* node = &model.graph.layers[node_id];
+        const Layer* node = &model.net.layers[node_id];
         if (resident_chain_finished) continue;
         if (resident_prefix_layers != 0 && node->plan_index < resident_prefix_layers)
             continue;
@@ -1481,10 +1481,10 @@ Result<void> forward_model(const CompiledModel& model,
             if (!stepped) return stepped;
             continue;
         }
-        if (node->plan_index >= model.graph.layer_plans.size())
+        if (node->plan_index >= model.net.layer_plans.size())
             return Error{ErrorCode::InternalError, "execution node layer is out of range"};
 
-        const CompiledLayerPlan& layer = model.graph.layer_plans[node->plan_index];
+        const CompiledLayerPlan& layer = model.net.layer_plans[node->plan_index];
         if (layer.layer_id >= state.layers.size())
             return Error{ErrorCode::InternalError, "execution layer id is out of range"};
         LayerState& layer_state = state.execution_state;
@@ -1678,9 +1678,9 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                 continue;
             entry.state->speculative_main_hidden.reset(1, speculative_hidden_columns, true);
             entry.state->speculative_main_hidden_position = entry.position_offset;
-            if (entry.state->speculative_layers.size() != model.speculative.graph.layer_plans.size())
+            if (entry.state->speculative_layers.size() != model.speculative.net.layer_plans.size())
             {
-                entry.state->speculative_layers.resize(model.speculative.graph.layer_plans.size());
+                entry.state->speculative_layers.resize(model.speculative.net.layer_plans.size());
             }
             if (model.speculative.kind == SpeculativeModelKind::Mtp)
             {
@@ -1775,12 +1775,12 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             auto& options = batch_scratch.bank_options;
             auto& bank_ids = batch_scratch.bank_ids;
             options.clear();
-            bank_ids.resize(model.graph.layer_plans.size());
-            options.resize(model.graph.layer_plans.size());
+            bank_ids.resize(model.net.layer_plans.size());
+            options.resize(model.net.layer_plans.size());
             uint64_t assignments = 0;
-            for (size_t index = 0; index < model.graph.layer_plans.size(); ++index)
+            for (size_t index = 0; index < model.net.layer_plans.size(); ++index)
             {
-                const auto& layer = model.graph.layer_plans[index];
+                const auto& layer = model.net.layer_plans[index];
                 for (const auto& entry : entries)
                 {
                     if (layer.layer_id >= entry.state->layers.size())
@@ -2347,18 +2347,18 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             }
             if (target_id != invalid_layer_id && use_speculative_context
                 && model.speculative.kind == SpeculativeModelKind::Mtp
-                && model.graph.layers[target_id].kind == LayerKind::FinalNorm)
+                && model.net.layers[target_id].kind == LayerKind::FinalNorm)
                 target_id = invalid_layer_id;
             if (target_id != invalid_layer_id)
             {
-                const auto& target = model.graph.layers[target_id];
+                const auto& target = model.net.layers[target_id];
                 std::string error;
                 if (target.kind == LayerKind::FinalNorm)
                     pending_continuation = model.gpu_head->prepare_head_continuation(requested_count != 0, false,
                                                                                      workspace.gpu_segment, error);
                 else
                 {
-                    const auto& next_layer = model.graph.layer_plans[target.plan_index];
+                    const auto& next_layer = model.net.layer_plans[target.plan_index];
                     auto& positions = workspace.staged_attention_positions;
                     auto& caches = workspace.staged_attention_caches;
                     auto filled = fill_attn_rows(entries, next_layer.layer_id, positions, caches);
@@ -2594,13 +2594,13 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         router_fused = false;
         return {};
     };
-    for (const LayerId node_id : model.schedule.node_order)
+    for (const LayerId node_id : model.net.order)
     {
-        if (node_id >= model.graph.layers.size())
+        if (node_id >= model.net.layers.size())
         {
             return Error{ErrorCode::InternalError, "execution schedule references an invalid node"};
         }
-        const Layer* node = &model.graph.layers[node_id];
+        const Layer* node = &model.net.layers[node_id];
         if (resident_chain_finished) continue;
         if (node->kind == LayerKind::TokenEmbedding)
         {
@@ -2620,12 +2620,12 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             if (!stepped) return stepped;
             continue;
         }
-        if (node->plan_index >= model.graph.layer_plans.size())
+        if (node->plan_index >= model.net.layer_plans.size())
         {
             return Error{ErrorCode::InternalError, "execution node layer is out of range"};
         }
 
-        const CompiledLayerPlan& layer = model.graph.layer_plans[node->plan_index];
+        const CompiledLayerPlan& layer = model.net.layer_plans[node->plan_index];
         const MoeBlockPlan& moe = layer.moe;
 
         Result<void> stepped;
@@ -2876,10 +2876,10 @@ static const CompiledLayerPlan* next_predict(const CompiledModel& model,
 
     const CompiledLayerPlan* next_layer = nullptr;
     for (size_t layer_index = static_cast<size_t>(layer.layer_id) + 1;
-         layer_index < model.graph.layer_plans.size();
+         layer_index < model.net.layer_plans.size();
          ++layer_index)
     {
-        const CompiledLayerPlan& candidate = model.graph.layer_plans[layer_index];
+        const CompiledLayerPlan& candidate = model.net.layer_plans[layer_index];
         if (candidate.moe.router_weight != invalid_tensor_handle
             && candidate.moe.token_experts == invalid_tensor_handle
             && candidate.moe.top_k != 0
@@ -3136,11 +3136,11 @@ static Result<void> finish_predict(const CompiledModel& model,
     if (!applied)
         return applied.error();
 
-    if (layer_id < model.graph.layer_plans.size())
+    if (layer_id < model.net.layer_plans.size())
     {
         // Admit predicted weights to the GPU queue after the host pair is ready.
         admit_predict(model,
-                      model.graph.layer_plans[layer_id],
+                      model.net.layer_plans[layer_id],
                       state,
                       token_count);
     }

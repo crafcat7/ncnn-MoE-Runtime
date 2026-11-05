@@ -429,25 +429,25 @@ Result<uint32_t> GpuSegment_vulkan::continuation_target(const CompiledModel& mod
                                                         uint32_t& fence_id)
 {
     fence_id = invalid_layer_id;
-    if (expert_node_id >= model.graph.layers.size()) return invalid_layer_id;
-    const auto& source = model.graph.layers[expert_node_id];
+    if (expert_node_id >= model.net.layers.size()) return invalid_layer_id;
+    const auto& source = model.net.layers[expert_node_id];
     if (source.kind != LayerKind::ExpertGroup || source.backend != ExecutionBackend::Vulkan
-        || source.plan_index >= model.graph.layer_plans.size()
+        || source.plan_index >= model.net.layer_plans.size()
         || source.plan_index >= model.gpu_segments.size() || !model.gpu_segments[source.plan_index])
         return invalid_layer_id;
-    const auto& source_layer = model.graph.layer_plans[source.plan_index];
+    const auto& source_layer = model.net.layer_plans[source.plan_index];
     const auto& context = model.gpu_segments[source.plan_index]->context();
     if (!context) return invalid_layer_id;
-    auto next = std::find(model.schedule.node_order.begin(), model.schedule.node_order.end(), expert_node_id);
-    if (next == model.schedule.node_order.end()) return invalid_layer_id;
+    auto next = std::find(model.net.order.begin(), model.net.order.end(), expert_node_id);
+    if (next == model.net.order.end()) return invalid_layer_id;
     bool combined = false;
     uint32_t target_id = invalid_layer_id;
     bool head = false;
-    while (++next != model.schedule.node_order.end())
+    while (++next != model.net.order.end())
     {
         const LayerId candidate_id = *next;
-        if (candidate_id >= model.graph.layers.size()) return invalid_layer_id;
-        const auto& candidate = model.graph.layers[candidate_id];
+        if (candidate_id >= model.net.layers.size()) return invalid_layer_id;
+        const auto& candidate = model.net.layers[candidate_id];
         if (!combined && candidate.plan_index == source.plan_index
             && candidate.backend == ExecutionBackend::Vulkan && candidate.kind == LayerKind::SharedExpertGroup)
             continue;
@@ -459,10 +459,10 @@ Result<uint32_t> GpuSegment_vulkan::continuation_target(const CompiledModel& mod
         }
         if (!combined || candidate.backend != ExecutionBackend::Vulkan) return invalid_layer_id;
         if (candidate.kind == LayerKind::Attention
-            && candidate.plan_index < model.graph.layer_plans.size()
+            && candidate.plan_index < model.net.layer_plans.size()
             && candidate.plan_index < model.gpu_segments.size()
             && candidate.plan_index != source.plan_index
-            && model.graph.layer_plans[candidate.plan_index].vulkan_device_index == source_layer.vulkan_device_index
+            && model.net.layer_plans[candidate.plan_index].vulkan_device_index == source_layer.vulkan_device_index
             && model.gpu_segments[candidate.plan_index]
             && model.gpu_segments[candidate.plan_index]->context() == context)
         {
@@ -483,15 +483,15 @@ Result<uint32_t> GpuSegment_vulkan::continuation_target(const CompiledModel& mod
 
     uint32_t resolved_fence = invalid_layer_id;
     auto fence = next;
-    while (++fence != model.schedule.node_order.end())
+    while (++fence != model.net.order.end())
     {
         const LayerId candidate_id = *fence;
-        if (candidate_id >= model.graph.layers.size())
+        if (candidate_id >= model.net.layers.size())
             return Error{ErrorCode::InvalidModel, "GPU continuation memory target has an invalid scheduled fence"};
-        const auto& candidate = model.graph.layers[candidate_id];
+        const auto& candidate = model.net.layers[candidate_id];
         if ((head && candidate.kind == LayerKind::LmHead)
             || (!head && candidate.kind == LayerKind::Router
-                && candidate.plan_index == model.graph.layers[target_id].plan_index))
+                && candidate.plan_index == model.net.layers[target_id].plan_index))
         {
             resolved_fence = candidate_id;
             break;
@@ -502,16 +502,16 @@ Result<uint32_t> GpuSegment_vulkan::continuation_target(const CompiledModel& mod
             || candidate.kind == LayerKind::DenseFfn || candidate.kind == LayerKind::TokenEmbedding)
             break;
     }
-    if (resolved_fence == invalid_layer_id || model.graph.layers[resolved_fence].backend != ExecutionBackend::Vulkan)
+    if (resolved_fence == invalid_layer_id || model.net.layers[resolved_fence].backend != ExecutionBackend::Vulkan)
         return Error{ErrorCode::InvalidModel, "GPU continuation memory target has no selected Router or LM head fence"};
 
     const auto device_index = [&](const Layer& node) {
-        return node.plan_index < model.graph.layer_plans.size()
-                   ? model.graph.layer_plans[node.plan_index].vulkan_device_index
+        return node.plan_index < model.net.layer_plans.size()
+                   ? model.net.layer_plans[node.plan_index].vulkan_device_index
                    : model.opt.vulkan_device_index;
     };
     const uint32_t device = device_index(source);
-    if (device_index(model.graph.layers[target_id]) != device || device_index(model.graph.layers[resolved_fence]) != device)
+    if (device_index(model.net.layers[target_id]) != device || device_index(model.net.layers[resolved_fence]) != device)
         return Error{ErrorCode::InvalidModel, "GPU continuation memory submission crosses a device boundary"};
 
     fence_id = resolved_fence;
@@ -879,12 +879,12 @@ public:
 
     void prepare_work_coefficients(const CompiledModel& model)
     {
-        if (work_coefficients_model == &model && layer_work_coefficients.size() == model.graph.layer_plans.size()) return;
+        if (work_coefficients_model == &model && layer_work_coefficients.size() == model.net.layer_plans.size()) return;
         // A copied compiled model may share its head but own a different graph.
         // Bind this cache to the current immutable compiled model as well.
         // Inspect weight shapes once; rows and selected-expert counts remain
         // runtime inputs. Publish the cache only after all shapes are read.
-        std::vector<LayerWorkCoefficients> prepared(model.graph.layer_plans.size());
+        std::vector<LayerWorkCoefficients> prepared(model.net.layer_plans.size());
         const auto projection_work = [&](TensorHandle handle) -> double {
             if (handle == invalid_tensor_handle) return 0;
             const auto& shape = model.weights.at(handle).shape;
@@ -896,7 +896,7 @@ public:
         };
         for (size_t layer = 0; layer < prepared.size(); ++layer)
         {
-            const auto& plan = model.graph.layer_plans[layer];
+            const auto& plan = model.net.layer_plans[layer];
             const auto& a = plan.attention;
             auto& coefficients = prepared[layer];
             for (auto handle : {a.query_weight, a.key_weight, a.value_weight, a.output_weight, a.output_gate_weight,
@@ -1210,7 +1210,7 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
                                          GpuSegmentWorkspace_vulkan* workspace, uint32_t layer_limit)
 {
 #if NCNN_MOE_WITH_VULKAN
-    const size_t layers = model.graph.layer_plans.size();
+    const size_t layers = model.net.layer_plans.size();
     const size_t rows = positions.size();
     const size_t limit = layer_limit == 0 ? layers : std::min(layers, static_cast<size_t>(layer_limit));
     if (layers == 0 || limit == 0 || rows == 0 || rows > static_cast<size_t>(std::numeric_limits<int>::max())
@@ -1236,7 +1236,7 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
             error = "resident graph chain has incompatible devices";
             return false;
         }
-        const bool dense = model.graph.layer_plans[layer].dense_ffn.down_weight != invalid_tensor_handle;
+        const bool dense = model.net.layer_plans[layer].dense_ffn.down_weight != invalid_tensor_handle;
         if (dense)
         {
             const bool attention_ready = segment->d->attention || segment->d->delta || segment->d->qsa;

@@ -1376,9 +1376,9 @@ static Result<void> compile_mtp_speculative_model(CompiledModel& compiled,
         || compiled.descriptor.speculative_block_size == 0
         || !compiled.descriptor.speculative_target_layer_ids.empty()
         || compiled.descriptor.hyper_connection_multiplier != 1
-        || compiled.graph.layer_plans.empty()
-        || compiled.graph.layer_plans.back().attention.kind != AttentionKind::Standard
-        || compiled.graph.layer_plans.back().attention.sliding_window != 0)
+        || compiled.net.layer_plans.empty()
+        || compiled.net.layer_plans.back().attention.kind != AttentionKind::Standard
+        || compiled.net.layer_plans.back().attention.sliding_window != 0)
     {
         return Error{ErrorCode::InvalidModel, "invalid Qwen MTP speculative model configuration"};
     }
@@ -1416,7 +1416,7 @@ static Result<void> compile_mtp_speculative_model(CompiledModel& compiled,
     if (!status)
         return status.error();
     const std::string layer_name = speculative_layer_prefix(0);
-    CompiledLayerPlan& layer_plan = speculative.graph.layer_plans.emplace_back(compiled.graph.layer_plans.back());
+    CompiledLayerPlan& layer_plan = speculative.net.layer_plans.emplace_back(compiled.net.layer_plans.back());
     layer_plan.layer_id = static_cast<uint32_t>(compiled.descriptor.layers.size());
     layer_plan.vulkan_device_index = compiled.opt.vulkan_device_index;
     layer_plan.hyper_connection = {};
@@ -1653,12 +1653,12 @@ static Result<void> compile_speculative_model(CompiledModel& compiled,
     draft_layer.attention.compression_ratio = 0;
     draft_layer.moe.flags |= MoeDescriptorRouterBias;
     const uint32_t main_layer_count = static_cast<uint32_t>(compiled.descriptor.layers.size());
-    speculative.graph.layer_plans.reserve(compiled.descriptor.speculative_layer_count);
+    speculative.net.layer_plans.reserve(compiled.descriptor.speculative_layer_count);
     for (uint32_t layer_id = 0; layer_id < compiled.descriptor.speculative_layer_count; ++layer_id)
     {
         const std::string layer_name = speculative_layer_prefix(layer_id);
         const MoeDescriptor& moe = draft_layer.moe;
-        CompiledLayerPlan& layer_plan = speculative.graph.layer_plans.emplace_back();
+        CompiledLayerPlan& layer_plan = speculative.net.layer_plans.emplace_back();
         layer_plan.layer_id = main_layer_count + layer_id;
         layer_plan.vulkan_device_index = compiled.opt.vulkan_device_index;
         layer_plan.attention.norm_epsilon = compiled.descriptor.norm_epsilon;
@@ -2149,7 +2149,7 @@ Result<void> compile_model(MoeModelDescriptor descriptor, WeightMapping mapping,
             return status.error();
     }
 
-    compiled.graph.layer_plans.reserve(layer_count);
+    compiled.net.layer_plans.reserve(layer_count);
     for (uint32_t layer_id = 0; layer_id < layer_count; ++layer_id)
     {
         const LayerDescriptor& layer = compiled.descriptor.layers[layer_id];
@@ -2177,7 +2177,7 @@ Result<void> compile_model(MoeModelDescriptor descriptor, WeightMapping mapping,
             return Error{ErrorCode::UnsupportedModel, "backend capabilities do not provide an MXFP4 CPU expert kernel"};
         }
 
-        CompiledLayerPlan& layer_plan = compiled.graph.layer_plans.emplace_back();
+        CompiledLayerPlan& layer_plan = compiled.net.layer_plans.emplace_back();
         layer_plan.layer_id = layer_id;
         layer_plan.vulkan_device_index = choose_layer_device(use_vulkan_dense, dense_device_indices, device_layer_counts, smooth_device_scores, total_device_score);
         layer_plan.moe.top_k = moe.top_k;

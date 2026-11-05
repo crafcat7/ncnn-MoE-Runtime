@@ -432,9 +432,9 @@ void release_host_copies(CompiledModel& compiled)
             shared_fallback_handles.push_back(shared.down_weight);
         }
     };
-    for (const CompiledLayerPlan& layer : compiled.graph.layer_plans)
+    for (const CompiledLayerPlan& layer : compiled.net.layer_plans)
         retain_shared(layer);
-    for (const CompiledLayerPlan& layer : compiled.speculative.graph.layer_plans)
+    for (const CompiledLayerPlan& layer : compiled.speculative.net.layer_plans)
         retain_shared(layer);
     for (TensorHandle handle = 0; handle < compiled.weights.size(); ++handle)
     {
@@ -510,9 +510,9 @@ void release_host_copies(CompiledModel& compiled)
         }
     };
 
-    for (CompiledLayerPlan& layer : compiled.graph.layer_plans)
+    for (CompiledLayerPlan& layer : compiled.net.layer_plans)
         release_fused_layer_handles(layer);
-    for (CompiledLayerPlan& layer : compiled.speculative.graph.layer_plans)
+    for (CompiledLayerPlan& layer : compiled.speculative.net.layer_plans)
         release_fused_layer_handles(layer);
 
     const MappedOwners retained_owners = mapped_owners();
@@ -1726,7 +1726,7 @@ uint64_t dense_pending_size(const CompiledModel& compiled,
                             uint32_t device_index) noexcept
 {
     uint64_t size = 0;
-    for (const ExecutionGraph* graph : {&compiled.graph, &compiled.speculative.graph})
+    for (const Net* graph : {&compiled.net, &compiled.speculative.net})
     {
         for (const CompiledLayerPlan& layer : graph->layer_plans)
         {
@@ -1780,7 +1780,7 @@ static GpuResourceRequest gated_residual_resources(const CompiledModel& compiled
     uint64_t peak_layer_elements = 0;
     uint64_t persistent_states = 0;
     uint64_t peak_initial_state = 0;
-    for (const CompiledLayerPlan& layer : compiled.graph.layer_plans)
+    for (const CompiledLayerPlan& layer : compiled.net.layer_plans)
     {
         if (layer.vulkan_device_index != device_index)
             continue;
@@ -1905,7 +1905,7 @@ uint64_t vulkan_pending_reserve(const CompiledModel& compiled,
 static uint64_t minimum_gpu_expert_reserve(const CompiledModel& compiled, uint32_t device_index)
 {
     uint64_t required = 0;
-    for (const ExecutionGraph* graph : {&compiled.graph, &compiled.speculative.graph})
+    for (const Net* graph : {&compiled.net, &compiled.speculative.net})
     {
         for (const CompiledLayerPlan& layer : graph->layer_plans)
         {
@@ -1947,7 +1947,7 @@ static Result<void> prepare_gated_residual_pipeline(CompiledModel& compiled)
     for (TensorHandle handle = 0; handle < compiled.weights.size(); ++handle)
         if (compiled.weights.at(handle).dtype == DType::Float8E4M3)
             return Error{ErrorCode::UnsupportedModel, "continuous gated residual Vulkan execution does not support FP8 model weights"};
-    for (const auto& layer : compiled.graph.layer_plans)
+    for (const auto& layer : compiled.net.layer_plans)
     {
         if (layer.vulkan_device_index != compiled.opt.vulkan_device_index)
             return Error{ErrorCode::UnsupportedModel, "gated residual device execution requires all layers and the output head on one Vulkan device"};
@@ -1961,7 +1961,7 @@ static Result<void> prepare_gated_residual_pipeline(CompiledModel& compiled)
     compiled.gated_residual_device_head = GatedResidualLayer_vulkan::create_head(compiled);
     if (!compiled.gated_residual_device_head)
         return Error{ErrorCode::InternalError, "failed to create the required Vulkan LM head for gated residual execution"};
-    for (CompiledLayerPlan& layer : compiled.graph.layer_plans)
+    for (CompiledLayerPlan& layer : compiled.net.layer_plans)
     {
         auto& attention = layer.attention;
         if (attention.kind == AttentionKind::GatedDeltaNet)
@@ -2022,7 +2022,7 @@ static GpuResourceSnapshot live_gpu_resources(const CompiledModel& compiled, uin
 static uint64_t expert_wave_workspace_size(const CompiledModel& model, uint32_t device)
 {
     uint64_t workspace = 0;
-    for (const ExecutionGraph* graph : {&model.graph, &model.speculative.graph})
+    for (const Net* graph : {&model.net, &model.speculative.net})
     {
         for (const CompiledLayerPlan& layer : graph->layer_plans)
         {
@@ -2087,7 +2087,7 @@ ResourcePlanner::ResourcePlanner(CompiledModel& model, const CompilerOption& opt
 {
     std::vector<uint32_t> devices = opt.device_indices;
     if (devices.empty()) devices.push_back(model.opt.vulkan_device_index);
-    for (const ExecutionGraph* graph : {&model.graph, &model.speculative.graph})
+    for (const Net* graph : {&model.net, &model.speculative.net})
         for (const auto& layer : graph->layer_plans)
             if (std::find(devices.begin(), devices.end(), layer.vulkan_device_index) == devices.end())
                 devices.push_back(layer.vulkan_device_index);
@@ -2417,7 +2417,7 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
         const GpuResourceRequest execution = gated_residual_resources(compiled, device);
         request.session_state_size = execution.session_state_size;
         request.workspace_size = execution.workspace_size;
-        for (const CompiledLayerPlan& layer : compiled.graph.layer_plans)
+        for (const CompiledLayerPlan& layer : compiled.net.layer_plans)
         {
             auto attention_result = attention_resource_request(compiled, layer);
             if (!attention_result) return attention_result.error();
@@ -2439,14 +2439,14 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
         if (!resources.can_admit(device, request))
             return Error{ErrorCode::InvalidArgument, "gated residual Vulkan persistent weights and minimum working set exceed the GPU heap budget on device " + std::to_string(device)};
         const auto previous_operators = compiled.operators;
-        const auto previous_layers = compiled.graph.layer_plans;
+        const auto previous_layers = compiled.net.layer_plans;
         auto prepared = prepare_gated_residual_pipeline(compiled);
         if (!prepared || !resources.allocation_fits(device, request))
         {
             compiled.gated_residual_device_head.reset();
             compiled.gated_residual_chain = false;
             compiled.operators = previous_operators;
-            compiled.graph.layer_plans = previous_layers;
+            compiled.net.layer_plans = previous_layers;
             if (!prepared) return prepared.error();
             return Error{ErrorCode::InvalidArgument, "gated residual Vulkan persistent weights and minimum working set exceed the GPU heap budget on device " + std::to_string(device)};
         }
@@ -2456,7 +2456,7 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
 
     // Complete attention groups have priority over independently useful
     // projections. Main and speculative graphs share the same device budget.
-    for (ExecutionGraph* graph : {&compiled.graph, &compiled.speculative.graph})
+    for (Net* graph : {&compiled.net, &compiled.speculative.net})
     {
         for (CompiledLayerPlan& layer : graph->layer_plans)
         {
@@ -2478,7 +2478,7 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
             if (!prepared) return prepared.error();
         }
     }
-    for (ExecutionGraph* graph : {&compiled.graph, &compiled.speculative.graph})
+    for (Net* graph : {&compiled.net, &compiled.speculative.net})
     {
         for (CompiledLayerPlan& layer : graph->layer_plans)
         {
@@ -2519,7 +2519,7 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
     // Automatic dense placement keeps frequently reused FFNs resident after
     // attention and the output head. Explicit cache capacity selects the
     // existing demand-cache policy, including its bounded-memory behavior.
-    for (ExecutionGraph* graph : {&compiled.graph, &compiled.speculative.graph})
+    for (Net* graph : {&compiled.net, &compiled.speculative.net})
     {
         for (CompiledLayerPlan& layer : graph->layer_plans)
         {
@@ -2541,12 +2541,12 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
         }
     }
 
-    compiled.gpu_segments.resize(compiled.graph.layer_plans.size());
+    compiled.gpu_segments.resize(compiled.net.layer_plans.size());
     if (has_flag(opt.flags, BackendVulkanExperts)
         && !has_flag(compiled.opt.flags, OptionDisableGpuExpertExecution))
     {
-        const bool dense_chain = !compiled.graph.layer_plans.empty() && GpuSegment_vulkan::supports_head(compiled)
-                                 && std::all_of(compiled.graph.layer_plans.begin(), compiled.graph.layer_plans.end(), [&](const auto& layer) {
+        const bool dense_chain = !compiled.net.layer_plans.empty() && GpuSegment_vulkan::supports_head(compiled)
+                                 && std::all_of(compiled.net.layer_plans.begin(), compiled.net.layer_plans.end(), [&](const auto& layer) {
                                         return layer.dense_ffn.down_weight != invalid_tensor_handle
                                                && layer.vulkan_device_index == device && GpuSegment_vulkan::supports(compiled, layer);
                                     });
@@ -2554,16 +2554,16 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
         {
             GpuResourceRequest request;
             request.persistent_size = constant_storage(compiled, {compiled.final_norm_weight, compiled.final_norm_bias}, alignment);
-            for (const auto& layer : compiled.graph.layer_plans)
+            for (const auto& layer : compiled.net.layer_plans)
                 request.persistent_size = saturating_add_u64(request.persistent_size,
                                                              saturating_add_u64(constant_storage(compiled, {layer.dense_pre_ffn_norm_weight, layer.dense_pre_ffn_norm_bias}, alignment), alignment * 8));
             request.workspace_size = saturating_multiply_u64(SessionOptions{}.prefill_chunk_size,
                                                              saturating_multiply_u64(compiled.descriptor.hidden_size, 4 * sizeof(float)));
             if (resources.can_admit(device, request))
             {
-                for (size_t index = 0; index < compiled.graph.layer_plans.size(); ++index)
+                for (size_t index = 0; index < compiled.net.layer_plans.size(); ++index)
                 {
-                    compiled.gpu_segments[index] = GpuSegment_vulkan::create(compiled, compiled.graph.layer_plans[index]);
+                    compiled.gpu_segments[index] = GpuSegment_vulkan::create(compiled, compiled.net.layer_plans[index]);
                     if (!compiled.gpu_segments[index])
                         return Error{ErrorCode::InternalError, "cannot prepare selected resident dense segment at layer " + std::to_string(index)};
                 }
@@ -2579,9 +2579,9 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
         // A mixed graph may contain a dense FFN beside routed layers. The
         // dense layer still needs a segment so the routed chain can continue
         // through it (and so a resident Expert bank chain can be selected).
-        for (size_t index = 0; index < compiled.graph.layer_plans.size(); ++index)
+        for (size_t index = 0; index < compiled.net.layer_plans.size(); ++index)
         {
-            CompiledLayerPlan& layer = compiled.graph.layer_plans[index];
+            CompiledLayerPlan& layer = compiled.net.layer_plans[index];
             if (layer.dense_ffn.down_weight == invalid_tensor_handle || compiled.gpu_segments[index]) continue;
             if (!GpuSegment_vulkan::supports(compiled, layer)) continue;
             const uint32_t dense_device = layer.vulkan_device_index;
@@ -2602,9 +2602,9 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
                 compiled.gpu_segments[index] = std::move(segment);
         }
 
-        for (size_t index = 0; index < compiled.graph.layer_plans.size(); ++index)
+        for (size_t index = 0; index < compiled.net.layer_plans.size(); ++index)
         {
-            const auto& layer = compiled.graph.layer_plans[index];
+            const auto& layer = compiled.net.layer_plans[index];
             if (layer.dense_ffn.down_weight != invalid_tensor_handle) continue;
             if (!GpuSegment_vulkan::supports(compiled, layer)
                 || !support_vulkan_experts(compiled.weights, layer.moe, compiled.opt.optimization_flags)) continue;
@@ -2647,7 +2647,7 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
     return {};
 }
 
-static uint32_t graph_node_device(const CompiledModel& model, const ExecutionGraph& graph,
+static uint32_t graph_node_device(const CompiledModel& model, const Net& graph,
                                   const Layer& node)
 {
     return node.plan_index < graph.layer_plans.size()
@@ -2655,25 +2655,25 @@ static uint32_t graph_node_device(const CompiledModel& model, const ExecutionGra
                : model.opt.vulkan_device_index;
 }
 
-static bool graph_has_resident_chain(const CompiledModel& model, const ExecutionGraph& graph)
+static bool graph_has_resident_chain(const CompiledModel& model, const Net& graph)
 {
-    return &graph == &model.graph && model.resident_submission_rows != 0 && !graph.layer_plans.empty();
+    return &graph == &model.net && model.resident_submission_rows != 0 && !graph.layer_plans.empty();
 }
 
-static bool graph_has_expert_banks(const CompiledModel& model, const ExecutionGraph& graph)
+static bool graph_has_expert_banks(const CompiledModel& model, const Net& graph)
 {
     return graph_has_resident_chain(model, graph) && model.resident_bank_layers != 0
            && model.gpu_expert_bank_plans.size() == graph.layer_plans.size();
 }
 
-static uint64_t graph_tensor_elements(const CompiledModel& model, const ExecutionGraph& graph,
-                                      const ExecutionTensor& tensor, uint32_t rows, uint32_t logits_rows)
+static uint64_t graph_tensor_elements(const CompiledModel& model, const Net& graph,
+                                      const Blob& tensor, uint32_t rows, uint32_t logits_rows)
 {
     if (tensor.producer >= graph.layers.size()) return UINT64_MAX;
     const Layer& producer = graph.layers[tensor.producer];
     // Full-bank recording folds routed aggregation and the following Combine
     // into one output. The ExpertGroup tensor is not materialized there.
-    if (tensor.lifetime != TensorLifetime::Activation) return 0;
+    if (tensor.lifetime != BlobLifetime::Activation) return 0;
     if (producer.kind == LayerKind::ExpertGroup && graph_has_expert_banks(model, graph)) return 0;
     uint64_t elements = 1;
     for (size_t dimension = 0; dimension < tensor.shape.size(); ++dimension)
@@ -2711,22 +2711,22 @@ static uint64_t proj_columns(const CompiledModel& model, TensorHandle weight)
     return matrix.shape.size() == 2 ? matrix.shape[1] : 0;
 }
 
-static bool graph_has_gpu_segment(const CompiledModel& model, const ExecutionGraph& graph, size_t index)
+static bool graph_has_gpu_segment(const CompiledModel& model, const Net& graph, size_t index)
 {
-    return &graph == &model.graph && index < model.gpu_segments.size() && model.gpu_segments[index];
+    return &graph == &model.net && index < model.gpu_segments.size() && model.gpu_segments[index];
 }
 
 uint32_t resident_chunk_layers(const CompiledModel& model, uint32_t rows) noexcept
 {
-    if (model.resident_submission_rows == 0 || model.graph.layer_plans.empty()) return 0;
-    return static_cast<uint32_t>(std::min<size_t>(model.graph.layer_plans.size(),
+    if (model.resident_submission_rows == 0 || model.net.layer_plans.empty()) return 0;
+    return static_cast<uint32_t>(std::min<size_t>(model.net.layer_plans.size(),
                                                   std::max(1u, model.resident_submission_rows / std::max(1u, rows))));
 }
 
 // Opaque recorders retain their VkMat operands through the submission fence.
 // These are their private intermediates only: graph inputs, graph outputs,
 // persistent weights/state and host-visible transfer-slot storage are omitted.
-static Result<void> append_graph_node_scratch(const CompiledModel& model, const ExecutionGraph& graph,
+static Result<void> append_graph_node_scratch(const CompiledModel& model, const Net& graph,
                                               const Layer& node, uint32_t rows, uint32_t context_tokens,
                                               uint32_t sequence_count,
                                               uint64_t alignment, uint32_t first, uint32_t last,
@@ -2857,7 +2857,7 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
             if (!branch) return branch.error();
         }
         const bool resident_input = segment_input || model.gated_residual_chain
-                                    || (&graph == &model.graph && !has_flag(model.opt.flags, OptionRouterPrediction)
+                                    || (&graph == &model.net && !has_flag(model.opt.flags, OptionRouterPrediction)
                                         && model.operators.at_weight(layer.attention.query_a_weight).latent_layer);
         const auto& experts = layer.moe.experts;
         if (routed && experts.empty())
@@ -2967,18 +2967,18 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
     return {};
 }
 
-static Result<void> append_graph_region_memory(const CompiledModel& model, const ExecutionGraph& graph,
-                                               const ExecutionSchedule& schedule, uint32_t rows, uint32_t logits_rows,
+static Result<void> append_graph_region_memory(const CompiledModel& model, const Net& graph,
+                                               uint32_t rows, uint32_t logits_rows,
                                                uint32_t context_tokens, uint32_t sequence_count, uint32_t node_offset,
                                                std::vector<GraphMemoryBuffer>& buffers,
                                                std::vector<GraphMemorySubmission>& submissions)
 {
     if (graph.layers.empty()) return {};
-    auto valid = schedule.validate(graph);
+    auto valid = graph.validate_order();
     if (!valid) return valid.error();
     std::vector<uint32_t> positions(graph.layers.size());
-    for (uint32_t position = 0; position < schedule.node_order.size(); ++position)
-        positions[schedule.node_order[position]] = node_offset + position;
+    for (uint32_t position = 0; position < graph.order.size(); ++position)
+        positions[graph.order[position]] = node_offset + position;
     const bool resident_chain = graph_has_resident_chain(model, graph);
     if (resident_chain)
     {
@@ -3013,8 +3013,8 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
             }
         }
     }
-    else if (&graph == &model.graph)
-        for (LayerId node_id : schedule.node_order)
+    else if (&graph == &model.net)
+        for (LayerId node_id : graph.order)
         {
             const Layer& source = graph.layers[node_id];
             if (source.kind != LayerKind::ExpertGroup) continue;
@@ -3037,7 +3037,7 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
     {
         const CompiledLayerPlan& layer = graph.layer_plans[index];
         fused_layers[index] = graph_has_gpu_segment(model, graph, index) || model.gated_residual_chain
-                              || (&graph == &model.graph && !has_flag(model.opt.flags, OptionRouterPrediction)
+                              || (&graph == &model.net && !has_flag(model.opt.flags, OptionRouterPrediction)
                                   && model.operators.at_weight(layer.attention.query_a_weight).latent_layer);
     }
     if (has_flag(model.opt.optimization_flags, OptimizationVulkanSharedExpertOverlap))
@@ -3049,21 +3049,21 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
                     && expert.plan_index == shared.plan_index)
                     starts[shared.id] = std::min(starts[shared.id], positions[expert.id]);
         }
-    for (size_t index = 0; index < schedule.node_order.size(); ++index)
+    for (size_t index = 0; index < graph.order.size(); ++index)
     {
-        const Layer& node = graph.layers[schedule.node_order[index]];
+        const Layer& node = graph.layers[graph.order[index]];
         if ((node.kind != LayerKind::Combine && !(resident_chain && node.kind == LayerKind::DenseFfn)) || node.plan_index >= fused_layers.size()
             || !fused_layers[node.plan_index]) continue;
         // Fused layers defer the combine and FFN post until the next device
         // Attention, materialization, or final head submission actually runs.
         uint32_t finish = positions[node.id];
-        if (!resident_chain && index + 1 < schedule.node_order.size())
+        if (!resident_chain && index + 1 < graph.order.size())
         {
-            finish = positions[schedule.node_order[index + 1]];
+            finish = positions[graph.order[index + 1]];
             if ((model.gpu_head || model.gated_residual_device_head || model.operators.at_weight(model.hyper_head_function).layer_head)
-                && graph.layers[schedule.node_order[index + 1]].kind == LayerKind::FinalNorm
-                && index + 2 < schedule.node_order.size())
-                finish = positions[schedule.node_order[index + 2]];
+                && graph.layers[graph.order[index + 1]].kind == LayerKind::FinalNorm
+                && index + 2 < graph.order.size())
+                finish = positions[graph.order[index + 2]];
         }
         layer_finish[node.plan_index] = finish;
     }
@@ -3079,7 +3079,7 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
                 if (attention.kind == LayerKind::Attention && attention.plan_index == node.plan_index)
                     starts[node.id] = positions[attention.id];
     }
-    for (const ExecutionTensor& tensor : graph.tensors)
+    for (const Blob& tensor : graph.blobs)
     {
         if (tensor.producer >= graph.layers.size())
             return Error{ErrorCode::InvalidModel, "graph memory tensor has no scheduled producer"};
@@ -3142,7 +3142,7 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
             if (!ret) return ret.error();
         }
     }
-    for (LayerId node_id : schedule.node_order)
+    for (LayerId node_id : graph.order)
     {
         const Layer& node = graph.layers[node_id];
         if (node.backend != ExecutionBackend::Vulkan) continue;
@@ -3254,13 +3254,13 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
     result.sequence_count = sequence_count;
     result.context_tokens = std::max(prefill_rows, context_tokens);
     uint32_t host_output_rows = 0;
-    for (const ExecutionGraph* graph : {&compiled.graph, &compiled.speculative.graph})
+    for (const Net* graph : {&compiled.net, &compiled.speculative.net})
         if (std::any_of(graph->layers.begin(), graph->layers.end(), [](const Layer& node) {
                 return node.kind == LayerKind::LmHead && node.backend == ExecutionBackend::Vulkan;
             }))
         {
             host_output_rows = std::max({host_output_rows, prefill_rows, sequence_count});
-            if (graph == &compiled.speculative.graph)
+            if (graph == &compiled.speculative.net)
                 host_output_rows = std::max(host_output_rows, compiled.speculative.block_size);
         }
     if (host_output_rows != 0)
@@ -3272,21 +3272,21 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
         result.host_output_slot_size = slot_size.value();
         result.host_output_workspace_size = slot_size.value() * 2;
     }
-    const uint64_t total_nodes = static_cast<uint64_t>(compiled.graph.layers.size()) + compiled.speculative.graph.layers.size();
+    const uint64_t total_nodes = static_cast<uint64_t>(compiled.net.layers.size()) + compiled.speculative.net.layers.size();
     if (total_nodes > UINT32_MAX)
         return Error{ErrorCode::InvalidModel, "graph memory schedule exceeds the node position range"};
     const auto shape_plan = [&](uint32_t rows) -> Result<GraphMemoryPlan> {
         std::vector<GraphMemoryBuffer> buffers;
         std::vector<GraphMemorySubmission> submissions;
-        auto ret = append_graph_region_memory(compiled, compiled.graph, compiled.schedule, rows, rows,
+        auto ret = append_graph_region_memory(compiled, compiled.net, rows, rows,
                                               result.context_tokens, sequence_count, 0, buffers, submissions);
         if (!ret) return ret.error();
         // Target and draft graphs execute serially, sharing the same arena.
         // Draft verification can record one full speculative block at once.
         const uint32_t draft_rows = std::max(rows, compiled.speculative.block_size);
-        ret = append_graph_region_memory(compiled, compiled.speculative.graph, compiled.speculative.schedule,
+        ret = append_graph_region_memory(compiled, compiled.speculative.net,
                                          draft_rows, draft_rows,
-                                         result.context_tokens, sequence_count, static_cast<uint32_t>(compiled.graph.layers.size()), buffers, submissions);
+                                         result.context_tokens, sequence_count, static_cast<uint32_t>(compiled.net.layers.size()), buffers, submissions);
         if (!ret) return ret.error();
         auto plan = plan_graph_memory(buffers, submissions);
         if (!plan) return plan.error();
@@ -3298,7 +3298,7 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
         if (!plan) return plan.error();
         (decode ? result.decode : result.prefill) = std::move(plan).value();
     }
-    if (graph_has_resident_chain(compiled, compiled.graph))
+    if (graph_has_resident_chain(compiled, compiled.net))
     {
         // Smaller row counts record more layers before a fence. A reservation
         // for P rows therefore needs the peak envelope of every 1..P shape,
@@ -3334,9 +3334,9 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
     }
     std::map<uint32_t, uint64_t> states;
     std::map<uint32_t, uint64_t> growth;
-    const bool resident_chain = graph_has_resident_chain(compiled, compiled.graph);
-    std::vector<uint64_t> resident_growth(compiled.graph.layer_plans.size(), 0);
-    for (const ExecutionGraph* graph : {&compiled.graph, &compiled.speculative.graph})
+    const bool resident_chain = graph_has_resident_chain(compiled, compiled.net);
+    std::vector<uint64_t> resident_growth(compiled.net.layer_plans.size(), 0);
+    for (const Net* graph : {&compiled.net, &compiled.speculative.net})
         for (const Layer& node : graph->layers)
         {
             if (node.kind != LayerKind::Attention || node.backend != ExecutionBackend::Vulkan
@@ -3353,7 +3353,7 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
                                               ? attention_session_state_size(compiled, layer.attention, layer.vulkan_device_index,
                                                                              std::max(1u, result.context_tokens / 2))
                                               : 0;
-                if (resident_chain && graph == &compiled.graph)
+                if (resident_chain && graph == &compiled.net)
                     resident_growth[node.plan_index] = previous;
                 else
                     growth[layer.vulkan_device_index] = std::max(growth[layer.vulkan_device_index], previous);
@@ -3396,7 +3396,7 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
                 uint64_t previous = 0;
                 for (size_t index = first; index < std::min(resident_growth.size(), first + chunk); ++index)
                     previous = saturating_add_u64(previous, resident_growth[index]);
-                const uint32_t device = compiled.graph.layer_plans[first].vulkan_device_index;
+                const uint32_t device = compiled.net.layer_plans[first].vulkan_device_index;
                 growth[device] = std::max(growth[device], previous);
             }
     }

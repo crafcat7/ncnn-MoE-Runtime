@@ -95,7 +95,7 @@ static void check_budget_admission(const MoeModelDescriptor& descriptor, const W
         if (budget == 0)
         {
             check(static_cast<bool>(compiled), compiled ? "" : compiled.error().message);
-            check(std::any_of(model.graph.layers.begin(), model.graph.layers.end(), [](const Layer& node) {
+            check(std::any_of(model.net.layers.begin(), model.net.layers.end(), [](const Layer& node) {
                       return node.backend == ExecutionBackend::Vulkan;
                   }),
                   "automatic live-heap planning did not place supported dense work on Vulkan");
@@ -255,7 +255,7 @@ static DenseBudgetTrace execute_budget_model(const CompiledModel& model)
     trace.counters.gated_delta_fusions = after.gated_delta_fusions - before.gated_delta_fusions;
     trace.counters.attention_cpu_fallbacks = after.attention_cpu_fallbacks - before.attention_cpu_fallbacks;
     for (size_t index = 0; index < state.layers.size(); ++index)
-        if (model.graph.layer_plans[index].attention.kind == AttentionKind::GatedDeltaNet)
+        if (model.net.layer_plans[index].attention.kind == AttentionKind::GatedDeltaNet)
             trace.gated_delta_state_bytes += state.layers[index].device_allocated_size;
     check(statistics.expert_assignments == 0 && statistics.expert_batches == 0,
           "budgeted dense execution recorded expert routes");
@@ -272,7 +272,7 @@ static void check_budget_trace(const DenseBudgetTrace& actual, const DenseBudget
 static size_t resident_ffn_projections(const CompiledModel& model)
 {
     size_t count = 0;
-    for (const CompiledLayerPlan& layer : model.graph.layer_plans)
+    for (const CompiledLayerPlan& layer : model.net.layer_plans)
         for (TensorHandle handle : {layer.dense_ffn.gate_weight, layer.dense_ffn.up_weight, layer.dense_ffn.down_weight})
             if (model.operators.at_weight(handle).bfloat16 || model.operators.at_weight(handle).linear)
                 ++count;
@@ -348,7 +348,7 @@ static bool test_partial_gpu_budget(const std::filesystem::path& root, const Gpu
     check(bias_free_storage > 0
               && dense_weight_size(cpu, biased_projection, alignment, device_index, true) > bias_free_storage,
           "generic FP32 projection budget omitted its bias allocation");
-    const uint64_t projection_storage = dense_weight_size(cpu, cpu.weights.at(cpu.graph.layer_plans.front().dense_ffn.gate_weight),
+    const uint64_t projection_storage = dense_weight_size(cpu, cpu.weights.at(cpu.net.layer_plans.front().dense_ffn.gate_weight),
                                                           alignment, device_index);
     if (projection_storage == 0)
     {
@@ -374,7 +374,7 @@ static bool test_partial_gpu_budget(const std::filesystem::path& root, const Gpu
     check_budget_trace(execute_budget_model(cpu), expected, device + " CPU after rejected GPU admission");
 
     uint64_t attention_storage = 0;
-    for (const CompiledLayerPlan& layer : cpu.graph.layer_plans)
+    for (const CompiledLayerPlan& layer : cpu.net.layer_plans)
         attention_storage += attn_vk_size(cpu, layer, alignment, device_index);
     const uint64_t head_storage = dense_weight_size(cpu, cpu.weights.at(cpu.lm_head_weight), alignment, device_index);
     if (gpu.heap_available < attention_storage + head_storage + projection_storage * 6)
@@ -389,7 +389,7 @@ static bool test_partial_gpu_budget(const std::filesystem::path& root, const Gpu
     CompiledModel model;
     const auto compiled = compile_model(descriptor.value(), mapping.value(), model, HybridMode::HybridExperts, full);
     check(static_cast<bool>(compiled), compiled ? "" : compiled.error().message);
-    for (const CompiledLayerPlan& layer : model.graph.layer_plans)
+    for (const CompiledLayerPlan& layer : model.net.layer_plans)
         check(support_vulkan_ffn(model.operators, layer.dense_ffn),
               "sufficient dense GPU capacity did not prepare a complete FFN operator");
     if (head_storage != 0)
@@ -526,7 +526,7 @@ static void check_dynamic_dense_plan(const CompiledModel& model, uint64_t entry_
     check(!require_backend || model.expert_backend, "runtime did not create the dense FFN GPU cache");
     check(resident_ffn_projections(model) == 0, "dynamic FFN retained static Vulkan projections");
     std::unordered_set<std::string> keys;
-    for (const CompiledLayerPlan& layer : model.graph.layer_plans)
+    for (const CompiledLayerPlan& layer : model.net.layer_plans)
     {
         const ExpertPlan& ffn = layer.dense_ffn;
         check(ffn.use_gpu_cache && !ffn.cache_key.empty() && ffn.weight_size == entry_size,
@@ -607,7 +607,7 @@ static bool test_dynamic_gpu_cache(const std::filesystem::path& root, const GpuI
     auto status = compile_model(descriptor.value(), mapping.value(), cpu, HybridMode::CpuOnly, cpu_opt);
     check(static_cast<bool>(status), status ? "" : status.error().message);
     const DenseBudgetTrace expected = execute_budget_model(cpu);
-    const ExpertPlan& first = cpu.graph.layer_plans.front().dense_ffn;
+    const ExpertPlan& first = cpu.net.layer_plans.front().dense_ffn;
     const auto sizing_runtime = create_vulkan_runtime();
     const uint64_t entry_size = quant_expert_bytes(cpu.weights.at(first.gate_weight),
                                                    &cpu.weights.at(first.up_weight), cpu.weights.at(first.down_weight), gpu.device_index,
@@ -667,7 +667,7 @@ static bool test_dynamic_gpu_cache(const std::filesystem::path& root, const GpuI
         const CompiledModel& model = model_compiled(*loaded.value());
         check(!model.expert_backend && model.opt.expert_gpu_cache_size == 0,
               "fully resident dense FFNs retained an unnecessary demand cache");
-        for (const CompiledLayerPlan& layer : model.graph.layer_plans)
+        for (const CompiledLayerPlan& layer : model.net.layer_plans)
         {
             check(!layer.dense_ffn.use_gpu_cache && support_vulkan_dense_ffn(model.operators, layer.dense_ffn),
                   "automatic dense placement did not prepare a complete persistent GPU FFN");
@@ -748,7 +748,7 @@ static bool test_dynamic_gpu_cache(const std::filesystem::path& root, const GpuI
         bool raised = false;
         try
         {
-            forward_dense_ffn(model, model.graph.layer_plans.front().dense_ffn, input, actual_ffn,
+            forward_dense_ffn(model, model.net.layer_plans.front().dense_ffn, input, actual_ffn,
                               failing_workspace, ExecutionBackend::Vulkan);
         }
         catch (const std::runtime_error&)
@@ -761,7 +761,7 @@ static bool test_dynamic_gpu_cache(const std::filesystem::path& root, const GpuI
         check(std::all_of(actual_ffn.values().begin(), actual_ffn.values().end(), [](float value) { return value == 123.0f; }),
               "a failed GPU dense cache operation published uncommitted output");
         ExpertWorkspace explicit_cpu_workspace;
-        forward_dense_ffn(model, model.graph.layer_plans.front().dense_ffn, input, actual_ffn,
+        forward_dense_ffn(model, model.net.layer_plans.front().dense_ffn, input, actual_ffn,
                           explicit_cpu_workspace, ExecutionBackend::Cpu);
         for (size_t row = 0; row < input.rows(); ++row)
             check_logits(std::vector<float>(actual_ffn.row(row), actual_ffn.row(row) + actual_ffn.columns()),
@@ -783,7 +783,7 @@ static bool test_dynamic_gpu_cache(const std::filesystem::path& root, const GpuI
             else
                 model.opt.optimization_flags &= ~OptimizationVulkanExpertGpuPriority;
             MoeBlockPlan moe;
-            moe.experts.push_back(model.graph.layer_plans.front().dense_ffn);
+            moe.experts.push_back(model.net.layer_plans.front().dense_ffn);
             LayerState routed;
             routed.resize_experts(1);
             routed.normalized = input;
@@ -914,7 +914,7 @@ static void run_dense_package(const std::filesystem::path& root, bool tied, bool
         size_t cached_ffn_count = 0;
         size_t static_ffn_count = 0;
         size_t dense_ffn_nodes = 0;
-        for (const Layer& node : compiled.graph.layers)
+        for (const Layer& node : compiled.net.layers)
         {
             if (node.kind != LayerKind::DenseFfn)
                 continue;
@@ -922,7 +922,7 @@ static void run_dense_package(const std::filesystem::path& root, bool tied, bool
             if (node.backend == ExecutionBackend::Cpu)
                 continue;
             check(node.backend == ExecutionBackend::Vulkan, "dense FFN selected an unsupported backend");
-            const CompiledLayerPlan& layer = compiled.graph.layer_plans[node.plan_index];
+            const CompiledLayerPlan& layer = compiled.net.layer_plans[node.plan_index];
             if (layer.dense_ffn.use_gpu_cache)
             {
                 check(static_cast<bool>(compiled.expert_backend), "cached dense Vulkan FFN lacks an Expert backend");

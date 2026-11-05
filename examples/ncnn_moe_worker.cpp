@@ -278,13 +278,13 @@ static std::string placement_json(const CompiledModel& compiled)
     uint64_t attention_cpu = 0;
     uint64_t gated_delta_gpu = 0;
     uint64_t gated_delta_cpu = 0;
-    for (const Layer& node : compiled.graph.layers)
+    for (const Layer& node : compiled.net.layers)
     {
-        if (node.kind != LayerKind::Attention || node.plan_index >= compiled.graph.layer_plans.size())
+        if (node.kind != LayerKind::Attention || node.plan_index >= compiled.net.layer_plans.size())
             continue;
         const bool gpu = node.backend == ExecutionBackend::Vulkan;
         (gpu ? attention_gpu : attention_cpu)++;
-        if (compiled.graph.layer_plans[node.plan_index].attention.kind == AttentionKind::GatedDeltaNet)
+        if (compiled.net.layer_plans[node.plan_index].attention.kind == AttentionKind::GatedDeltaNet)
             (gpu ? gated_delta_gpu : gated_delta_cpu)++;
     }
     result.add_uint("attention_gpu_layers", attention_gpu);

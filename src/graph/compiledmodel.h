@@ -64,8 +64,7 @@ struct SpeculativeModelPlan
     // payloads are not part of the target model's main layer vector.  The
     // graph is still the sole owner of order, backend placement, and
     // prefetch policy for this region.
-    ExecutionGraph graph;
-    ExecutionSchedule schedule;
+    Net net;
     std::vector<LayerNodes> layer_nodes;
     std::vector<uint32_t> target_layer_ids;
     TensorHandle mtp_embedding_norm_weight = invalid_tensor_handle;
@@ -88,7 +87,7 @@ struct SpeculativeModelPlan
     [[nodiscard]] bool enabled() const noexcept
     {
         return kind != SpeculativeModelKind::None
-               && !graph.layer_plans.empty()
+               && !net.layer_plans.empty()
                && block_size != 0;
     }
 };
@@ -96,8 +95,7 @@ struct SpeculativeModelPlan
 struct CompiledModel
 {
     MoeModelDescriptor descriptor;
-    ExecutionGraph graph;
-    ExecutionSchedule schedule;
+    Net net;
     ModelMemoryPlan memory_plan;
     std::shared_ptr<GraphResources> graph_resources;
     uint64_t released_dense_host_size = 0;

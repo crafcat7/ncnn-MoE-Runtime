@@ -349,7 +349,7 @@ static void test_fixture(const std::filesystem::path& root, bool tied)
     auto status = compile_model(desc, mapping.value(), compiled, HybridMode::CpuOnly, opt);
     check(static_cast<bool>(status), status ? "" : status.error().message);
     size_t dense_count = 0;
-    for (const auto& node : compiled.graph.layers)
+    for (const auto& node : compiled.net.layers)
     {
         dense_count += node.kind == LayerKind::DenseFfn;
         check(node.kind != LayerKind::Router && node.kind != LayerKind::ExpertDispatch
@@ -458,7 +458,7 @@ static void test_gpu_fixture(const std::filesystem::path& root, uint32_t device_
     const auto& compiled = model_compiled(*loaded.value());
     check(compiled.resident_submission_rows > 0, "supported dense model did not select continuous GPU execution");
     check(!compiled.expert_backend, "resident dense model allocated a routed Expert cache");
-    for (const auto& layer : compiled.graph.layer_plans)
+    for (const auto& layer : compiled.net.layer_plans)
         check(!layer.dense_ffn.use_gpu_cache, "dense FFN remained in the evictable Expert cache");
     const auto before = get_vulkan_statistics(compiled.vulkan_runtime);
     check_execution(compiled, tensors, true);

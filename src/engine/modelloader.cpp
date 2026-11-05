@@ -622,9 +622,9 @@ uint32_t ModelLoader::resolve_expert_io_threads() const
     }
 
     uint32_t max_active_experts = 1;
-    for (const CompiledLayerPlan& layer : model.graph.layer_plans)
+    for (const CompiledLayerPlan& layer : model.net.layer_plans)
         max_active_experts = std::max(max_active_experts, layer.moe.top_k);
-    for (const CompiledLayerPlan& layer : model.speculative.graph.layer_plans)
+    for (const CompiledLayerPlan& layer : model.speculative.net.layer_plans)
         max_active_experts = std::max(max_active_experts, layer.moe.top_k);
 
     const uint32_t max_io_threads = max_active_experts > std::numeric_limits<uint32_t>::max() / 2
@@ -786,10 +786,10 @@ Result<void> ModelLoader::create_expert_backend(const std::vector<uint64_t>& gpu
     else
     {
         std::vector<uint32_t> group_device_indices;
-        group_device_indices.reserve(model.graph.layer_plans.size() + model.speculative.graph.layer_plans.size());
-        for (const CompiledLayerPlan& layer : model.graph.layer_plans)
+        group_device_indices.reserve(model.net.layer_plans.size() + model.speculative.net.layer_plans.size());
+        for (const CompiledLayerPlan& layer : model.net.layer_plans)
             group_device_indices.push_back(layer.vulkan_device_index);
-        for (const CompiledLayerPlan& layer : model.speculative.graph.layer_plans)
+        for (const CompiledLayerPlan& layer : model.speculative.net.layer_plans)
             group_device_indices.push_back(layer.vulkan_device_index);
 
         model.expert_backend = create_multi_device(std::move(backends),
@@ -828,7 +828,7 @@ Result<void> ModelLoader::configure_expert_cache()
     if (!ret)
         return ret.error();
 
-    const size_t group_count = model.graph.layer_plans.size() + model.speculative.graph.layer_plans.size();
+    const size_t group_count = model.net.layer_plans.size() + model.speculative.net.layer_plans.size();
     if (group_count > std::numeric_limits<uint32_t>::max())
         return Error{ErrorCode::InvalidModel, "the total Expert residency-group count overflows"};
 
@@ -883,7 +883,7 @@ Result<void> ModelLoader::configure_resident()
         else
             total += size;
     };
-    const auto inspect_graph = [&](const ExecutionGraph& graph) {
+    const auto inspect_graph = [&](const Net& graph) {
         for (const CompiledLayerPlan& layer : graph.layer_plans)
         {
             const auto found = std::find(device_indices.begin(), device_indices.end(), layer.vulkan_device_index);
@@ -947,8 +947,8 @@ Result<void> ModelLoader::configure_resident()
             max_pair_sizes[device] = std::max(max_pair_sizes[device], layer_maximum);
         }
     };
-    inspect_graph(model.graph);
-    inspect_graph(model.speculative.graph);
+    inspect_graph(model.net);
+    inspect_graph(model.speculative.net);
     if (invalid_storage_size)
         return Error{ErrorCode::InvalidArgument, "resident quantized Expert GPU storage size is invalid or overflows"};
 
@@ -1046,10 +1046,10 @@ Result<void> ModelLoader::configure_resident()
     if (backends.empty())
         return {};
     std::vector<uint32_t> group_device_indices;
-    group_device_indices.reserve(model.graph.layer_plans.size() + model.speculative.graph.layer_plans.size());
-    for (const CompiledLayerPlan& layer : model.graph.layer_plans)
+    group_device_indices.reserve(model.net.layer_plans.size() + model.speculative.net.layer_plans.size());
+    for (const CompiledLayerPlan& layer : model.net.layer_plans)
         group_device_indices.push_back(layer.vulkan_device_index);
-    for (const CompiledLayerPlan& layer : model.speculative.graph.layer_plans)
+    for (const CompiledLayerPlan& layer : model.speculative.net.layer_plans)
         group_device_indices.push_back(layer.vulkan_device_index);
     model.expert_backend = create_multi_device(std::move(backends), std::move(cache_devices),
                                                std::move(group_device_indices));
@@ -1090,13 +1090,13 @@ Result<void> ModelLoader::load(const std::filesystem::path& model_path)
         // owns the whole graph. Without it, keep the ordinary dense node path
         // instead of materializing the device hidden at that layer.
         for (size_t index = 0; index < model.gpu_segments.size()
-                               && index < model.graph.layer_plans.size();
+                               && index < model.net.layer_plans.size();
              ++index)
-            if (model.graph.layer_plans[index].dense_ffn.down_weight != invalid_tensor_handle)
+            if (model.net.layer_plans[index].dense_ffn.down_weight != invalid_tensor_handle)
                 model.gpu_segments[index].reset();
     }
     const bool partial_banks = model.resident_bank_layers != 0
-                               && model.resident_bank_layers < model.graph.layer_plans.size();
+                               && model.resident_bank_layers < model.net.layer_plans.size();
     if (model.gpu_expert_banks.empty() || partial_banks)
     {
         ret = configure_expert_cache();
@@ -1107,7 +1107,7 @@ Result<void> ModelLoader::load(const std::filesystem::path& model_path)
             return ret.error();
     }
     if (!model.expert_backend && (model.gpu_expert_banks.empty() || partial_banks)
-        && std::any_of(model.graph.layers.begin(), model.graph.layers.end(), [](const Layer& node) {
+        && std::any_of(model.net.layers.begin(), model.net.layers.end(), [](const Layer& node) {
                return node.kind == LayerKind::ExpertGroup && node.backend == ExecutionBackend::Vulkan;
            }))
         return Error{ErrorCode::UnsupportedModel, "GPU Expert placement requires an executable device cache; CPU retry is disabled"};

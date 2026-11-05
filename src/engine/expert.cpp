@@ -424,10 +424,10 @@ static std::string gpu_expert_error(const CompiledModel& model, uint32_t group,
                                     const char* operation, const char* reason)
 {
     uint32_t device = model.opt.vulkan_device_index;
-    if (group < model.graph.layer_plans.size())
-        device = model.graph.layer_plans[group].vulkan_device_index;
-    else if (group - model.graph.layer_plans.size() < model.speculative.graph.layer_plans.size())
-        device = model.speculative.graph.layer_plans[group - model.graph.layer_plans.size()].vulkan_device_index;
+    if (group < model.net.layer_plans.size())
+        device = model.net.layer_plans[group].vulkan_device_index;
+    else if (group - model.net.layer_plans.size() < model.speculative.net.layer_plans.size())
+        device = model.speculative.net.layer_plans[group - model.net.layer_plans.size()].vulkan_device_index;
     return std::string(reason) + " (layer " + std::to_string(group) + ", op " + operation
            + ", Vulkan device " + std::to_string(device) + ")";
 }

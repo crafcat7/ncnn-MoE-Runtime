@@ -26,7 +26,7 @@ static ExecutionBackend shared_lm_head_backend(const CompiledModel& model)
     // The draft shares the target head, including its selected backend and
     // device-only weight lifetime. Other draft projections keep their own
     // placement; Hybrid mode alone does not imply that the head uses Vulkan.
-    for (const Layer& node : model.graph.layers)
+    for (const Layer& node : model.net.layers)
     {
         if (node.kind == LayerKind::LmHead
             && !node.weights.empty()
@@ -48,7 +48,7 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
                                               HyperConnectionScratch& hyper_connection_scratch,
                                               AttentionScratch& attention_scratch)
 {
-    const ExecutionGraph& graph = model.speculative.graph;
+    const Net& graph = model.speculative.net;
     if (plan_index >= graph.layer_plans.size()
         || execution.attention >= graph.layers.size()
         || execution.router >= graph.layers.size()
@@ -368,7 +368,7 @@ static Result<void> append_mtp_context(const CompiledModel& model,
                                        SessionState& state)
 {
     const std::vector<SpeculativeModelPlan::LayerNodes>& layer_nodes = model.speculative.layer_nodes;
-    const ExecutionGraph& graph = model.speculative.graph;
+    const Net& graph = model.speculative.net;
     if (layer_nodes.size() != graph.layer_plans.size())
     {
         return Error{
@@ -546,7 +546,7 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
                      projected,
                      model.descriptor.norm_weight_offset);
     const std::vector<SpeculativeModelPlan::LayerNodes>& layer_nodes = model.speculative.layer_nodes;
-    const ExecutionGraph& graph = model.speculative.graph;
+    const Net& graph = model.speculative.net;
     if (layer_nodes.size() != graph.layer_plans.size())
     {
         return Error{
@@ -619,7 +619,7 @@ static Result<void> propose_mtp(const CompiledModel& model,
     if (model.vulkan_runtime)
         vulkan_before = get_vulkan_statistics(model.vulkan_runtime);
     const std::vector<SpeculativeModelPlan::LayerNodes>& layer_nodes = model.speculative.layer_nodes;
-    if (layer_nodes.size() != model.speculative.graph.layer_plans.size())
+    if (layer_nodes.size() != model.speculative.net.layer_plans.size())
     {
         return Error{
             ErrorCode::InternalError,
@@ -711,7 +711,7 @@ Result<void> propose_speculative(const CompiledModel& model, int32_t input_id, S
             "DSpark proposal requires a token sampler"};
     }
     const std::vector<SpeculativeModelPlan::LayerNodes>& layer_nodes = model.speculative.layer_nodes;
-    if (layer_nodes.size() != model.speculative.graph.layer_plans.size())
+    if (layer_nodes.size() != model.speculative.net.layer_plans.size())
     {
         return Error{
             ErrorCode::InternalError,
