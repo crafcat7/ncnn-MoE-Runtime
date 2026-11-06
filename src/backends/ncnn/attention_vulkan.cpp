@@ -267,8 +267,14 @@ static bool fill_attention_mask_staging(ncnn::VkMat& staging, size_t token_count
                                         const LayerCache& cache, const AttentionConfig_vulkan& config, const std::vector<float>& sinks,
                                         bool bfloat16_storage, ncnn::VkAllocator* allocator)
 {
+    // Attention sinks are per head, so they need one mask channel per head.
+    // Without sinks the additive mask is identical for every head and ncnn's
+    // SDPA broadcasts a single channel (channel stride 0), which cuts the mask
+    // fill, upload and retained staging memory by the head count.
+    const bool per_head_mask = has_flag(config.flags, AttentionSink);
+    const int mask_channels = per_head_mask ? static_cast<int>(config.head_count) : 1;
     if (destination_count > static_cast<uint64_t>(std::numeric_limits<int>::max()) || token_count > static_cast<size_t>(std::numeric_limits<int>::max())
-        || !create_staging(staging, static_cast<int>(destination_count), static_cast<int>(token_count), static_cast<int>(config.head_count),
+        || !create_staging(staging, static_cast<int>(destination_count), static_cast<int>(token_count), mask_channels,
                            bfloat16_storage ? sizeof(uint16_t) : sizeof(float), allocator))
         return false;
 
@@ -313,7 +319,7 @@ static bool fill_attention_mask_staging(ncnn::VkMat& staging, size_t token_count
             std::fill(row + actual_end + (use_attention_sink ? 1 : 0), row + destination_count, masked_logit);
         }
     }
-    for (uint32_t head = 1; head < config.head_count; ++head)
+    for (uint32_t head = 1; per_head_mask && head < config.head_count; ++head)
     {
         ncnn::Mat head_mask = mapped.channel(static_cast<int>(head));
         for (size_t query_index = 0; query_index < token_count; ++query_index)

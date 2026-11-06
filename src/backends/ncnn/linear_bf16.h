@@ -112,7 +112,8 @@ private:
                                   ncnn::VkCompute& cmd) const;
     void record_rms_norm_projection(const ncnn::VkMat& input,
                                     ncnn::VkMat& output,
-                                    ncnn::VkCompute& cmd) const;
+                                    ncnn::VkCompute& cmd,
+                                    ncnn::VkMat* row_scale_workspace = nullptr) const;
     [[nodiscard]] const std::shared_ptr<VulkanContext>& vulkan_context() const noexcept;
     [[nodiscard]] const ncnn::Option& option() const noexcept;
     [[nodiscard]] uint32_t input_columns() const noexcept;

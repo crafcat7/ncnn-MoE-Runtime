@@ -1,0 +1,282 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// 32x64 tile, 128 threads: doubles the workgroup count of narrow output tiles.
+// This file and bfloat16_tile_64x64.comp share one kernel body and differ only in the
+// tile geometry constants (TILE_M/TILE_N/THREADS/TOKEN_STEP and the two
+// staging splits), so the file name states the geometry. Tile sizes stay
+// compile-time constants: driving them from specialization constants measured
+// about 5x slower on MoltenVK because the staging and epilogue loops stop
+// being unrolled. Keep both files in sync when editing the kernel body.
+
+// Prefill projection: BF16 weight rows by FP32 activation rows.
+//
+// One workgroup owns a 64-token by 64-output tile and stages both operands in
+// shared memory as FP16, so a staged tile costs half the bytes (and half the
+// shared traffic per multiply-add) of the FP32 staging variant. Weights are
+// BF16 on the device and are converted while staging; the accumulator stays
+// FP32 so the reduction keeps its range and precision.
+//
+// A 16-wide K slice amortizes one barrier pair over 16 reduction
+// steps, and every thread owns a 4x4 register tile written out as
+// named scalars: GLSL local arrays indexed at run time end up in scratch memory.
+//
+// Layout: activations are [token][column], weights are [output][column] packed
+// as two BF16 per word, outputs are [token][output].
+
+layout(binding = 0) readonly buffer input_blob
+{
+    vec4 input_data[];
+};
+layout(binding = 1) readonly buffer packed_blob
+{
+    uint packed_words[];
+};
+layout(binding = 2) readonly buffer bias_blob
+{
+    float bias_data[];
+};
+layout(binding = 3) readonly buffer row_scale_blob
+{
+    float row_scale_data[];
+};
+layout(binding = 4) readonly buffer column_scale_blob
+{
+    float column_scale_data[];
+};
+layout(binding = 5) writeonly buffer output_blob
+{
+    float output_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint input_columns;
+    uint output_columns;
+    uint token_count;
+    uint apply_row_scale;
+    uint apply_column_scale;
+    uint output_stride;
+    uint output_column_offset;
+    uint input_group_count;
+    uint group_columns;
+}
+p;
+
+#define TILE_M      32
+#define TILE_N      64
+#define TILE_K      16
+#define K_GROUPS    (TILE_K / 4)
+#define THREADS     128
+#define REGISTER_M  4
+#define REGISTER_N  4
+#define TOKEN_STEP  8
+#define OUTPUT_STEP 16
+// One padding vector per row: neighbouring rows then land on disjoint shared banks.
+#define SHMEM_STRIDE (K_GROUPS * 2 + 4)
+
+layout(local_size_x = THREADS, local_size_y = 1, local_size_z = 1) in;
+
+// Two-element (half2) staging rows with a four-half2 pad, the layout llama.cpp
+// uses for its mul_mm shared tiles.
+shared f16vec2 staged_a[TILE_M * SHMEM_STRIDE];
+shared f16vec2 staged_b[TILE_N * SHMEM_STRIDE];
+
+float decode_bfloat16(uint value)
+{
+    return uintBitsToFloat(value << 16);
+}
+
+// Four-term FP16 dot with an FP32 accumulator: one packed dot plus one
+// widening convert, instead of four converts and four FP32 fmas.
+float dot4(f16vec4 a, f16vec4 b)
+{
+    return float(dot(a, b));
+}
+
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint column_group = lane % 16u;
+    const uint row_group = lane / 16u;
+    const uint token_begin = gl_WorkGroupID.y * TILE_M;
+    const uint output_begin = gl_WorkGroupID.x * TILE_N;
+    // Grouped operators tile one contiguous output group per workgroup, so the
+    // activation row base is constant for the whole tile.
+    const uint group = p.group_columns != 0u ? output_begin / p.group_columns : 0u;
+
+    // Activation rows and weight rows use independent staging splits: A has
+    // TILE_M rows, B TILE_N rows.
+    const uint stage_a_row = lane / 4u;
+    const uint stage_a_segment = (lane % 4u) * 1u;
+    const uint stage_b_row = lane / 2u;
+    const uint stage_b_segment = (lane % 2u) * 2u;
+    const uint load_token = token_begin + stage_a_row;
+    const uint load_output = output_begin + stage_b_row;
+    const bool token_active = load_token < p.token_count;
+    const bool output_active = load_output < p.output_columns;
+    float token_scale = 1.0;
+    if (p.apply_row_scale != 0 && token_active)
+        token_scale = row_scale_data[load_token];
+
+    float acc_0_0 = 0.0;
+    float acc_0_1 = 0.0;
+    float acc_0_2 = 0.0;
+    float acc_0_3 = 0.0;
+    float acc_1_0 = 0.0;
+    float acc_1_1 = 0.0;
+    float acc_1_2 = 0.0;
+    float acc_1_3 = 0.0;
+    float acc_2_0 = 0.0;
+    float acc_2_1 = 0.0;
+    float acc_2_2 = 0.0;
+    float acc_2_3 = 0.0;
+    float acc_3_0 = 0.0;
+    float acc_3_1 = 0.0;
+    float acc_3_2 = 0.0;
+    float acc_3_3 = 0.0;
+
+    for (uint k = 0; k < p.input_columns; k += TILE_K)
+    {
+        for (uint index = 0; index < 1u; ++index)
+        {
+            const uint segment = stage_a_segment + index;
+            const uint load_column = k + segment * 4u;
+            if (token_active)
+            {
+                vec4 values = input_data[(((load_token * p.input_group_count + group) * p.input_columns + load_column) >> 2)] * token_scale;
+                if (p.apply_column_scale != 0)
+                {
+                    values *= vec4(column_scale_data[load_column],
+                                   column_scale_data[load_column + 1u],
+                                   column_scale_data[load_column + 2u],
+                                   column_scale_data[load_column + 3u]);
+                }
+                staged_a[stage_a_row * SHMEM_STRIDE + segment * 2u] = f16vec2(values.xy);
+                staged_a[stage_a_row * SHMEM_STRIDE + segment * 2u + 1u] = f16vec2(values.zw);
+            }
+            else
+            {
+                staged_a[stage_a_row * SHMEM_STRIDE + segment * 2u] = f16vec2(0.0);
+                staged_a[stage_a_row * SHMEM_STRIDE + segment * 2u + 1u] = f16vec2(0.0);
+            }
+        }
+        for (uint index = 0; index < 2u; ++index)
+        {
+            const uint segment = stage_b_segment + index;
+            const uint load_column = k + segment * 4u;
+            if (output_active)
+            {
+                const uint word = (load_output * p.input_columns + load_column) / 2u;
+                const uint low = packed_words[word];
+                const uint high = packed_words[word + 1u];
+                staged_b[stage_b_row * SHMEM_STRIDE + segment * 2u] = f16vec2(decode_bfloat16(low & 65535u),
+                                                                              decode_bfloat16(low >> 16));
+                staged_b[stage_b_row * SHMEM_STRIDE + segment * 2u + 1u] = f16vec2(decode_bfloat16(high & 65535u),
+                                                                                   decode_bfloat16(high >> 16));
+            }
+            else
+            {
+                staged_b[stage_b_row * SHMEM_STRIDE + segment * 2u] = f16vec2(0.0);
+                staged_b[stage_b_row * SHMEM_STRIDE + segment * 2u + 1u] = f16vec2(0.0);
+            }
+        }
+
+        barrier();
+
+        for (uint segment = 0; segment < K_GROUPS; ++segment)
+        {
+            const f16vec4 a0 = f16vec4(staged_a[(row_group + 0u) * SHMEM_STRIDE + segment * 2u], staged_a[(row_group + 0u) * SHMEM_STRIDE + segment * 2u + 1u]);
+            const f16vec4 a1 = f16vec4(staged_a[(row_group + 8u) * SHMEM_STRIDE + segment * 2u], staged_a[(row_group + 8u) * SHMEM_STRIDE + segment * 2u + 1u]);
+            const f16vec4 a2 = f16vec4(staged_a[(row_group + 16u) * SHMEM_STRIDE + segment * 2u], staged_a[(row_group + 16u) * SHMEM_STRIDE + segment * 2u + 1u]);
+            const f16vec4 a3 = f16vec4(staged_a[(row_group + 24u) * SHMEM_STRIDE + segment * 2u], staged_a[(row_group + 24u) * SHMEM_STRIDE + segment * 2u + 1u]);
+            const f16vec4 b0 = f16vec4(staged_b[(column_group + 0u * OUTPUT_STEP) * SHMEM_STRIDE + segment * 2u], staged_b[(column_group + 0u * OUTPUT_STEP) * SHMEM_STRIDE + segment * 2u + 1u]);
+            const f16vec4 b1 = f16vec4(staged_b[(column_group + 1u * OUTPUT_STEP) * SHMEM_STRIDE + segment * 2u], staged_b[(column_group + 1u * OUTPUT_STEP) * SHMEM_STRIDE + segment * 2u + 1u]);
+            const f16vec4 b2 = f16vec4(staged_b[(column_group + 2u * OUTPUT_STEP) * SHMEM_STRIDE + segment * 2u], staged_b[(column_group + 2u * OUTPUT_STEP) * SHMEM_STRIDE + segment * 2u + 1u]);
+            const f16vec4 b3 = f16vec4(staged_b[(column_group + 3u * OUTPUT_STEP) * SHMEM_STRIDE + segment * 2u], staged_b[(column_group + 3u * OUTPUT_STEP) * SHMEM_STRIDE + segment * 2u + 1u]);
+            acc_0_0 += dot4(a0, b0);
+            acc_0_1 += dot4(a0, b1);
+            acc_0_2 += dot4(a0, b2);
+            acc_0_3 += dot4(a0, b3);
+            acc_1_0 += dot4(a1, b0);
+            acc_1_1 += dot4(a1, b1);
+            acc_1_2 += dot4(a1, b2);
+            acc_1_3 += dot4(a1, b3);
+            acc_2_0 += dot4(a2, b0);
+            acc_2_1 += dot4(a2, b1);
+            acc_2_2 += dot4(a2, b2);
+            acc_2_3 += dot4(a2, b3);
+            acc_3_0 += dot4(a3, b0);
+            acc_3_1 += dot4(a3, b1);
+            acc_3_2 += dot4(a3, b2);
+            acc_3_3 += dot4(a3, b3);
+        }
+        barrier();
+    }
+
+    // Tokens advance by TOKEN_STEP within the tile so neighbouring lanes stay
+    // adjacent.
+    const uint out_col_0 = output_begin + column_group + 0u * OUTPUT_STEP;
+    const bool out_valid_0 = out_col_0 < p.output_columns;
+    const float out_bias_0 = out_valid_0 ? bias_data[out_col_0] : 0.0;
+    const uint out_col_1 = output_begin + column_group + 1u * OUTPUT_STEP;
+    const bool out_valid_1 = out_col_1 < p.output_columns;
+    const float out_bias_1 = out_valid_1 ? bias_data[out_col_1] : 0.0;
+    const uint out_col_2 = output_begin + column_group + 2u * OUTPUT_STEP;
+    const bool out_valid_2 = out_col_2 < p.output_columns;
+    const float out_bias_2 = out_valid_2 ? bias_data[out_col_2] : 0.0;
+    const uint out_col_3 = output_begin + column_group + 3u * OUTPUT_STEP;
+    const bool out_valid_3 = out_col_3 < p.output_columns;
+    const float out_bias_3 = out_valid_3 ? bias_data[out_col_3] : 0.0;
+
+    const uint token_0 = token_begin + row_group + 0u;
+    if (token_0 < p.token_count)
+    {
+        if (out_valid_0)
+            output_data[token_0 * p.output_stride + p.output_column_offset + out_col_0] = acc_0_0 + out_bias_0;
+        if (out_valid_1)
+            output_data[token_0 * p.output_stride + p.output_column_offset + out_col_1] = acc_0_1 + out_bias_1;
+        if (out_valid_2)
+            output_data[token_0 * p.output_stride + p.output_column_offset + out_col_2] = acc_0_2 + out_bias_2;
+        if (out_valid_3)
+            output_data[token_0 * p.output_stride + p.output_column_offset + out_col_3] = acc_0_3 + out_bias_3;
+    }
+    const uint token_1 = token_begin + row_group + 8u;
+    if (token_1 < p.token_count)
+    {
+        if (out_valid_0)
+            output_data[token_1 * p.output_stride + p.output_column_offset + out_col_0] = acc_1_0 + out_bias_0;
+        if (out_valid_1)
+            output_data[token_1 * p.output_stride + p.output_column_offset + out_col_1] = acc_1_1 + out_bias_1;
+        if (out_valid_2)
+            output_data[token_1 * p.output_stride + p.output_column_offset + out_col_2] = acc_1_2 + out_bias_2;
+        if (out_valid_3)
+            output_data[token_1 * p.output_stride + p.output_column_offset + out_col_3] = acc_1_3 + out_bias_3;
+    }
+    const uint token_2 = token_begin + row_group + 16u;
+    if (token_2 < p.token_count)
+    {
+        if (out_valid_0)
+            output_data[token_2 * p.output_stride + p.output_column_offset + out_col_0] = acc_2_0 + out_bias_0;
+        if (out_valid_1)
+            output_data[token_2 * p.output_stride + p.output_column_offset + out_col_1] = acc_2_1 + out_bias_1;
+        if (out_valid_2)
+            output_data[token_2 * p.output_stride + p.output_column_offset + out_col_2] = acc_2_2 + out_bias_2;
+        if (out_valid_3)
+            output_data[token_2 * p.output_stride + p.output_column_offset + out_col_3] = acc_2_3 + out_bias_3;
+    }
+    const uint token_3 = token_begin + row_group + 24u;
+    if (token_3 < p.token_count)
+    {
+        if (out_valid_0)
+            output_data[token_3 * p.output_stride + p.output_column_offset + out_col_0] = acc_3_0 + out_bias_0;
+        if (out_valid_1)
+            output_data[token_3 * p.output_stride + p.output_column_offset + out_col_1] = acc_3_1 + out_bias_1;
+        if (out_valid_2)
+            output_data[token_3 * p.output_stride + p.output_column_offset + out_col_2] = acc_3_2 + out_bias_2;
+        if (out_valid_3)
+            output_data[token_3 * p.output_stride + p.output_column_offset + out_col_3] = acc_3_3 + out_bias_3;
+    }
+}

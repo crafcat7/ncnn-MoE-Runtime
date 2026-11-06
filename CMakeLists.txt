@@ -519,7 +519,10 @@ if(NCNN_MOE_WITH_VULKAN)
         src/kernels/vulkan/bfloat16_cooperative_projection.comp
         src/kernels/vulkan/bfloat16_projection.comp
         src/kernels/vulkan/bfloat16_rms_norm_projection.comp
+        src/kernels/vulkan/bfloat16_row_rms.comp
         src/kernels/vulkan/bfloat16_swiglu_down.comp
+        src/kernels/vulkan/bfloat16_tile_64x64.comp
+        src/kernels/vulkan/bfloat16_tile_32x64.comp
         src/kernels/vulkan/float8_projection.comp
         src/kernels/vulkan/float8_quantize.comp
         src/kernels/vulkan/float8_rms_norm_quantize.comp
@@ -527,6 +530,7 @@ if(NCNN_MOE_WITH_VULKAN)
         src/kernels/vulkan/projection_matvec.comp
         src/kernels/vulkan/gated_delta_conv.comp
         src/kernels/vulkan/gated_delta_rule.comp
+        src/kernels/vulkan/gated_delta_rule_reg.comp
         src/kernels/vulkan/gated_delta_qk.comp
         src/kernels/vulkan/gated_delta_norm.comp
         src/kernels/vulkan/residual_ple.comp

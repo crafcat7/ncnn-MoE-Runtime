@@ -51,7 +51,10 @@
 #include "kernels/vulkan/bfloat16_cooperative_projection.comp.hex.h"
 #include "kernels/vulkan/bfloat16_projection.comp.hex.h"
 #include "kernels/vulkan/bfloat16_rms_norm_projection.comp.hex.h"
+#include "kernels/vulkan/bfloat16_row_rms.comp.hex.h"
 #include "kernels/vulkan/bfloat16_swiglu_down.comp.hex.h"
+#include "kernels/vulkan/bfloat16_tile_64x64.comp.hex.h"
+#include "kernels/vulkan/bfloat16_tile_32x64.comp.hex.h"
 #endif
 #include "linear_impl.h"
 #include "linear_internal.h"
@@ -335,6 +338,158 @@ static bool create_bfloat16_swiglu_down_pipeline(const std::shared_ptr<VulkanCon
                             destination);
     return true;
 }
+
+#if NCNN_MOE_WITH_VULKAN
+bool create_tile_gemm(const std::shared_ptr<VulkanContext>& context,
+                      const ncnn::Option& option,
+                      TileGemm (&pipes)[2])
+{
+    // One kernel body, two compile-time geometries: a narrow output tile would
+    // otherwise idle most of the last wave.
+    struct geometry
+    {
+        const char* source;
+        int length;
+        uint32_t bm;
+        uint32_t bn;
+        uint32_t wg;
+    };
+    const geometry geometries[2] = {
+        {bfloat16_tile_64x64_shader, static_cast<int>(sizeof(bfloat16_tile_64x64_shader) - 1), 64, 64, 256},
+        {bfloat16_tile_32x64_shader, static_cast<int>(sizeof(bfloat16_tile_32x64_shader) - 1), 32, 64, 128},
+    };
+
+    ncnn::Option compile_option = option;
+    compile_option.use_fp16_packed = false;
+    compile_option.use_fp16_arithmetic = false;
+    compile_option.use_bf16_packed = false;
+    const size_t variant = (option.use_subgroup_ops ? 1u : 0u) * 3 + activation_variant(option);
+    ncnn::VulkanDevice* device = context->device();
+    bool any = false;
+    for (size_t index = 0; index < 2; ++index)
+    {
+        const geometry& item = geometries[index];
+        const std::shared_ptr<const std::vector<uint32_t>> spirv = context->shader_binary(item.source, item.length, compile_option, variant);
+        if (!spirv || spirv->empty())
+            continue;
+        std::shared_ptr<ncnn::Pipeline> pipeline = context->find_pipeline(item.source, variant);
+        if (!pipeline)
+        {
+            std::unique_ptr<ncnn::Pipeline> created(new ncnn::Pipeline(device));
+            created->set_subgroup_size(32);
+            created->set_local_size_xyz(static_cast<int>(item.wg), 1, 1);
+            const std::vector<ncnn::vk_specialization_type> specializations;
+            if (created->create(spirv->data(), spirv->size() * sizeof(uint32_t), specializations) != 0)
+                continue;
+            pipeline = std::shared_ptr<ncnn::Pipeline>(created.release(),
+                                                       [context = context](ncnn::Pipeline* value) mutable {
+                                                           {
+                                                               const std::lock_guard<std::mutex> lock(context->command_mutex());
+                                                               delete value;
+                                                           }
+                                                           context.reset();
+                                                       });
+            context->cache_pipeline(item.source, variant, pipeline);
+        }
+        pipes[index].pipeline = std::move(pipeline);
+        pipes[index].bm = item.bm;
+        pipes[index].bn = item.bn;
+        pipes[index].wg = item.wg;
+        any = true;
+    }
+    return any;
+}
+
+bool record_tile_gemm(const TileGemm (&pipes)[2],
+                      const ncnn::VkMat& in,
+                      const ncnn::VkMat& w,
+                      const ncnn::VkMat& bias,
+                      const ncnn::VkMat& row_scale,
+                      const ncnn::VkMat& col_scale,
+                      ncnn::VkMat& out,
+                      const TileShape& shape,
+                      ncnn::VkCompute& command)
+{
+    constexpr uint32_t tile_k = 16;
+    const uint32_t stride = shape.stride != 0 ? shape.stride : shape.n;
+    const uint32_t group_columns = shape.groups > 1 ? shape.n / shape.groups : shape.n;
+    if (shape.rows < 8 || shape.k == 0 || shape.n == 0
+        || shape.k % tile_k != 0 || shape.n % 4 != 0 || shape.groups == 0
+        || static_cast<uint64_t>(group_columns) * shape.groups != shape.n
+        || stride < static_cast<uint64_t>(shape.offset) + shape.n
+        || (!row_scale.empty() && (row_scale.w < static_cast<int>(shape.rows) || row_scale.elempack != 1))
+        || (!col_scale.empty() && (col_scale.w < static_cast<int>(shape.k) || col_scale.elempack != 1))
+        || in.empty() || in.dims != 2 || in.elempack != 1 || in.elemsize != sizeof(float)
+        || in.w != static_cast<int>(static_cast<uint64_t>(shape.k) * shape.groups)
+        || in.h != static_cast<int>(shape.rows)
+        // vec4 activation loads: the binding must be 16 B aligned and the rows contiguous.
+        || (in.offset & 15u) != 0 || in.cstep != static_cast<size_t>(in.w) * in.h
+        || out.empty() || out.dims != 2 || out.elempack != 1 || out.elemsize != sizeof(float)
+        || out.w != static_cast<int>(stride) || out.h != static_cast<int>(shape.rows)
+        || w.empty() || bias.empty()
+        || w.buffer_capacity() < static_cast<uint64_t>(shape.k) * shape.n * sizeof(uint16_t)
+        || bias.buffer_capacity() < static_cast<uint64_t>(shape.n) * sizeof(float)
+        || out.buffer_capacity() < static_cast<uint64_t>(stride) * shape.rows * sizeof(float))
+        return false;
+
+    // Take the first geometry whose grid still fills the device. 160 workgroups
+    // is four waves on the 40-core class of device this runtime targets; the
+    // 32x64 geometry doubles the count for narrow output tiles, which otherwise
+    // idle most of their last wave. A device-derived threshold needs the shared
+    // parallelism query that attentiondecode_vulkan.cpp keeps private.
+    constexpr uint64_t minimum_workgroups = 160;
+    const TileGemm* selected = nullptr;
+    const TileGemm* fallback = nullptr;
+    for (const TileGemm& candidate : pipes)
+    {
+        if (!candidate.pipeline || candidate.bm == 0 || candidate.bn == 0)
+            continue;
+        // A workgroup derives its activation group from the tile origin, so a
+        // grouped operator must split on tile boundaries.
+        if (shape.groups > 1 && group_columns % candidate.bn != 0)
+            continue;
+        const uint64_t cols = (shape.n + candidate.bn - 1) / candidate.bn;
+        const uint64_t rows = (shape.rows + candidate.bm - 1) / candidate.bm;
+        const uint64_t tiles = cols * rows;
+        if (tiles * candidate.wg > static_cast<uint64_t>(std::numeric_limits<int>::max()))
+            continue;
+        fallback = &candidate;
+        if (tiles >= minimum_workgroups)
+        {
+            selected = &candidate;
+            break;
+        }
+    }
+    if (!selected)
+        selected = fallback;
+    if (!selected)
+        return false;
+
+    const uint64_t cols = (shape.n + selected->bn - 1) / selected->bn;
+    const uint64_t rows = (shape.rows + selected->bm - 1) / selected->bm;
+    const std::vector<ncnn::VkMat> bindings = {in, w, bias, row_scale, col_scale, out};
+    std::vector<ncnn::vk_constant_type> constants(9);
+    constants[0].u32 = shape.k;
+    constants[1].u32 = shape.n;
+    constants[2].u32 = shape.rows;
+    constants[3].u32 = row_scale.empty() ? 0u : 1u;
+    constants[4].u32 = col_scale.empty() ? 0u : 1u;
+    constants[5].u32 = stride;
+    constants[6].u32 = shape.offset;
+    constants[7].u32 = shape.groups;
+    constants[8].u32 = shape.groups > 1 ? group_columns : 0u;
+    ncnn::VkMat dispatcher;
+    dispatcher.w = static_cast<int>(cols * selected->wg);
+    dispatcher.h = static_cast<int>(rows);
+    dispatcher.c = 1;
+    command.record_pipeline_readonly(selected->pipeline.get(),
+                                     bindings,
+                                     {1, 0, 0, 1, 1, 0},
+                                     constants,
+                                     dispatcher);
+    return true;
+}
+#endif
 
 static bool prepare_bfloat16_upload(std::span<const uint16_t> source,
                                     ncnn::Mat& destination)
@@ -840,6 +995,36 @@ Bfloat16Linear_vulkan::create_with_allocator(const TensorData& matrix,
         {
             return {};
         }
+        create_tile_gemm(implementation.vulkan_context, implementation.option, implementation.tile_gemm);
+        if (!implementation.row_rms_scale_pipeline)
+        {
+            constexpr size_t row_rms_variant = 0;
+            const std::shared_ptr<const std::vector<uint32_t>> rms_spirv = implementation.vulkan_context->shader_binary(bfloat16_row_rms_shader,
+                                                                                                                        static_cast<int>(sizeof(bfloat16_row_rms_shader) - 1),
+                                                                                                                        implementation.option,
+                                                                                                                        row_rms_variant);
+            if (rms_spirv && !rms_spirv->empty())
+            {
+                std::unique_ptr<ncnn::Pipeline> rms_pipeline(new ncnn::Pipeline(device));
+                rms_pipeline->set_subgroup_size(32);
+                rms_pipeline->set_local_size_xyz(256, 1, 1);
+                const std::vector<ncnn::vk_specialization_type> rms_specializations;
+                if (rms_pipeline->create(rms_spirv->data(),
+                                         rms_spirv->size() * sizeof(uint32_t),
+                                         rms_specializations)
+                    == 0)
+                {
+                    implementation.row_rms_scale_pipeline = std::shared_ptr<ncnn::Pipeline>(rms_pipeline.release(),
+                                                                                            [ctx = implementation.vulkan_context](ncnn::Pipeline* value) mutable {
+                                                                                                {
+                                                                                                    const std::lock_guard<std::mutex> lock(ctx->command_mutex());
+                                                                                                    delete value;
+                                                                                                }
+                                                                                                ctx.reset();
+                                                                                            });
+                }
+            }
+        }
         if (has_flag(implementation.optimization_flags,
                      OptimizationVulkanBfloat16CoopMatrix))
         {
@@ -1047,6 +1232,8 @@ bool Bfloat16Linear_vulkan::Implementation::record_projection(const ncnn::VkMat&
     constants[1].u32 = output_columns;
     constants[2].u32 = block_count;
     constants[3].u32 = token_count;
+    if (record_tile(input, output, token_count, ncnn::VkMat(), ncnn::VkMat(), command))
+        return false;
     ncnn::VkMat dispatcher;
     dispatcher.w = static_cast<int>(output_columns * 32);
     dispatcher.h = static_cast<int>(token_count);
@@ -1057,6 +1244,19 @@ bool Bfloat16Linear_vulkan::Implementation::record_projection(const ncnn::VkMat&
                                      constants,
                                      dispatcher);
     return false;
+}
+
+bool Bfloat16Linear_vulkan::Implementation::record_tile(const ncnn::VkMat& input,
+                                                        ncnn::VkMat& output,
+                                                        uint32_t rows,
+                                                        const ncnn::VkMat& row_scale,
+                                                        const ncnn::VkMat& column_scale,
+                                                        ncnn::VkCompute& command) const
+{
+    if ((!tile_gemm[0].pipeline && !tile_gemm[1].pipeline) || activation_variant(option) != 0)
+        return false;
+    const TileShape shape{rows, input_columns, output_columns, output_columns, 0, 1};
+    return record_tile_gemm(tile_gemm, input, packed, bias, row_scale, column_scale, output, shape, command);
 }
 #endif
 
@@ -1079,6 +1279,9 @@ void Bfloat16Linear_vulkan::record_scalar_projection(const ncnn::VkMat& input,
         implementation.packed,
         implementation.bias,
         output};
+    if (implementation.record_tile(input, output, static_cast<uint32_t>(input.h),
+                                   ncnn::VkMat(), ncnn::VkMat(), cmd))
+        return;
     std::vector<ncnn::vk_constant_type> constants(4);
     constants[0].u32 = implementation.input_columns;
     constants[1].u32 = implementation.output_columns;
@@ -1102,10 +1305,45 @@ void Bfloat16Linear_vulkan::record_scalar_projection(const ncnn::VkMat& input,
 
 void Bfloat16Linear_vulkan::record_rms_norm_projection(const ncnn::VkMat& input,
                                                        ncnn::VkMat& output,
-                                                       ncnn::VkCompute& cmd) const
+                                                       ncnn::VkCompute& cmd,
+                                                       ncnn::VkMat* row_scale_workspace) const
 {
 #if NCNN_MOE_WITH_VULKAN
     const Implementation& implementation = *d;
+    if (row_scale_workspace
+        && implementation.row_rms_scale_pipeline
+        && implementation.vulkan_context
+        && !implementation.rms_norm_weight.empty()
+        && input.h >= 8
+        && implementation.input_columns % 16 == 0)
+    {
+        // Exactly `token_count` floats of graph-arena scratch, retained by the
+        // caller until the submission completes (GatedDeltaWork keeps it). The
+        // per-token byte count is far below the arena slack reserved for the
+        // workspace peak, so this allocation never grows the plan.
+        row_scale_workspace->create(input.h, sizeof(float),
+                                    implementation.vulkan_context->blob_allocator());
+        if (!row_scale_workspace->empty())
+        {
+            std::vector<ncnn::vk_constant_type> scale_constants(2);
+            scale_constants[0].u32 = implementation.input_columns;
+            scale_constants[1].f = implementation.rms_norm_epsilon;
+            ncnn::VkMat scale_dispatcher;
+            scale_dispatcher.w = 256 * input.h;
+            scale_dispatcher.h = 1;
+            scale_dispatcher.c = 1;
+            cmd.record_pipeline_readonly(implementation.row_rms_scale_pipeline.get(),
+                                         {input, *row_scale_workspace},
+                                         {1, 0},
+                                         scale_constants,
+                                         scale_dispatcher);
+            if (implementation.record_tile(input, output, static_cast<uint32_t>(input.h),
+                                           *row_scale_workspace, implementation.rms_norm_weight, cmd))
+            {
+                return;
+            }
+        }
+    }
     const std::vector<ncnn::VkMat> bindings = {
         input,
         implementation.packed,
@@ -1177,6 +1415,9 @@ int Bfloat16Linear_vulkan::forward(const ncnn::VkMat& input,
                       implementation.bias, output, cmd);
         return 0;
     }
+    if (implementation.record_tile(input, output, static_cast<uint32_t>(input.h),
+                                   ncnn::VkMat(), ncnn::VkMat(), cmd))
+        return 0;
     const std::vector<ncnn::VkMat> bindings = {
         input,
         implementation.packed,

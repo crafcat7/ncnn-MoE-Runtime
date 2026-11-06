@@ -732,6 +732,8 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
             || !create_qnk_projection_pipeline(implementation.vulkan_context, implementation.option, matrix.dtype,
                                                implementation.columns_offset != 0, 4, implementation.prefill_pipeline))
             return {};
+        if (matrix.dtype == DType::BFloat16)
+            create_tile_gemm(implementation.vulkan_context, implementation.option, implementation.tile_gemm);
     }
     if ((output_columns + 3u) / 4u > static_cast<uint32_t>(std::numeric_limits<int>::max()) / implementation.pipeline->local_size_x())
         return {};
@@ -862,6 +864,21 @@ void QnkLinear_vulkan::record(const ncnn::VkMat& input,
     constants[11].u32 = static_cast<uint32_t>(output.w);
     constants[12].u32 = output_column_offset;
     constants[13].u32 = implementation.input_group_count;
+    if ((implementation.tile_gemm[0].pipeline || implementation.tile_gemm[1].pipeline)
+        && activation_variant(implementation.option) == 0
+        && implementation.block_count == 0
+        && implementation.block_size == static_cast<uint64_t>(implementation.input_columns) * sizeof(uint16_t))
+    {
+        const TileShape shape{constants[3].u32,
+                              implementation.input_columns,
+                              implementation.output_columns,
+                              static_cast<uint32_t>(output.w),
+                              output_column_offset,
+                              implementation.input_group_count};
+        if (record_tile_gemm(implementation.tile_gemm, input, implementation.quantized,
+                             implementation.bias, ncnn::VkMat(), ncnn::VkMat(), output, shape, command))
+            return;
+    }
     const uint32_t tile_rows = constants[3].u32 > 1 ? 4u : 1u;
     const auto& pipeline = tile_rows == 1 ? implementation.pipeline : implementation.prefill_pipeline;
     ncnn::VkMat dispatcher;
