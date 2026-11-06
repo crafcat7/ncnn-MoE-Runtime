@@ -179,7 +179,8 @@ private:
                                                                            const VulkanRuntimePtr& vulkan_runtime,
                                                                            uint64_t optimization_flags);
     void record_input_projection(const ncnn::VkMat& input, ncnn::VkMat& output,
-                                 ncnn::VkCompute& command, bool normalize) const;
+                                 ncnn::VkCompute& command, bool normalize,
+                                 ncnn::VkMat* row_scale_workspace = nullptr) const;
     void record_output_projection(const ncnn::VkMat& input, ncnn::VkMat& output,
                                   ncnn::VkCompute& command) const;
 
