@@ -193,8 +193,9 @@ class ModelAdapter:
         resolved_type = (native_type or config_type) if self._gguf else (config_type or native_type)
         self.model_type = str(resolved_type or "unknown").lower()
         self.name = self._model_name(self.model_type)
-        # PhiMoE is a plain instruct model without a reasoning channel.
-        self.thinking = bool(thinking) and self.name != "phimoe"
+        # PhiMoE and plain Qwen3 instruction templates have no reasoning channel.
+        plain = self.name == "qwen3" and self._native_model_info.get("native_plain_chat") is True
+        self.thinking = bool(thinking) and self.name != "phimoe" and not plain
         self._stop_tokens = self._validate_stop_tokens(native_stop_tokens)
         self.model_fingerprint, self.legacy_model_fingerprints = self._fingerprints()
 

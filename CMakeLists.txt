@@ -199,6 +199,7 @@ set(NCNN_MOE_SOURCES
     src/models/ggufmodel.cpp
     src/models/ggufmodel_gptoss.cpp
     src/models/ggufmodel_qwen.cpp
+    src/models/ggufmodel_qwen3.cpp
     src/models/tokenizer.cpp
     # Storage
     src/storage/expertcache.cpp
@@ -224,6 +225,7 @@ if(NCNN_MOE_SIZE_OPTIMIZE_COLD_PATHS AND NOT NCNN_MOE_OPT_LEVEL STREQUAL "O0")
         src/models/ggufmodel.cpp
         src/models/ggufmodel_gptoss.cpp
         src/models/ggufmodel_qwen.cpp
+        src/models/ggufmodel_qwen3.cpp
         src/models/modeladapter.cpp
         src/models/modeladapter_deepseekv4.cpp
         src/models/modeladapter_gptoss.cpp
@@ -676,10 +678,10 @@ if(NCNN_MOE_BUILD_TESTS)
     add_test(NAME ncnn_moe_public_api_test COMMAND ncnn_moe_public_api_test)
     set_tests_properties(ncnn_moe_public_api_test PROPERTIES TIMEOUT 60)
 
+    # Model-driven JSONL harness; run manually against a tokenizer package.
     add_executable(ncnn_moe_tokenizer_test tests/test_tokenizer.cpp)
     target_link_libraries(ncnn_moe_tokenizer_test PRIVATE ncnn::moe)
     target_include_directories(ncnn_moe_tokenizer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    add_test(NAME ncnn_moe_tokenizer COMMAND ncnn_moe_tokenizer_test)
 
     add_test(
         NAME ncnn_moe_style

@@ -32,6 +32,10 @@ public:
     {
         return stops;
     }
+    bool plain_chat() const noexcept
+    {
+        return plain;
+    }
 
 private:
     struct EncodeScratch;
@@ -97,6 +101,7 @@ private:
     Family family = Family::None;
     bool ignore_merges = false;
     bool merge_leading_system_messages = false;
+    bool plain = false;
 };
 
 } // namespace moe

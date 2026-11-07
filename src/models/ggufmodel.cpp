@@ -1,6 +1,7 @@
 #include "ggufmodel.h"
 #include "ggufmodel_gptoss.h"
 #include "ggufmodel_qwen.h"
+#include "ggufmodel_qwen3.h"
 #include "json.h"
 
 #include <cmath>
@@ -351,6 +352,7 @@ static Result<const GgufModelEntry*> gguf_model_entry(const GgufArchive& archive
     static const GgufModelEntry entries[] = {
         {"deepseek4", deepseek_gguf_manifest, deepseek_gguf_tensors},
         {"gpt-oss", gguf_gpt_oss_manifest, gguf_gpt_oss_tensors},
+        {"qwen3", gguf_qwen3_manifest, gguf_qwen3_tensors},
         {"qwen35", gguf_qwen_manifest, gguf_qwen_tensors},
         {"qwen35moe", gguf_qwen_manifest, gguf_qwen_tensors},
         {"qwen4exp", gguf_qwen_manifest, gguf_qwen_tensors}};
