@@ -1,0 +1,164 @@
+#version 450
+
+// Split phase of the mask-free decode attention.
+//
+// attention_decode_sdpa.comp scans the whole cache with one workgroup per head,
+// which stops scaling once the cache is longer than a few thousand rows. This
+// shader scans one KV range per workgroup and stores a partial online-softmax
+// state (numerator, maximum, denominator) per (head, split); the merge shader
+// combines them. The block arithmetic matches the single-workgroup kernel.
+//
+// 256 invocations cover 256 head dimensions. The first 128 drive the QK scan and
+// the upper half only contributes output dimensions.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer query_blob
+{
+    float query_data[];
+};
+layout(binding = 1) readonly buffer key_blob
+{
+    sfp key_data[];
+};
+layout(binding = 2) readonly buffer value_blob
+{
+    sfp value_data[];
+};
+layout(binding = 3) readonly buffer sink_blob
+{
+    float sink_data[];
+};
+layout(binding = 4) writeonly buffer partial_blob
+{
+    float partial_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint head_dimension;
+    uint destination_count;
+    uint head_count;
+    uint key_value_head_count;
+    uint query_cstep;
+    uint key_cstep;
+    uint value_cstep;
+    uint use_attention_sink;
+    float scale;
+    uint split_count;
+    uint split_tokens;
+}
+p;
+
+shared float reduction[256];
+shared float cached_query[256];
+shared float scores[16];
+shared float weights[16];
+shared float online_maximum;
+shared float online_sum;
+shared float previous_scale;
+shared float next_maximum;
+
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint head = gl_WorkGroupID.z;
+    const uint split = gl_WorkGroupID.y;
+    if (head >= p.head_count || split >= p.split_count || p.split_tokens == 0)
+        return;
+    const uint split_begin = min(p.destination_count, split * p.split_tokens);
+    const uint split_end = min(p.destination_count, split_begin + p.split_tokens);
+    if (split_begin >= split_end)
+        return;
+
+    const uint heads_per_group = p.head_count / p.key_value_head_count;
+    const uint key_value_head = head / heads_per_group;
+    const uint query_base = head * p.query_cstep;
+    const uint key_base = key_value_head * p.key_cstep;
+    const uint value_base = key_value_head * p.value_cstep;
+    float numerator = 0.0;
+
+    for (uint index = lane; index < p.head_dimension; index += 256u)
+        cached_query[index] = query_data[query_base + index];
+    if (lane == 0)
+    {
+        online_maximum = -3.402823466e+38;
+        online_sum = 0.0;
+    }
+    barrier();
+
+    const uint token_lane = (lane & 127u) >> 3;
+    const uint dimension_lane = lane & 7u;
+    for (uint block = split_begin; block < split_end; block += 16)
+    {
+        const uint token = block + token_lane;
+        const bool valid_token = token < split_end;
+        const bool sink_token = p.use_attention_sink != 0 && token + 1 == p.destination_count;
+        float partial = 0.0;
+        if (valid_token && !sink_token && lane < 128u)
+        {
+            for (uint dimension = dimension_lane; dimension < p.head_dimension; dimension += 8)
+                partial += cached_query[dimension]
+                           * buffer_ld1(key_data, key_base + token * p.head_dimension + dimension);
+        }
+        reduction[lane] = partial;
+        barrier();
+        for (uint stride = 4; stride > 0; stride >>= 1)
+        {
+            if (dimension_lane < stride)
+                reduction[lane] += reduction[lane + stride];
+            barrier();
+        }
+        if (lane < 128u && dimension_lane == 0)
+            scores[token_lane] = !valid_token ? -3.402823466e+38
+                                 : sink_token ? sink_data[head]
+                                              : reduction[lane] * p.scale;
+        barrier();
+
+        if (lane == 0)
+        {
+            float block_maximum = scores[0];
+            for (uint index = 1; index < 16; ++index)
+                block_maximum = max(block_maximum, scores[index]);
+            next_maximum = max(online_maximum, block_maximum);
+            previous_scale = online_sum == 0.0 ? 0.0 : exp(online_maximum - next_maximum);
+        }
+        barrier();
+        if (lane < 16)
+            weights[lane] = block + lane < split_end ? exp(scores[lane] - next_maximum) : 0.0;
+        barrier();
+        if (lane == 0)
+        {
+            float block_sum = 0.0;
+            for (uint index = 0; index < 16; ++index)
+                block_sum += weights[index];
+            online_sum = online_sum * previous_scale + block_sum;
+            online_maximum = next_maximum;
+        }
+        barrier();
+
+        if (lane < p.head_dimension)
+        {
+            float block_numerator = 0.0;
+            for (uint index = 0; index < 16 && block + index < split_end; ++index)
+            {
+                const uint value_token = block + index;
+                if (p.use_attention_sink == 0 || value_token + 1 != p.destination_count)
+                    block_numerator += weights[index]
+                                       * buffer_ld1(value_data, value_base + value_token * p.head_dimension + lane);
+            }
+            numerator = numerator * previous_scale + block_numerator;
+        }
+        barrier();
+    }
+
+    // [head][split][head_dimension numerator][maximum][denominator]
+    const uint row = (head * p.split_count + split) * (p.head_dimension + 2u);
+    if (lane < p.head_dimension)
+        partial_data[row + lane] = numerator;
+    if (lane == 0)
+    {
+        partial_data[row + p.head_dimension] = online_maximum;
+        partial_data[row + p.head_dimension + 1u] = online_sum;
+    }
+}

@@ -1,0 +1,67 @@
+#version 450
+
+// Merge phase of the split decode attention: combines the per-split online
+// softmax states written by attention_decode_split.comp into the final output.
+//
+// One workgroup owns one head, one invocation per head dimension (at most 256).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer partial_blob
+{
+    float partial_data[];
+};
+layout(binding = 1) writeonly buffer output_blob
+{
+    float output_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint head_dimension;
+    uint head_count;
+    uint split_count;
+}
+p;
+
+shared float merged_maximum;
+shared float merged_denominator;
+
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint head = gl_WorkGroupID.x;
+    if (head >= p.head_count || p.split_count == 0)
+        return;
+
+    float maximum = -3.402823466e+38;
+    for (uint split = 0; split < p.split_count; ++split)
+        maximum = max(maximum, partial_data[(head * p.split_count + split) * (p.head_dimension + 2u) + p.head_dimension]);
+    if (lane == 0)
+        merged_maximum = maximum;
+    barrier();
+    maximum = merged_maximum;
+
+    float numerator = 0.0;
+    float denominator = 0.0;
+    for (uint split = 0; split < p.split_count; ++split)
+    {
+        const uint row = (head * p.split_count + split) * (p.head_dimension + 2u);
+        const float split_maximum = partial_data[row + p.head_dimension];
+        if (split_maximum <= -3.402823466e+38)
+            continue;
+        const float split_scale = exp(split_maximum - maximum);
+        if (lane < p.head_dimension)
+            numerator += partial_data[row + lane] * split_scale;
+        if (lane == 0)
+            denominator += partial_data[row + p.head_dimension + 1u] * split_scale;
+    }
+    if (lane == 0)
+        merged_denominator = denominator;
+    barrier();
+    if (lane < p.head_dimension)
+    {
+        const float sum = merged_denominator;
+        output_data[head * p.head_dimension + lane] = sum == 0.0 ? 0.0 : numerator / sum;
+    }
+}
