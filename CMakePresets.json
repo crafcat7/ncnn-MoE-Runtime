@@ -9,7 +9,7 @@
     {
       "name": "worker-release",
       "displayName": "Release worker",
-      "binaryDir": "${sourceDir}/build-worker",
+      "binaryDir": "${sourceDir}/build-ncnn",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "NCNN_MOE_BUILD_TESTS": "OFF",
@@ -20,7 +20,7 @@
       "name": "worker-release-cpu",
       "displayName": "Release worker (CPU only)",
       "inherits": "worker-release",
-      "binaryDir": "${sourceDir}/build-worker-cpu",
+      "binaryDir": "${sourceDir}/build-ncnn-cpu",
       "cacheVariables": {
         "NCNN_MOE_USE_VULKAN": "OFF"
       }
