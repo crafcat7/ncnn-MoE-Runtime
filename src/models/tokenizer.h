@@ -32,9 +32,9 @@ public:
     {
         return stops;
     }
-    bool plain_chat_enabled() const noexcept
+    bool plain_chat() const noexcept
     {
-        return plain_chat;
+        return plain;
     }
 
 private:
@@ -101,7 +101,7 @@ private:
     Family family = Family::None;
     bool ignore_merges = false;
     bool merge_leading_system_messages = false;
-    bool plain_chat = false;
+    bool plain = false;
 };
 
 } // namespace moe

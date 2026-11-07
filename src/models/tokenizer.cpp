@@ -273,6 +273,22 @@ static const char qwen3_template[] = R"QWEN3({%- if tools %}
     {%- endif %}
 {%- endif %})QWEN3";
 
+static bool qwen3_chat(std::string_view chat, bool& plain)
+{
+    if (chat == std::string_view(qwen3_template, sizeof(qwen3_template) - 1))
+    {
+        plain = false;
+        return true;
+    }
+    if (chat.find("thinking") == std::string_view::npos
+        && chat.find("reasoning_content") == std::string_view::npos)
+    {
+        plain = true;
+        return true;
+    }
+    return false;
+}
+
 static const char qwen36_template[] = R"QWEN({%- set image_count = namespace(value=0) %}
 {%- set video_count = namespace(value=0) %}
 {%- macro render_content(content, do_vision_count, is_system_content=false) %}
@@ -962,13 +978,7 @@ bool Tokenizer::load_gguf_impl(const std::string& model_path, size_t vocabulary_
             || !optional_id("tokenizer.ggml.bos_token_id", base_vocabulary))
             return false;
         const auto* chat = string_value("tokenizer.chat_template");
-        if (!chat)
-            return false;
-        if (*chat == std::string_view(qwen3_template, sizeof(qwen3_template) - 1))
-            new_plain_chat = false;
-        else if (chat->find("thinking") == std::string::npos && chat->find("reasoning_content") == std::string::npos)
-            new_plain_chat = true;
-        else
+        if (!chat || !qwen3_chat(*chat, new_plain_chat))
             return false;
     }
     else
@@ -1168,7 +1178,7 @@ bool Tokenizer::load_gguf_impl(const std::string& model_path, size_t vocabulary_
     family = new_family;
     ignore_merges = gpt;
     merge_leading_system_messages = new_merge_leading_system_messages;
-    plain_chat = new_plain_chat;
+    plain = new_plain_chat;
     return true;
 }
 
@@ -1308,14 +1318,8 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
             if (template_input.bad())
                 return false;
         }
-        if (*chat_template != qwen3_template)
-        {
-            // Plain Qwen3 instruction templates omit the reasoning channel.
-            if (chat_template->find("<think>") != std::string::npos
-                || chat_template->find("reasoning_content") != std::string::npos)
-                return false;
-            new_plain_chat = true;
-        }
+        if (!qwen3_chat(*chat_template, new_plain_chat))
+            return false;
     }
     else if (new_family == Family::Qwen36 || new_family == Family::Qwen38)
     {
@@ -2258,7 +2262,7 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
     family = new_family;
     ignore_merges = profile_ignore_merges;
     merge_leading_system_messages = new_merge_leading_system_messages;
-    plain_chat = new_plain_chat;
+    plain = new_plain_chat;
     return true;
 }
 
@@ -3608,7 +3612,7 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
                 }
             }
             prompt += "<|im_start|>assistant\n";
-            if (!plain_chat && (family == Family::Qwen38 || (static_cast<int32_t>(i) > last_user_index && (!qwen3 || i + 1 == messages.size() || !reasoning.empty()))))
+            if (!plain && (family == Family::Qwen38 || (static_cast<int32_t>(i) > last_user_index && (!qwen3 || i + 1 == messages.size() || !reasoning.empty()))))
             {
                 if (qwen3)
                 {
@@ -3641,9 +3645,9 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
     }
 
     prompt += "<|im_start|>assistant\n";
-    if (!enable_thinking && !plain_chat)
+    if (!enable_thinking && !plain)
         prompt += "<think>\n\n</think>\n\n";
-    else if (!qwen3 && !plain_chat)
+    else if (!qwen3 && !plain)
         prompt += "<think>\n";
     std::vector<int32_t> ids;
     encode_impl(prompt, true, scratch, ids);

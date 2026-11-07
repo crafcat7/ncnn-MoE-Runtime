@@ -98,7 +98,7 @@ const std::vector<int32_t>& Model::stop_tokens() const noexcept
 
 bool Model::plain_chat() const noexcept
 {
-    return compiled->tokenizer && compiled->tokenizer->plain_chat_enabled();
+    return compiled->tokenizer && compiled->tokenizer->plain_chat();
 }
 
 const CompiledModel& model_compiled(const Model& model) noexcept
