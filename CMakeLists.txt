@@ -508,7 +508,9 @@ endif()
 # Embed GLSL for runtime compilation.
 if(NCNN_MOE_WITH_VULKAN)
     set(NCNN_MOE_VULKAN_SHADER_SOURCES
+        src/kernels/vulkan/attention_decode_merge.comp
         src/kernels/vulkan/attention_decode_sdpa.comp
+        src/kernels/vulkan/attention_decode_split.comp
         src/kernels/vulkan/attention_gqa_matrix.comp
         src/kernels/vulkan/attention_gqa_reduce.comp
         src/kernels/vulkan/attention_output_gate.comp
