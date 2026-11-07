@@ -32,6 +32,7 @@ public:
     // to flush an incomplete final character without appending another token.
     [[nodiscard]] Result<std::string> decode(int32_t token_id, std::string& pending, bool final = false) const;
     [[nodiscard]] const std::vector<int32_t>& stop_tokens() const noexcept;
+    [[nodiscard]] bool plain_chat() const noexcept;
 
 private:
     explicit Model(std::shared_ptr<const CompiledModel> _compiled);

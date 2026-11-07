@@ -887,6 +887,7 @@ bool Tokenizer::load_gguf_impl(const std::string& model_path, size_t vocabulary_
 
     Family new_family = Family::None;
     bool new_merge_leading_system_messages = false;
+    bool new_plain_chat = false;
     size_t base_vocabulary = 0;
     size_t total_vocabulary = 0;
     if (*architecture == "deepseek4" && *pre == "joyai-llm")
@@ -939,6 +940,37 @@ bool Tokenizer::load_gguf_impl(const std::string& model_path, size_t vocabulary_
         if (new_family == Family::None)
             return false;
     }
+    else if (*architecture == "qwen3" && *pre == "qwen2")
+    {
+        new_family = Family::Qwen3;
+        total_vocabulary = tokens->size();
+        base_vocabulary = total_vocabulary;
+        for (uint32_t id = 0; id < tokens->size(); ++id)
+        {
+            const auto type = (*types)[id].integer();
+            if (!type)
+                return false;
+            if (*type != 1)
+            {
+                base_vocabulary = id;
+                break;
+            }
+        }
+        if (base_vocabulary == total_vocabulary || base_vocabulary < 2
+            || integer_value("tokenizer.ggml.eos_token_id") != base_vocabulary + 2
+            || integer_value("tokenizer.ggml.padding_token_id") != base_vocabulary
+            || !optional_id("tokenizer.ggml.bos_token_id", base_vocabulary))
+            return false;
+        const auto* chat = string_value("tokenizer.chat_template");
+        if (!chat)
+            return false;
+        if (*chat == std::string_view(qwen3_template, sizeof(qwen3_template) - 1))
+            new_plain_chat = false;
+        else if (chat->find("thinking") == std::string::npos && chat->find("reasoning_content") == std::string::npos)
+            new_plain_chat = true;
+        else
+            return false;
+    }
     else
         return false;
     if (tokens->size() != total_vocabulary || (vocabulary_size != 0 && vocabulary_size != total_vocabulary))
@@ -950,6 +982,7 @@ bool Tokenizer::load_gguf_impl(const std::string& model_path, size_t vocabulary_
             return false;
     }
     const bool qwen = new_family == Family::Qwen36 || new_family == Family::Qwen38;
+    const bool qwen3 = new_family == Family::Qwen3;
     const bool gpt = new_family == Family::GptOss;
     const bool deepseek = new_family == Family::DeepSeekV4;
     static const std::array<std::string_view, 21> gpt_tokens = {
@@ -965,11 +998,12 @@ bool Tokenizer::load_gguf_impl(const std::string& model_path, size_t vocabulary_
         "<|fim_middle|>", "<|fim_suffix|>", "<|fim_pad|>", "<|repo_name|>", "<|file_sep|>", "<tool_response>",
         "</tool_response>", "<think>", "</think>", "<|audio_start|>", "<|audio_end|>", "<tts_pad>", "<tts_text_bos>",
         "<tts_text_eod>", "<tts_text_bos_single>", "<|audio_pad|>"};
-    if (gpt || qwen)
+    if (gpt || qwen || qwen3)
     {
         const std::span<const std::string_view> expected = gpt ? std::span<const std::string_view>(gpt_tokens)
                                                                : std::span<const std::string_view>(qwen_tokens);
-        for (size_t i = 0; i < expected.size(); ++i)
+        const size_t expected_count = qwen3 ? 26 : expected.size();
+        for (size_t i = 0; i < expected_count; ++i)
         {
             const auto* token = (*tokens)[base_vocabulary + i].string();
             if (!token || (*token != expected[i] && !(gpt && i == 20 && *token == "<|reserved_200018|>")))
@@ -1053,8 +1087,10 @@ bool Tokenizer::load_gguf_impl(const std::string& model_path, size_t vocabulary_
         const auto* token = (*tokens)[id].string();
         const auto type = (*types)[id].integer();
         const bool added = (deepseek && id < 3) || id >= base_vocabulary;
-        const size_t added_count = gpt ? gpt_tokens.size() : qwen ? qwen_tokens.size()
-                                                                  : total_vocabulary - base_vocabulary;
+        const size_t added_count = qwen3  ? 26
+                                   : gpt  ? gpt_tokens.size()
+                                   : qwen ? qwen_tokens.size()
+                                          : total_vocabulary - base_vocabulary;
         const bool unused = !deepseek && id >= base_vocabulary + added_count;
         if (!token || token->empty() || !type || !vocab.emplace(*token, id).second)
             return false;
@@ -1071,9 +1107,9 @@ bool Tokenizer::load_gguf_impl(const std::string& model_path, size_t vocabulary_
         // GGUF exporters may promote user-defined <|fim_*|> pieces to CONTROL.
         // The supported Qwen profile still exposes them, as its HF tokenizer does.
         const size_t relative = added && id >= base_vocabulary ? id - base_vocabulary : 0;
-        const bool special = qwen  ? added && (relative < 14 || relative >= 26)
-                             : gpt ? added
-                                   : id < 3 || *type == 3;
+        const bool special = qwen || qwen3 ? added && (relative < 14 || relative >= 26)
+                             : gpt         ? added
+                                           : id < 3 || *type == 3;
         if (!store(id, *token, added, special))
             return false;
         if (added && !(gpt && id == 200018))
@@ -1125,12 +1161,14 @@ bool Tokenizer::load_gguf_impl(const std::string& model_path, size_t vocabulary_
         }
         stops = {200002, 200012};
     }
+    else if (qwen3)
+        stops = {static_cast<int32_t>(base_vocabulary + 2), static_cast<int32_t>(base_vocabulary)};
     else
         stops = qwen ? std::vector<int32_t>{248046, 248044} : std::vector<int32_t>{1};
     family = new_family;
     ignore_merges = gpt;
     merge_leading_system_messages = new_merge_leading_system_messages;
-    plain_chat = false;
+    plain_chat = new_plain_chat;
     return true;
 }
 

@@ -766,6 +766,7 @@ private:
         if (native_text_supported)
         {
             model_json.add_string("native_text_version", "ncnn-moe-text-v2");
+            model_json.add_bool("native_plain_chat", model->plain_chat());
             const std::vector<int32_t>& native_stop_tokens = model->stop_tokens();
             std::string stop_tokens = "[";
             for (size_t index = 0; index < native_stop_tokens.size(); ++index)

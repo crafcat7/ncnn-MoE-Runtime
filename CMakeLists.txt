@@ -199,6 +199,7 @@ set(NCNN_MOE_SOURCES
     src/models/ggufmodel.cpp
     src/models/ggufmodel_gptoss.cpp
     src/models/ggufmodel_qwen.cpp
+    src/models/ggufmodel_qwen3.cpp
     src/models/tokenizer.cpp
     # Storage
     src/storage/expertcache.cpp
@@ -224,6 +225,7 @@ if(NCNN_MOE_SIZE_OPTIMIZE_COLD_PATHS AND NOT NCNN_MOE_OPT_LEVEL STREQUAL "O0")
         src/models/ggufmodel.cpp
         src/models/ggufmodel_gptoss.cpp
         src/models/ggufmodel_qwen.cpp
+        src/models/ggufmodel_qwen3.cpp
         src/models/modeladapter.cpp
         src/models/modeladapter_deepseekv4.cpp
         src/models/modeladapter_gptoss.cpp

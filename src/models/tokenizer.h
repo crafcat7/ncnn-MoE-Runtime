@@ -32,6 +32,10 @@ public:
     {
         return stops;
     }
+    bool plain_chat_enabled() const noexcept
+    {
+        return plain_chat;
+    }
 
 private:
     struct EncodeScratch;

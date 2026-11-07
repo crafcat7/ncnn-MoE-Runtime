@@ -194,15 +194,7 @@ class ModelAdapter:
         self.model_type = str(resolved_type or "unknown").lower()
         self.name = self._model_name(self.model_type)
         # PhiMoE and plain Qwen3 instruction templates have no reasoning channel.
-        plain = False
-        if self.name == "qwen3":
-            template_path = self._asset_root / "chat_template.jinja"
-            if template_path.is_file():
-                plain = "<think>" not in template_path.read_text(encoding="utf-8")
-            else:
-                config_path = self._asset_root / "tokenizer_config.json"
-                template = _load_json(config_path).get("chat_template") if config_path.is_file() else None
-                plain = isinstance(template, str) and "<think>" not in template
+        plain = self.name == "qwen3" and self._native_model_info.get("native_plain_chat") is True
         self.thinking = bool(thinking) and self.name != "phimoe" and not plain
         self._stop_tokens = self._validate_stop_tokens(native_stop_tokens)
         self.model_fingerprint, self.legacy_model_fingerprints = self._fingerprints()
