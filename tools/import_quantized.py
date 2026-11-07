@@ -38,7 +38,7 @@ ASSETS = ("tokenizer.json", "tokenizer_config.json", "tokenizer.model", "vocab.j
           "merges.txt", "special_tokens_map.json", "added_tokens.json",
           "generation_config.json", "chat_template.jinja", "preprocessor_config.json")
 QWEN_TYPES = {"qwen3_5", "qwen3_5_moe", "qwen4_exp"}
-MODEL_TYPES = QWEN_TYPES | {"gpt_oss", "deepseek_v4"}
+MODEL_TYPES = QWEN_TYPES | {"qwen3", "gpt_oss", "deepseek_v4"}
 
 
 @dataclass(frozen=True)
@@ -525,6 +525,8 @@ def validate_gguf_metadata(reader: Any, architecture: str, config: dict[str, Any
     if head_dimension is None and type(heads) is int and heads > 0 and type(hidden) is int and hidden % heads == 0:
         head_dimension = hidden // heads
     partial = rope.get("partial_rotary_factor", text.get("partial_rotary_factor"))
+    if partial is None and architecture == "qwen3":
+        partial = 1.0
     rope_dimension = None
     if type(head_dimension) is int and type(partial) in {int, float}:
         product = head_dimension * partial
@@ -546,7 +548,7 @@ def validate_gguf_metadata(reader: Any, architecture: str, config: dict[str, Any
         "rope.dimension_count": rope_dimension,
         "attention.layer_norm_rms_epsilon": text.get("rms_norm_eps"),
     }
-    if architecture == "qwen35":
+    if architecture == "qwen35" or architecture == "qwen3":
         expected["feed_forward_length"] = text.get("intermediate_size")
     elif architecture in {"qwen35moe", "qwen4exp"}:
         expected["expert_feed_forward_length"] = text.get("moe_intermediate_size")
@@ -772,7 +774,7 @@ def gguf_weights(source: Path, config: dict[str, Any]) -> Iterator[tuple[str, st
         raise ValueError("GGUF import requires the official llama.cpp Python package: pip install gguf") from error
     text = text_config(config)
     family = config.get("model_type")
-    expected_architecture = {"qwen3_5": "qwen35", "qwen3_5_moe": "qwen35moe", "qwen4_exp": "qwen4exp",
+    expected_architecture = {"qwen3": "qwen3", "qwen3_5": "qwen35", "qwen3_5_moe": "qwen35moe", "qwen4_exp": "qwen4exp",
                              "gpt_oss": "gpt-oss", "deepseek_v4": "deepseek4"}.get(family)
     if expected_architecture is None:
         raise ValueError(f"unsupported canonical model_type: {family!r}")
