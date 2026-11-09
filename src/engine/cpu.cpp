@@ -477,6 +477,48 @@ uint32_t cpu_openmp_thread_limit() noexcept
 #endif
 }
 
+void cpu_bind_thread() noexcept
+{
+#if defined(_WIN32) && defined(_OPENMP)
+    thread_local bool pinned = false;
+    if (pinned)
+        return;
+    pinned = true;
+    static const std::vector<DWORD_PTR> core_masks = []() {
+        std::vector<DWORD_PTR> masks;
+        DWORD length = 0;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length);
+        if (length == 0)
+            return masks;
+        std::vector<unsigned char> buffer(length);
+        if (!GetLogicalProcessorInformationEx(RelationProcessorCore,
+                                              reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()),
+                                              &length))
+            return masks;
+        DWORD offset = 0;
+        while (offset + sizeof(DWORD) <= length)
+        {
+            const auto* info = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
+            if (info->Relationship == RelationProcessorCore && info->Size >= sizeof(DWORD))
+            {
+                // Prefer the first logical processor of every physical core.
+                const DWORD_PTR mask = info->Processor.GroupMask[0].Mask;
+                if (mask != 0)
+                    masks.push_back(mask & (~mask + 1));
+            }
+            if (info->Size == 0)
+                break;
+            offset += info->Size;
+        }
+        return masks;
+    }();
+    if (core_masks.empty())
+        return;
+    const size_t index = static_cast<size_t>(omp_get_thread_num()) % core_masks.size();
+    SetThreadAffinityMask(GetCurrentThread(), core_masks[index]);
+#endif
+}
+
 CpuThreadBudgetController::Lease::Lease(CpuThreadBudgetController* _owner, uint32_t _count, uint32_t _base_count) noexcept
     : owner(_owner), count(_count), base_count(_base_count)
 {

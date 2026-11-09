@@ -696,6 +696,422 @@ size_t avx512_float_argmax(const float* values, size_t count) noexcept
     return count;
 }
 
+void avx512_gdn_step(float* state,
+                     const float* key,
+                     const float* query,
+                     const float* value,
+                     uint32_t key_dim,
+                     uint32_t value_dim,
+                     float decay,
+                     float beta,
+                     float scale,
+                     float* memory,
+                     float* delta,
+                     float* output) noexcept
+{
+    const __m512 decay_values = _mm512_set1_ps(decay);
+    const __m512 beta_values = _mm512_set1_ps(beta);
+    const __m512 scale_values = _mm512_set1_ps(scale);
+    const __m512 zero = _mm512_setzero_ps();
+
+    if (value_dim == 128)
+    {
+        __m512 memory_regs[8];
+        __m512 delta_regs[8];
+        __m512 output_regs[8];
+        memory_regs[0] = zero;
+        memory_regs[1] = zero;
+        memory_regs[2] = zero;
+        memory_regs[3] = zero;
+        memory_regs[4] = zero;
+        memory_regs[5] = zero;
+        memory_regs[6] = zero;
+        memory_regs[7] = zero;
+        for (uint32_t row = 0; row < key_dim; ++row)
+        {
+            const float* state_row = state + static_cast<size_t>(row) * 128;
+            const __m512 key_values = _mm512_set1_ps(key[row]);
+            const __m512 decayed0 = _mm512_mul_ps(_mm512_loadu_ps(state_row + 0), decay_values);
+            memory_regs[0] = _mm512_fmadd_ps(decayed0, key_values, memory_regs[0]);
+            const __m512 decayed1 = _mm512_mul_ps(_mm512_loadu_ps(state_row + 16), decay_values);
+            memory_regs[1] = _mm512_fmadd_ps(decayed1, key_values, memory_regs[1]);
+            const __m512 decayed2 = _mm512_mul_ps(_mm512_loadu_ps(state_row + 32), decay_values);
+            memory_regs[2] = _mm512_fmadd_ps(decayed2, key_values, memory_regs[2]);
+            const __m512 decayed3 = _mm512_mul_ps(_mm512_loadu_ps(state_row + 48), decay_values);
+            memory_regs[3] = _mm512_fmadd_ps(decayed3, key_values, memory_regs[3]);
+            const __m512 decayed4 = _mm512_mul_ps(_mm512_loadu_ps(state_row + 64), decay_values);
+            memory_regs[4] = _mm512_fmadd_ps(decayed4, key_values, memory_regs[4]);
+            const __m512 decayed5 = _mm512_mul_ps(_mm512_loadu_ps(state_row + 80), decay_values);
+            memory_regs[5] = _mm512_fmadd_ps(decayed5, key_values, memory_regs[5]);
+            const __m512 decayed6 = _mm512_mul_ps(_mm512_loadu_ps(state_row + 96), decay_values);
+            memory_regs[6] = _mm512_fmadd_ps(decayed6, key_values, memory_regs[6]);
+            const __m512 decayed7 = _mm512_mul_ps(_mm512_loadu_ps(state_row + 112), decay_values);
+            memory_regs[7] = _mm512_fmadd_ps(decayed7, key_values, memory_regs[7]);
+        }
+        delta_regs[0] = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(value + 0), memory_regs[0]), beta_values);
+        output_regs[0] = zero;
+        delta_regs[1] = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(value + 16), memory_regs[1]), beta_values);
+        output_regs[1] = zero;
+        delta_regs[2] = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(value + 32), memory_regs[2]), beta_values);
+        output_regs[2] = zero;
+        delta_regs[3] = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(value + 48), memory_regs[3]), beta_values);
+        output_regs[3] = zero;
+        delta_regs[4] = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(value + 64), memory_regs[4]), beta_values);
+        output_regs[4] = zero;
+        delta_regs[5] = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(value + 80), memory_regs[5]), beta_values);
+        output_regs[5] = zero;
+        delta_regs[6] = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(value + 96), memory_regs[6]), beta_values);
+        output_regs[6] = zero;
+        delta_regs[7] = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(value + 112), memory_regs[7]), beta_values);
+        output_regs[7] = zero;
+        for (uint32_t row = 0; row < key_dim; ++row)
+        {
+            float* state_row = state + static_cast<size_t>(row) * 128;
+            const __m512 key_values = _mm512_set1_ps(key[row]);
+            const __m512 query_values = _mm512_set1_ps(query[row]);
+            const __m512 updated0 = _mm512_fmadd_ps(key_values, delta_regs[0],
+                                                    _mm512_mul_ps(_mm512_loadu_ps(state_row + 0), decay_values));
+            _mm512_storeu_ps(state_row + 0, updated0);
+            output_regs[0] = _mm512_fmadd_ps(updated0, query_values, output_regs[0]);
+            const __m512 updated1 = _mm512_fmadd_ps(key_values, delta_regs[1],
+                                                    _mm512_mul_ps(_mm512_loadu_ps(state_row + 16), decay_values));
+            _mm512_storeu_ps(state_row + 16, updated1);
+            output_regs[1] = _mm512_fmadd_ps(updated1, query_values, output_regs[1]);
+            const __m512 updated2 = _mm512_fmadd_ps(key_values, delta_regs[2],
+                                                    _mm512_mul_ps(_mm512_loadu_ps(state_row + 32), decay_values));
+            _mm512_storeu_ps(state_row + 32, updated2);
+            output_regs[2] = _mm512_fmadd_ps(updated2, query_values, output_regs[2]);
+            const __m512 updated3 = _mm512_fmadd_ps(key_values, delta_regs[3],
+                                                    _mm512_mul_ps(_mm512_loadu_ps(state_row + 48), decay_values));
+            _mm512_storeu_ps(state_row + 48, updated3);
+            output_regs[3] = _mm512_fmadd_ps(updated3, query_values, output_regs[3]);
+            const __m512 updated4 = _mm512_fmadd_ps(key_values, delta_regs[4],
+                                                    _mm512_mul_ps(_mm512_loadu_ps(state_row + 64), decay_values));
+            _mm512_storeu_ps(state_row + 64, updated4);
+            output_regs[4] = _mm512_fmadd_ps(updated4, query_values, output_regs[4]);
+            const __m512 updated5 = _mm512_fmadd_ps(key_values, delta_regs[5],
+                                                    _mm512_mul_ps(_mm512_loadu_ps(state_row + 80), decay_values));
+            _mm512_storeu_ps(state_row + 80, updated5);
+            output_regs[5] = _mm512_fmadd_ps(updated5, query_values, output_regs[5]);
+            const __m512 updated6 = _mm512_fmadd_ps(key_values, delta_regs[6],
+                                                    _mm512_mul_ps(_mm512_loadu_ps(state_row + 96), decay_values));
+            _mm512_storeu_ps(state_row + 96, updated6);
+            output_regs[6] = _mm512_fmadd_ps(updated6, query_values, output_regs[6]);
+            const __m512 updated7 = _mm512_fmadd_ps(key_values, delta_regs[7],
+                                                    _mm512_mul_ps(_mm512_loadu_ps(state_row + 112), decay_values));
+            _mm512_storeu_ps(state_row + 112, updated7);
+            output_regs[7] = _mm512_fmadd_ps(updated7, query_values, output_regs[7]);
+        }
+        _mm512_storeu_ps(output + 0, _mm512_mul_ps(output_regs[0], scale_values));
+        _mm512_storeu_ps(output + 16, _mm512_mul_ps(output_regs[1], scale_values));
+        _mm512_storeu_ps(output + 32, _mm512_mul_ps(output_regs[2], scale_values));
+        _mm512_storeu_ps(output + 48, _mm512_mul_ps(output_regs[3], scale_values));
+        _mm512_storeu_ps(output + 64, _mm512_mul_ps(output_regs[4], scale_values));
+        _mm512_storeu_ps(output + 80, _mm512_mul_ps(output_regs[5], scale_values));
+        _mm512_storeu_ps(output + 96, _mm512_mul_ps(output_regs[6], scale_values));
+        _mm512_storeu_ps(output + 112, _mm512_mul_ps(output_regs[7], scale_values));
+        return;
+    }
+
+    uint32_t column = 0;
+    for (; column + 16 <= value_dim; column += 16)
+        _mm512_storeu_ps(memory + column, zero);
+    for (; column < value_dim; ++column)
+        memory[column] = 0.0f;
+
+    // Pass 1: decay the state into the memory vector.  The state is only read
+    // here; the updated value is recomputed in pass 2 and written once.
+    for (uint32_t row = 0; row < key_dim; ++row)
+    {
+        const float* state_row = state + static_cast<size_t>(row) * value_dim;
+        const __m512 key_values = _mm512_set1_ps(key[row]);
+        column = 0;
+        for (; column + 16 <= value_dim; column += 16)
+        {
+            const __m512 decayed = _mm512_mul_ps(_mm512_loadu_ps(state_row + column), decay_values);
+            _mm512_storeu_ps(memory + column,
+                             _mm512_fmadd_ps(decayed, key_values, _mm512_loadu_ps(memory + column)));
+        }
+        for (; column < value_dim; ++column)
+            memory[column] += state_row[column] * decay * key[row];
+    }
+
+    column = 0;
+    for (; column + 16 <= value_dim; column += 16)
+        _mm512_storeu_ps(delta + column,
+                         _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(value + column),
+                                                     _mm512_loadu_ps(memory + column)),
+                                       beta_values));
+    for (; column < value_dim; ++column)
+        delta[column] = (value[column] - memory[column]) * beta;
+
+    column = 0;
+    for (; column + 16 <= value_dim; column += 16)
+        _mm512_storeu_ps(output + column, zero);
+    for (; column < value_dim; ++column)
+        output[column] = 0.0f;
+
+    // Pass 2: apply the rank-one update in place and project it onto the
+    // query vector.  Fusing both passes keeps the 16K-element state resident
+    // while dropping the per-key vector helper call overhead.
+    for (uint32_t row = 0; row < key_dim; ++row)
+    {
+        float* state_row = state + static_cast<size_t>(row) * value_dim;
+        const __m512 key_values = _mm512_set1_ps(key[row]);
+        const __m512 query_values = _mm512_set1_ps(query[row]);
+        column = 0;
+        for (; column + 16 <= value_dim; column += 16)
+        {
+            const __m512 updated = _mm512_fmadd_ps(key_values,
+                                                   _mm512_loadu_ps(delta + column),
+                                                   _mm512_mul_ps(_mm512_loadu_ps(state_row + column),
+                                                                 decay_values));
+            _mm512_storeu_ps(state_row + column, updated);
+            _mm512_storeu_ps(output + column,
+                             _mm512_fmadd_ps(updated,
+                                             query_values,
+                                             _mm512_loadu_ps(output + column)));
+        }
+        for (; column < value_dim; ++column)
+        {
+            const float updated = state_row[column] * decay + key[row] * delta[column];
+            state_row[column] = updated;
+            output[column] += updated * query[row];
+        }
+    }
+
+    column = 0;
+    for (; column + 16 <= value_dim; column += 16)
+        _mm512_storeu_ps(output + column, _mm512_mul_ps(_mm512_loadu_ps(output + column), scale_values));
+    for (; column < value_dim; ++column)
+        output[column] *= scale;
+}
+
+void avx512_gdn_conv4(float* state,
+                      float* values,
+                      size_t value_stride,
+                      size_t first,
+                      size_t row_count,
+                      uint32_t begin,
+                      uint32_t end,
+                      uint32_t columns,
+                      const float* taps) noexcept
+{
+    const float* tap0 = taps;
+    const float* tap1 = taps + columns;
+    const float* tap2 = taps + static_cast<size_t>(columns) * 2;
+    const float* tap3 = taps + static_cast<size_t>(columns) * 3;
+    for (size_t token = 0; token < row_count; ++token)
+    {
+        float* row = values + (first + token) * value_stride;
+        uint32_t channel = begin;
+        for (; channel + 16 <= end; channel += 16)
+        {
+            const __m512 x = _mm512_loadu_ps(row + channel);
+            const __m512 h1 = _mm512_loadu_ps(state + columns + channel);
+            const __m512 h2 = _mm512_loadu_ps(state + static_cast<size_t>(columns) * 2 + channel);
+            const __m512 h3 = _mm512_loadu_ps(state + static_cast<size_t>(columns) * 3 + channel);
+            __m512 sum = _mm512_mul_ps(h1, _mm512_loadu_ps(tap0 + channel));
+            sum = _mm512_fmadd_ps(h2, _mm512_loadu_ps(tap1 + channel), sum);
+            sum = _mm512_fmadd_ps(h3, _mm512_loadu_ps(tap2 + channel), sum);
+            sum = _mm512_fmadd_ps(x, _mm512_loadu_ps(tap3 + channel), sum);
+            _mm512_storeu_ps(state + channel, h1);
+            _mm512_storeu_ps(state + columns + channel, h2);
+            _mm512_storeu_ps(state + static_cast<size_t>(columns) * 2 + channel, h3);
+            _mm512_storeu_ps(state + static_cast<size_t>(columns) * 3 + channel, x);
+            _mm512_storeu_ps(row + channel, sum);
+        }
+        for (; channel < end; ++channel)
+        {
+            const float x = row[channel];
+            const float h1 = state[columns + channel];
+            const float h2 = state[static_cast<size_t>(columns) * 2 + channel];
+            const float h3 = state[static_cast<size_t>(columns) * 3 + channel];
+            row[channel] = h1 * tap0[channel]
+                           + h2 * tap1[channel]
+                           + h3 * tap2[channel]
+                           + x * tap3[channel];
+            state[channel] = h1;
+            state[columns + channel] = h2;
+            state[static_cast<size_t>(columns) * 2 + channel] = h3;
+            state[static_cast<size_t>(columns) * 3 + channel] = x;
+        }
+    }
+}
+
+void avx512_pv_f32(float* output,
+                   const float* values0,
+                   size_t value_stride,
+                   const float* weights0,
+                   uint32_t count0,
+                   const float* values1,
+                   const float* weights1,
+                   uint32_t count1,
+                   uint32_t columns) noexcept
+{
+    uint32_t column = 0;
+    for (; column + 256 <= columns; column += 256)
+    {
+        __m512 a0 = _mm512_setzero_ps();
+        __m512 a1 = _mm512_setzero_ps();
+        __m512 a2 = _mm512_setzero_ps();
+        __m512 a3 = _mm512_setzero_ps();
+        __m512 a4 = _mm512_setzero_ps();
+        __m512 a5 = _mm512_setzero_ps();
+        __m512 a6 = _mm512_setzero_ps();
+        __m512 a7 = _mm512_setzero_ps();
+        __m512 a8 = _mm512_setzero_ps();
+        __m512 a9 = _mm512_setzero_ps();
+        __m512 a10 = _mm512_setzero_ps();
+        __m512 a11 = _mm512_setzero_ps();
+        __m512 a12 = _mm512_setzero_ps();
+        __m512 a13 = _mm512_setzero_ps();
+        __m512 a14 = _mm512_setzero_ps();
+        __m512 a15 = _mm512_setzero_ps();
+        const float* row = values0 + column;
+        for (uint32_t key = 0; key < count0; ++key)
+        {
+            const __m512 weight = _mm512_set1_ps(weights0[key]);
+            a0 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 0), a0);
+            a1 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 16), a1);
+            a2 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 32), a2);
+            a3 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 48), a3);
+            a4 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 64), a4);
+            a5 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 80), a5);
+            a6 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 96), a6);
+            a7 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 112), a7);
+            a8 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 128), a8);
+            a9 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 144), a9);
+            a10 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 160), a10);
+            a11 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 176), a11);
+            a12 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 192), a12);
+            a13 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 208), a13);
+            a14 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 224), a14);
+            a15 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 240), a15);
+            row += value_stride;
+        }
+        row = values1 + column;
+        for (uint32_t key = 0; key < count1; ++key)
+        {
+            const __m512 weight = _mm512_set1_ps(weights1[key]);
+            a0 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 0), a0);
+            a1 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 16), a1);
+            a2 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 32), a2);
+            a3 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 48), a3);
+            a4 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 64), a4);
+            a5 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 80), a5);
+            a6 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 96), a6);
+            a7 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 112), a7);
+            a8 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 128), a8);
+            a9 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 144), a9);
+            a10 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 160), a10);
+            a11 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 176), a11);
+            a12 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 192), a12);
+            a13 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 208), a13);
+            a14 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 224), a14);
+            a15 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 240), a15);
+            row += value_stride;
+        }
+        _mm512_storeu_ps(output + column + 0, _mm512_add_ps(_mm512_loadu_ps(output + column + 0), a0));
+        _mm512_storeu_ps(output + column + 16, _mm512_add_ps(_mm512_loadu_ps(output + column + 16), a1));
+        _mm512_storeu_ps(output + column + 32, _mm512_add_ps(_mm512_loadu_ps(output + column + 32), a2));
+        _mm512_storeu_ps(output + column + 48, _mm512_add_ps(_mm512_loadu_ps(output + column + 48), a3));
+        _mm512_storeu_ps(output + column + 64, _mm512_add_ps(_mm512_loadu_ps(output + column + 64), a4));
+        _mm512_storeu_ps(output + column + 80, _mm512_add_ps(_mm512_loadu_ps(output + column + 80), a5));
+        _mm512_storeu_ps(output + column + 96, _mm512_add_ps(_mm512_loadu_ps(output + column + 96), a6));
+        _mm512_storeu_ps(output + column + 112, _mm512_add_ps(_mm512_loadu_ps(output + column + 112), a7));
+        _mm512_storeu_ps(output + column + 128, _mm512_add_ps(_mm512_loadu_ps(output + column + 128), a8));
+        _mm512_storeu_ps(output + column + 144, _mm512_add_ps(_mm512_loadu_ps(output + column + 144), a9));
+        _mm512_storeu_ps(output + column + 160, _mm512_add_ps(_mm512_loadu_ps(output + column + 160), a10));
+        _mm512_storeu_ps(output + column + 176, _mm512_add_ps(_mm512_loadu_ps(output + column + 176), a11));
+        _mm512_storeu_ps(output + column + 192, _mm512_add_ps(_mm512_loadu_ps(output + column + 192), a12));
+        _mm512_storeu_ps(output + column + 208, _mm512_add_ps(_mm512_loadu_ps(output + column + 208), a13));
+        _mm512_storeu_ps(output + column + 224, _mm512_add_ps(_mm512_loadu_ps(output + column + 224), a14));
+        _mm512_storeu_ps(output + column + 240, _mm512_add_ps(_mm512_loadu_ps(output + column + 240), a15));
+    }
+    for (; column + 128 <= columns; column += 128)
+    {
+        __m512 a0 = _mm512_setzero_ps();
+        __m512 a1 = _mm512_setzero_ps();
+        __m512 a2 = _mm512_setzero_ps();
+        __m512 a3 = _mm512_setzero_ps();
+        __m512 a4 = _mm512_setzero_ps();
+        __m512 a5 = _mm512_setzero_ps();
+        __m512 a6 = _mm512_setzero_ps();
+        __m512 a7 = _mm512_setzero_ps();
+        const float* row = values0 + column;
+        for (uint32_t key = 0; key < count0; ++key)
+        {
+            const __m512 weight = _mm512_set1_ps(weights0[key]);
+            a0 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 0), a0);
+            a1 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 16), a1);
+            a2 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 32), a2);
+            a3 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 48), a3);
+            a4 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 64), a4);
+            a5 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 80), a5);
+            a6 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 96), a6);
+            a7 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 112), a7);
+            row += value_stride;
+        }
+        row = values1 + column;
+        for (uint32_t key = 0; key < count1; ++key)
+        {
+            const __m512 weight = _mm512_set1_ps(weights1[key]);
+            a0 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 0), a0);
+            a1 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 16), a1);
+            a2 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 32), a2);
+            a3 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 48), a3);
+            a4 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 64), a4);
+            a5 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 80), a5);
+            a6 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 96), a6);
+            a7 = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 112), a7);
+            row += value_stride;
+        }
+        _mm512_storeu_ps(output + column + 0, _mm512_add_ps(_mm512_loadu_ps(output + column + 0), a0));
+        _mm512_storeu_ps(output + column + 16, _mm512_add_ps(_mm512_loadu_ps(output + column + 16), a1));
+        _mm512_storeu_ps(output + column + 32, _mm512_add_ps(_mm512_loadu_ps(output + column + 32), a2));
+        _mm512_storeu_ps(output + column + 48, _mm512_add_ps(_mm512_loadu_ps(output + column + 48), a3));
+        _mm512_storeu_ps(output + column + 64, _mm512_add_ps(_mm512_loadu_ps(output + column + 64), a4));
+        _mm512_storeu_ps(output + column + 80, _mm512_add_ps(_mm512_loadu_ps(output + column + 80), a5));
+        _mm512_storeu_ps(output + column + 96, _mm512_add_ps(_mm512_loadu_ps(output + column + 96), a6));
+        _mm512_storeu_ps(output + column + 112, _mm512_add_ps(_mm512_loadu_ps(output + column + 112), a7));
+    }
+    for (; column + 16 <= columns; column += 16)
+    {
+        __m512 accumulator = _mm512_setzero_ps();
+        const float* row = values0 + column;
+        for (uint32_t key = 0; key < count0; ++key)
+        {
+            accumulator = _mm512_fmadd_ps(_mm512_set1_ps(weights0[key]), _mm512_loadu_ps(row), accumulator);
+            row += value_stride;
+        }
+        row = values1 + column;
+        for (uint32_t key = 0; key < count1; ++key)
+        {
+            accumulator = _mm512_fmadd_ps(_mm512_set1_ps(weights1[key]), _mm512_loadu_ps(row), accumulator);
+            row += value_stride;
+        }
+        _mm512_storeu_ps(output + column, _mm512_add_ps(_mm512_loadu_ps(output + column), accumulator));
+    }
+    for (; column < columns; ++column)
+    {
+        const float* row = values0 + column;
+        float sum = 0.0f;
+        for (uint32_t key = 0; key < count0; ++key)
+        {
+            sum += weights0[key] * row[0];
+            row += value_stride;
+        }
+        row = values1 + column;
+        for (uint32_t key = 0; key < count1; ++key)
+        {
+            sum += weights1[key] * row[0];
+            row += value_stride;
+        }
+        output[column] += sum;
+    }
+}
+
 } // namespace moe
 } // namespace ncnn
 

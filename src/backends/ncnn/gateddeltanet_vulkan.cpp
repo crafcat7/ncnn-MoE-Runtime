@@ -696,9 +696,14 @@ bool GatedDeltaState_vulkan::prepare_cpu_state(const std::vector<float>& convolu
     {
         return false;
     }
-    std::copy(convolution.begin(),
-              convolution.end(),
-              static_cast<float*>(implementation.cpu_convolution.mapped_ptr()));
+    {
+        float* destination = static_cast<float*>(implementation.cpu_convolution.mapped_ptr());
+        const uint32_t convolution_columns = implementation.convolution_size;
+        const uint32_t kernel_size = implementation.kernel_size;
+        for (uint32_t channel = 0; channel < convolution_columns; ++channel)
+            for (uint32_t tap = 0; tap < kernel_size; ++tap)
+                destination[static_cast<size_t>(channel) * kernel_size + tap] = convolution[static_cast<size_t>(tap) * convolution_columns + channel];
+    }
     std::copy(recurrent.begin(),
               recurrent.end(),
               static_cast<float*>(implementation.cpu_recurrent.mapped_ptr()));
@@ -838,8 +843,15 @@ bool GatedDeltaState_vulkan::download(std::vector<float>& convolution,
     const ncnn::Mat recurrent_mapped = recurrent_staging.mapped();
     if (convolution_mapped.empty() || recurrent_mapped.empty())
         return false;
-    convolution.assign(static_cast<const float*>(convolution_mapped.data),
-                       static_cast<const float*>(convolution_mapped.data) + convolution_count);
+    convolution.resize(convolution_count);
+    {
+        const float* source = static_cast<const float*>(convolution_mapped.data);
+        const uint32_t convolution_columns = implementation.convolution_size;
+        const uint32_t kernel_size = implementation.kernel_size;
+        for (uint32_t channel = 0; channel < convolution_columns; ++channel)
+            for (uint32_t tap = 0; tap < kernel_size; ++tap)
+                convolution[static_cast<size_t>(tap) * convolution_columns + channel] = source[static_cast<size_t>(channel) * kernel_size + tap];
+    }
     recurrent.assign(static_cast<const float*>(recurrent_mapped.data),
                      static_cast<const float*>(recurrent_mapped.data) + recurrent_count);
     ++runtime_state.compute_submissions;

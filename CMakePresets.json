@@ -13,7 +13,8 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "NCNN_MOE_BUILD_TESTS": "OFF",
-        "NCNN_MOE_BUILD_EXAMPLES": "ON"
+        "NCNN_MOE_BUILD_EXAMPLES": "ON",
+        "NCNN_MOE_ENABLE_LTO": "ON"
       }
     },
     {

@@ -1,5 +1,6 @@
 #include "attention.h"
 
+#include "engine/cpu.h"
 #include "fastmath.h"
 #include "ops.h"
 #include "bfloat16.h"
@@ -678,132 +679,65 @@ static void sdpa_into(const AttentionBlockPlan& plan, const TensorData* sinks, u
                         {
                             const float probability = tile_scores[key_offset];
                             if (std::isfinite(probability))
+                            {
                                 tile_normalizer += probability;
+                            }
+                            else
+                            {
+                                // Fold masked/future keys to an additive zero so
+                                // the probability-value kernel can run branch-free.
+                                tile_scores[key_offset] = 0.0f;
+                            }
                         }
-#if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
-                        constexpr uint32_t pv_tile = 64;
-#else
-                        constexpr uint32_t pv_tile = 32;
-#endif
                         if (bf16_pv)
                         {
-                            uint32_t d = 0;
-                            for (; d + pv_tile <= head_dimension; d += pv_tile)
-                            {
-                                std::array<float, pv_tile> a;
-                                std::copy_n(query_tile_output + d, pv_tile, a.data());
-                                const size_t vo = static_cast<size_t>(kv_head) * head_dimension + d;
-                                for (uint64_t b = tile_begin; b < tile_end;)
-                                {
-                                    const uint64_t e = direct_bfloat16_ring && b < ring_tail
-                                                           ? std::min(tile_end, ring_tail)
-                                                           : tile_end;
-                                    const uint64_t slot = direct_bfloat16_contiguous || b < ring_tail
-                                                              ? cache.first_slot + b
-                                                              : b - ring_tail;
-                                    const uint16_t* v = bfloat16_value_values
-                                                        + static_cast<size_t>(slot) * cache.columns + vo;
-                                    for (uint64_t k = b; k < e; ++k)
-                                    {
-                                        const float p = tile_scores[static_cast<size_t>(k - tile_begin)];
-                                        if (std::isfinite(p))
-                                        {
-#if defined(__clang__)
-#pragma clang loop unroll(full)
-#endif
-                                            for (uint32_t i = 0; i < pv_tile; ++i)
-                                                a[i] += p * bfloat16_to_float(v[i]);
-                                        }
-                                        v += cache.columns;
-                                    }
-                                    b = e;
-                                }
-#if defined(__clang__)
-#pragma clang loop unroll(full)
-#endif
-                                for (uint32_t i = 0; i < pv_tile; ++i)
-                                    query_tile_output[d + i] = a[i];
-                            }
-                            if (d < head_dimension)
-                            {
-                                const uint32_t n = head_dimension - d;
-                                const size_t vo = static_cast<size_t>(kv_head) * head_dimension + d;
-                                for (uint64_t b = tile_begin; b < tile_end;)
-                                {
-                                    const uint64_t e = direct_bfloat16_ring && b < ring_tail
-                                                           ? std::min(tile_end, ring_tail)
-                                                           : tile_end;
-                                    const uint64_t slot = direct_bfloat16_contiguous || b < ring_tail
-                                                              ? cache.first_slot + b
-                                                              : b - ring_tail;
-                                    const uint16_t* v = bfloat16_value_values
-                                                        + static_cast<size_t>(slot) * cache.columns + vo;
-                                    for (uint64_t k = b; k < e; ++k)
-                                    {
-                                        const float p = tile_scores[static_cast<size_t>(k - tile_begin)];
-                                        if (std::isfinite(p))
-                                            bfloat16_scaled_add(query_tile_output + d, v, p, n);
-                                        v += cache.columns;
-                                    }
-                                    b = e;
-                                }
-                            }
+                            const bool crosses_ring = direct_bfloat16_ring
+                                                      && tile_begin < ring_tail
+                                                      && tile_end > ring_tail;
+                            const uint64_t middle = crosses_ring ? ring_tail : tile_end;
+                            const auto value_rows = [&](uint64_t key_index) {
+                                const uint64_t slot = direct_bfloat16_contiguous || key_index < ring_tail
+                                                          ? cache.first_slot + key_index
+                                                          : key_index - ring_tail;
+                                return bfloat16_value_values
+                                       + static_cast<size_t>(slot) * cache.columns
+                                       + static_cast<size_t>(kv_head) * head_dimension;
+                            };
+                            const uint16_t* first_values = value_rows(tile_begin);
+                            const uint16_t* second_values = crosses_ring ? value_rows(middle) : first_values;
+                            pv_bf16(query_tile_output,
+                                    first_values,
+                                    cache.columns,
+                                    tile_scores,
+                                    static_cast<uint32_t>(middle - tile_begin),
+                                    second_values,
+                                    tile_scores + static_cast<size_t>(middle - tile_begin),
+                                    static_cast<uint32_t>(tile_end - middle),
+                                    head_dimension);
                         }
                         else
                         {
-                            uint32_t d = 0;
-                            for (; d + pv_tile <= head_dimension; d += pv_tile)
-                            {
-                                std::array<float, pv_tile> a = {};
-                                const size_t vo = static_cast<size_t>(kv_head) * head_dimension + d;
-                                for (uint64_t b = tile_begin; b < tile_end;)
-                                {
-                                    const uint64_t e = direct_float32_ring && b < ring_tail
-                                                           ? std::min(tile_end, ring_tail)
-                                                           : tile_end;
-                                    const float* v = float32_vector(value_values, b, 0);
-                                    for (uint64_t k = b; k < e; ++k)
-                                    {
-                                        const float p = tile_scores[static_cast<size_t>(k - tile_begin)];
-                                        if (std::isfinite(p))
-                                        {
-#if defined(__clang__)
-#pragma clang loop unroll(full)
-#endif
-                                            for (uint32_t i = 0; i < pv_tile; ++i)
-                                                a[i] += p * v[vo + i];
-                                        }
-                                        v += cache.columns;
-                                    }
-                                    b = e;
-                                }
-#if defined(__clang__)
-#pragma clang loop unroll(full)
-#endif
-                                for (uint32_t i = 0; i < pv_tile; ++i)
-                                    query_tile_output[d + i] = a[i];
-                            }
-                            if (d < head_dimension)
-                            {
-                                const uint32_t n = head_dimension - d;
-                                const size_t vo = static_cast<size_t>(kv_head) * head_dimension + d;
-                                std::fill(query_tile_output + d, query_tile_output + head_dimension, 0.0f);
-                                for (uint64_t b = tile_begin; b < tile_end;)
-                                {
-                                    const uint64_t e = direct_float32_ring && b < ring_tail
-                                                           ? std::min(tile_end, ring_tail)
-                                                           : tile_end;
-                                    const float* v = float32_vector(value_values, b, 0);
-                                    for (uint64_t k = b; k < e; ++k)
-                                    {
-                                        const float p = tile_scores[static_cast<size_t>(k - tile_begin)];
-                                        if (std::isfinite(p))
-                                            float_scaled_add(query_tile_output + d, v + vo, p, n);
-                                        v += cache.columns;
-                                    }
-                                    b = e;
-                                }
-                            }
+                            std::fill(query_tile_output,
+                                      query_tile_output + head_dimension,
+                                      0.0f);
+                            const bool crosses_ring = direct_float32_ring
+                                                      && tile_begin < ring_tail
+                                                      && tile_end > ring_tail;
+                            const uint64_t middle = crosses_ring ? ring_tail : tile_end;
+                            const size_t value_offset = static_cast<size_t>(kv_head) * head_dimension;
+                            const float* first_values = float32_vector(value_values, tile_begin, 0) + value_offset;
+                            const float* second_values = crosses_ring
+                                                             ? float32_vector(value_values, middle, 0) + value_offset
+                                                             : first_values;
+                            pv_f32(query_tile_output,
+                                   first_values,
+                                   cache.columns,
+                                   tile_scores,
+                                   static_cast<uint32_t>(middle - tile_begin),
+                                   second_values,
+                                   tile_scores + static_cast<size_t>(middle - tile_begin),
+                                   static_cast<uint32_t>(tile_end - middle),
+                                   head_dimension);
                         }
                         if (bf16_pv)
                         {
@@ -865,11 +799,12 @@ static void sdpa_into(const AttentionBlockPlan& plan, const TensorData* sinks, u
             {
 #pragma omp parallel num_threads(num_threads)
                 {
+                    cpu_bind_thread();
                     const size_t worker_offset = static_cast<size_t>(omp_get_thread_num()) * worker_stride;
                     float* running = scratch.workspace.data() + worker_offset;
                     float* tile_output = running + (bf16_pv ? 0 : running_size);
                     float* tile_logits = running + running_size + output_size;
-#pragma omp for schedule(static)
+#pragma omp for schedule(static, 1)
                     for (int64_t job = 0; job < static_cast<int64_t>(job_count); ++job)
                         process_flash_group(static_cast<uint64_t>(job), running, tile_output, tile_logits);
                 }

@@ -156,6 +156,11 @@ private:
     uint32_t active_base_threads = 0;
 };
 
+// Pin the calling OpenMP worker to a distinct physical CPU core.  On Windows
+// the default placement can put a full team on the SMT siblings of half the
+// cores, which roughly halves GEMM throughput.  Idempotent per thread.
+void cpu_bind_thread() noexcept;
+
 // Select a team size for the given work shape.
 [[nodiscard]] uint32_t choose_cpu_team_size(uint64_t work_units,
                                             uint32_t independent_work_items,
