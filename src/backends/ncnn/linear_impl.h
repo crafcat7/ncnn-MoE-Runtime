@@ -11,6 +11,7 @@
 
 #if NCNN_MOE_USE_NCNN
 #include <allocator.h>
+#include <layer.h>
 #include <mat.h>
 #include <option.h>
 #endif
@@ -28,6 +29,10 @@ public:
     std::shared_ptr<ncnn::Pipeline> pipeline;
     std::shared_ptr<ncnn::Pipeline> single_row_pipeline;
     std::shared_ptr<ncnn::Pipeline> cooperative_pipeline;
+    // ncnn's cooperative-matrix Gemm for prefill; the tiled shader below is the
+    // fallback and serves decode.
+    std::shared_ptr<ncnn::Layer> coop_gemm;
+    ncnn::Option coop_opt = {};
     // Tiled FP16-staged FP32-accumulate projection geometries, pipe[0] wide.
     TileGemm tile_gemm[2];
     std::shared_ptr<ncnn::Pipeline> row_rms_scale_pipeline;
@@ -168,6 +173,10 @@ public:
     std::shared_ptr<ncnn::Pipeline> prefill_pipeline;
     // Tiled FP16-staged FP32-accumulate projection geometries, pipe[0] wide.
     TileGemm tile_gemm[2];
+    // Plain BF16 rows can run prefill through ncnn's cooperative-matrix Gemm; it
+    // is created only for weight layouts the Gemm layer can pack on the host.
+    std::shared_ptr<ncnn::Layer> coop_gemm;
+    ncnn::Option coop_opt = {};
     ncnn::VkMat storage;
     ncnn::VkMat quantized;
     ncnn::VkMat bias;

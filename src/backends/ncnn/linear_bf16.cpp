@@ -1,4 +1,8 @@
 #include "linear.h"
+#include <command.h>
+#include <layer.h>
+#include <layer/gemm.h>
+#include <layer_type.h>
 #include "sharedffn_vulkan.h"
 #include "mxfp4_weightpacking.h"
 #include "rmsnorm_vulkan.h"
@@ -647,12 +651,12 @@ bool Bfloat16Linear_vulkan::has_rms_norm_chain() const noexcept
 #endif
 }
 
-bool Bfloat16Linear_vulkan::prepare_input_rms_norm(const TensorData& weight, float epsilon)
+bool Bfloat16Linear_vulkan::prepare_input_rms_norm(const TensorData& weight, float epsilon, float weight_offset)
 {
 #if NCNN_MOE_WITH_VULKAN
     if (!d->vulkan_context || weight.shape.size() != 1 || weight.shape[0] != d->input_columns || d->input_rms_norm)
         return false;
-    d->input_rms_norm = RmsNorm_vulkan::create(weight, epsilon, 0.0f, d->vulkan_context, d->option);
+    d->input_rms_norm = RmsNorm_vulkan::create(weight, epsilon, weight_offset, d->vulkan_context, d->option);
     return static_cast<bool>(d->input_rms_norm);
 #else
     (void)weight;
@@ -880,6 +884,85 @@ Bfloat16Linear_vulkan::create(const TensorData& matrix,
                                  optimization_flags);
 }
 
+bool create_coop_gemm(const std::shared_ptr<VulkanContext>& context,
+                      const ncnn::Option& base,
+                      uint32_t input_columns,
+                      uint32_t output_columns,
+                      std::span<const uint16_t> weights,
+                      std::shared_ptr<ncnn::Layer>& destination,
+                      ncnn::Option& destination_option)
+{
+#if NCNN_MOE_WITH_VULKAN
+    if (!context)
+        return false;
+    ncnn::VulkanDevice* device = context->device();
+    if (!device->info.support_cooperative_matrix()
+        || weights.size() != static_cast<size_t>(input_columns) * output_columns)
+        return false;
+    ncnn::Layer* raw = ncnn::create_layer_vulkan(ncnn::LayerType::Gemm);
+    if (!raw)
+        return false;
+
+    ncnn::Option option;
+    option.use_vulkan_compute = true;
+    option.use_fp16_storage = true;
+    option.use_fp16_packed = false;
+    option.use_fp16_arithmetic = false;
+    option.use_bf16_storage = false;
+    option.use_cooperative_matrix = true;
+    option.use_subgroup_ops = device->info.support_subgroup_ops();
+    option.num_threads = base.num_threads;
+    option.blob_vkallocator = base.blob_vkallocator;
+    option.workspace_vkallocator = base.workspace_vkallocator;
+    option.staging_vkallocator = base.staging_vkallocator;
+
+    std::shared_ptr<ncnn::Layer> layer(raw, [option](ncnn::Layer* value) {
+        if (!value) return;
+        value->destroy_pipeline(option);
+        delete value;
+    });
+    raw->vkdev = device;
+
+    ncnn::ParamDict pd;
+    pd.set(0, 1.f); // alpha
+    pd.set(1, 0.f); // beta
+    pd.set(2, 0);   // transA
+    pd.set(3, 1);   // transB: B rows are outputs
+    pd.set(4, 0);   // constantA
+    pd.set(5, 1);   // constantB
+    pd.set(6, 0);   // constantC
+    pd.set(8, static_cast<int>(output_columns));
+    pd.set(9, static_cast<int>(input_columns));
+    ncnn::Mat host_weights(static_cast<int>(input_columns), static_cast<int>(output_columns));
+    if (raw->load_param(pd) != 0 || host_weights.empty())
+        return false;
+    for (uint32_t output = 0; output < output_columns; ++output)
+    {
+        float* row = host_weights.row<float>(static_cast<int>(output));
+        const uint16_t* source = weights.data() + static_cast<size_t>(output) * input_columns;
+        for (uint32_t column = 0; column < input_columns; ++column)
+            row[column] = bfloat16_to_float(source[column]);
+    }
+    static_cast<ncnn::Gemm*>(raw)->B_data = host_weights;
+    ncnn::VkTransfer upload(device);
+    if (raw->create_pipeline(option) != 0 || raw->upload_model(upload, option) != 0
+        || upload.submit_and_wait() != 0)
+        return false;
+    destination = layer;
+    destination_option = option;
+    return true;
+#else
+    (void)context;
+    (void)base;
+    (void)input_columns;
+    (void)output_columns;
+    (void)weights;
+    (void)destination;
+    (void)destination_option;
+    return false;
+#endif
+}
+
 std::shared_ptr<Bfloat16Linear_vulkan>
 Bfloat16Linear_vulkan::create_with_allocator(const TensorData& matrix,
                                              const TensorData* bias,
@@ -1073,6 +1156,13 @@ Bfloat16Linear_vulkan::create_with_allocator(const TensorData& matrix,
     implementation.weight_staging_allocator.reset();
     if (!uploaded)
         return {};
+    {
+        // Pipeline creation and the weight upload both submit through the shared
+        // context; the QNK path takes this same lock.
+        const std::lock_guard<std::mutex> lock(implementation.vulkan_context->command_mutex());
+        (void)create_coop_gemm(implementation.vulkan_context, implementation.option, input_columns, output_columns,
+                               weights, implementation.coop_gemm, implementation.coop_opt);
+    }
     return result;
 #else
     (void)matrix;
@@ -1260,6 +1350,56 @@ bool Bfloat16Linear_vulkan::Implementation::record_tile(const ncnn::VkMat& input
 }
 #endif
 
+bool Bfloat16Linear_vulkan::record_coop(const ncnn::VkMat& input,
+                                        ncnn::VkMat& output,
+                                        ncnn::VkCompute& cmd,
+                                        bool normalize) const
+{
+#if NCNN_MOE_WITH_VULKAN
+    const Implementation& implementation = *d;
+    if (!implementation.coop_gemm || !implementation.vulkan_context
+        || (normalize && !implementation.input_rms_norm)
+        || input.dims != 2 || input.elemsize != sizeof(float) || input.elempack != 1
+        || input.h < 32 || input.w != static_cast<int>(implementation.input_columns)
+        || output.dims != 2 || output.elemsize != sizeof(float) || output.elempack != 1
+        || output.w != static_cast<int>(implementation.output_columns)
+        || output.h != input.h)
+    {
+        return false;
+    }
+    // The Gemm path cannot fold the norm into its tile loads, so the prepared
+    // normalization is materialized first when the caller asks for it.
+    ncnn::VkMat source = input;
+    if (normalize)
+    {
+        ncnn::VkMat normalized;
+        if (!record_input_normalization(input, normalized, cmd) || normalized.empty())
+            return false;
+        source = normalized;
+    }
+    const ncnn::Option& gemm_option = implementation.coop_opt;
+    ncnn::VulkanDevice* device = implementation.vulkan_context->device();
+    ncnn::VkMat input_fp16;
+    device->convert_packing(source, input_fp16, 1, 2, cmd, gemm_option);
+    if (input_fp16.empty())
+        return false;
+    std::vector<ncnn::VkMat> tops(1);
+    if (implementation.coop_gemm->forward({input_fp16}, tops, cmd, gemm_option) != 0 || tops[0].empty())
+        return false;
+    ncnn::VkMat projected;
+    device->convert_packing(tops[0], projected, 1, 1, cmd, gemm_option);
+    if (projected.empty())
+        return false;
+    output = projected;
+    return true;
+#else
+    (void)input;
+    (void)output;
+    (void)cmd;
+    return false;
+#endif
+}
+
 void Bfloat16Linear_vulkan::record_scalar_projection(const ncnn::VkMat& input,
                                                      ncnn::VkMat& output,
                                                      ncnn::VkCompute& cmd) const
@@ -1274,6 +1414,8 @@ void Bfloat16Linear_vulkan::record_scalar_projection(const ncnn::VkMat& input,
                       implementation.bias, output, cmd);
         return;
     }
+    if (record_coop(input, output, cmd))
+        return;
     const std::vector<ncnn::VkMat> bindings = {
         input,
         implementation.packed,
@@ -1415,6 +1557,10 @@ int Bfloat16Linear_vulkan::forward(const ncnn::VkMat& input,
                       implementation.bias, output, cmd);
         return 0;
     }
+    // Prefill takes the cooperative-matrix Gemm when the weights and shape fit;
+    // this is the same reuse record_scalar_projection already applies.
+    if (record_coop(input, output, cmd))
+        return 0;
     if (implementation.record_tile(input, output, static_cast<uint32_t>(input.h),
                                    ncnn::VkMat(), ncnn::VkMat(), cmd))
         return 0;

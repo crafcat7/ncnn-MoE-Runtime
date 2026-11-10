@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <layer.h>
 #include <memory>
 #include <span>
 
@@ -69,6 +70,18 @@ struct TileGemm
     uint32_t bn = 0; // tile columns, in outputs
     uint32_t wg = 0; // workgroup size
 };
+
+// Builds ncnn's cooperative-matrix Gemm for plain BF16 rows: it packs the weights
+// itself and runs FP16 storage with FP32 accumulate, which is the default prefill
+// path. Returns false when the device or the shape cannot use it, in which case
+// callers keep the tiled shader.
+[[nodiscard]] bool create_coop_gemm(const std::shared_ptr<VulkanContext>& context,
+                                    const ncnn::Option& base,
+                                    uint32_t input_columns,
+                                    uint32_t output_columns,
+                                    std::span<const uint16_t> weights,
+                                    std::shared_ptr<ncnn::Layer>& destination,
+                                    ncnn::Option& destination_option);
 
 struct TileShape
 {
