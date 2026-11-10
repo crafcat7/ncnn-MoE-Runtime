@@ -49,6 +49,24 @@
 namespace ncnn {
 namespace moe {
 
+// Longest cache the single-workgroup mask-free decode kernel scans. Beyond it the
+// KV scan splits across workgroups (decode_split_count), and neither path needs
+// the additive mask plane.
+static constexpr uint64_t decode_single_workgroup_tokens = 4096;
+
+// KV rows per split workgroup and the widest split for a long cache.
+static constexpr uint64_t decode_split_tokens = 2048;
+static constexpr uint64_t decode_split_maximum = 32;
+
+static uint64_t decode_split_count(uint64_t destination_count, bool split_available)
+{
+    if (!split_available || destination_count <= decode_single_workgroup_tokens)
+        return 0;
+    const uint64_t splits = std::min((destination_count + decode_split_tokens - 1) / decode_split_tokens,
+                                     decode_split_maximum);
+    return splits >= 2 ? splits : 0;
+}
+
 std::vector<uint64_t> Attention_vulkan::scratch_elements(const AttentionConfig_vulkan& config, uint32_t rows,
                                                          uint32_t context_tokens, uint32_t sequence_count,
                                                          uint64_t kv_element_size, bool direct_ring)
@@ -68,7 +86,8 @@ std::vector<uint64_t> Attention_vulkan::scratch_elements(const AttentionConfig_v
     // Anything else still needs the mask plane here.
     const bool decode_sdpa = rows == 1
                              && (config.head_dimension <= 128
-                                 || (static_cast<uint64_t>(context_tokens) + (has_flag(config.flags, AttentionSink) ? 1 : 0) > 4096
+                                 || (static_cast<uint64_t>(context_tokens) + (has_flag(config.flags, AttentionSink) ? 1 : 0)
+                                         > decode_single_workgroup_tokens
                                      && config.head_dimension <= 256))
                              && (config.sliding_window == 0 || context_tokens <= config.sliding_window)
                              && has_flag(config.optimization_flags, OptimizationVulkanDecodeSdpa);
@@ -93,6 +112,21 @@ std::vector<uint64_t> Attention_vulkan::scratch_elements(const AttentionConfig_v
         else
             columns.push_back(query);
 #endif
+    }
+    else
+    {
+        // Split decode keeps one online-softmax state per split and one merged
+        // output, both allocated from this arena. Reserve the widest split rather
+        // than the planned one: decode destinations outgrow the planned context by
+        // the generated tokens before ensure_graph replans, and the split count is
+        // capped, so the widest split is a hard bound.
+        const uint64_t destinations = saturating_add_u64(context_tokens, has_flag(config.flags, AttentionSink) ? 1 : 0);
+        if (decode_split_count(destinations, true) != 0)
+        {
+            elements.push_back(saturating_multiply_u64(saturating_multiply_u64(decode_split_maximum, config.head_count),
+                                                       saturating_add_u64(config.head_dimension, 2)));
+            elements.push_back(query);
+        }
     }
     if (!has_flag(config.optimization_flags, OptimizationVulkanDeviceRope))
         columns.insert(columns.end(), {config.head_dimension, config.head_dimension});
@@ -1021,19 +1055,6 @@ static bool record_attention_decode_sdpa(const ncnn::Pipeline* pipeline, const n
     dispatcher.c = static_cast<int>(config.head_count);
     command.record_pipeline(pipeline, bindings, constants, dispatcher);
     return true;
-}
-
-// KV rows per split workgroup and the widest split for a long cache.
-static constexpr uint64_t decode_split_tokens = 2048;
-static constexpr uint64_t decode_split_maximum = 32;
-
-static uint64_t decode_split_count(uint64_t destination_count, bool split_available)
-{
-    if (!split_available || destination_count <= 4096)
-        return 0;
-    const uint64_t splits = std::min((destination_count + decode_split_tokens - 1) / decode_split_tokens,
-                                     decode_split_maximum);
-    return splits >= 2 ? splits : 0;
 }
 
 static bool record_attention_decode_split(const ncnn::Pipeline* split_pipeline, const ncnn::Pipeline* merge_pipeline,
@@ -2260,7 +2281,8 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
                                                                        position_offset,
                                                                        actual_token_count,
                                                                        config.sliding_window)
-                                 && ((destination_count <= 4096 && config.head_dimension <= 128)
+                                 && ((destination_count <= decode_single_workgroup_tokens
+                                      && config.head_dimension <= 128)
                                      || (config.head_dimension <= 256
                                          && decode_split_count(destination_count, decode_split_available) != 0));
 
@@ -3288,7 +3310,7 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
                                                                      actual_token_count,
                                                                      config.sliding_window)
                                && config.head_dimension <= 256
-                               && destination_count <= 4096;
+                               && destination_count <= decode_single_workgroup_tokens;
         work.next_cache = cache.vulkan_attention_cache;
         work.retained_tokens = config.sliding_window == 0
                                    ? actual_token_count

@@ -288,8 +288,14 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
             // Layers per resident command buffer = resident_submission_rows / rows.
             // Merging layers removes one fence wait per layer but grows the graph
             // memory plan; past the plan's limit the submission falls off a cliff,
-            // so the default keeps a margin and the knob tunes it per model (see
-            // benchmarks/ for the sweep).
+            // so the default keeps a margin and the knob tunes it per model.
+            //
+            // The plan below models (prefill_rows * layers) tokens recorded one
+            // layer per submission, while execution records prefill_rows tokens with
+            // `layers` layers per submission. Every per-layer scratch buffer scales
+            // with rows, so the candidate bounds the execution peak (and exceeds it
+            // for context-dependent buffers); row-independent per-layer scratch
+            // would break that bound.
             uint32_t layers = 8;
             const uint32_t base_rows = std::max(1u, prefill_rows);
             for (;;)

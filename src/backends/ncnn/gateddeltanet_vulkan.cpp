@@ -1103,10 +1103,13 @@ GatedDeltaNet_vulkan::create_impl(const std::shared_ptr<Bfloat16Linear_vulkan>& 
                                 static_cast<int>(sizeof(gated_delta_rule_shader) - 1),
                                 implementation.rule)
             // The register-resident rule kernel assumes one 32-lane subgroup per
-            // value column with KEY_ROWS = head_dimension / 32 = 4.
+            // value column with KEY_ROWS = head_dimension / 32 = 4, and indexes
+            // the gate by (value head, key row), so the gate is either one scalar
+            // per head or one value per key row.
             || (implementation.vulkan_context->device()->info.subgroup_size() == 32
                 && head_dimension == 128u
                 && value_head_dimension % 4u == 0
+                && (gate_channels == 1u || gate_channels == head_dimension)
                 && !create_pipeline(implementation.vulkan_context,
                                     implementation.opt,
                                     gated_delta_rule_reg_shader,
