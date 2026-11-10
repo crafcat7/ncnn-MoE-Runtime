@@ -531,6 +531,8 @@ if(NCNN_MOE_WITH_VULKAN)
         src/kernels/vulkan/float8_swiglu_quantize.comp
         src/kernels/vulkan/projection_matvec.comp
         src/kernels/vulkan/gated_delta_conv.comp
+        src/kernels/vulkan/gated_delta_conv_history.comp
+        src/kernels/vulkan/gated_delta_conv_parallel.comp
         src/kernels/vulkan/gated_delta_rule.comp
         src/kernels/vulkan/gated_delta_rule_reg.comp
         src/kernels/vulkan/gated_delta_qk.comp

@@ -1,7 +1,13 @@
 #version 450
 
 // Per-head RMS norm and output gate for the gated delta rule. One workgroup owns
-// one value head so the reduction spans all value columns of that head.
+// one (value head, token) pair so the reduction spans all value columns of that
+// head while tokens spread across the grid: the reduction is per token, so the
+// token loop this kernel used to run serially bought nothing but barriers.
+
+// The token index comes from gl_WorkGroupID.y, which is only equal to the token
+// when local_size_y is 1.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) readonly buffer fused_input_blob
 {
@@ -48,8 +54,9 @@ void main()
 {
     const uint lane = gl_LocalInvocationID.x;
     const uint value_head = gl_WorkGroupID.x;
-
-    for (uint token = 0; token < p.token_count; ++token)
+    const uint token = gl_WorkGroupID.y;
+    if (token >= p.token_count)
+        return;
     {
         const uint input_row = token * p.fused_columns;
         const uint output_base = token * p.value_size
@@ -83,6 +90,5 @@ void main()
                                                        * norm_weight[value_column]
                                                        * (p.sigmoid_gate != 0 ? sigmoid(gate) : gate * sigmoid(gate));
         }
-        barrier();
     }
 }

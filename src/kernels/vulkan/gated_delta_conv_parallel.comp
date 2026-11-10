@@ -1,0 +1,91 @@
+#version 450
+
+// Token-parallel causal convolution and SiLU for the gated delta rule.
+//
+// The sequential kernel (gated_delta_conv.comp) keeps one rolling window per
+// channel and walks the token range in order, which leaves a 512-token prefill
+// on 6144 threads. This variant dispatches one thread per (channel, token): a
+// token only needs its own four input tokens, so the range spreads across the
+// device. History for the first tokens of the chunk still comes from the state
+// buffer, and gated_delta_conv_history.comp rewrites that buffer afterwards so
+// the next chunk sees the same window the sequential kernel would have left.
+//
+// Columns at or past convolution_size belong to the value half of the fused
+// projection, which this stage passes through unchanged.
+
+// The token index comes from gl_WorkGroupID.y, which is only equal to the token
+// when local_size_y is 1.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer fused_input_blob
+{
+    float fused_input[];
+};
+layout(binding = 1) writeonly buffer fused_output_blob
+{
+    float fused_output[];
+};
+layout(binding = 2) readonly buffer convolution_state_blob
+{
+    float convolution_state[];
+};
+layout(binding = 3) readonly buffer convolution_weight_blob
+{
+    float convolution_weight[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint convolution_size;
+    uint value_size;
+    uint fused_columns;
+    uint head_count;
+    uint kv_head_count;
+    uint head_dimension;
+    uint value_head_dimension;
+    uint kernel_size;
+    uint token_count;
+    float norm_epsilon;
+    uint sigmoid_gate;
+    uint gate_channels;
+    float lower_bound;
+}
+p;
+
+float sigmoid(float value)
+{
+    if (value >= 0.0)
+        return 1.0 / (1.0 + exp(-value));
+    const float exponential = exp(value);
+    return exponential / (1.0 + exponential);
+}
+
+void main()
+{
+    const uint channel = gl_WorkGroupID.x * 128u + gl_LocalInvocationID.x;
+    const uint token = gl_WorkGroupID.y;
+    if (channel >= p.fused_columns || token >= p.token_count)
+        return;
+    const uint row = token * p.fused_columns + channel;
+    if (channel >= p.convolution_size)
+    {
+        fused_output[row] = fused_input[row];
+        return;
+    }
+    const uint state_base = channel * p.kernel_size;
+    // Weight tap j multiplies input token - (kernel_size - 1) + j, matching the
+    // time-ordered window the sequential kernel accumulates.
+    const int base = int(token) - int(p.kernel_size - 1u);
+    float sum = 0.0;
+    for (uint tap = 0; tap < p.kernel_size; ++tap)
+    {
+        // Negative rows are the carried window, whose last entry is the previous
+        // chunk's final token, so x[-m] lives at state[kernel_size - m].
+        const int index = base + int(tap);
+        const float value = index >= 0
+                                ? fused_input[uint(index) * p.fused_columns + channel]
+                                : convolution_state[state_base + p.kernel_size - uint(-index)];
+        sum += value * convolution_weight[state_base + tap];
+    }
+    fused_output[row] = sum * sigmoid(sum);
+}
