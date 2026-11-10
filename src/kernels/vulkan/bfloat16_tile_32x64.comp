@@ -13,7 +13,7 @@
 
 // Prefill projection: BF16 weight rows by FP32 activation rows.
 //
-// One workgroup owns a 64-token by 64-output tile and stages both operands in
+// One workgroup owns a 32-token by 64-output tile and stages both operands in
 // shared memory as FP16, so a staged tile costs half the bytes (and half the
 // shared traffic per multiply-add) of the FP32 staging variant. Weights are
 // BF16 on the device and are converted while staging; the accumulator stays

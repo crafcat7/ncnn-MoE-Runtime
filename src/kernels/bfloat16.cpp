@@ -694,84 +694,6 @@ __attribute__((target("avx512f,avx512bw"))) static void avx512_pv_bf16(float* ou
     }
 }
 
-__attribute__((target("avx512bf16,avx512f,avx512bw"))) static void avx512bf16_linear_tile4x4(const uint16_t* weights,
-                                                                                             const uint16_t* input,
-                                                                                             size_t input_stride,
-                                                                                             uint32_t input_columns,
-                                                                                             float* output,
-                                                                                             size_t output_stride,
-                                                                                             size_t valid_rows) noexcept
-{
-    __m512 sum00 = _mm512_setzero_ps();
-    __m512 sum01 = _mm512_setzero_ps();
-    __m512 sum02 = _mm512_setzero_ps();
-    __m512 sum03 = _mm512_setzero_ps();
-    __m512 sum10 = _mm512_setzero_ps();
-    __m512 sum11 = _mm512_setzero_ps();
-    __m512 sum12 = _mm512_setzero_ps();
-    __m512 sum13 = _mm512_setzero_ps();
-    __m512 sum20 = _mm512_setzero_ps();
-    __m512 sum21 = _mm512_setzero_ps();
-    __m512 sum22 = _mm512_setzero_ps();
-    __m512 sum23 = _mm512_setzero_ps();
-    __m512 sum30 = _mm512_setzero_ps();
-    __m512 sum31 = _mm512_setzero_ps();
-    __m512 sum32 = _mm512_setzero_ps();
-    __m512 sum33 = _mm512_setzero_ps();
-    for (uint32_t column = 0; column < input_columns; column += 32)
-    {
-        const __m512bh input0 = (__m512bh)_mm512_loadu_si512(input + column);
-        const __m512bh input1 = (__m512bh)_mm512_loadu_si512(input + input_stride + column);
-        const __m512bh input2 = (__m512bh)_mm512_loadu_si512(input + input_stride * 2 + column);
-        const __m512bh input3 = (__m512bh)_mm512_loadu_si512(input + input_stride * 3 + column);
-        const __m512bh weight0 = (__m512bh)_mm512_loadu_si512(weights + column);
-        const __m512bh weight1 = (__m512bh)_mm512_loadu_si512(weights + input_columns + column);
-        const __m512bh weight2 = (__m512bh)_mm512_loadu_si512(weights + static_cast<size_t>(input_columns) * 2 + column);
-        const __m512bh weight3 = (__m512bh)_mm512_loadu_si512(weights + static_cast<size_t>(input_columns) * 3 + column);
-        sum00 = _mm512_dpbf16_ps(sum00, input0, weight0);
-        sum01 = _mm512_dpbf16_ps(sum01, input0, weight1);
-        sum02 = _mm512_dpbf16_ps(sum02, input0, weight2);
-        sum03 = _mm512_dpbf16_ps(sum03, input0, weight3);
-        sum10 = _mm512_dpbf16_ps(sum10, input1, weight0);
-        sum11 = _mm512_dpbf16_ps(sum11, input1, weight1);
-        sum12 = _mm512_dpbf16_ps(sum12, input1, weight2);
-        sum13 = _mm512_dpbf16_ps(sum13, input1, weight3);
-        sum20 = _mm512_dpbf16_ps(sum20, input2, weight0);
-        sum21 = _mm512_dpbf16_ps(sum21, input2, weight1);
-        sum22 = _mm512_dpbf16_ps(sum22, input2, weight2);
-        sum23 = _mm512_dpbf16_ps(sum23, input2, weight3);
-        sum30 = _mm512_dpbf16_ps(sum30, input3, weight0);
-        sum31 = _mm512_dpbf16_ps(sum31, input3, weight1);
-        sum32 = _mm512_dpbf16_ps(sum32, input3, weight2);
-        sum33 = _mm512_dpbf16_ps(sum33, input3, weight3);
-    }
-    output[0] = _mm512_reduce_add_ps(sum00);
-    output[1] = _mm512_reduce_add_ps(sum01);
-    output[2] = _mm512_reduce_add_ps(sum02);
-    output[3] = _mm512_reduce_add_ps(sum03);
-    if (valid_rows > 1)
-    {
-        output[output_stride] = _mm512_reduce_add_ps(sum10);
-        output[output_stride + 1] = _mm512_reduce_add_ps(sum11);
-        output[output_stride + 2] = _mm512_reduce_add_ps(sum12);
-        output[output_stride + 3] = _mm512_reduce_add_ps(sum13);
-    }
-    if (valid_rows > 2)
-    {
-        output[output_stride * 2] = _mm512_reduce_add_ps(sum20);
-        output[output_stride * 2 + 1] = _mm512_reduce_add_ps(sum21);
-        output[output_stride * 2 + 2] = _mm512_reduce_add_ps(sum22);
-        output[output_stride * 2 + 3] = _mm512_reduce_add_ps(sum23);
-    }
-    if (valid_rows > 3)
-    {
-        output[output_stride * 3] = _mm512_reduce_add_ps(sum30);
-        output[output_stride * 3 + 1] = _mm512_reduce_add_ps(sum31);
-        output[output_stride * 3 + 2] = _mm512_reduce_add_ps(sum32);
-        output[output_stride * 3 + 3] = _mm512_reduce_add_ps(sum33);
-    }
-}
-
 __attribute__((target("avx512bf16,avx512f,avx512bw"))) static void avx512bf16_linear_tile4x6(const uint16_t* weights,
                                                                                              const uint16_t* input,
                                                                                              uint32_t input_columns,
@@ -872,7 +794,6 @@ static void avx512bf16_batched_linear(const uint16_t* weights,
               uint16_t{0});
 
     const uint16_t* packed_input_data = packed_input.data();
-    const int64_t output_groups = output_columns / 4;
     const int64_t output_groups6 = output_columns / 6;
     const uint32_t remainder_columns = output_columns - static_cast<uint32_t>(output_groups6) * 6;
     const size_t token_block = 32;
