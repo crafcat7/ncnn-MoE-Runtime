@@ -440,6 +440,9 @@ if(NCNN_MOE_USE_NCNN)
 
     # Force runtime-owned options when reconfiguring an existing cache.
     set(NCNN_BUILD_BENCHMARK OFF CACHE BOOL "Build ncnn benchmark")
+    # Runtime never uses ncnn's layer timing; keep the timestamp API and the
+    # string support it requires out of the build.
+    set(NCNN_BENCHMARK OFF CACHE BOOL "Build ncnn with benchmark timestamp support" FORCE)
     set(NCNN_BUILD_TESTS OFF CACHE BOOL "Build ncnn tests")
     set(NCNN_BUILD_EXAMPLES OFF CACHE BOOL "Build ncnn examples")
     set(NCNN_BUILD_TOOLS OFF CACHE BOOL "Build ncnn tools")
