@@ -889,6 +889,7 @@ bool create_coop_gemm(const std::shared_ptr<VulkanContext>& context,
                       uint32_t input_columns,
                       uint32_t output_columns,
                       std::span<const uint16_t> weights,
+                      std::span<const float> bias,
                       std::shared_ptr<ncnn::Layer>& destination,
                       ncnn::Option& destination_option)
 {
@@ -897,8 +898,18 @@ bool create_coop_gemm(const std::shared_ptr<VulkanContext>& context,
         return false;
     ncnn::VulkanDevice* device = context->device();
     if (!device->info.support_cooperative_matrix()
-        || weights.size() != static_cast<size_t>(input_columns) * output_columns)
+        || weights.size() != static_cast<size_t>(input_columns) * output_columns
+        || (!bias.empty() && bias.size() != output_columns))
         return false;
+    // A zero bias keeps the previous constant-free Gemm; a real bias rides along
+    // as the broadcast C operand so the cooperative path cannot silently drop it.
+    bool has_bias = false;
+    for (float value : bias)
+        if (value != 0.0f)
+        {
+            has_bias = true;
+            break;
+        }
     ncnn::Layer* raw = ncnn::create_layer_vulkan(ncnn::LayerType::Gemm);
     if (!raw)
         return false;
@@ -924,16 +935,18 @@ bool create_coop_gemm(const std::shared_ptr<VulkanContext>& context,
     raw->vkdev = device;
 
     ncnn::ParamDict pd;
-    pd.set(0, 1.f); // alpha
-    pd.set(1, 0.f); // beta
-    pd.set(2, 0);   // transA
-    pd.set(3, 1);   // transB: B rows are outputs
-    pd.set(4, 0);   // constantA
-    pd.set(5, 1);   // constantB
-    pd.set(6, 0);   // constantC
+    pd.set(0, 1.f);                  // alpha
+    pd.set(1, has_bias ? 1.f : 0.f); // beta: keep the broadcast bias
+    pd.set(2, 0);                    // transA
+    pd.set(3, 1);                    // transB: B rows are outputs
+    pd.set(4, 0);                    // constantA
+    pd.set(5, 1);                    // constantB
+    pd.set(6, has_bias ? 1 : 0);     // constantC
     pd.set(8, static_cast<int>(output_columns));
     pd.set(9, static_cast<int>(input_columns));
+    pd.set(10, 4); // constantC is one value per output column
     ncnn::Mat host_weights(static_cast<int>(input_columns), static_cast<int>(output_columns));
+    ncnn::Mat host_bias;
     if (raw->load_param(pd) != 0 || host_weights.empty())
         return false;
     for (uint32_t output = 0; output < output_columns; ++output)
@@ -944,6 +957,14 @@ bool create_coop_gemm(const std::shared_ptr<VulkanContext>& context,
             row[column] = bfloat16_to_float(source[column]);
     }
     static_cast<ncnn::Gemm*>(raw)->B_data = host_weights;
+    if (has_bias)
+    {
+        host_bias.create(static_cast<int>(output_columns), 1, sizeof(float));
+        if (host_bias.empty())
+            return false;
+        std::memcpy(host_bias.data, bias.data(), bias.size_bytes());
+        static_cast<ncnn::Gemm*>(raw)->C_data = host_bias;
+    }
     ncnn::VkTransfer upload(device);
     if (raw->create_pipeline(option) != 0 || raw->upload_model(upload, option) != 0
         || upload.submit_and_wait() != 0)
@@ -957,6 +978,7 @@ bool create_coop_gemm(const std::shared_ptr<VulkanContext>& context,
     (void)input_columns;
     (void)output_columns;
     (void)weights;
+    (void)bias;
     (void)destination;
     (void)destination_option;
     return false;
@@ -1161,7 +1183,9 @@ Bfloat16Linear_vulkan::create_with_allocator(const TensorData& matrix,
         // context; the QNK path takes this same lock.
         const std::lock_guard<std::mutex> lock(implementation.vulkan_context->command_mutex());
         (void)create_coop_gemm(implementation.vulkan_context, implementation.option, input_columns, output_columns,
-                               weights, implementation.coop_gemm, implementation.coop_opt);
+                               weights,
+                               std::span<const float>(bias_values, static_cast<size_t>(output_columns)),
+                               implementation.coop_gemm, implementation.coop_opt);
     }
     return result;
 #else

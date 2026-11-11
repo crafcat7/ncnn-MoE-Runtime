@@ -715,6 +715,28 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
                 bias_values[index] = bfloat16_to_float(values[index]);
         }
     }
+    std::vector<float> coop_bias;
+    if (matrix.dtype == DType::BFloat16 && bias)
+    {
+        // Keep the f32 bias for the cooperative Gemm; the packed storage below
+        // cannot be read back once the weight upload owns it.
+        coop_bias.resize(output_columns);
+        if (bias->dtype == DType::Float32)
+        {
+            const std::span<const float> values = bias->float32_values();
+            if (values.size() != output_columns)
+                return {};
+            std::copy(values.begin(), values.end(), coop_bias.begin());
+        }
+        else
+        {
+            const std::span<const uint16_t> values = bias->bfloat16_values();
+            if (values.size() != output_columns)
+                return {};
+            for (uint32_t index = 0; index < output_columns; ++index)
+                coop_bias[index] = bfloat16_to_float(values[index]);
+        }
+    }
     const auto copy_metadata = [&](uint32_t offset, const void* data, size_t bytes) {
         if (bytes != 0)
             std::memcpy(packed_storage.data() + offset, data, bytes);
@@ -739,7 +761,9 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
                 && implementation.block_size == static_cast<uint64_t>(implementation.input_columns) * sizeof(uint16_t))
                 (void)create_coop_gemm(implementation.vulkan_context, implementation.option,
                                        implementation.input_columns, implementation.output_columns,
-                                       matrix.bfloat16_values(), implementation.coop_gemm,
+                                       matrix.bfloat16_values(),
+                                       std::span<const float>(coop_bias),
+                                       implementation.coop_gemm,
                                        implementation.coop_opt);
         }
     }

@@ -73,13 +73,15 @@ struct TileGemm
 
 // Builds ncnn's cooperative-matrix Gemm for plain BF16 rows: it packs the weights
 // itself and runs FP16 storage with FP32 accumulate, which is the default prefill
-// path. Returns false when the device or the shape cannot use it, in which case
-// callers keep the tiled shader.
+// path. An optional per-output bias is folded into the Gemm operand so the
+// cooperative path keeps the projection's bias. Returns false when the device or
+// the shape cannot use it, in which case callers keep the tiled shader.
 [[nodiscard]] bool create_coop_gemm(const std::shared_ptr<VulkanContext>& context,
                                     const ncnn::Option& base,
                                     uint32_t input_columns,
                                     uint32_t output_columns,
                                     std::span<const uint16_t> weights,
+                                    std::span<const float> bias,
                                     std::shared_ptr<ncnn::Layer>& destination,
                                     ncnn::Option& destination_option);
 
