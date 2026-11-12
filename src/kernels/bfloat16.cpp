@@ -513,81 +513,257 @@ __attribute__((target("avx512bf16,avx512f,avx512bw"))) static float avx512bf16_p
     return sum;
 }
 
-__attribute__((target("avx512bf16,avx512f,avx512bw"))) static void avx512bf16_linear_tile4x4(const uint16_t* weights,
+__attribute__((target("avx512f,avx512bw"))) static void avx512_pv_bf16(float* output,
+                                                                       const uint16_t* values0,
+                                                                       size_t value_stride,
+                                                                       const float* weights0,
+                                                                       uint32_t count0,
+                                                                       const uint16_t* values1,
+                                                                       const float* weights1,
+                                                                       uint32_t count1,
+                                                                       uint32_t columns) noexcept
+{
+    uint32_t column = 0;
+#define NCNN_MOE_BF16_ROW2_LOAD(ptr, off) _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>((ptr) + (off)))), 16))
+    for (; column + 256 <= columns; column += 256)
+    {
+        __m512 a0 = _mm512_setzero_ps();
+        __m512 a1 = _mm512_setzero_ps();
+        __m512 a2 = _mm512_setzero_ps();
+        __m512 a3 = _mm512_setzero_ps();
+        __m512 a4 = _mm512_setzero_ps();
+        __m512 a5 = _mm512_setzero_ps();
+        __m512 a6 = _mm512_setzero_ps();
+        __m512 a7 = _mm512_setzero_ps();
+        __m512 a8 = _mm512_setzero_ps();
+        __m512 a9 = _mm512_setzero_ps();
+        __m512 a10 = _mm512_setzero_ps();
+        __m512 a11 = _mm512_setzero_ps();
+        __m512 a12 = _mm512_setzero_ps();
+        __m512 a13 = _mm512_setzero_ps();
+        __m512 a14 = _mm512_setzero_ps();
+        __m512 a15 = _mm512_setzero_ps();
+        const uint16_t* row = values0 + column;
+        for (uint32_t key = 0; key < count0; ++key)
+        {
+            const __m512 weight = _mm512_set1_ps(weights0[key]);
+            a0 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 0), a0);
+            a1 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 16), a1);
+            a2 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 32), a2);
+            a3 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 48), a3);
+            a4 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 64), a4);
+            a5 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 80), a5);
+            a6 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 96), a6);
+            a7 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 112), a7);
+            a8 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 128), a8);
+            a9 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 144), a9);
+            a10 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 160), a10);
+            a11 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 176), a11);
+            a12 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 192), a12);
+            a13 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 208), a13);
+            a14 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 224), a14);
+            a15 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 240), a15);
+            row += value_stride;
+        }
+        row = values1 + column;
+        for (uint32_t key = 0; key < count1; ++key)
+        {
+            const __m512 weight = _mm512_set1_ps(weights1[key]);
+            a0 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 0), a0);
+            a1 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 16), a1);
+            a2 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 32), a2);
+            a3 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 48), a3);
+            a4 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 64), a4);
+            a5 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 80), a5);
+            a6 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 96), a6);
+            a7 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 112), a7);
+            a8 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 128), a8);
+            a9 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 144), a9);
+            a10 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 160), a10);
+            a11 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 176), a11);
+            a12 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 192), a12);
+            a13 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 208), a13);
+            a14 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 224), a14);
+            a15 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 240), a15);
+            row += value_stride;
+        }
+        _mm512_storeu_ps(output + column + 0, _mm512_add_ps(_mm512_loadu_ps(output + column + 0), a0));
+        _mm512_storeu_ps(output + column + 16, _mm512_add_ps(_mm512_loadu_ps(output + column + 16), a1));
+        _mm512_storeu_ps(output + column + 32, _mm512_add_ps(_mm512_loadu_ps(output + column + 32), a2));
+        _mm512_storeu_ps(output + column + 48, _mm512_add_ps(_mm512_loadu_ps(output + column + 48), a3));
+        _mm512_storeu_ps(output + column + 64, _mm512_add_ps(_mm512_loadu_ps(output + column + 64), a4));
+        _mm512_storeu_ps(output + column + 80, _mm512_add_ps(_mm512_loadu_ps(output + column + 80), a5));
+        _mm512_storeu_ps(output + column + 96, _mm512_add_ps(_mm512_loadu_ps(output + column + 96), a6));
+        _mm512_storeu_ps(output + column + 112, _mm512_add_ps(_mm512_loadu_ps(output + column + 112), a7));
+        _mm512_storeu_ps(output + column + 128, _mm512_add_ps(_mm512_loadu_ps(output + column + 128), a8));
+        _mm512_storeu_ps(output + column + 144, _mm512_add_ps(_mm512_loadu_ps(output + column + 144), a9));
+        _mm512_storeu_ps(output + column + 160, _mm512_add_ps(_mm512_loadu_ps(output + column + 160), a10));
+        _mm512_storeu_ps(output + column + 176, _mm512_add_ps(_mm512_loadu_ps(output + column + 176), a11));
+        _mm512_storeu_ps(output + column + 192, _mm512_add_ps(_mm512_loadu_ps(output + column + 192), a12));
+        _mm512_storeu_ps(output + column + 208, _mm512_add_ps(_mm512_loadu_ps(output + column + 208), a13));
+        _mm512_storeu_ps(output + column + 224, _mm512_add_ps(_mm512_loadu_ps(output + column + 224), a14));
+        _mm512_storeu_ps(output + column + 240, _mm512_add_ps(_mm512_loadu_ps(output + column + 240), a15));
+    }
+    for (; column + 128 <= columns; column += 128)
+    {
+        __m512 a0 = _mm512_setzero_ps();
+        __m512 a1 = _mm512_setzero_ps();
+        __m512 a2 = _mm512_setzero_ps();
+        __m512 a3 = _mm512_setzero_ps();
+        __m512 a4 = _mm512_setzero_ps();
+        __m512 a5 = _mm512_setzero_ps();
+        __m512 a6 = _mm512_setzero_ps();
+        __m512 a7 = _mm512_setzero_ps();
+        const uint16_t* row = values0 + column;
+        for (uint32_t key = 0; key < count0; ++key)
+        {
+            const __m512 weight = _mm512_set1_ps(weights0[key]);
+            a0 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 0), a0);
+            a1 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 16), a1);
+            a2 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 32), a2);
+            a3 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 48), a3);
+            a4 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 64), a4);
+            a5 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 80), a5);
+            a6 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 96), a6);
+            a7 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 112), a7);
+            row += value_stride;
+        }
+        row = values1 + column;
+        for (uint32_t key = 0; key < count1; ++key)
+        {
+            const __m512 weight = _mm512_set1_ps(weights1[key]);
+            a0 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 0), a0);
+            a1 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 16), a1);
+            a2 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 32), a2);
+            a3 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 48), a3);
+            a4 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 64), a4);
+            a5 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 80), a5);
+            a6 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 96), a6);
+            a7 = _mm512_fmadd_ps(weight, NCNN_MOE_BF16_ROW2_LOAD(row, 112), a7);
+            row += value_stride;
+        }
+        _mm512_storeu_ps(output + column + 0, _mm512_add_ps(_mm512_loadu_ps(output + column + 0), a0));
+        _mm512_storeu_ps(output + column + 16, _mm512_add_ps(_mm512_loadu_ps(output + column + 16), a1));
+        _mm512_storeu_ps(output + column + 32, _mm512_add_ps(_mm512_loadu_ps(output + column + 32), a2));
+        _mm512_storeu_ps(output + column + 48, _mm512_add_ps(_mm512_loadu_ps(output + column + 48), a3));
+        _mm512_storeu_ps(output + column + 64, _mm512_add_ps(_mm512_loadu_ps(output + column + 64), a4));
+        _mm512_storeu_ps(output + column + 80, _mm512_add_ps(_mm512_loadu_ps(output + column + 80), a5));
+        _mm512_storeu_ps(output + column + 96, _mm512_add_ps(_mm512_loadu_ps(output + column + 96), a6));
+        _mm512_storeu_ps(output + column + 112, _mm512_add_ps(_mm512_loadu_ps(output + column + 112), a7));
+    }
+    for (; column + 16 <= columns; column += 16)
+    {
+        __m512 accumulator = _mm512_setzero_ps();
+        const uint16_t* row = values0 + column;
+        for (uint32_t key = 0; key < count0; ++key)
+        {
+            accumulator = _mm512_fmadd_ps(_mm512_set1_ps(weights0[key]), NCNN_MOE_BF16_ROW2_LOAD(row, 0), accumulator);
+            row += value_stride;
+        }
+        row = values1 + column;
+        for (uint32_t key = 0; key < count1; ++key)
+        {
+            accumulator = _mm512_fmadd_ps(_mm512_set1_ps(weights1[key]), NCNN_MOE_BF16_ROW2_LOAD(row, 0), accumulator);
+            row += value_stride;
+        }
+        _mm512_storeu_ps(output + column, _mm512_add_ps(_mm512_loadu_ps(output + column), accumulator));
+    }
+#undef NCNN_MOE_BF16_ROW2_LOAD
+    for (; column < columns; ++column)
+    {
+        const uint16_t* row = values0 + column;
+        float sum = 0.0f;
+        for (uint32_t key = 0; key < count0; ++key)
+        {
+            const uint32_t bits = static_cast<uint32_t>(row[0]) << 16;
+            float value = 0.0f;
+            std::memcpy(&value, &bits, sizeof(value));
+            sum += weights0[key] * value;
+            row += value_stride;
+        }
+        row = values1 + column;
+        for (uint32_t key = 0; key < count1; ++key)
+        {
+            const uint32_t bits = static_cast<uint32_t>(row[0]) << 16;
+            float value = 0.0f;
+            std::memcpy(&value, &bits, sizeof(value));
+            sum += weights1[key] * value;
+            row += value_stride;
+        }
+        output[column] += sum;
+    }
+}
+
+__attribute__((target("avx512bf16,avx512f,avx512bw"))) static void avx512bf16_linear_tile4x6(const uint16_t* weights,
                                                                                              const uint16_t* input,
-                                                                                             size_t input_stride,
                                                                                              uint32_t input_columns,
                                                                                              float* output,
                                                                                              size_t output_stride,
                                                                                              size_t valid_rows) noexcept
 {
-    __m512 sum00 = _mm512_setzero_ps();
-    __m512 sum01 = _mm512_setzero_ps();
-    __m512 sum02 = _mm512_setzero_ps();
-    __m512 sum03 = _mm512_setzero_ps();
-    __m512 sum10 = _mm512_setzero_ps();
-    __m512 sum11 = _mm512_setzero_ps();
-    __m512 sum12 = _mm512_setzero_ps();
-    __m512 sum13 = _mm512_setzero_ps();
-    __m512 sum20 = _mm512_setzero_ps();
-    __m512 sum21 = _mm512_setzero_ps();
-    __m512 sum22 = _mm512_setzero_ps();
-    __m512 sum23 = _mm512_setzero_ps();
-    __m512 sum30 = _mm512_setzero_ps();
-    __m512 sum31 = _mm512_setzero_ps();
-    __m512 sum32 = _mm512_setzero_ps();
-    __m512 sum33 = _mm512_setzero_ps();
+    __m512 a00 = _mm512_setzero_ps();
+    __m512 a01 = a00, a02 = a00, a03 = a00, a04 = a00, a05 = a00;
+    __m512 a10 = a00, a11 = a00, a12 = a00, a13 = a00, a14 = a00, a15 = a00;
+    __m512 a20 = a00, a21 = a00, a22 = a00, a23 = a00, a24 = a00, a25 = a00;
+    __m512 a30 = a00, a31 = a00, a32 = a00, a33 = a00, a34 = a00, a35 = a00;
     for (uint32_t column = 0; column < input_columns; column += 32)
     {
         const __m512bh input0 = (__m512bh)_mm512_loadu_si512(input + column);
-        const __m512bh input1 = (__m512bh)_mm512_loadu_si512(input + input_stride + column);
-        const __m512bh input2 = (__m512bh)_mm512_loadu_si512(input + input_stride * 2 + column);
-        const __m512bh input3 = (__m512bh)_mm512_loadu_si512(input + input_stride * 3 + column);
-        const __m512bh weight0 = (__m512bh)_mm512_loadu_si512(weights + column);
-        const __m512bh weight1 = (__m512bh)_mm512_loadu_si512(weights + input_columns + column);
-        const __m512bh weight2 = (__m512bh)_mm512_loadu_si512(weights + static_cast<size_t>(input_columns) * 2 + column);
-        const __m512bh weight3 = (__m512bh)_mm512_loadu_si512(weights + static_cast<size_t>(input_columns) * 3 + column);
-        sum00 = _mm512_dpbf16_ps(sum00, input0, weight0);
-        sum01 = _mm512_dpbf16_ps(sum01, input0, weight1);
-        sum02 = _mm512_dpbf16_ps(sum02, input0, weight2);
-        sum03 = _mm512_dpbf16_ps(sum03, input0, weight3);
-        sum10 = _mm512_dpbf16_ps(sum10, input1, weight0);
-        sum11 = _mm512_dpbf16_ps(sum11, input1, weight1);
-        sum12 = _mm512_dpbf16_ps(sum12, input1, weight2);
-        sum13 = _mm512_dpbf16_ps(sum13, input1, weight3);
-        sum20 = _mm512_dpbf16_ps(sum20, input2, weight0);
-        sum21 = _mm512_dpbf16_ps(sum21, input2, weight1);
-        sum22 = _mm512_dpbf16_ps(sum22, input2, weight2);
-        sum23 = _mm512_dpbf16_ps(sum23, input2, weight3);
-        sum30 = _mm512_dpbf16_ps(sum30, input3, weight0);
-        sum31 = _mm512_dpbf16_ps(sum31, input3, weight1);
-        sum32 = _mm512_dpbf16_ps(sum32, input3, weight2);
-        sum33 = _mm512_dpbf16_ps(sum33, input3, weight3);
+        const __m512bh input1 = (__m512bh)_mm512_loadu_si512(input + input_columns + column);
+        const __m512bh input2 = (__m512bh)_mm512_loadu_si512(input + static_cast<size_t>(input_columns) * 2 + column);
+        const __m512bh input3 = (__m512bh)_mm512_loadu_si512(input + static_cast<size_t>(input_columns) * 3 + column);
+#define NCNN_MOE_BF16_TILE4X6_STEP(index)                                                                                    \
+    do                                                                                                                       \
+    {                                                                                                                        \
+        const __m512bh weight = (__m512bh)_mm512_loadu_si512(weights + static_cast<size_t>(index) * input_columns + column); \
+        a0##index = _mm512_dpbf16_ps(a0##index, input0, weight);                                                             \
+        a1##index = _mm512_dpbf16_ps(a1##index, input1, weight);                                                             \
+        a2##index = _mm512_dpbf16_ps(a2##index, input2, weight);                                                             \
+        a3##index = _mm512_dpbf16_ps(a3##index, input3, weight);                                                             \
+    } while (0)
+        NCNN_MOE_BF16_TILE4X6_STEP(0);
+        NCNN_MOE_BF16_TILE4X6_STEP(1);
+        NCNN_MOE_BF16_TILE4X6_STEP(2);
+        NCNN_MOE_BF16_TILE4X6_STEP(3);
+        NCNN_MOE_BF16_TILE4X6_STEP(4);
+        NCNN_MOE_BF16_TILE4X6_STEP(5);
+#undef NCNN_MOE_BF16_TILE4X6_STEP
     }
-    output[0] = _mm512_reduce_add_ps(sum00);
-    output[1] = _mm512_reduce_add_ps(sum01);
-    output[2] = _mm512_reduce_add_ps(sum02);
-    output[3] = _mm512_reduce_add_ps(sum03);
+    output[0] = _mm512_reduce_add_ps(a00);
+    output[1] = _mm512_reduce_add_ps(a01);
+    output[2] = _mm512_reduce_add_ps(a02);
+    output[3] = _mm512_reduce_add_ps(a03);
+    output[4] = _mm512_reduce_add_ps(a04);
+    output[5] = _mm512_reduce_add_ps(a05);
     if (valid_rows > 1)
     {
-        output[output_stride] = _mm512_reduce_add_ps(sum10);
-        output[output_stride + 1] = _mm512_reduce_add_ps(sum11);
-        output[output_stride + 2] = _mm512_reduce_add_ps(sum12);
-        output[output_stride + 3] = _mm512_reduce_add_ps(sum13);
+        float* row = output + output_stride;
+        row[0] = _mm512_reduce_add_ps(a10);
+        row[1] = _mm512_reduce_add_ps(a11);
+        row[2] = _mm512_reduce_add_ps(a12);
+        row[3] = _mm512_reduce_add_ps(a13);
+        row[4] = _mm512_reduce_add_ps(a14);
+        row[5] = _mm512_reduce_add_ps(a15);
     }
     if (valid_rows > 2)
     {
-        output[output_stride * 2] = _mm512_reduce_add_ps(sum20);
-        output[output_stride * 2 + 1] = _mm512_reduce_add_ps(sum21);
-        output[output_stride * 2 + 2] = _mm512_reduce_add_ps(sum22);
-        output[output_stride * 2 + 3] = _mm512_reduce_add_ps(sum23);
+        float* row = output + output_stride * 2;
+        row[0] = _mm512_reduce_add_ps(a20);
+        row[1] = _mm512_reduce_add_ps(a21);
+        row[2] = _mm512_reduce_add_ps(a22);
+        row[3] = _mm512_reduce_add_ps(a23);
+        row[4] = _mm512_reduce_add_ps(a24);
+        row[5] = _mm512_reduce_add_ps(a25);
     }
     if (valid_rows > 3)
     {
-        output[output_stride * 3] = _mm512_reduce_add_ps(sum30);
-        output[output_stride * 3 + 1] = _mm512_reduce_add_ps(sum31);
-        output[output_stride * 3 + 2] = _mm512_reduce_add_ps(sum32);
-        output[output_stride * 3 + 3] = _mm512_reduce_add_ps(sum33);
+        float* row = output + output_stride * 3;
+        row[0] = _mm512_reduce_add_ps(a30);
+        row[1] = _mm512_reduce_add_ps(a31);
+        row[2] = _mm512_reduce_add_ps(a32);
+        row[3] = _mm512_reduce_add_ps(a33);
+        row[4] = _mm512_reduce_add_ps(a34);
+        row[5] = _mm512_reduce_add_ps(a35);
     }
 }
 
@@ -618,22 +794,46 @@ static void avx512bf16_batched_linear(const uint16_t* weights,
               uint16_t{0});
 
     const uint16_t* packed_input_data = packed_input.data();
-    const int64_t output_groups = output_columns / 4;
-#pragma omp parallel for num_threads(thread_count) if (thread_count > 1)
-    for (int64_t output_group = 0; output_group < output_groups; ++output_group)
+    const int64_t output_groups6 = output_columns / 6;
+    const uint32_t remainder_columns = output_columns - static_cast<uint32_t>(output_groups6) * 6;
+    const size_t token_block = 32;
+#pragma omp parallel num_threads(thread_count) if (thread_count > 1)
     {
-        const uint32_t first_output = static_cast<uint32_t>(output_group) * 4;
-        const uint16_t* group_weights = weights + static_cast<size_t>(first_output) * input_columns;
-        for (size_t token = 0; token < token_count; token += 4)
+        cpu_bind_thread();
+#pragma omp for schedule(static)
+        for (int64_t output_group = 0; output_group < output_groups6; ++output_group)
         {
-            const size_t valid_rows = std::min<size_t>(4, token_count - token);
-            avx512bf16_linear_tile4x4(group_weights,
-                                      packed_input_data + token * input_columns,
-                                      input_columns,
-                                      input_columns,
-                                      output + token * output_stride + first_output,
-                                      output_stride,
-                                      valid_rows);
+            const uint32_t first_output = static_cast<uint32_t>(output_group) * 6;
+            const uint16_t* group_weights = weights + static_cast<size_t>(first_output) * input_columns;
+            for (size_t block = 0; block < token_count; block += token_block)
+            {
+                const size_t block_end = std::min(token_count, block + token_block);
+                for (size_t token = block; token < block_end; token += 4)
+                {
+                    const size_t valid_rows = std::min<size_t>(4, token_count - token);
+                    avx512bf16_linear_tile4x6(group_weights,
+                                              packed_input_data + token * input_columns,
+                                              input_columns,
+                                              output + token * output_stride + first_output,
+                                              output_stride,
+                                              valid_rows);
+                }
+            }
+        }
+        if (remainder_columns != 0)
+        {
+#pragma omp for schedule(static)
+            for (int64_t output_group = 0; output_group < static_cast<int64_t>(remainder_columns); ++output_group)
+            {
+                const uint32_t output_column = static_cast<uint32_t>(output_groups6) * 6
+                                               + static_cast<uint32_t>(output_group);
+                const uint16_t* column_weights = weights + static_cast<size_t>(output_column) * input_columns;
+                for (size_t token = 0; token < token_count; ++token)
+                {
+                    const uint16_t* token_input = packed_input_data + token * input_columns;
+                    output[token * output_stride + output_column] = avx512bf16_pair_dot(column_weights, token_input, input_columns);
+                }
+            }
         }
     }
 }
@@ -778,6 +978,57 @@ void bfloat16_scaled_add(float* output, const uint16_t* input, float scale, uint
 {
     static const Bfloat16ScaledAddFunction function = select_bfloat16_scaled_add();
     function(output, input, scale, count);
+}
+
+void pv_bf16(float* output,
+             const uint16_t* values0,
+             size_t value_stride,
+             const float* weights0,
+             uint32_t count0,
+             const uint16_t* values1,
+             const float* weights1,
+             uint32_t count1,
+             uint32_t columns) noexcept
+{
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+    if ((cpu_isa_flags() & CpuIsaX86Avx512) != 0)
+    {
+        msvc_avx512_pv_bf16(output, values0, value_stride, weights0, count0,
+                            values1, weights1, count1, columns);
+        return;
+    }
+#elif (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+    if ((cpu_isa_flags() & CpuIsaX86Avx512) != 0)
+    {
+        avx512_pv_bf16(output, values0, value_stride, weights0, count0,
+                       values1, weights1, count1, columns);
+        return;
+    }
+#endif
+    for (uint32_t key = 0; key < count0; ++key)
+    {
+        const float weight = weights0[key];
+        const uint16_t* row = values0 + static_cast<size_t>(key) * value_stride;
+        for (uint32_t column = 0; column < columns; ++column)
+        {
+            const uint32_t bits = static_cast<uint32_t>(row[column]) << 16;
+            float value = 0.0f;
+            std::memcpy(&value, &bits, sizeof(value));
+            output[column] += weight * value;
+        }
+    }
+    for (uint32_t key = 0; key < count1; ++key)
+    {
+        const float weight = weights1[key];
+        const uint16_t* row = values1 + static_cast<size_t>(key) * value_stride;
+        for (uint32_t column = 0; column < columns; ++column)
+        {
+            const uint32_t bits = static_cast<uint32_t>(row[column]) << 16;
+            float value = 0.0f;
+            std::memcpy(&value, &bits, sizeof(value));
+            output[column] += weight * value;
+        }
+    }
 }
 
 const char* bfloat16_batched_linear_kernel_name(uint64_t optimization_flags) noexcept

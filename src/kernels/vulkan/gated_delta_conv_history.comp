@@ -1,0 +1,47 @@
+#version 450
+
+// Rewrites the gated delta convolution window after a token-parallel prefill.
+//
+// gated_delta_conv.comp leaves the state buffer holding the last kernel_size
+// input tokens of the chunk, in time order. The parallel kernel cannot update it
+// in place (its early tokens read the previous window), so this pass reproduces
+// the same contents from the input rows once the convolution has been recorded.
+// Only used when token_count >= kernel_size.
+
+layout(binding = 0) readonly buffer fused_input_blob
+{
+    float fused_input[];
+};
+layout(binding = 1) writeonly buffer convolution_state_blob
+{
+    float convolution_state[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint convolution_size;
+    uint value_size;
+    uint fused_columns;
+    uint head_count;
+    uint kv_head_count;
+    uint head_dimension;
+    uint value_head_dimension;
+    uint kernel_size;
+    uint token_count;
+    float norm_epsilon;
+    uint sigmoid_gate;
+    uint gate_channels;
+    float lower_bound;
+}
+p;
+
+void main()
+{
+    const uint channel = gl_WorkGroupID.x * 128u + gl_LocalInvocationID.x;
+    if (channel >= p.convolution_size || p.token_count < p.kernel_size)
+        return;
+    const uint state_base = channel * p.kernel_size;
+    const uint first = p.token_count - p.kernel_size;
+    for (uint tap = 0; tap < p.kernel_size; ++tap)
+        convolution_state[state_base + tap] = fused_input[(first + tap) * p.fused_columns + channel];
+}

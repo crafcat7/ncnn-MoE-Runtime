@@ -115,6 +115,36 @@ void avx512_float_scaled_add_and_accumulate(float* values,
                                             float* output,
                                             float output_scale,
                                             uint32_t count) noexcept;
+void avx512_gdn_step(float* state,
+                     const float* key,
+                     const float* query,
+                     const float* value,
+                     uint32_t key_dim,
+                     uint32_t value_dim,
+                     float decay,
+                     float beta,
+                     float scale,
+                     float* memory,
+                     float* delta,
+                     float* output) noexcept;
+void avx512_gdn_conv4(float* state,
+                      float* values,
+                      size_t value_stride,
+                      size_t first,
+                      size_t row_count,
+                      uint32_t begin,
+                      uint32_t end,
+                      uint32_t columns,
+                      const float* taps) noexcept;
+void avx512_pv_f32(float* output,
+                   const float* values0,
+                   size_t value_stride,
+                   const float* weights0,
+                   uint32_t count0,
+                   const float* values1,
+                   const float* weights1,
+                   uint32_t count1,
+                   uint32_t columns) noexcept;
 void avx2_float_weighted_scale(float* output, const float* input, const float* weight, float scale, float weight_offset, uint32_t count) noexcept;
 void avx512_float_weighted_scale(float* output, const float* input, const float* weight, float scale, float weight_offset, uint32_t count) noexcept;
 void avx2_bfloat16_weighted_scale(float* output, const float* input, const uint16_t* weight, float scale, float weight_offset, uint32_t count) noexcept;

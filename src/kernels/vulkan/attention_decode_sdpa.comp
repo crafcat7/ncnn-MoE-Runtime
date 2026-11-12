@@ -7,7 +7,7 @@
 
 layout(constant_id = 0) const uint use_subgroup_reductions = 0;
 
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) readonly buffer query_blob
 {
@@ -44,8 +44,8 @@ layout(push_constant) uniform parameter
 }
 p;
 
-shared float reduction[128];
-shared float cached_query[128];
+shared float reduction[256];
+shared float cached_query[256];
 shared float scores[16];
 shared float weights[16];
 shared float online_maximum;
@@ -58,7 +58,7 @@ void subgroup_decode()
 {
     // Address work by subgroup IDs rather than assuming a particular mapping
     // from local invocation IDs to lanes. Selection requires full groups of
-    // at least sixteen lanes in this 128-invocation workgroup.
+    // at least sixteen lanes, and the QK scan uses the first half of the 256.
     const uint lane = gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID;
     const uint head = gl_WorkGroupID.z;
     if (head >= p.head_count)
@@ -67,9 +67,10 @@ void subgroup_decode()
     const uint query_base = head * p.query_cstep;
     const uint key_base = key_value_head * p.key_cstep;
     const uint value_base = key_value_head * p.value_cstep;
-    const uint token_lane = lane >> 3;
-    const uint dimension_lane = gl_SubgroupInvocationID & 7u;
-    const uint score_lane = gl_SubgroupInvocationID & 15u;
+    const uint query_lane = lane & 127u;
+    const uint token_lane = query_lane >> 3;
+    const uint dimension_lane = query_lane & 7u;
+    const uint score_lane = query_lane & 15u;
     float maximum = -3.402823466e+38;
     float denominator = 0.0;
     float numerator = 0.0;
@@ -83,7 +84,7 @@ void subgroup_decode()
         const bool valid_token = token < p.destination_count;
         const bool sink_token = p.use_attention_sink != 0 && token + 1 == p.destination_count;
         float partial = 0.0;
-        if (valid_token && !sink_token)
+        if (valid_token && !sink_token && lane < 128u)
             for (uint dimension = dimension_lane; dimension < p.head_dimension; dimension += 8)
                 partial += cached_query[dimension]
                            * buffer_ld1(key_data, key_base + token * p.head_dimension + dimension);
@@ -91,7 +92,7 @@ void subgroup_decode()
         partial += subgroupShuffleXor(partial, 4u);
         partial += subgroupShuffleXor(partial, 2u);
         partial += subgroupShuffleXor(partial, 1u);
-        if (dimension_lane == 0)
+        if (lane < 128u && dimension_lane == 0)
             scores[token_lane] = !valid_token ? -3.402823466e+38
                                  : sink_token ? sink_data[head]
                                               : partial * p.scale;
@@ -197,7 +198,7 @@ void main()
         const bool valid_token = token < p.destination_count;
         const bool sink_token = p.use_attention_sink != 0 && token + 1 == p.destination_count;
         float partial = 0.0;
-        if (valid_token && !sink_token)
+        if (valid_token && !sink_token && lane < 128u)
         {
             for (uint dimension = dimension_lane; dimension < p.head_dimension; dimension += 8)
                 partial += cached_query[dimension]
@@ -211,7 +212,7 @@ void main()
                 reduction[lane] += reduction[lane + stride];
             barrier();
         }
-        if (dimension_lane == 0)
+        if (lane < 128u && dimension_lane == 0)
             scores[token_lane] = !valid_token ? -3.402823466e+38
                                  : sink_token ? sink_data[head]
                                               : reduction[lane] * p.scale;

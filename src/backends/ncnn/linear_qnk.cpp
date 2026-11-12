@@ -2,6 +2,7 @@
 #include "sharedffn_vulkan.h"
 #include "mxfp4_weightpacking.h"
 #include "rmsnorm_vulkan.h"
+#include <command.h>
 #include "vulkancontext.h"
 #include "experttransfer_vulkan.h"
 #include "expertbackend_vulkan.h"
@@ -32,8 +33,6 @@
 #include <vector>
 
 #if NCNN_MOE_USE_NCNN
-#include <layer.h>
-#include <layer_type.h>
 #include <mat.h>
 #include <modelbin.h>
 #include <paramdict.h>
@@ -716,6 +715,28 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
                 bias_values[index] = bfloat16_to_float(values[index]);
         }
     }
+    std::vector<float> coop_bias;
+    if (matrix.dtype == DType::BFloat16 && bias)
+    {
+        // Keep the f32 bias for the cooperative Gemm; the packed storage below
+        // cannot be read back once the weight upload owns it.
+        coop_bias.resize(output_columns);
+        if (bias->dtype == DType::Float32)
+        {
+            const std::span<const float> values = bias->float32_values();
+            if (values.size() != output_columns)
+                return {};
+            std::copy(values.begin(), values.end(), coop_bias.begin());
+        }
+        else
+        {
+            const std::span<const uint16_t> values = bias->bfloat16_values();
+            if (values.size() != output_columns)
+                return {};
+            for (uint32_t index = 0; index < output_columns; ++index)
+                coop_bias[index] = bfloat16_to_float(values[index]);
+        }
+    }
     const auto copy_metadata = [&](uint32_t offset, const void* data, size_t bytes) {
         if (bytes != 0)
             std::memcpy(packed_storage.data() + offset, data, bytes);
@@ -732,6 +753,19 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
             || !create_qnk_projection_pipeline(implementation.vulkan_context, implementation.option, matrix.dtype,
                                                implementation.columns_offset != 0, 4, implementation.prefill_pipeline))
             return {};
+        if (matrix.dtype == DType::BFloat16)
+        {
+            create_tile_gemm(implementation.vulkan_context, implementation.option, implementation.tile_gemm);
+            // Plain BF16 rows are the only layout ncnn's Gemm can pack as-is.
+            if (implementation.block_count == 0 && implementation.input_group_count == 1
+                && implementation.block_size == static_cast<uint64_t>(implementation.input_columns) * sizeof(uint16_t))
+                (void)create_coop_gemm(implementation.vulkan_context, implementation.option,
+                                       implementation.input_columns, implementation.output_columns,
+                                       matrix.bfloat16_values(),
+                                       std::span<const float>(coop_bias),
+                                       implementation.coop_gemm,
+                                       implementation.coop_opt);
+        }
     }
     if ((output_columns + 3u) / 4u > static_cast<uint32_t>(std::numeric_limits<int>::max()) / implementation.pipeline->local_size_x())
         return {};
@@ -862,6 +896,46 @@ void QnkLinear_vulkan::record(const ncnn::VkMat& input,
     constants[11].u32 = static_cast<uint32_t>(output.w);
     constants[12].u32 = output_column_offset;
     constants[13].u32 = implementation.input_group_count;
+    if (implementation.coop_gemm && implementation.block_count == 0
+        && implementation.input_group_count == 1 && output_column_offset == 0
+        && output.elemsize == sizeof(float) && output.elempack == 1
+        && static_cast<uint32_t>(output.w) == implementation.output_columns
+        && input.elemsize == sizeof(float) && input.elempack == 1
+        && input.dims == 2 && input.h >= 32)
+    {
+        const auto& gemm_option = implementation.coop_opt;
+        ncnn::VulkanDevice* device = implementation.vulkan_context->device();
+        ncnn::VkMat input_fp16;
+        std::vector<ncnn::VkMat> tops(1);
+        ncnn::VkMat projected;
+        device->convert_packing(input, input_fp16, 1, 2, command, gemm_option);
+        if (!input_fp16.empty()
+            && implementation.coop_gemm->forward({input_fp16}, tops, command, gemm_option) == 0
+            && !tops[0].empty())
+        {
+            device->convert_packing(tops[0], projected, 1, 1, command, gemm_option);
+            if (!projected.empty())
+            {
+                output = projected;
+                return;
+            }
+        }
+    }
+    if ((implementation.tile_gemm[0].pipeline || implementation.tile_gemm[1].pipeline)
+        && activation_variant(implementation.option) == 0
+        && implementation.block_count == 0
+        && implementation.block_size == static_cast<uint64_t>(implementation.input_columns) * sizeof(uint16_t))
+    {
+        const TileShape shape{constants[3].u32,
+                              implementation.input_columns,
+                              implementation.output_columns,
+                              static_cast<uint32_t>(output.w),
+                              output_column_offset,
+                              implementation.input_group_count};
+        if (record_tile_gemm(implementation.tile_gemm, input, implementation.quantized,
+                             implementation.bias, ncnn::VkMat(), ncnn::VkMat(), output, shape, command))
+            return;
+    }
     const uint32_t tile_rows = constants[3].u32 > 1 ? 4u : 1u;
     const auto& pipeline = tile_rows == 1 ? implementation.pipeline : implementation.prefill_pipeline;
     ncnn::VkMat dispatcher;

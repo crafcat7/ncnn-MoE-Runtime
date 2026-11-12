@@ -7,6 +7,7 @@
 #include "statecache.h"
 #include "backends/ncnn/linear.h"
 #include "graph/compiledoperator.h"
+#include "engine/cpu.h"
 #include "ncnn/moe/option.h"
 
 #include <algorithm>
@@ -58,72 +59,90 @@ static void configure_gated_delta_cache(LayerCache& cache, const AttentionBlockP
     cache.gated_delta_token_count = 0;
 }
 
-static void conv_row(const TensorData& weight,
-                     uint32_t kernel_size,
-                     std::vector<float>& state,
-                     float* values,
-                     uint32_t columns)
+static void conv_rows(const TensorData& weight,
+                      uint32_t kernel_size,
+                      LayerCache& cache,
+                      float* values,
+                      size_t value_stride,
+                      size_t first,
+                      size_t row_count,
+                      uint32_t columns)
 {
     assert(weight.shape.size() == 3);
     assert(weight.shape[0] == columns);
     assert(weight.shape[1] == 1);
     assert(weight.shape[2] == kernel_size);
-    if (kernel_size == 4 && weight.dtype == DType::Float32)
-    {
-        const std::span<const float> filter = weight.float32_values();
-        for (uint32_t channel = 0; channel < columns; ++channel)
-        {
-            float* history = state.data() + static_cast<size_t>(channel) * 4;
-            history[0] = history[1];
-            history[1] = history[2];
-            history[2] = history[3];
-            history[3] = values[channel];
-            const float* taps = filter.data() + static_cast<size_t>(channel) * 4;
-            float sum = history[0] * taps[0];
-            sum += history[1] * taps[1];
-            sum += history[2] * taps[2];
-            sum += history[3] * taps[3];
-            values[channel] = sum;
-        }
-        float_silu_inplace(values, columns);
+    if (row_count == 0 || columns == 0)
         return;
-    }
-    if (kernel_size == 4 && weight.dtype == DType::BFloat16)
+
+    // Cache the [tap][channel] FP32 filter with the session state.  The
+    // weights are immutable, so prefill and decode can share one vectorized
+    // convolution kernel instead of rebuilding or special-casing the filter.
+    std::vector<float>& taps = cache.gated_delta_conv_taps;
+    if (taps.size() != static_cast<size_t>(kernel_size) * columns)
     {
-        const std::span<const uint16_t> filter = weight.bfloat16_values();
-        for (uint32_t channel = 0; channel < columns; ++channel)
-        {
-            float* history = state.data() + static_cast<size_t>(channel) * 4;
-            history[0] = history[1];
-            history[1] = history[2];
-            history[2] = history[3];
-            history[3] = values[channel];
-            const size_t offset = static_cast<size_t>(channel) * 4;
-            float sum = history[0] * bfloat16_to_float(filter[offset]);
-            sum += history[1] * bfloat16_to_float(filter[offset + 1]);
-            sum += history[2] * bfloat16_to_float(filter[offset + 2]);
-            sum += history[3] * bfloat16_to_float(filter[offset + 3]);
-            values[channel] = sum;
-        }
-        float_silu_inplace(values, columns);
-        return;
-    }
-    for (uint32_t channel = 0; channel < columns; ++channel)
-    {
-        float* history = state.data() + static_cast<size_t>(channel) * kernel_size;
-        std::move(history + 1, history + kernel_size, history);
-        history[kernel_size - 1] = values[channel];
-        float sum = 0.0f;
+        taps.resize(static_cast<size_t>(kernel_size) * columns);
         for (uint32_t tap = 0; tap < kernel_size; ++tap)
-        {
-            sum += history[tap]
-                   * gated_delta_tensor_value(weight,
-                                              static_cast<size_t>(channel) * kernel_size
-                                                  + tap);
-        }
-        values[channel] = sum;
+            for (uint32_t channel = 0; channel < columns; ++channel)
+                taps[static_cast<size_t>(tap) * columns + channel] = gated_delta_tensor_value(weight, static_cast<size_t>(channel) * kernel_size + tap);
     }
-    float_silu_inplace(values, columns);
+
+    const uint32_t team_size = row_count > 1
+                                   ? static_cast<uint32_t>(cpu_linear_team_size(static_cast<uint64_t>(row_count) * columns * kernel_size,
+                                                                                DType::Float32))
+                                   : 1;
+    const auto process_range = [&](uint32_t begin, uint32_t end) {
+        std::vector<float>& state = cache.gated_delta_convolution;
+        if (kernel_size == 4)
+        {
+            gdn_conv4(state.data(), values, value_stride, first, row_count,
+                      begin, end, columns, taps.data());
+            return;
+        }
+        for (size_t token = 0; token < row_count; ++token)
+        {
+            float* row = values + (first + token) * value_stride;
+            for (uint32_t channel = begin; channel < end; ++channel)
+            {
+                const float current = row[channel];
+                for (uint32_t tap = 0; tap + 1 < kernel_size; ++tap)
+                    state[static_cast<size_t>(tap) * columns + channel] = state[static_cast<size_t>(tap + 1) * columns + channel];
+                state[static_cast<size_t>(kernel_size - 1) * columns + channel] = current;
+                float sum = 0.0f;
+                for (uint32_t tap = 0; tap < kernel_size; ++tap)
+                    sum += state[static_cast<size_t>(tap) * columns + channel]
+                           * taps[static_cast<size_t>(tap) * columns + channel];
+                row[channel] = sum;
+            }
+        }
+    };
+
+    if (team_size <= 1)
+    {
+        process_range(0, columns);
+    }
+    else
+    {
+        const uint64_t chunk_count = team_size;
+        const uint32_t chunk_size = (columns + static_cast<uint32_t>(chunk_count) - 1) / static_cast<uint32_t>(chunk_count);
+#pragma omp parallel num_threads(team_size)
+        {
+            cpu_bind_thread();
+#pragma omp for schedule(static)
+            for (int64_t chunk = 0; chunk < static_cast<int64_t>(chunk_count); ++chunk)
+            {
+                const uint32_t begin = static_cast<uint32_t>(chunk) * chunk_size;
+                if (begin >= columns)
+                    continue;
+                const uint32_t end = std::min(columns, begin + chunk_size);
+                process_range(begin, end);
+            }
+        }
+    }
+    // Activation is independent per element; run it through the vectorized
+    // kernel over each contiguous row instead of per-channel scalar calls.
+    for (size_t token = 0; token < row_count; ++token)
+        float_silu_inplace(values + (first + token) * value_stride, columns);
 }
 
 static void gdn_recurrence(const WeightStore& weights,
@@ -181,6 +200,7 @@ static void gdn_recurrence(const WeightStore& weights,
                                              static_cast<uint32_t>(cpu_linear_team_size(operation_count,
                                                                                         DType::Float32)));
     const bool parallelize_value_heads = head_team_size > 1;
+
     const size_t scratch_head_count = head_team_size > 1
                                           ? plan.head_count
                                           : 1;
@@ -189,151 +209,171 @@ static void gdn_recurrence(const WeightStore& weights,
     delta.resize(static_cast<size_t>(scratch_head_count)
                  * plan.value_head_dimension);
 
-#pragma omp parallel for schedule(static) num_threads(head_team_size) if (parallelize_value_heads)
-    for (int64_t value_head_index = 0;
-         value_head_index < static_cast<int64_t>(plan.head_count);
-         ++value_head_index)
+#pragma omp parallel num_threads(head_team_size) if (parallelize_value_heads)
     {
-        const uint32_t value_head = static_cast<uint32_t>(value_head_index);
-        const uint32_t key_head = value_head / head_ratio;
-        float* recurrent = cache.gated_delta_recurrent.data()
-                           + static_cast<size_t>(value_head) * plan.head_dimension
-                                 * plan.value_head_dimension;
-        float* memory_values = memory.data() + static_cast<size_t>(parallelize_value_heads ? value_head : 0) * plan.value_head_dimension;
-        float* delta_values = delta.data() + static_cast<size_t>(parallelize_value_heads ? value_head : 0) * plan.value_head_dimension;
-        const float decay_scale = -float_approximate_exp(gated_delta_tensor_value(decay_log, value_head));
-        const bool bounded_gate = has_flag(plan.flags, AttentionBlockDeltaGate);
-        const uint32_t gate_channels = plan.delta_gate_channels;
-        const float gate_scale = bounded_gate
-                                     ? float_approximate_exp(gated_delta_tensor_value(decay_log, value_head))
-                                     : 0.0f;
-        const size_t gate_offset = static_cast<size_t>(value_head) * gate_channels;
-        for (size_t token_index = 0; token_index < row_count; ++token_index)
+        cpu_bind_thread();
+#pragma omp for schedule(static)
+        for (int64_t value_head_index = 0;
+             value_head_index < static_cast<int64_t>(plan.head_count);
+             ++value_head_index)
         {
-            const float* token_qkv = qkv + token_index * qkv_stride;
-            const float* query = token_qkv + static_cast<size_t>(key_head) * plan.head_dimension;
-            const float* key = token_qkv + key_size
-                               + static_cast<size_t>(key_head) * plan.head_dimension;
-            const float* value = token_qkv + key_size * 2
-                                 + static_cast<size_t>(value_head) * plan.value_head_dimension;
-            const float* token_beta = beta_values + token_index * beta_stride;
-            const float* token_alpha = alpha_values + token_index * alpha_stride
-                                       + static_cast<size_t>(value_head) * gate_channels;
-            const float beta = gated_delta_sigmoid(token_beta[value_head]);
-            const float scalar_decay = bounded_gate
-                                           ? 0.0f
-                                           : float_approximate_exp(decay_scale
-                                                                   * gated_delta_softplus(token_alpha[0]
-                                                                                          + gated_delta_tensor_value(time_bias, gate_offset)));
-            float* head_output = recurrent_output
-                                 + token_index * scratch.recurrent_output.columns()
-                                 + static_cast<size_t>(value_head) * plan.value_head_dimension;
-            // Keep the state in its public [key][value] layout, but traverse it
-            // row-wise.  Decay and the first matrix-vector product share one
-            // load/store pass: the state is updated in place and the decayed
-            // row is accumulated into memory before moving to the next key.
-            std::fill(memory_values,
-                      memory_values + plan.value_head_dimension,
-                      0.0f);
-            for (uint32_t key_column = 0;
-                 key_column < plan.head_dimension;
-                 ++key_column)
+            const uint32_t value_head = static_cast<uint32_t>(value_head_index);
+            const uint32_t key_head = value_head / head_ratio;
+            float* recurrent = cache.gated_delta_recurrent.data()
+                               + static_cast<size_t>(value_head) * plan.head_dimension
+                                     * plan.value_head_dimension;
+            float* memory_values = memory.data() + static_cast<size_t>(parallelize_value_heads ? value_head : 0) * plan.value_head_dimension;
+            float* delta_values = delta.data() + static_cast<size_t>(parallelize_value_heads ? value_head : 0) * plan.value_head_dimension;
+            const float decay_scale = -float_approximate_exp(gated_delta_tensor_value(decay_log, value_head));
+            const bool bounded_gate = has_flag(plan.flags, AttentionBlockDeltaGate);
+            const uint32_t gate_channels = plan.delta_gate_channels;
+            const float gate_scale = bounded_gate
+                                         ? float_approximate_exp(gated_delta_tensor_value(decay_log, value_head))
+                                         : 0.0f;
+            const size_t gate_offset = static_cast<size_t>(value_head) * gate_channels;
+            for (size_t token_index = 0; token_index < row_count; ++token_index)
             {
-                const float decay = bounded_gate
-                                        ? float_approximate_exp(plan.delta_lower_bound
-                                                                * gated_delta_sigmoid(gate_scale * (token_alpha[key_column] + gated_delta_tensor_value(time_bias, gate_offset + key_column))))
-                                        : scalar_decay;
-                scale_add(recurrent
-                              + static_cast<size_t>(key_column)
-                                    * plan.value_head_dimension,
-                          decay,
-                          memory_values,
-                          key[key_column],
-                          plan.value_head_dimension);
-            }
-            for (uint32_t value_column = 0;
-                 value_column < plan.value_head_dimension;
-                 ++value_column)
-            {
-                delta_values[value_column] = (value[value_column] - memory_values[value_column]) * beta;
-            }
-            std::fill(head_output,
-                      head_output + plan.value_head_dimension,
-                      0.0f);
-            for (uint32_t key_column = 0;
-                 key_column < plan.head_dimension;
-                 ++key_column)
-            {
-                scaled_acc(recurrent
-                               + static_cast<size_t>(key_column)
-                                     * plan.value_head_dimension,
-                           delta_values,
-                           key[key_column],
-                           head_output,
-                           query[key_column],
-                           plan.value_head_dimension);
-            }
-            float_scale_inplace(head_output,
-                                query_scale,
-                                plan.value_head_dimension);
-
-            const bool fused_norm = norm_weight.dtype == DType::Float32 || norm_weight.dtype == DType::BFloat16;
-            if (fused_norm && norm_weight.dtype == DType::Float32)
-            {
-                float_rms_norm(head_output,
-                               head_output,
-                               norm_weight.float32_values().data(),
-                               plan.norm_epsilon,
-                               0.0f,
-                               plan.value_head_dimension);
-            }
-            else if (fused_norm)
-            {
-                bfloat16_rms_norm(head_output,
-                                  head_output,
-                                  norm_weight.bfloat16_values().data(),
-                                  plan.norm_epsilon,
-                                  0.0f,
-                                  plan.value_head_dimension);
-            }
-            if (fused_norm)
-            {
-                const float* head_gate = z + token_index * z_stride
-                                         + static_cast<size_t>(value_head) * plan.value_head_dimension;
-                if (has_flag(plan.flags, AttentionBlockSigmoidGate))
+                const float* token_qkv = qkv + token_index * qkv_stride;
+                const float* query = token_qkv + static_cast<size_t>(key_head) * plan.head_dimension;
+                const float* key = token_qkv + key_size
+                                   + static_cast<size_t>(key_head) * plan.head_dimension;
+                const float* value = token_qkv + key_size * 2
+                                     + static_cast<size_t>(value_head) * plan.value_head_dimension;
+                const float* token_beta = beta_values + token_index * beta_stride;
+                const float* token_alpha = alpha_values + token_index * alpha_stride
+                                           + static_cast<size_t>(value_head) * gate_channels;
+                const float beta = gated_delta_sigmoid(token_beta[value_head]);
+                const float scalar_decay = bounded_gate
+                                               ? 0.0f
+                                               : float_approximate_exp(decay_scale
+                                                                       * gated_delta_softplus(token_alpha[0]
+                                                                                              + gated_delta_tensor_value(time_bias, gate_offset)));
+                float* head_output = recurrent_output
+                                     + token_index * scratch.recurrent_output.columns()
+                                     + static_cast<size_t>(value_head) * plan.value_head_dimension;
+                // Keep the state in its public [key][value] layout.  The common
+                // scalar-decay path is a single fused SIMD kernel so the 16K
+                // element state is touched once per pass instead of once per key
+                // row through a vector-helper call.
+                if (!bounded_gate)
                 {
-                    float_sigmoid_mul(head_output, head_gate, head_output,
-                                      plan.value_head_dimension);
+                    gdn_step(recurrent,
+                             key,
+                             query,
+                             value,
+                             plan.head_dimension,
+                             plan.value_head_dimension,
+                             scalar_decay,
+                             beta,
+                             query_scale,
+                             memory_values,
+                             delta_values,
+                             head_output);
                 }
                 else
                 {
-                    float_silu_mul(head_output,
-                                   head_gate,
+                    std::fill(memory_values,
+                              memory_values + plan.value_head_dimension,
+                              0.0f);
+                    for (uint32_t key_column = 0;
+                         key_column < plan.head_dimension;
+                         ++key_column)
+                    {
+                        const float decay = float_approximate_exp(plan.delta_lower_bound
+                                                                  * gated_delta_sigmoid(gate_scale * (token_alpha[key_column] + gated_delta_tensor_value(time_bias, gate_offset + key_column))));
+                        scale_add(recurrent
+                                      + static_cast<size_t>(key_column)
+                                            * plan.value_head_dimension,
+                                  decay,
+                                  memory_values,
+                                  key[key_column],
+                                  plan.value_head_dimension);
+                    }
+                    for (uint32_t value_column = 0;
+                         value_column < plan.value_head_dimension;
+                         ++value_column)
+                    {
+                        delta_values[value_column] = (value[value_column] - memory_values[value_column]) * beta;
+                    }
+                    std::fill(head_output,
+                              head_output + plan.value_head_dimension,
+                              0.0f);
+                    for (uint32_t key_column = 0;
+                         key_column < plan.head_dimension;
+                         ++key_column)
+                    {
+                        scaled_acc(recurrent
+                                       + static_cast<size_t>(key_column)
+                                             * plan.value_head_dimension,
+                                   delta_values,
+                                   key[key_column],
                                    head_output,
-                                   1.0f,
+                                   query[key_column],
+                                   plan.value_head_dimension);
+                    }
+                    float_scale_inplace(head_output,
+                                        query_scale,
+                                        plan.value_head_dimension);
+                }
+
+                const bool fused_norm = norm_weight.dtype == DType::Float32 || norm_weight.dtype == DType::BFloat16;
+                if (fused_norm && norm_weight.dtype == DType::Float32)
+                {
+                    float_rms_norm(head_output,
+                                   head_output,
+                                   norm_weight.float32_values().data(),
+                                   plan.norm_epsilon,
                                    0.0f,
                                    plan.value_head_dimension);
                 }
-            }
-            else
-            {
-                const float square_sum = float_dot(head_output, head_output, plan.value_head_dimension);
-                const float inverse_rms = 1.0f
-                                          / std::sqrt(square_sum
-                                                          / static_cast<float>(plan.value_head_dimension)
-                                                      + plan.norm_epsilon);
-                const float* head_gate = z + token_index * z_stride
-                                         + static_cast<size_t>(value_head) * plan.value_head_dimension;
-                for (uint32_t value_column = 0;
-                     value_column < plan.value_head_dimension;
-                     ++value_column)
+                else if (fused_norm)
                 {
-                    head_output[value_column] *= inverse_rms
-                                                 * gated_delta_tensor_value(norm_weight, value_column)
-                                                 * (has_flag(plan.flags, AttentionBlockSigmoidGate)
-                                                        ? gated_delta_sigmoid(head_gate[value_column])
-                                                        : head_gate[value_column]
-                                                              * gated_delta_sigmoid(head_gate[value_column]));
+                    bfloat16_rms_norm(head_output,
+                                      head_output,
+                                      norm_weight.bfloat16_values().data(),
+                                      plan.norm_epsilon,
+                                      0.0f,
+                                      plan.value_head_dimension);
+                }
+                if (fused_norm)
+                {
+                    const float* head_gate = z + token_index * z_stride
+                                             + static_cast<size_t>(value_head) * plan.value_head_dimension;
+                    if (has_flag(plan.flags, AttentionBlockSigmoidGate))
+                    {
+                        float_sigmoid_mul(head_output, head_gate, head_output,
+                                          plan.value_head_dimension);
+                    }
+                    else
+                    {
+                        float_silu_mul(head_output,
+                                       head_gate,
+                                       head_output,
+                                       1.0f,
+                                       0.0f,
+                                       plan.value_head_dimension);
+                    }
+                }
+                else
+                {
+                    const float square_sum = float_dot(head_output, head_output, plan.value_head_dimension);
+                    const float inverse_rms = 1.0f
+                                              / std::sqrt(square_sum
+                                                              / static_cast<float>(plan.value_head_dimension)
+                                                          + plan.norm_epsilon);
+                    const float* head_gate = z + token_index * z_stride
+                                             + static_cast<size_t>(value_head) * plan.value_head_dimension;
+                    for (uint32_t value_column = 0;
+                         value_column < plan.value_head_dimension;
+                         ++value_column)
+                    {
+                        head_output[value_column] *= inverse_rms
+                                                     * gated_delta_tensor_value(norm_weight, value_column)
+                                                     * (has_flag(plan.flags, AttentionBlockSigmoidGate)
+                                                            ? gated_delta_sigmoid(head_gate[value_column])
+                                                            : head_gate[value_column]
+                                                                  * gated_delta_sigmoid(head_gate[value_column]));
+                    }
                 }
             }
         }
@@ -478,19 +518,18 @@ Result<void> forward_gated_delta(const WeightStore& weights,
     // Transactions retain each token's state; ordinary prefill shares one
     // head team across all rows without changing their recurrent order.
     const size_t rows = cache.transaction.active ? 1 : hidden_rows;
+    float* conv_values = fused_input ? scratch.fused_input.row(0) : scratch.qkv.row(0);
+    const size_t conv_stride = fused_input ? scratch.fused_input.columns() : scratch.qkv.columns();
     for (size_t first = 0; first < hidden_rows; first += rows)
     {
-        for (size_t token_index = first; token_index < first + rows; ++token_index)
-        {
-            float* qkv = fused_input
-                             ? scratch.fused_input.row(token_index)
-                             : scratch.qkv.row(token_index);
-            conv_row(weights.at(plan.delta_convolution_weight),
-                     plan.convolution_kernel_size,
-                     cache.gated_delta_convolution,
-                     qkv,
-                     convolution_size);
-        }
+        conv_rows(weights.at(plan.delta_convolution_weight),
+                  plan.convolution_kernel_size,
+                  cache,
+                  conv_values,
+                  conv_stride,
+                  first,
+                  rows,
+                  convolution_size);
         gdn_recurrence(weights,
                        plan,
                        cache,

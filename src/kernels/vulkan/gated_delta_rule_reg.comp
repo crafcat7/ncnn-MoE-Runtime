@@ -1,0 +1,182 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// Register-resident recurrent gated delta rule: the file name states the
+// implementation, the state lives in registers instead of device memory.
+//
+// One subgroup owns one value column of one head: its 32 lanes cover the 128
+// key rows four at a time, so the whole 128-float state column stays in
+// registers across the token loop and each token only costs the input reads,
+// two subgroup reductions and one output store. gated_delta_rule.comp is the
+// device-memory variant, which re-reads and re-writes the state per token.
+//
+// A 128-invocation workgroup covers four value columns of one head.
+
+layout(binding = 0) readonly buffer fused_input_blob
+{
+    float fused_input[];
+};
+layout(binding = 1) buffer recurrent_state_blob
+{
+    float recurrent_state[];
+};
+layout(binding = 2) readonly buffer time_bias_blob
+{
+    float time_bias[];
+};
+layout(binding = 3) readonly buffer decay_log_blob
+{
+    float decay_log[];
+};
+layout(binding = 4) buffer output_blob
+{
+    float output_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint convolution_size;
+    uint value_size;
+    uint fused_columns;
+    uint head_count;
+    uint kv_head_count;
+    uint head_dimension;
+    uint value_head_dimension;
+    uint kernel_size;
+    uint token_count;
+    float norm_epsilon;
+    uint sigmoid_gate;
+    uint gate_channels;
+    float lower_bound;
+}
+p;
+
+#define LANES             32
+#define COLUMNS_PER_GROUP 4
+// head_dimension is validated to be 128 on the host for this path.
+#define KEY_ROWS 4
+
+layout(local_size_x = LANES * COLUMNS_PER_GROUP, local_size_y = 1, local_size_z = 1) in;
+
+float sigmoid(float value)
+{
+    if (value >= 0.0)
+        return 1.0 / (1.0 + exp(-value));
+    const float exponential = exp(value);
+    return exponential / (1.0 + exponential);
+}
+
+float softplus(float value)
+{
+    if (value > 20.0)
+        return value;
+    if (value < -20.0)
+        return exp(value);
+    return log(1.0 + exp(value));
+}
+
+struct TokenInputs
+{
+    float k0, k1, k2, k3;
+    float q0, q1, q2, q3;
+    float beta, value;
+    float d0, d1, d2, d3;
+};
+
+// Loads everything one token needs. The loads, the softplus and the exp do not
+// depend on the previous token's state, so the loop below issues them one
+// iteration ahead of the reduction that consumes them.
+TokenInputs load_token_inputs(uint token, uint key_head, uint value_head, uint value_column, uint lane, float a_log,
+                              uint key_size)
+{
+    TokenInputs result;
+    const uint input_row = token * p.fused_columns;
+    const uint query_base = input_row + key_head * p.head_dimension;
+    const uint key_base = input_row + key_size + key_head * p.head_dimension;
+    const uint value_base = input_row + key_size * 2 + value_head * p.value_head_dimension;
+    result.beta = sigmoid(fused_input[input_row + p.convolution_size + p.value_size + value_head]);
+    const uint alpha_base = input_row + p.convolution_size + p.value_size + p.head_count
+                            + value_head * p.gate_channels;
+    result.value = fused_input[value_base + value_column];
+    // One scalar gate keeps the Qwen3-Next softplus decay; a per-channel gate uses
+    // the bounded sigmoid form and indexes dt_bias by that channel.
+    if (p.gate_channels == 1)
+    {
+        const float alpha = fused_input[alpha_base] + time_bias[value_head];
+        const float decay = exp(-a_log * softplus(alpha));
+        result.d0 = decay;
+        result.d1 = decay;
+        result.d2 = decay;
+        result.d3 = decay;
+    }
+    else
+    {
+        const uint bias_base = value_head * p.gate_channels;
+        result.d0 = exp(p.lower_bound * sigmoid(a_log * (fused_input[alpha_base + 0u * LANES + lane] + time_bias[bias_base + 0u * LANES + lane])));
+        result.d1 = exp(p.lower_bound * sigmoid(a_log * (fused_input[alpha_base + 1u * LANES + lane] + time_bias[bias_base + 1u * LANES + lane])));
+        result.d2 = exp(p.lower_bound * sigmoid(a_log * (fused_input[alpha_base + 2u * LANES + lane] + time_bias[bias_base + 2u * LANES + lane])));
+        result.d3 = exp(p.lower_bound * sigmoid(a_log * (fused_input[alpha_base + 3u * LANES + lane] + time_bias[bias_base + 3u * LANES + lane])));
+    }
+    result.k0 = fused_input[key_base + 0u * LANES + lane];
+    result.k1 = fused_input[key_base + 1u * LANES + lane];
+    result.k2 = fused_input[key_base + 2u * LANES + lane];
+    result.k3 = fused_input[key_base + 3u * LANES + lane];
+    result.q0 = fused_input[query_base + 0u * LANES + lane];
+    result.q1 = fused_input[query_base + 1u * LANES + lane];
+    result.q2 = fused_input[query_base + 2u * LANES + lane];
+    result.q3 = fused_input[query_base + 3u * LANES + lane];
+    return result;
+}
+
+void main()
+{
+    const uint lane = gl_SubgroupInvocationID;
+    const uint subgroup = gl_SubgroupID;
+    const uint group = gl_WorkGroupID.x;
+    const uint blocks = p.value_head_dimension / COLUMNS_PER_GROUP;
+    const uint value_head = group / blocks;
+    const uint value_column = (group % blocks) * COLUMNS_PER_GROUP + subgroup;
+
+    const uint head_ratio = p.head_count / p.kv_head_count;
+    const uint key_head = value_head / head_ratio;
+    const uint key_size = p.kv_head_count * p.head_dimension;
+    const uint value_columns = p.value_head_dimension;
+    const uint recurrent_base = value_head * p.head_dimension * value_columns;
+    const float query_scale = 1.0 / sqrt(float(p.head_dimension));
+    const float a_log = exp(decay_log[value_head]);
+
+    float s0 = recurrent_state[recurrent_base + (0u * LANES + lane) * value_columns + value_column];
+    float s1 = recurrent_state[recurrent_base + (1u * LANES + lane) * value_columns + value_column];
+    float s2 = recurrent_state[recurrent_base + (2u * LANES + lane) * value_columns + value_column];
+    float s3 = recurrent_state[recurrent_base + (3u * LANES + lane) * value_columns + value_column];
+
+    TokenInputs current = load_token_inputs(0, key_head, value_head, value_column, lane, a_log, key_size);
+    for (uint token = 0; token < p.token_count; ++token)
+    {
+        const TokenInputs prefetched = load_token_inputs(min(token + 1u, p.token_count - 1u), key_head, value_head,
+                                                         value_column, lane, a_log, key_size);
+
+        const float memory = s0 * current.k0 * current.d0 + s1 * current.k1 * current.d1
+                             + s2 * current.k2 * current.d2 + s3 * current.k3 * current.d3;
+        const float delta = (current.value - subgroupAdd(memory)) * current.beta;
+
+        s0 = s0 * current.d0 + current.k0 * delta;
+        s1 = s1 * current.d1 + current.k1 * delta;
+        s2 = s2 * current.d2 + current.k2 * delta;
+        s3 = s3 * current.d3 + current.k3 * delta;
+
+        const float attention = s0 * current.q0 + s1 * current.q1 + s2 * current.q2 + s3 * current.q3;
+        const float reduced = subgroupAdd(attention);
+        if (lane == 0u)
+            output_data[token * p.value_size + value_head * p.value_head_dimension + value_column] = reduced * query_scale;
+
+        current = prefetched;
+    }
+
+    recurrent_state[recurrent_base + (0u * LANES + lane) * value_columns + value_column] = s0;
+    recurrent_state[recurrent_base + (1u * LANES + lane) * value_columns + value_column] = s1;
+    recurrent_state[recurrent_base + (2u * LANES + lane) * value_columns + value_column] = s2;
+    recurrent_state[recurrent_base + (3u * LANES + lane) * value_columns + value_column] = s3;
+}

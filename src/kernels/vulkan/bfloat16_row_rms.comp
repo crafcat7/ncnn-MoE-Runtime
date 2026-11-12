@@ -1,0 +1,51 @@
+#version 450
+
+// Per-token inverse RMS for the fused RMSNorm projection. One workgroup owns
+// one token row; the tiled projection then applies the scalar together with the
+// norm weight while staging its activation tile.
+
+layout(binding = 0) readonly buffer input_blob
+{
+    vec4 input_data[];
+};
+layout(binding = 1) writeonly buffer scale_blob
+{
+    float scale_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint input_columns;
+    float epsilon;
+}
+p;
+
+#define THREADS 256
+
+layout(local_size_x = THREADS, local_size_y = 1, local_size_z = 1) in;
+
+shared float partial_sum[THREADS];
+
+void main()
+{
+    const uint token = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint row = token * p.input_columns;
+    float square_sum = 0.0;
+    for (uint column = lane * 4u; column + 3u < p.input_columns; column += THREADS * 4u)
+    {
+        const vec4 values = input_data[(row + column) >> 2];
+        square_sum += values.x * values.x + values.y * values.y
+                      + values.z * values.z + values.w * values.w;
+    }
+    partial_sum[lane] = square_sum;
+    barrier();
+    for (uint stride = THREADS / 2; stride > 0; stride >>= 1)
+    {
+        if (lane < stride)
+            partial_sum[lane] += partial_sum[lane + stride];
+        barrier();
+    }
+    if (lane == 0)
+        scale_data[token] = 1.0 / sqrt(partial_sum[0] / float(p.input_columns) + p.epsilon);
+}

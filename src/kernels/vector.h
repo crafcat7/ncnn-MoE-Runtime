@@ -65,6 +65,45 @@ void scaled_acc(float* values,
                 float* output,
                 float output_scale,
                 uint32_t count) noexcept;
+// One token of the gated delta rule for a single head.  The state is
+// [key_dim][value_dim]; the key/query vectors have key_dim entries and the
+// value vector has value_dim entries.  memory/delta/output are caller scratch
+// of value_dim floats.
+void gdn_step(float* state,
+              const float* key,
+              const float* query,
+              const float* value,
+              uint32_t key_dim,
+              uint32_t value_dim,
+              float decay,
+              float beta,
+              float scale,
+              float* memory,
+              float* delta,
+              float* output) noexcept;
+
+// Causal depthwise convolution for one gated delta layer.  The state layout is
+// [tap][channel] and taps is the same layout in FP32, so both the state and the
+// filter are contiguous across channels.
+void gdn_conv4(float* state,
+               float* values,
+               size_t value_stride,
+               size_t first,
+               size_t row_count,
+               uint32_t begin,
+               uint32_t end,
+               uint32_t columns,
+               const float* taps) noexcept;
+
+void pv_f32(float* output,
+            const float* values0,
+            size_t value_stride,
+            const float* weights0,
+            uint32_t count0,
+            const float* values1,
+            const float* weights1,
+            uint32_t count1,
+            uint32_t columns) noexcept;
 void float_weighted_scale(float* output, const float* input, const float* weight,
                           float scale, float weight_offset, uint32_t count) noexcept;
 void bfloat16_weighted_scale(float* output, const float* input, const uint16_t* weight,

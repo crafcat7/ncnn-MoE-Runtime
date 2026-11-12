@@ -1020,6 +1020,11 @@ static void prepare_gdn_ops(CompiledModel& compiled,
         (void)fused_input_operator->prepare_rms_norm(compiled.weights.at(plan.pre_attention_norm_weight),
                                                      plan.norm_epsilon,
                                                      plan.norm_weight_offset);
+        // The cooperative-matrix prefill path cannot fold the norm into its tile
+        // loads, so it needs the normalization as its own pass. Keep the fused
+        // chain above as the fallback.
+        (void)fused_input_operator->prepare_input_rms_norm(compiled.weights.at(plan.pre_attention_norm_weight),
+                                                           plan.norm_epsilon, plan.norm_weight_offset);
     }
 
     std::shared_ptr<Bfloat16Linear_vulkan> output_operator = Bfloat16Linear_vulkan::create(output_matrix,

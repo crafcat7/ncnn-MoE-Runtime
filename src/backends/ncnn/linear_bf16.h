@@ -29,7 +29,7 @@ public:
                                         float epsilon,
                                         float weight_offset = 0.0f);
     [[nodiscard]] bool has_rms_norm_chain() const noexcept;
-    [[nodiscard]] bool prepare_input_rms_norm(const TensorData& weight, float epsilon);
+    [[nodiscard]] bool prepare_input_rms_norm(const TensorData& weight, float epsilon, float weight_offset = 0.0f);
     [[nodiscard]] bool prepare_output_rms_norm(const TensorData& weight, float epsilon);
     [[nodiscard]] bool forward(const ActivationBuffer& input, ActivationBuffer& output) const;
     // Records a device projection without submitting or publishing counters.
@@ -106,13 +106,26 @@ private:
                                            FfnRecordStatistics_vulkan& statistics) const;
 #endif
 
-    // Caller provides allocated outputs and holds the context lock; scalar uses readonly bindings.
+    // Caller provides an allocated output and holds the context lock; the scalar
+    // path writes it in place, the cooperative path may replace it (see record_coop).
     void record_scalar_projection(const ncnn::VkMat& input,
                                   ncnn::VkMat& output,
                                   ncnn::VkCompute& cmd) const;
+    // Prefill projection through ncnn's cooperative-matrix Gemm, optionally after
+    // materializing the prepared input RMSNorm (the fused shader below folds the
+    // norm into its tile load, which the Gemm path cannot do). On success `output`
+    // is replaced by the Gemm's own result buffer, so callers must use the
+    // reference afterwards rather than a copy taken before the call. Returns false
+    // without touching the command when the shape or packed weights do not fit, so
+    // callers keep their tiled fallback.
+    [[nodiscard]] bool record_coop(const ncnn::VkMat& input,
+                                   ncnn::VkMat& output,
+                                   ncnn::VkCompute& cmd,
+                                   bool normalize = false) const;
     void record_rms_norm_projection(const ncnn::VkMat& input,
                                     ncnn::VkMat& output,
-                                    ncnn::VkCompute& cmd) const;
+                                    ncnn::VkCompute& cmd,
+                                    ncnn::VkMat* row_scale_workspace = nullptr) const;
     [[nodiscard]] const std::shared_ptr<VulkanContext>& vulkan_context() const noexcept;
     [[nodiscard]] const ncnn::Option& option() const noexcept;
     [[nodiscard]] uint32_t input_columns() const noexcept;

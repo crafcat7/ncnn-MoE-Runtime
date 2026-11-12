@@ -1,8 +1,14 @@
 #version 450
 
-// Query/key RMS norm for the gated delta rule. One workgroup owns one key head
-// and lanes cover its columns, so the reduction is a workgroup tree instead of a
-// serial lane loop.
+// Query/key RMS norm for the gated delta rule. One workgroup owns one (key head,
+// token) pair and lanes cover its columns, so the reduction is a workgroup tree
+// and tokens spread across the grid. The per-token reduction is independent, so
+// the token loop this kernel used to run bought nothing but barriers: with only
+// kv_head_count workgroups the GPU was idle for most of the stage.
+
+// The token index comes from gl_WorkGroupID.y, which is only equal to the token
+// when local_size_y is 1.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) buffer fused_input_blob
 {
@@ -34,10 +40,12 @@ void main()
 {
     const uint lane = gl_LocalInvocationID.x;
     const uint key_head = gl_WorkGroupID.x;
+    const uint token = gl_WorkGroupID.y;
+    if (token >= p.token_count)
+        return;
     const uint key_size = p.kv_head_count * p.head_dimension;
     const bool valid = lane < p.head_dimension;
 
-    for (uint token = 0; token < p.token_count; ++token)
     {
         const uint input_row = token * p.fused_columns;
         const uint query_base = input_row + key_head * p.head_dimension;
@@ -64,6 +72,5 @@ void main()
             fused_input[query_base + lane] *= query_inverse;
             fused_input[key_base + lane] *= key_inverse;
         }
-        barrier();
     }
 }

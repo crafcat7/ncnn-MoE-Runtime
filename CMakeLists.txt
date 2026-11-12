@@ -440,6 +440,9 @@ if(NCNN_MOE_USE_NCNN)
 
     # Force runtime-owned options when reconfiguring an existing cache.
     set(NCNN_BUILD_BENCHMARK OFF CACHE BOOL "Build ncnn benchmark")
+    # Runtime never uses ncnn's layer timing; keep the timestamp API and the
+    # string support it requires out of the build.
+    set(NCNN_BENCHMARK OFF CACHE BOOL "Build ncnn with benchmark timestamp support" FORCE)
     set(NCNN_BUILD_TESTS OFF CACHE BOOL "Build ncnn tests")
     set(NCNN_BUILD_EXAMPLES OFF CACHE BOOL "Build ncnn examples")
     set(NCNN_BUILD_TOOLS OFF CACHE BOOL "Build ncnn tools")
@@ -508,7 +511,9 @@ endif()
 # Embed GLSL for runtime compilation.
 if(NCNN_MOE_WITH_VULKAN)
     set(NCNN_MOE_VULKAN_SHADER_SOURCES
+        src/kernels/vulkan/attention_decode_merge.comp
         src/kernels/vulkan/attention_decode_sdpa.comp
+        src/kernels/vulkan/attention_decode_split.comp
         src/kernels/vulkan/attention_gqa_matrix.comp
         src/kernels/vulkan/attention_gqa_reduce.comp
         src/kernels/vulkan/attention_output_gate.comp
@@ -519,14 +524,20 @@ if(NCNN_MOE_WITH_VULKAN)
         src/kernels/vulkan/bfloat16_cooperative_projection.comp
         src/kernels/vulkan/bfloat16_projection.comp
         src/kernels/vulkan/bfloat16_rms_norm_projection.comp
+        src/kernels/vulkan/bfloat16_row_rms.comp
         src/kernels/vulkan/bfloat16_swiglu_down.comp
+        src/kernels/vulkan/bfloat16_tile_64x64.comp
+        src/kernels/vulkan/bfloat16_tile_32x64.comp
         src/kernels/vulkan/float8_projection.comp
         src/kernels/vulkan/float8_quantize.comp
         src/kernels/vulkan/float8_rms_norm_quantize.comp
         src/kernels/vulkan/float8_swiglu_quantize.comp
         src/kernels/vulkan/projection_matvec.comp
         src/kernels/vulkan/gated_delta_conv.comp
+        src/kernels/vulkan/gated_delta_conv_history.comp
+        src/kernels/vulkan/gated_delta_conv_parallel.comp
         src/kernels/vulkan/gated_delta_rule.comp
+        src/kernels/vulkan/gated_delta_rule_reg.comp
         src/kernels/vulkan/gated_delta_qk.comp
         src/kernels/vulkan/gated_delta_norm.comp
         src/kernels/vulkan/residual_ple.comp

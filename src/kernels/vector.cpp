@@ -30,6 +30,9 @@ using FloatScaledAddFunction = void (*)(float*, const float*, float, uint32_t) n
 using FloatScaleAddFunction = void (*)(float*, float, const float*, float, uint32_t) noexcept;
 using FloatScaleInplaceAndScaledAddFunction = void (*)(float*, float, float*, float, uint32_t) noexcept;
 using FloatScaledAddAndAccumulateFunction = void (*)(float*, const float*, float, float*, float, uint32_t) noexcept;
+using GdnStepFunction = void (*)(float*, const float*, const float*, const float*, uint32_t, uint32_t, float, float, float, float*, float*, float*) noexcept;
+using GdnConv4Function = void (*)(float*, float*, size_t, size_t, size_t, uint32_t, uint32_t, uint32_t, const float*) noexcept;
+using PvF32Function = void (*)(float*, const float*, size_t, const float*, uint32_t, const float*, const float*, uint32_t, uint32_t) noexcept;
 using FloatWeightedScaleFunction = void (*)(float*, const float*, const float*, float, float, uint32_t) noexcept;
 using Bfloat16WeightedScaleFunction = void (*)(float*, const float*, const uint16_t*, float, float, uint32_t) noexcept;
 using FloatRmsScaleFunction = void (*)(float*, float, uint32_t) noexcept;
@@ -439,6 +442,113 @@ static void scalar_float_scaled_add_and_accumulate(float* values,
     }
 }
 
+static void scalar_pv_f32(float* output,
+                          const float* values0,
+                          size_t value_stride,
+                          const float* weights0,
+                          uint32_t count0,
+                          const float* values1,
+                          const float* weights1,
+                          uint32_t count1,
+                          uint32_t columns) noexcept
+{
+    for (uint32_t key = 0; key < count0; ++key)
+    {
+        const float weight = weights0[key];
+        const float* row = values0 + static_cast<size_t>(key) * value_stride;
+        for (uint32_t column = 0; column < columns; ++column)
+            output[column] += weight * row[column];
+    }
+    for (uint32_t key = 0; key < count1; ++key)
+    {
+        const float weight = weights1[key];
+        const float* row = values1 + static_cast<size_t>(key) * value_stride;
+        for (uint32_t column = 0; column < columns; ++column)
+            output[column] += weight * row[column];
+    }
+}
+
+static void scalar_gdn_conv4(float* state,
+                             float* values,
+                             size_t value_stride,
+                             size_t first,
+                             size_t row_count,
+                             uint32_t begin,
+                             uint32_t end,
+                             uint32_t columns,
+                             const float* taps) noexcept
+{
+    const float* tap0 = taps;
+    const float* tap1 = taps + columns;
+    const float* tap2 = taps + static_cast<size_t>(columns) * 2;
+    const float* tap3 = taps + static_cast<size_t>(columns) * 3;
+    for (size_t token = 0; token < row_count; ++token)
+    {
+        float* row = values + (first + token) * value_stride;
+        for (uint32_t channel = begin; channel < end; ++channel)
+        {
+            const float x = row[channel];
+            const float h1 = state[columns + channel];
+            const float h2 = state[static_cast<size_t>(columns) * 2 + channel];
+            const float h3 = state[static_cast<size_t>(columns) * 3 + channel];
+            row[channel] = h1 * tap0[channel]
+                           + h2 * tap1[channel]
+                           + h3 * tap2[channel]
+                           + x * tap3[channel];
+            state[channel] = h1;
+            state[columns + channel] = h2;
+            state[static_cast<size_t>(columns) * 2 + channel] = h3;
+            state[static_cast<size_t>(columns) * 3 + channel] = x;
+        }
+    }
+}
+
+static void scalar_gdn_step(float* state,
+                            const float* key,
+                            const float* query,
+                            const float* value,
+                            uint32_t key_dim,
+                            uint32_t value_dim,
+                            float decay,
+                            float beta,
+                            float scale,
+                            float* memory,
+                            float* delta,
+                            float* output) noexcept
+{
+    for (uint32_t column = 0; column < value_dim; ++column)
+        memory[column] = 0.0f;
+    for (uint32_t row = 0; row < key_dim; ++row)
+    {
+        const float* state_row = state + static_cast<size_t>(row) * value_dim;
+        const float key_value = key[row];
+        for (uint32_t column = 0; column < value_dim; ++column)
+        {
+            const float decayed = state_row[column] * decay;
+            memory[column] += decayed * key_value;
+        }
+    }
+    for (uint32_t column = 0; column < value_dim; ++column)
+    {
+        delta[column] = (value[column] - memory[column]) * beta;
+        output[column] = 0.0f;
+    }
+    for (uint32_t row = 0; row < key_dim; ++row)
+    {
+        float* state_row = state + static_cast<size_t>(row) * value_dim;
+        const float key_value = key[row];
+        const float query_value = query[row];
+        for (uint32_t column = 0; column < value_dim; ++column)
+        {
+            const float updated = state_row[column] * decay + key_value * delta[column];
+            state_row[column] = updated;
+            output[column] += updated * query_value;
+        }
+    }
+    for (uint32_t column = 0; column < value_dim; ++column)
+        output[column] *= scale;
+}
+
 static void scalar_float_weighted_scale(float* output, const float* input, const float* weight, float scale, float weight_offset, uint32_t count) noexcept
 {
     for (uint32_t index = 0; index < count; ++index)
@@ -681,6 +791,33 @@ static FloatScaledAddAndAccumulateFunction select_float_scaled_add_and_accumulat
         return avx2_float_scaled_add_and_accumulate;
 #endif
     return scalar_float_scaled_add_and_accumulate;
+}
+
+static GdnStepFunction select_gdn_step() noexcept
+{
+#if defined(NCNN_MOE_VECTOR_X86_SIMD)
+    if ((cpu_isa_flags() & CpuIsaX86Avx512) != 0)
+        return avx512_gdn_step;
+#endif
+    return scalar_gdn_step;
+}
+
+static GdnConv4Function select_gdn_conv4() noexcept
+{
+#if defined(NCNN_MOE_VECTOR_X86_SIMD)
+    if ((cpu_isa_flags() & CpuIsaX86Avx512) != 0)
+        return avx512_gdn_conv4;
+#endif
+    return scalar_gdn_conv4;
+}
+
+static PvF32Function select_pv_f32() noexcept
+{
+#if defined(NCNN_MOE_VECTOR_X86_SIMD)
+    if ((cpu_isa_flags() & CpuIsaX86Avx512) != 0)
+        return avx512_pv_f32;
+#endif
+    return scalar_pv_f32;
 }
 
 static FloatWeightedScaleFunction select_float_weighted_scale() noexcept
@@ -1093,6 +1230,51 @@ void scaled_acc(float* values,
 {
     static const FloatScaledAddAndAccumulateFunction function = select_float_scaled_add_and_accumulate();
     function(values, input, input_scale, output, output_scale, count);
+}
+
+void gdn_step(float* state,
+              const float* key,
+              const float* query,
+              const float* value,
+              uint32_t key_dim,
+              uint32_t value_dim,
+              float decay,
+              float beta,
+              float scale,
+              float* memory,
+              float* delta,
+              float* output) noexcept
+{
+    static const GdnStepFunction function = select_gdn_step();
+    function(state, key, query, value, key_dim, value_dim, decay, beta, scale, memory, delta, output);
+}
+
+void gdn_conv4(float* state,
+               float* values,
+               size_t value_stride,
+               size_t first,
+               size_t row_count,
+               uint32_t begin,
+               uint32_t end,
+               uint32_t columns,
+               const float* taps) noexcept
+{
+    static const GdnConv4Function function = select_gdn_conv4();
+    function(state, values, value_stride, first, row_count, begin, end, columns, taps);
+}
+
+void pv_f32(float* output,
+            const float* values0,
+            size_t value_stride,
+            const float* weights0,
+            uint32_t count0,
+            const float* values1,
+            const float* weights1,
+            uint32_t count1,
+            uint32_t columns) noexcept
+{
+    static const PvF32Function function = select_pv_f32();
+    function(output, values0, value_stride, weights0, count0, values1, weights1, count1, columns);
 }
 
 void float_weighted_scale(float* output, const float* input, const float* weight, float scale, float weight_offset, uint32_t count) noexcept

@@ -87,6 +87,7 @@ void msvc_avx512_float_to_bfloat16_array(uint16_t* output,
                                                   uint32_t count) noexcept;
 
 void msvc_avx512_bfloat16_scaled_add(float* output, const uint16_t* input, float scale, uint32_t count) noexcept;
+void msvc_avx512_pv_bf16(float* output, const uint16_t* values0, size_t value_stride, const float* weights0, uint32_t count0, const uint16_t* values1, const float* weights1, uint32_t count1, uint32_t columns) noexcept;
 
 void msvc_avx512_bfloat16_batched_linear(const uint16_t* weights, const float* input, size_t input_stride, size_t token_count, uint32_t output_columns,
                                          uint32_t input_columns, float* output, size_t output_stride, int thread_count,

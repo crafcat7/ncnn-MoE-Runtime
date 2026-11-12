@@ -11,6 +11,7 @@
 
 #if NCNN_MOE_USE_NCNN
 #include <allocator.h>
+#include <layer.h>
 #include <mat.h>
 #include <option.h>
 #endif
@@ -28,6 +29,13 @@ public:
     std::shared_ptr<ncnn::Pipeline> pipeline;
     std::shared_ptr<ncnn::Pipeline> single_row_pipeline;
     std::shared_ptr<ncnn::Pipeline> cooperative_pipeline;
+    // ncnn's cooperative-matrix Gemm for prefill; the tiled shader below is the
+    // fallback and serves decode.
+    std::shared_ptr<ncnn::Layer> coop_gemm;
+    ncnn::Option coop_opt = {};
+    // Tiled FP16-staged FP32-accumulate projection geometries, pipe[0] wide.
+    TileGemm tile_gemm[2];
+    std::shared_ptr<ncnn::Pipeline> row_rms_scale_pipeline;
     mutable std::shared_ptr<ncnn::Pipeline> swiglu_down_pipeline;
     std::shared_ptr<ncnn::Pipeline> rms_norm_projection_pipeline;
     ncnn::VkMat packed;
@@ -50,6 +58,14 @@ public:
                                          ncnn::VkCompute& command,
                                          std::vector<ncnn::VkMat>& bindings,
                                          std::vector<ncnn::vk_constant_type>& constants) const;
+    // Tiled prefill projection over the packed BF16 weights; the row and column
+    // scales fold an RMSNorm into the activation tile load.
+    [[nodiscard]] bool record_tile(const ncnn::VkMat& input,
+                                   ncnn::VkMat& output,
+                                   uint32_t rows,
+                                   const ncnn::VkMat& row_scale,
+                                   const ncnn::VkMat& column_scale,
+                                   ncnn::VkCompute& command) const;
 #endif
     uint32_t input_columns = 0;
     uint32_t output_columns = 0;
@@ -155,6 +171,12 @@ public:
     std::unique_ptr<ncnn::VkWeightStagingAllocator> weight_staging_allocator;
     std::shared_ptr<ncnn::Pipeline> pipeline;
     std::shared_ptr<ncnn::Pipeline> prefill_pipeline;
+    // Tiled FP16-staged FP32-accumulate projection geometries, pipe[0] wide.
+    TileGemm tile_gemm[2];
+    // Plain BF16 rows can run prefill through ncnn's cooperative-matrix Gemm; it
+    // is created only for weight layouts the Gemm layer can pack on the host.
+    std::shared_ptr<ncnn::Layer> coop_gemm;
+    ncnn::Option coop_opt = {};
     ncnn::VkMat storage;
     ncnn::VkMat quantized;
     ncnn::VkMat bias;

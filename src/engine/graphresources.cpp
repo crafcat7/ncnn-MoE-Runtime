@@ -285,7 +285,52 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
             // Keep the full plan metadata visible to the resident memory plan;
             // the selected prefix is truncated below.
             model.gpu_expert_bank_plans = plans;
-            model.resident_submission_rows = std::max(1u, prefill_rows);
+            // Layers per resident command buffer = resident_submission_rows / rows.
+            // Merging layers removes one fence wait per layer but grows the graph
+            // memory plan; past the plan's limit the submission falls off a cliff,
+            // so the default keeps a margin and the knob tunes it per model.
+            //
+            // The plan below models (prefill_rows * layers) tokens recorded one
+            // layer per submission, while execution records prefill_rows tokens with
+            // `layers` layers per submission. Every per-layer scratch buffer scales
+            // with rows, so the candidate bounds the execution peak (and exceeds it
+            // for context-dependent buffers); row-independent per-layer scratch
+            // would break that bound.
+            uint32_t layers = 8;
+            const uint32_t base_rows = std::max(1u, prefill_rows);
+            for (;;)
+            {
+                model.resident_submission_rows = base_rows <= std::numeric_limits<uint32_t>::max() / layers
+                                                     ? base_rows * layers
+                                                     : base_rows;
+                // The plan grows with the grouping, so verify it still fits this
+                // device and step back instead of degrading silently.
+                const auto planned = plan_model_graph_memory(model, model.resident_submission_rows,
+                                                             std::max(1u, model.opt.num_concurrent_sessions));
+                if (planned)
+                {
+                    const auto fit_requests = graph_resource_requests(planned.value(),
+                                                                      std::max(1u, model.opt.num_concurrent_sessions));
+                    const auto fit_request = fit_requests.find(device);
+                    const auto fit_devices = model.memory_plan.gpu_devices;
+                    const auto fit_device = std::find_if(fit_devices.begin(), fit_devices.end(),
+                                                         [&](const auto& item) { return item.initial.device_index == device; });
+                    const uint64_t free_heap = fit_device != fit_devices.end()
+                                                       && fit_device->initial.heap_budget > fit_device->initial.heap_usage
+                                                   ? fit_device->initial.heap_budget - fit_device->initial.heap_usage
+                                                   : 0;
+                    const uint64_t plan_bytes = fit_request == fit_requests.end()
+                                                    ? 0
+                                                    : fit_request->second.persistent_size
+                                                          + fit_request->second.session_state_size
+                                                          + fit_request->second.workspace_size;
+                    if (fit_request == fit_requests.end() || free_heap == 0 || plan_bytes <= free_heap)
+                        break;
+                }
+                if (layers <= 1)
+                    break;
+                layers /= 2;
+            }
             auto graph = plan_model_graph_memory(model, model.resident_submission_rows, std::max(1u, model.opt.num_concurrent_sessions));
             if (!graph) return graph.error();
             auto candidate = model.memory_plan.gpu_devices;

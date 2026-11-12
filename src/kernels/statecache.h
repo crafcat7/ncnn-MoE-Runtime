@@ -120,6 +120,7 @@ struct LayerCache
 
     // Gated DeltaNet state.
     std::vector<float> gated_delta_convolution;
+    std::vector<float> gated_delta_conv_taps;
     std::vector<float> gated_delta_recurrent;
     std::shared_ptr<GatedDeltaState_vulkan> gated_delta_device_state;
     uint64_t gated_delta_token_count = 0;
@@ -166,7 +167,8 @@ struct LayerCache
     [[nodiscard]] uint64_t allocated_bytes() const noexcept
     {
         return static_cast<uint64_t>(keys.capacity() + values.capacity()
-                                     + gated_delta_convolution.capacity() + gated_delta_recurrent.capacity()
+                                     + gated_delta_convolution.capacity() + gated_delta_conv_taps.capacity()
+                                     + gated_delta_recurrent.capacity()
                                      + latent_window.capacity() + latent_compressed.capacity() + latent_index_compressed.capacity()
                                      + compressor_pending_values.capacity() + compressor_pending_scores.capacity()
                                      + compressor_previous_values.capacity() + compressor_previous_scores.capacity()

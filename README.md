@@ -130,9 +130,9 @@ cmake --preset worker-release
 cmake --build --preset worker-release
 ```
 
-Presets use `build-worker`; pass `--worker build-worker/Release/ncnn_moe_worker.exe`
-(or the single-config path) to the Python CLI. The direct `build-ncnn` command
-matches the CLI default.
+Presets and the direct `cmake -S . -B build-ncnn` command above share one
+convention: the worker lands in `build-ncnn/`, which is also the CLI default, so
+no `--worker` override is needed.
 
 Useful options:
 

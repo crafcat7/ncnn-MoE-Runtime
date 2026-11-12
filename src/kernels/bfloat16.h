@@ -24,6 +24,18 @@ void float_to_bfloat16_array(uint16_t* output,
 // Runtime-dispatched accumulation of BF16 values into an FP32 vector.
 void bfloat16_scaled_add(float* output, const uint16_t* input, float scale, uint32_t count) noexcept;
 
+// output[c] += sum(weights[k] * values[k][c]) over two contiguous key ranges.
+// Used by the attention probability-value product.
+void pv_bf16(float* output,
+             const uint16_t* values0,
+             size_t value_stride,
+             const float* weights0,
+             uint32_t count0,
+             const uint16_t* values1,
+             const float* weights1,
+             uint32_t count1,
+             uint32_t columns) noexcept;
+
 // Uses a runtime-dispatched BF16 dot-product matrix kernel when a batch can
 // amortize packing the FP32 activations to BF16.
 // Returns false without modifying output when the kernel is unavailable or not
