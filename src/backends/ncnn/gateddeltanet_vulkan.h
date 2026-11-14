@@ -136,8 +136,6 @@ public:
                                               ActivationBuffer& projected) const;
     [[nodiscard]] bool has_input_rms_norm() const noexcept;
     [[nodiscard]] GatedDeltaBatchResult_vulkan forward_batch(std::span<const GatedDeltaBatchEntry_vulkan> entries) const;
-    // Shape-only query for the two FP32 record-local buffers, in recorder
-    // order. Rows are included; UINT64_MAX signals an unrepresentable shape.
     [[nodiscard]] static std::vector<uint64_t> scratch_elements(uint32_t head_count,
                                                                 uint32_t kv_head_count,
                                                                 uint32_t head_dimension,

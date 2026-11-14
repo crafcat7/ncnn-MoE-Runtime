@@ -35,6 +35,7 @@ public:
     // Repeating a covered size preserves live state without a second warm-up.
     [[nodiscard]] bool reserve_graph_compute(uint64_t bytes);
     [[nodiscard]] VulkanGraphArenaSize physical_size() const;
+    [[nodiscard]] bool sealed() const;
 
 private:
     mutable std::mutex mutex;
