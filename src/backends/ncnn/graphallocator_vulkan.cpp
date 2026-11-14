@@ -104,6 +104,12 @@ VulkanGraphArenaSize VulkanGraphAllocator::physical_size() const
     return {preparation, total};
 }
 
+bool VulkanGraphAllocator::sealed() const
+{
+    const std::lock_guard<std::mutex> lock(mutex);
+    return reserved;
+}
+
 } // namespace moe
 } // namespace ncnn
 #endif // NCNN_MOE_WITH_VULKAN

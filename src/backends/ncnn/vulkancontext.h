@@ -351,6 +351,8 @@ public:
         return blob_alloc;
     }
 
+    [[nodiscard]] bool graph_arena_sealed() const noexcept;
+
     [[nodiscard]] bool reserve_graph_compute(uint64_t bytes);
     [[nodiscard]] VulkanGraphArenaSize graph_compute_physical_size() const;
 

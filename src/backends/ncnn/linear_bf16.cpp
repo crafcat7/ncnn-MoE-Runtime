@@ -896,6 +896,8 @@ bool create_coop_gemm(const std::shared_ptr<VulkanContext>& context,
 #if NCNN_MOE_WITH_VULKAN
     if (!context)
         return false;
+    if (context->graph_arena_sealed())
+        return false;
     ncnn::VulkanDevice* device = context->device();
     if (!device->info.support_cooperative_matrix()
         || weights.size() != static_cast<size_t>(input_columns) * output_columns

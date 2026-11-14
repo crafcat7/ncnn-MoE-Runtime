@@ -928,6 +928,11 @@ VulkanGraphArenaSize VulkanContext::graph_compute_physical_size() const
     return graph_allocator ? graph_allocator->physical_size() : VulkanGraphArenaSize{};
 }
 
+bool VulkanContext::graph_arena_sealed() const noexcept
+{
+    return graph_allocator && graph_allocator->sealed();
+}
+
 std::shared_ptr<VulkanContext> VulkanContext::find(uint32_t requested_device_index,
                                                    const VulkanRuntimePtr& vulkan_runtime,
                                                    uint64_t optimization_flags)
