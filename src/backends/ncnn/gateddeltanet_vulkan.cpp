@@ -77,7 +77,11 @@ std::vector<uint64_t> GatedDeltaNet_vulkan::scratch_elements(uint32_t head_count
     const uint64_t recurrent_elements = saturating_multiply_u64(value_columns, rows);
     if (fused_elements == UINT64_MAX || recurrent_elements == UINT64_MAX)
         return {UINT64_MAX};
-    return {fused_elements, recurrent_elements};
+    // The token-parallel convolution keeps the fused input for the gate reads and
+    // writes its windowed result into a second fused-sized buffer. The sequential
+    // kernel rewrites the fused input in place, so the extra buffer is only
+    // recorded for multi-row chunks; shape-only callers include it either way.
+    return {fused_elements, recurrent_elements, fused_elements};
 }
 
 #if NCNN_MOE_WITH_VULKAN
