@@ -1394,6 +1394,9 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
     const std::optional<int64_t> manifest_vocab = json_integer(model_config, "vocab_size");
     if (model_type == std::optional<std::string>("phimoe"))
         return load_phi(tokenizer, config_text, model_config, vocabulary_size);
+    if (model_type == std::optional<std::string>("gemma4")
+        || model_type == std::optional<std::string>("gemma4_text"))
+        return load_gemma4(tokenizer, config_text, model_config, vocabulary_size);
     Family new_family = Family::None;
     bool new_merge_leading_system_messages = false;
     size_t base_vocab_size = 0;
@@ -2431,21 +2434,64 @@ bool Tokenizer::load_impl(const std::string& model_directory, size_t vocabulary_
 bool Tokenizer::load_phi(std::string_view tokenizer, std::string_view config, std::string_view model_config,
                          size_t vocabulary_size)
 {
+    return load_sentencepiece(tokenizer, config, model_config, vocabulary_size, Family::Phi);
+}
+
+bool Tokenizer::load_gemma4(std::string_view tokenizer, std::string_view config, std::string_view model_config,
+                            size_t vocabulary_size)
+{
+    return load_sentencepiece(tokenizer, config, model_config, vocabulary_size, Family::Gemma4);
+}
+
+bool Tokenizer::load_sentencepiece(std::string_view tokenizer, std::string_view config, std::string_view model_config,
+                                   size_t vocabulary_size, Family target_family)
+{
     try
     {
         if (tokenizer.empty() || config.empty() || model_config.empty())
             return false;
-        if (json_string(model_config, "model_type") != std::optional<std::string>("phimoe"))
-            return false;
-        if (json_string(config, "tokenizer_class") != std::optional<std::string>("LlamaTokenizer")
-            || json_integer(config, "model_max_length") != std::optional<int64_t>(4096)
-            || json_boolean(config, "add_bos_token") != std::optional<bool>(false)
-            || json_boolean(config, "add_eos_token") != std::optional<bool>(false)
-            || json_string(config, "bos_token") != std::optional<std::string>("<s>")
-            || json_string(config, "eos_token") != std::optional<std::string>("<|endoftext|>"))
-            return false;
-        const auto config_vocab_size = json_integer(model_config, "vocab_size");
-        const uint32_t total_vocabulary = config_vocab_size ? static_cast<uint32_t>(*config_vocab_size) : 32064;
+        const bool gemma4 = target_family == Family::Gemma4;
+        std::string text_config_storage;
+        std::string_view config_scope = model_config;
+        if (gemma4)
+        {
+            const auto text_config = find_manifest_member(model_config, "text_config");
+            if (text_config)
+            {
+                text_config_storage = std::string(*text_config);
+                config_scope = text_config_storage;
+            }
+            const auto type = json_string(config_scope, "model_type");
+            const auto root_type = json_string(model_config, "model_type");
+            if ((!type || (*type != "gemma4_text" && *type != "gemma4"))
+                && (!root_type || *root_type != "gemma4"))
+                return false;
+        }
+        else
+        {
+            if (json_string(model_config, "model_type") != std::optional<std::string>("phimoe"))
+                return false;
+            if (json_string(config, "tokenizer_class") != std::optional<std::string>("LlamaTokenizer")
+                || json_integer(config, "model_max_length") != std::optional<int64_t>(4096)
+                || json_boolean(config, "add_bos_token") != std::optional<bool>(false)
+                || json_boolean(config, "add_eos_token") != std::optional<bool>(false)
+                || json_string(config, "bos_token") != std::optional<std::string>("<s>")
+                || json_string(config, "eos_token") != std::optional<std::string>("<|endoftext|>"))
+                return false;
+        }
+        uint32_t total_vocabulary = 0;
+        if (gemma4)
+        {
+            const auto config_vocab_size = json_integer(config_scope, "vocab_size");
+            if (!config_vocab_size || *config_vocab_size <= 0)
+                return false;
+            total_vocabulary = static_cast<uint32_t>(*config_vocab_size);
+        }
+        else
+        {
+            const auto config_vocab_size = json_integer(model_config, "vocab_size");
+            total_vocabulary = config_vocab_size ? static_cast<uint32_t>(*config_vocab_size) : 32064;
+        }
         if (total_vocabulary == 0 || (vocabulary_size != 0 && vocabulary_size != total_vocabulary))
             return false;
 
@@ -2642,14 +2688,35 @@ bool Tokenizer::load_phi(std::string_view tokenizer, std::string_view config, st
                 ++position;
                 break;
             }
-            std::string merge_text;
-            if (!parse_json_string(merges_json, position, &merge_text))
-                return false;
-            const size_t separator = merge_text.find(' ');
-            if (separator == std::string::npos || separator == 0 || separator + 1 >= merge_text.size())
-                return false;
-            const std::string left = merge_text.substr(0, separator);
-            const std::string right = merge_text.substr(separator + 1);
+            std::string left;
+            std::string right;
+            if (merges_json[position] == '[')
+            {
+                ++position;
+                position = skip_space(merges_json, position);
+                if (!parse_json_string(merges_json, position, &left))
+                    return false;
+                position = skip_space(merges_json, position);
+                if (position >= merges_json.size() || merges_json[position++] != ',')
+                    return false;
+                position = skip_space(merges_json, position);
+                if (!parse_json_string(merges_json, position, &right))
+                    return false;
+                position = skip_space(merges_json, position);
+                if (position >= merges_json.size() || merges_json[position++] != ']')
+                    return false;
+            }
+            else
+            {
+                std::string merge_text;
+                if (!parse_json_string(merges_json, position, &merge_text))
+                    return false;
+                const size_t separator = merge_text.find(' ');
+                if (separator == std::string::npos || separator == 0 || separator + 1 >= merge_text.size())
+                    return false;
+                left = merge_text.substr(0, separator);
+                right = merge_text.substr(separator + 1);
+            }
             const auto left_id = vocab.find(left);
             const auto right_id = vocab.find(right);
             const auto merged_id = vocab.find(left + right);
@@ -2712,6 +2779,10 @@ bool Tokenizer::load_phi(std::string_view tokenizer, std::string_view config, st
         position = skip_space(added_array, 1);
         if (position < added_array.size() && added_array[position] == ']')
             return false;
+        // Gemma stop tokens are derived from the tokenizer's own added tokens
+        // instead of hardcoded ids, so vocabulary variants keep working.
+        int32_t eos_token_id = -1;
+        int32_t turn_end_token_id = -1;
         for (;;)
         {
             position = skip_space(added_array, position);
@@ -2733,6 +2804,13 @@ bool Tokenizer::load_phi(std::string_view tokenizer, std::string_view config, st
                 return false;
             if (!add_token(static_cast<uint32_t>(*id), *content, *special, *rstrip))
                 return false;
+            if (gemma4)
+            {
+                if (*content == "<eos>")
+                    eos_token_id = static_cast<int32_t>(*id);
+                else if (*content == "<turn|>" || *content == "<end_of_turn>")
+                    turn_end_token_id = static_cast<int32_t>(*id);
+            }
             position = skip_space(added_array, position);
             if (position >= added_array.size())
                 return false;
@@ -2754,8 +2832,24 @@ bool Tokenizer::load_phi(std::string_view tokenizer, std::string_view config, st
                 return false;
             byte_ids[byte] = phi_byte_ids[byte];
         }
-        stops = {32000, 32001, 32007};
-        family = Family::Phi;
+        stops.clear();
+        if (gemma4)
+        {
+            if (eos_token_id >= 0)
+                stops.push_back(eos_token_id);
+            if (turn_end_token_id >= 0 && turn_end_token_id != eos_token_id)
+                stops.push_back(turn_end_token_id);
+            if (stops.empty())
+            {
+                // Standard Gemma-4 vocabulary: <eos> = 1, <turn|> = 106.
+                stops = {1, 106};
+            }
+        }
+        else
+        {
+            stops = {32000, 32001, 32007};
+        }
+        family = target_family;
         ignore_merges = false;
         merge_leading_system_messages = false;
         return true;
@@ -2789,7 +2883,7 @@ void Tokenizer::bpe(std::string_view raw,
     // vocabulary. ByteLevel families start from byte symbols directly.
     std::vector<uint32_t> phi_symbols;
     size_t count = raw_count;
-    if (family == Family::Phi)
+    if (family == Family::Phi || family == Family::Gemma4)
     {
         phi_symbols.reserve(raw_count);
         for (size_t offset = 0; offset < raw.size();)
@@ -2814,7 +2908,7 @@ void Tokenizer::bpe(std::string_view raw,
     nodes.resize(count);
     for (size_t i = 0; i < count; ++i)
     {
-        const int32_t symbol = family == Family::Phi
+        const int32_t symbol = (family == Family::Phi || family == Family::Gemma4)
                                    ? static_cast<int32_t>(phi_symbols[i])
                                    : byte_ids[static_cast<uint8_t>(raw[i])];
         nodes[i] = {symbol, i == 0 ? count : i - 1,
@@ -2955,14 +3049,17 @@ void Tokenizer::encode_impl(std::string_view text,
     auto encode_segment = [&](std::string_view segment) {
         if (segment.empty())
             return;
-        if (family == Family::Phi)
+        if (family == Family::Phi || family == Family::Gemma4)
         {
             std::string& normalized = scratch.normalized;
             normalized.clear();
             normalized.reserve(segment.size() + 1);
-            normalized.push_back('\xe2');
-            normalized.push_back('\x96');
-            normalized.push_back('\x81');
+            if (family == Family::Phi)
+            {
+                normalized.push_back('\xe2');
+                normalized.push_back('\x96');
+                normalized.push_back('\x81');
+            }
             for (const char character : segment)
             {
                 if (character == ' ')
@@ -3366,6 +3463,58 @@ std::vector<int32_t> Tokenizer::encode_chat(std::string_view messages_json, bool
         position = skip_space(messages_json, position);
         if (position >= messages_json.size() || messages_json[position] == ']')
             throw std::invalid_argument("invalid messages array delimiter");
+    }
+
+    if (family == Family::Gemma4)
+    {
+        if (messages.empty())
+            throw std::invalid_argument("Gemma4 chat requires at least one message");
+        std::string prompt = "<bos>";
+        const auto append_turn = [&](std::string_view role, std::string_view content) {
+            prompt += "<|turn>";
+            prompt += role;
+            prompt += '\n';
+            prompt += content;
+            prompt += "<turn|>";
+        };
+        const auto role_name = [](const std::string& role) -> std::string {
+            if (role == "assistant")
+                return "model";
+            if (role == "user" || role == "system" || role == "tool")
+                return role;
+            throw std::invalid_argument("unsupported Gemma4 message role: " + role);
+        };
+        bool has_system = false;
+        std::string system_content;
+        for (const Message& message : messages)
+        {
+            if (role_name(message.role) == "system")
+            {
+                if (has_system)
+                    throw std::invalid_argument("Gemma4 chat supports one system message");
+                has_system = true;
+                system_content = message.content;
+            }
+        }
+        if (has_system || enable_thinking)
+        {
+            std::string content;
+            if (enable_thinking)
+                content += "<|think|>";
+            content += system_content;
+            append_turn("system", content);
+        }
+        for (const Message& message : messages)
+        {
+            const std::string role = role_name(message.role);
+            if (role == "system")
+                continue;
+            append_turn(role, message.content);
+        }
+        prompt += "<|turn>model\n";
+        std::vector<int32_t> ids;
+        encode_impl(prompt, true, scratch, ids);
+        return ids;
     }
 
     if (family == Family::GptOss)
@@ -3828,7 +3977,7 @@ std::string Tokenizer::decode(int32_t id, std::string& pending, bool final) cons
         if ((entry.flags & Present) != 0 && (!skip_special || (entry.flags & Special) == 0) && entry.length != 0)
         {
             const char* entry_bytes = reinterpret_cast<const char*>(bytes.data() + entry.offset);
-            if (family == Family::Phi)
+            if (family == Family::Phi || family == Family::Gemma4)
             {
                 for (size_t index = 0; index < entry.length;)
                 {
@@ -3875,7 +4024,7 @@ std::string Tokenizer::decode(int32_t id, std::string& pending, bool final) cons
             ++offset;
             continue;
         }
-        if (family == Family::Phi && lead == 0xe2)
+        if ((family == Family::Phi || family == Family::Gemma4) && lead == 0xe2)
         {
             const size_t available = pending.size() - offset;
             if (available < 3)
