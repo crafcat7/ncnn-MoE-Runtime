@@ -27,6 +27,7 @@ public:
                               const ncnn::VkMat& value,
                               const ncnn::VkMat& sinks,
                               bool attention_sink,
+                              float scale,
                               ncnn::VkMat& output,
                               ncnn::VkCompute& command,
                               ncnn::VkAllocator* allocator,

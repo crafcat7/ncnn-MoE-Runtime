@@ -62,6 +62,7 @@ layout(push_constant) uniform parameter
     uint output_gate;
     uint round_kv;
     uint lane_stride;
+    uint value_norm;
 }
 p;
 
@@ -163,6 +164,29 @@ void main()
                                       + destination_row * p.head_dimension;
         const uint value_destination_base = local_head * p.value_cstep
                                             + destination_row * p.head_dimension;
+        float value_inverse_rms = 1.0;
+        if (p.value_norm != 0)
+        {
+            float value_square_sum = 0.0;
+            for (uint dimension = lane; dimension < p.head_dimension; dimension += 32u)
+            {
+                const uint value_source = token * p.total_columns
+                                          + p.query_columns + p.key_value_columns
+                                          + local_head * p.head_dimension + dimension;
+                const float value = fused_qkv_data[value_source];
+                value_square_sum += value * value;
+            }
+            partial[lane] = value_square_sum;
+            barrier();
+            for (uint stride = 16; stride > 0; stride >>= 1)
+            {
+                if (lane < stride)
+                    partial[lane] += partial[lane + stride];
+                barrier();
+            }
+            value_inverse_rms = inversesqrt(partial[0] / float(p.head_dimension) + p.epsilon);
+            barrier();
+        }
         for (uint pair = lane; pair < rope_half; pair += p.lane_stride)
         {
             const float key_scale_first = p.query_key_norm != 0 ? key_norm_data[pair] : 1.0;
@@ -215,7 +239,8 @@ void main()
                                       + p.query_columns + p.key_value_columns
                                       + local_head * p.head_dimension + dimension;
             const float value = fused_qkv_data[value_source];
-            const float stored_value = p.round_kv != 0u ? round_bf16(value) : value;
+            const float normalized_value = value * value_inverse_rms;
+            const float stored_value = p.round_kv != 0u ? round_bf16(normalized_value) : normalized_value;
             buffer_st1(value_data, value_destination_base + dimension, stored_value);
             if (p.direct_ring != 0)
             {
