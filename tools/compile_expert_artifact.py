@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile Qwen routed BF16 Experts into an optional MXFP4 sidecar."""
+"""Compile routed BF16 Experts into an optional MXFP4 Safetensors sidecar."""
 
 from __future__ import annotations
 
@@ -28,6 +28,8 @@ FAMILIES = {
         "identity": "v3",
         "scope": "main-and-mtp-routed-experts",
         "mtp": True,
+        "interleave_gate_up": True,
+        "expert_source": "model.language_model.layers.{layer}.mlp.experts.",
     },
     "qwen4_exp": {
         "label": "Qwen3.8",
@@ -37,6 +39,20 @@ FAMILIES = {
         "identity": "v1",
         "scope": "main-routed-experts",
         "mtp": False,
+        "interleave_gate_up": True,
+        "expert_source": "model.language_model.layers.{layer}.mlp.experts.",
+    },
+    "gemma4": {
+        "label": "Gemma-4 26B-A4B",
+        "name": "ncnn-moe-gemma4-26b-a4b-mxfp4.safetensors",
+        "prefix": "__ncnn_moe_gemma4_mxfp4__",
+        "format": "ncnn-moe-gemma4-mxfp4-v1",
+        "identity": "v1",
+        "scope": "main-routed-experts",
+        "mtp": False,
+        # The MXFP4 expert kernels read gate/up as interleaved row pairs.
+        "interleave_gate_up": True,
+        "expert_source": "model.language_model.layers.{layer}.experts.",
     },
 }
 ARTIFACT_NAME = FAMILIES["qwen3_5_moe"]["name"]
@@ -74,8 +90,9 @@ class ArtifactTensor:
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compile the routed Experts from an official Qwen BF16 "
-            "checkpoint into an optional OCP MXFP4 Safetensors sidecar."
+            "Compile the routed Experts from an official BF16 checkpoint "
+            "(Qwen3.6/Qwen3.8/Gemma-4) into an optional OCP MXFP4 "
+            "Safetensors sidecar."
         )
     )
     parser.add_argument("model", type=Path, help="Official model directory")
@@ -377,6 +394,8 @@ def compile_artifact(
     intermediate_size: int,
     workers: int,
     overwrite: bool,
+    expert_source: str,
+    interleave_gate_up: bool,
 ) -> None:
     if output.exists() and not overwrite:
         raise FileExistsError(
@@ -400,9 +419,7 @@ def compile_artifact(
             destination.write(struct.pack("<Q", len(header)))
             destination.write(header)
             for layer_id in range(layer_count):
-                source_prefix = (
-                    f"model.language_model.layers.{layer_id}.mlp.experts."
-                )
+                source_prefix = expert_source.format(layer=layer_id)
                 gate_up = required_source(
                     tensors,
                     source_prefix + "gate_up_proj",
@@ -419,7 +436,7 @@ def compile_artifact(
                     intermediate_size * 2,
                     hidden_size,
                     workers,
-                    True,
+                    interleave_gate_up,
                 )
                 print(
                     f"compiled layer {layer_id + 1}/{layer_count} gate/up",
@@ -526,7 +543,7 @@ def main() -> int:
         family = FAMILIES.get(model_type)
         if family is None:
             raise ValueError(
-                "the compiler requires an official Qwen routed-Expert package"
+                "the compiler requires an official routed-Expert BF16 package"
             )
         ARTIFACT_NAME = family["name"]
         ARTIFACT_PREFIX = family["prefix"]
@@ -558,7 +575,7 @@ def main() -> int:
             or hidden_size % 32
             or intermediate_size % 32
         ):
-            raise ValueError("unsupported Qwen routed Expert dimensions")
+            raise ValueError("unsupported routed Expert dimensions")
 
         output = model / ARTIFACT_NAME
         tensors = scan_tensors(model, output)
@@ -585,7 +602,7 @@ def main() -> int:
         )
         print(
             f"compiling {(layer_count + mtp_layer_count) * expert_count} "
-            f"main/MTP routed Experts "
+            f"routed Experts "
             f"into {artifact_bytes / (1024 ** 3):.2f} GiB at {output}",
             flush=True,
         )
@@ -601,6 +618,8 @@ def main() -> int:
             intermediate_size,
             arguments.workers,
             arguments.overwrite,
+            family["expert_source"],
+            family["interleave_gate_up"],
         )
         print(f"compiled {family['label']} MXFP4 artifact: {output}", flush=True)
         return 0
