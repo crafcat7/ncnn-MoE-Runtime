@@ -14,6 +14,7 @@ for prefill, decode, generation, batching, and speculative decoding.
 | Qwen3 dense | `qwen3` | Dense Transformer |
 | Qwen3.5 / Qwen3.6 | `qwen3_5`, `qwen3_5_moe` | Dense and MoE, optional MXFP4 Expert sidecar |
 | Qwen3.8-Flash-Next | `qwen4_exp` | MoE text backbone, optional MXFP4 Expert sidecar |
+| Gemma-4 26B-A4B | `gemma4`, `gemma4_text` | Parallel dense+MoE FFN, partial RoPE, optional MXFP4 Expert sidecar |
 | Phi-mini-MoE-instruct | `phimoe` | CPU and Hybrid |
 | Ling-3.0-tiny | `bailing_hybrid` | Hybrid attention/FFN layout |
 
@@ -28,8 +29,8 @@ Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL, IQ4_XS
 Optional package tools:
 
 ```text
-tools/import_quantized.py         AWQ/GPTQ/GGUF -> native Safetensors
-tools/compile_qwen_artifact.py    Qwen routed Experts -> MXFP4 sidecar
+tools/import_quantized.py          AWQ/GPTQ/GGUF -> native Safetensors
+tools/compile_expert_artifact.py   Routed BF16 Experts -> MXFP4 sidecar (Qwen3.6/Qwen3.8/Gemma-4)
 ```
 
 Native text requires tokenizer assets from the model package. Token-ID input
@@ -154,6 +155,12 @@ Tests:
 cmake -S . -B build-test -DNCNN_MOE_BUILD_TESTS=ON
 cmake --build build-test --config Release --parallel
 ctest --test-dir build-test -C Release --output-on-failure
+```
+
+Python CLI tests:
+
+```bash
+python -m unittest discover -s tests_py -v
 ```
 
 ## Features
