@@ -1,11 +1,25 @@
 #ifndef NCNN_MOE_BFLOAT16_H
 #define NCNN_MOE_BFLOAT16_H
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 
 namespace ncnn {
 namespace moe {
+
+[[nodiscard]] inline float bfloat16_to_float(uint16_t value) noexcept
+{
+    return std::bit_cast<float>(static_cast<uint32_t>(value) << 16);
+}
+
+// Round-to-nearest-even; bulk conversions use float_to_bfloat16_array().
+[[nodiscard]] inline uint16_t float_to_bfloat16(float value) noexcept
+{
+    const uint32_t bits = std::bit_cast<uint32_t>(value);
+    const uint32_t rounding = 0x7fffu + ((bits >> 16) & 1u);
+    return static_cast<uint16_t>((bits + rounding) >> 16);
+}
 
 // Runtime-dispatched BF16-by-FP32 dot product with scalar fallback.
 [[nodiscard]] float bfloat16_dot(const uint16_t* weights, const float* input, uint32_t count) noexcept;
