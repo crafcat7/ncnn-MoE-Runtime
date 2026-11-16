@@ -110,5 +110,58 @@ class GenerationDefaultsTest(unittest.TestCase):
             self.assertEqual(adapter._read_generation_config(), {})
 
 
+def make_chat_app(adapter: ncnn_moe.ModelAdapter) -> ncnn_moe.ConversationApp:
+    app = ncnn_moe.ConversationApp.__new__(ncnn_moe.ConversationApp)
+    app.adapter = adapter
+    app.arguments = argparse.Namespace(stream=False)
+    return app
+
+
+class Gemma4StopTokenTest(unittest.TestCase):
+    @staticmethod
+    def _app(thinking: bool) -> ncnn_moe.ConversationApp:
+        return make_chat_app(make_adapter(name="gemma4", thinking=thinking, _stop_tokens=[1, 106]))
+
+    def test_stop_token_text_is_not_rendered(self) -> None:
+        app = self._app(thinking=True)
+        streamed: dict[str, object] = {}
+        app._on_generation_event(
+            {"event": "token", "token_id": 106, "text": "<turn|>", "is_stop_token": True},
+            streamed,
+            display=False,
+        )
+        self.assertFalse(streamed.get("decoded_chunks"))
+        self.assertTrue(streamed.get("ended_with_stop_token"))
+
+        app._on_generation_event(
+            {"event": "token", "token_id": 50, "text": "answer", "is_stop_token": False},
+            streamed,
+            display=False,
+        )
+        self.assertEqual(streamed["decoded_chunks"], ["answer"])
+
+    def test_stop_token_id_without_flag(self) -> None:
+        app = self._app(thinking=False)
+        streamed: dict[str, object] = {}
+        app._on_generation_event(
+            {"event": "token", "token_id": 106, "text": "<turn|>"},
+            streamed,
+            display=False,
+        )
+        self.assertFalse(streamed.get("decoded_chunks"))
+        self.assertTrue(streamed.get("ended_with_stop_token"))
+
+    def test_decode_strips_legacy_turn_marker(self) -> None:
+        app = self._app(thinking=False)
+        completion = app._decode_completion(
+            {"decoded_chunks": ["answer<turn|>"], "ended_with_stop_token": True}
+        )
+        self.assertEqual(completion.answer, "answer")
+
+    def test_plain_reply_is_answer_when_thinking(self) -> None:
+        adapter = make_adapter(name="gemma4", thinking=True, _stop_tokens=[1, 106])
+        self.assertEqual(adapter.decode_completion_text("plain answer").answer, "plain answer")
+
+
 if __name__ == "__main__":
     unittest.main()

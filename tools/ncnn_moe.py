@@ -357,7 +357,11 @@ class ModelAdapter:
         if self.name == "deepseek-v4":
             return _decode_deepseek(text, self.thinking)
         if self.name == "gemma4":
-            return _split_thinking(self._gemma4_normalize(text), self.thinking)
+            normalized = self._gemma4_normalize(text)
+            if self.thinking and "<think" not in normalized:
+                # The model answered without opening a thought channel.
+                return Completion("", normalized.strip())
+            return _split_thinking(normalized, self.thinking)
         return _split_thinking(text, self.thinking)
 
     def _gemma4_normalize(self, text: str) -> str:
@@ -2170,6 +2174,16 @@ class ConversationApp:
         text = event.get("text")
         if not isinstance(text, str):
             raise WorkerError("native worker token event did not include decoded text", event)
+        token_id = event.get("token_id")
+        token_is_stop = event.get("is_stop_token") is True or (
+            isinstance(token_id, int)
+            and not isinstance(token_id, bool)
+            and token_id in self.adapter.stop_tokens
+        )
+        if self.adapter.name == "gemma4" and token_is_stop:
+            # Stop tokens are protocol markers, not answer text.
+            streamed["ended_with_stop_token"] = True
+            return
         if self.adapter.name == "deepseek-v4":
             token_id = event.get("token_id")
             if isinstance(token_id, bool) or not isinstance(token_id, int):
@@ -2207,6 +2221,18 @@ class ConversationApp:
                 "".join(state.get("answer_parts", [])).strip(),
             )
         text = "".join(streamed.get("decoded_chunks", []))
+        if self.adapter.name == "gemma4":
+            # Defensive: older worker events could have appended the stop
+            # marker before it was filtered.
+            text = text.rstrip()
+            stripping = True
+            while stripping:
+                stripping = False
+                for marker in ("<turn|>", "<end_of_turn>", "<eos>"):
+                    if text.endswith(marker):
+                        text = text[: -len(marker)].rstrip()
+                        stripping = True
+                        break
         if self.adapter.name.startswith("qwen") and streamed.get("ended_with_stop_token"):
             text = text.rstrip().rstrip("\ufffd").rstrip()
         return self.adapter.decode_completion_text(text)
