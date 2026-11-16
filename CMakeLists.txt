@@ -189,6 +189,7 @@ set(NCNN_MOE_SOURCES
     src/models/modeladapter.cpp
     src/models/modeladapter_gptoss.cpp
     src/models/modeladapter_deepseekv4.cpp
+    src/models/modeladapter_gemma4.cpp
     src/models/modeladapter_qwen3.cpp
     src/models/modeladapter_qwen3_5.cpp
     src/models/modeladapter_qwen4exp.cpp
@@ -228,6 +229,7 @@ if(NCNN_MOE_SIZE_OPTIMIZE_COLD_PATHS AND NOT NCNN_MOE_OPT_LEVEL STREQUAL "O0")
         src/models/ggufmodel_qwen3.cpp
         src/models/modeladapter.cpp
         src/models/modeladapter_deepseekv4.cpp
+        src/models/modeladapter_gemma4.cpp
         src/models/modeladapter_gptoss.cpp
         src/models/modeladapter_ling.cpp
         src/models/modeladapter_phimoe.cpp
