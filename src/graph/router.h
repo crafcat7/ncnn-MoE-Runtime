@@ -43,6 +43,8 @@ struct ExpertDispatchOptions
     float routed_scaling_factor = 1.0f;
     float jitter = 0.0f;
     std::span<const float> selection_bias;
+    // Applied after top-k normalization, once per selected Expert.
+    std::span<const float> expert_scale;
     std::span<const uint32_t> explicit_expert_ids;
 };
 

@@ -1276,14 +1276,14 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& input_descri
     if (descriptor.layers.empty())
         return Error{ErrorCode::InvalidModel, "memory planner requires at least one layer"};
     if (std::all_of(descriptor.layers.begin(), descriptor.layers.end(), [](const LayerDescriptor& layer) {
-            return layer.dense.enabled();
+            return layer.moe.expert_count == 0;
         }))
     {
         plan.selected_mode = ExpertMemoryMode::Eager;
         return plan;
     }
     const auto first_moe = std::find_if(descriptor.layers.begin(), descriptor.layers.end(), [](const LayerDescriptor& layer) {
-        return !layer.dense.enabled();
+        return layer.moe.expert_count != 0;
     });
     const MoeDescriptor& moe = first_moe->moe;
     const auto add_expert_layers = [&](const MoeDescriptor& layer_moe,
@@ -1338,7 +1338,7 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& input_descri
     {
         for (const LayerDescriptor& layer : descriptor.layers)
         {
-            if (layer.dense.enabled())
+            if (layer.moe.expert_count == 0)
                 continue;
             auto status = add_expert_layers(layer.moe, 1);
             if (!status)
@@ -1445,7 +1445,7 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& input_descri
                          : 0;
     for (const LayerDescriptor& layer : descriptor.layers)
     {
-        if (layer.dense.enabled())
+        if (layer.moe.expert_count == 0)
             continue;
         if (!file_experts(layer.moe))
         {

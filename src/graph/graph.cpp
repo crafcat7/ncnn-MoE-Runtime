@@ -355,7 +355,8 @@ static LayerId add_moe_nodes(Net& graph,
                              size_t plan_index,
                              const std::string& prefix,
                              BlobId& hidden,
-                             bool use_vulkan_experts)
+                             bool use_vulkan_experts,
+                             BlobId dense_output = invalid_blob_id)
 {
     const CompiledLayerPlan& layer = graph.layer_plans[plan_index];
     const bool resident = &graph == &compiled.net && plan_index < compiled.gpu_segments.size()
@@ -413,6 +414,8 @@ static LayerId add_moe_nodes(Net& graph,
                                      compiled.descriptor.activation_dtype,
                                      {0, compiled.descriptor.hidden_size});
     std::vector<BlobId> combine_inputs = {hidden, expert_output};
+    if (dense_output != invalid_blob_id)
+        combine_inputs.push_back(dense_output);
     if (layer.moe.has_shared_expert)
     {
         const bool shared_before_routed = compiled.opt.hybrid_mode == HybridMode::CpuOnly;
@@ -660,7 +663,25 @@ Result<void> build_graph(CompiledModel& compiled, bool use_vulkan_experts)
             hidden = attention_output;
         }
 
-        if (layer.dense_ffn.down_weight != invalid_tensor_handle)
+        if (layer.moe.parallel_ffn && layer.dense_ffn.down_weight != invalid_tensor_handle)
+        {
+            const bool vulkan = compiled.opt.hybrid_mode != HybridMode::CpuOnly
+                                && ((use_vulkan_experts && layer.dense_ffn.use_gpu_cache)
+                                    || support_vulkan_dense_ffn(compiled.operators, layer.dense_ffn));
+            const BlobId dense_output = add_blob(graph, prefix + "dense_ffn.hidden",
+                                                 compiled.descriptor.activation_dtype,
+                                                 {0, compiled.descriptor.hidden_size});
+            add_node(graph,
+                     LayerKind::DenseFfn,
+                     vulkan ? ExecutionBackend::Vulkan : ExecutionBackend::Cpu,
+                     vulkan ? ExecutionBackendCpu | ExecutionBackendVulkan : ExecutionBackendCpu,
+                     {hidden},
+                     {dense_output},
+                     static_cast<uint32_t>(plan_index),
+                     0);
+            add_moe_nodes(graph, compiled, plan_index, prefix, hidden, use_vulkan_experts, dense_output);
+        }
+        else if (layer.dense_ffn.down_weight != invalid_tensor_handle)
         {
             const bool vulkan = compiled.opt.hybrid_mode != HybridMode::CpuOnly
                                 && ((use_vulkan_experts && layer.dense_ffn.use_gpu_cache)
