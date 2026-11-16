@@ -1,6 +1,7 @@
 #include "ops.h"
 
 #include "bfloat16.h"
+#include "activation.h"
 #include "fastmath.h"
 #include "float8.h"
 #include "int4.h"
@@ -190,6 +191,11 @@ static float expert_activation(float value,
     case ExpertActivation::Gelu:
         return 0.5f * value
                * (1.0f + std::erf(value / std::sqrt(2.0f)));
+    case ExpertActivation::GeluTanh:
+        // TODO: scalar std::tanh only. Silu has a vectorized float_silu_mul
+        // counterpart; add an AVX/NEON GELU-tanh kernel before CPU-only
+        // GELU-tanh dense/MoE FFNs become a throughput target.
+        return gelu_tanh(value);
     case ExpertActivation::ClampedSilu:
     {
         const float clamped = limit > 0.0f ? std::clamp(value, -limit, limit) : value;
@@ -203,6 +209,23 @@ static float expert_activation(float value,
     case ExpertActivation::GptOssSwiGlu: return value;
     }
     return value;
+}
+
+static float mxfp4_gated(float gate, float up, ExpertActivation activation,
+                         float clamp_limit, uint64_t optimization_flags,
+                         bool approximate) noexcept
+{
+    // Branch-less clamp: callers pass FLT_MAX when no activation limit applies.
+    gate = std::min(gate, clamp_limit);
+    up = std::clamp(up, -clamp_limit, clamp_limit);
+    if (activation == ExpertActivation::Silu
+        || activation == ExpertActivation::DeepSeekSwiGlu)
+        return gate / (1.0f + float_approximate_exp(-gate)) * up;
+    if (activation == ExpertActivation::GptOssSwiGlu)
+        return (approximate ? float_silu(gate, 1.702f) : exact_scaled_silu(gate, 1.702f))
+               * (up + 1.0f);
+    // Already clamped above; the generic path must not clamp a second time.
+    return expert_activation(gate, activation, 0.0f, optimization_flags) * up;
 }
 
 static void apply_float8_gate_up_activation(float* output,
@@ -1512,6 +1535,9 @@ void forward_gate_up_mxfp4(const TensorData& matrix, const TensorData* bias, con
     assert(matrix.dtype == DType::MxFp4 && matrix.shape.size() == 2);
     assert(matrix.shape[0] % 2 == 0 && matrix.shape[1] == input.columns());
     const bool approximate_activation = has_flag(optimization_flags, OptimizationCpuFastSilu);
+    const float clamp_limit = activation_limit > 0.0f
+                                  ? activation_limit
+                                  : std::numeric_limits<float>::max();
     const uint32_t intermediate_size = matrix.shape[0] / 2;
     const uint32_t input_columns = matrix.shape[1];
     const uint32_t blocks_per_row = input_columns / 32;
@@ -1674,30 +1700,15 @@ void forward_gate_up_mxfp4(const TensorData& matrix, const TensorData* bias, con
             {
                 const uint32_t column = first_column + local_column;
                 const size_t gate_row = static_cast<size_t>(column) * 2;
-                const size_t up_row = gate_row + 1;
                 float gate = output.row(0)[column];
                 float up = linear[local_column];
                 if (bias)
                 {
                     gate += tensor_value(*bias, gate_row);
-                    up += tensor_value(*bias, up_row);
+                    up += tensor_value(*bias, gate_row + 1);
                 }
-                if (activation_limit > 0.0f)
-                {
-                    gate = std::min(gate, activation_limit);
-                    up = std::clamp(up, -activation_limit, activation_limit);
-                }
-                if (activation == ExpertActivation::Silu
-                    || activation == ExpertActivation::DeepSeekSwiGlu)
-                {
-                    output.row(0)[column] = gate / (1.0f + float_approximate_exp(-gate)) * up;
-                }
-                else
-                {
-                    output.row(0)[column] = (approximate_activation ? float_silu(gate, 1.702f)
-                                                                    : exact_scaled_silu(gate, 1.702f))
-                                            * (up + 1.0f);
-                }
+                output.row(0)[column] = mxfp4_gated(gate, up, activation, clamp_limit,
+                                                    optimization_flags, approximate_activation);
             }
         }
         return;
@@ -1737,25 +1748,10 @@ void forward_gate_up_mxfp4(const TensorData& matrix, const TensorData* bias, con
                      output.row(0) + column, output.columns(), linear, 1);
         for (size_t token_index = 0; token_index < input.rows(); ++token_index)
         {
-            float gate = output.row(token_index)[column] + gate_bias;
-            float up = linear[token_index] + up_bias;
-            if (activation_limit > 0.0f)
-            {
-                gate = std::min(gate, activation_limit);
-                up = std::clamp(up, -activation_limit, activation_limit);
-            }
-            if (activation == ExpertActivation::Silu
-                || activation == ExpertActivation::DeepSeekSwiGlu)
-            {
-                const float silu = gate / (1.0f + float_approximate_exp(-gate));
-                output.row(token_index)[column] = silu * up;
-            }
-            else
-            {
-                const float silu = approximate_activation ? float_silu(gate, 1.702f)
-                                                          : exact_scaled_silu(gate, 1.702f);
-                output.row(token_index)[column] = silu * (up + 1.0f);
-            }
+            const float gate = output.row(token_index)[column] + gate_bias;
+            const float up = linear[token_index] + up_bias;
+            output.row(token_index)[column] = mxfp4_gated(gate, up, activation, clamp_limit,
+                                                          optimization_flags, approximate_activation);
         }
     }
 }
@@ -1836,7 +1832,9 @@ static bool support_experts_mxfp4(std::span<const Mxfp4Task> tasks)
             || task.down->shape[1] != task.gate_up->shape[0] / 2
             || (task.activation != ExpertActivation::Silu
                 && task.activation != ExpertActivation::GptOssSwiGlu
-                && task.activation != ExpertActivation::DeepSeekSwiGlu))
+                && task.activation != ExpertActivation::DeepSeekSwiGlu
+                && task.activation != ExpertActivation::Gelu
+                && task.activation != ExpertActivation::GeluTanh))
         {
             return false;
         }
@@ -2055,6 +2053,9 @@ static bool forward_mxfp4_decode(std::span<const Mxfp4Task> tasks,
             const uint32_t first_column = pair_group * pair_group_size;
             const uint32_t column_count = std::min<uint32_t>(pair_group_size, intermediate_size - first_column);
             const size_t gate_row = static_cast<size_t>(first_column) * 2;
+            const float clamp_limit = task.activation_limit > 0.0f
+                                          ? task.activation_limit
+                                          : std::numeric_limits<float>::max();
             float gates[2] = {};
             float linears[2] = {};
             if (q8_gate_packed[task_index])
@@ -2107,31 +2108,17 @@ static bool forward_mxfp4_decode(std::span<const Mxfp4Task> tasks,
             {
                 const uint32_t column = first_column + local_column;
                 const size_t local_gate_row = static_cast<size_t>(column) * 2;
-                const size_t local_up_row = local_gate_row + 1;
                 float gate = gates[local_column];
                 float linear = linears[local_column];
                 if (task.gate_up_bias)
                 {
                     gate += tensor_value(*task.gate_up_bias, local_gate_row);
-                    linear += tensor_value(*task.gate_up_bias, local_up_row);
+                    linear += tensor_value(*task.gate_up_bias, local_gate_row + 1);
                 }
-                if (task.activation_limit > 0.0f)
-                {
-                    gate = std::min(gate, task.activation_limit);
-                    linear = std::clamp(linear, -task.activation_limit, task.activation_limit);
-                }
-                if (task.activation == ExpertActivation::Silu
-                    || task.activation == ExpertActivation::DeepSeekSwiGlu)
-                {
-                    const float silu = gate / (1.0f + float_approximate_exp(-gate));
-                    activated[task_index].row(0)[column] = silu * linear;
-                }
-                else
-                {
-                    const float silu = approximate_activation ? float_silu(gate, 1.702f)
-                                                              : exact_scaled_silu(gate, 1.702f);
-                    activated[task_index].row(0)[column] = silu * (linear + 1.0f);
-                }
+                activated[task_index].row(0)[column] = mxfp4_gated(gate, linear, task.activation,
+                                                                   clamp_limit,
+                                                                   optimization_flags,
+                                                                   approximate_activation);
             }
         }
 
@@ -2550,7 +2537,13 @@ bool forward_experts_mxfp4(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scrat
             const bool use_vector_activation = approximate_activation
                                                && tasks[index].input->rows() > 1
                                                && task.gate_up_bias == nullptr
-                                               && task.activation_limit <= 0.0f;
+                                               && task.activation_limit <= 0.0f
+                                               && (task.activation == ExpertActivation::Silu
+                                                   || task.activation == ExpertActivation::DeepSeekSwiGlu
+                                                   || task.activation == ExpertActivation::GptOssSwiGlu);
+            const float clamp_limit = task.activation_limit > 0.0f
+                                          ? task.activation_limit
+                                          : std::numeric_limits<float>::max();
             for (size_t token_index = 0; token_index < task.input->rows(); ++token_index)
             {
                 float* gate_values = activated[index].row(token_index);
@@ -2570,33 +2563,17 @@ bool forward_experts_mxfp4(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scrat
                 for (uint32_t column = 0; column < task.gate_up->shape[0] / 2; ++column)
                 {
                     const size_t gate_row = static_cast<size_t>(column) * 2;
-                    const size_t up_row = gate_row + 1;
                     float gate = gate_values[column];
                     float up = linear_values[column];
                     if (task.gate_up_bias)
                     {
                         gate += tensor_value(*task.gate_up_bias, gate_row);
-                        up += tensor_value(*task.gate_up_bias, up_row);
+                        up += tensor_value(*task.gate_up_bias, gate_row + 1);
                     }
-                    if (task.activation_limit > 0.0f)
-                    {
-                        gate = std::min(gate, task.activation_limit);
-                        up = std::clamp(up, -task.activation_limit, task.activation_limit);
-                    }
-                    if (task.activation == ExpertActivation::Silu
-                        || task.activation
-                               == ExpertActivation::DeepSeekSwiGlu)
-                    {
-                        const float silu = gate
-                                           / (1.0f + float_approximate_exp(-gate));
-                        gate_values[column] = silu * up;
-                    }
-                    else
-                    {
-                        const float silu = approximate_activation ? float_silu(gate, 1.702f)
-                                                                  : exact_scaled_silu(gate, 1.702f);
-                        gate_values[column] = silu * (up + 1.0f);
-                    }
+                    gate_values[column] = mxfp4_gated(gate, up, task.activation,
+                                                      clamp_limit,
+                                                      optimization_flags,
+                                                      approximate_activation);
                 }
             }
         }

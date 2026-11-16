@@ -4,6 +4,7 @@
 #include "expertbackend.h"
 #include "graph/compiledmodel.h"
 #include "kernels/bfloat16.h"
+#include "kernels/activation.h"
 #include "kernels/fastmath.h"
 #include "kernels/ops.h"
 #include "kernels/qnk.h"
@@ -126,6 +127,9 @@ static float activate(float value,
     case ExpertActivation::Silu:
         return scaled_silu(value, 1.0f, optimization_flags);
     case ExpertActivation::Gelu: return 0.5f * value * (1.0f + std::erf(value / std::sqrt(2.0f)));
+    case ExpertActivation::GeluTanh:
+        // TODO: scalar std::tanh only; no vectorized GELU-tanh kernel yet.
+        return gelu_tanh(value);
     case ExpertActivation::ClampedSilu:
     {
         const float clamped = limit > 0.0f ? std::clamp(value, -limit, limit) : value;
