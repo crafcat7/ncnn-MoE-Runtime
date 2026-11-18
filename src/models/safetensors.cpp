@@ -1,6 +1,7 @@
 #include "safetensors.h"
 #include "ggufmodel.h"
 #include "json.h"
+#include "kernels/bfloat16.h"
 #include "kernels/int4.h"
 #include "kernels/qnk.h"
 #include "kernels/mxfp4.h"
@@ -1174,8 +1175,7 @@ Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name, uint
             const float value = read_safetensor_float(bytes.value().data(), index, info->dtype);
             if (!std::isfinite(value))
                 return Error{ErrorCode::InvalidModel, "non-finite floating-point tensor: " + name};
-            const uint32_t bits = std::bit_cast<uint32_t>(value);
-            const uint16_t rounded = static_cast<uint16_t>((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+            const uint16_t rounded = float_to_bfloat16(value);
             if ((rounded & 0x7f80u) == 0x7f80u)
                 return Error{ErrorCode::InvalidModel, "floating-point tensor overflows BF16: " + name};
             tensor.bfloat16_data[index] = rounded;
@@ -1486,8 +1486,7 @@ Result<TensorData> SafetensorsArchive::load_gguf_tensor(const SafetensorInfo& in
                 result.float32_data[destination] = value;
             else
             {
-                const uint32_t bits = std::bit_cast<uint32_t>(value);
-                result.bfloat16_data[destination] = static_cast<uint16_t>((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+                result.bfloat16_data[destination] = float_to_bfloat16(value);
             }
         }
     }

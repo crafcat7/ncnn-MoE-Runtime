@@ -30,6 +30,8 @@ layout(push_constant) uniform parameter
     uint token_count;
     uint apply_router_gate;
     float activation_limit;
+    // Gated FFN activation: 0 = SiLU, 1 = GELU-tanh (set by linear_bf16.cpp).
+    uint activation;
 }
 p;
 
@@ -43,6 +45,17 @@ float sigmoid(float value)
     return 1.0 / (1.0 + exp(-value));
 }
 
+float gelu_tanh(float value)
+{
+    // Tanh-approximated GELU (PyTorch gelu_pytorch_tanh). The coefficients are
+    // the published approximation constants; keep in sync with the host
+    // definition in src/kernels/activation.h.
+    const float coefficient = 0.7978845608028654; // sqrt(2/pi)
+    const float cubic = 0.044715;
+    return 0.5 * value
+           * (1.0 + tanh(coefficient * (value + cubic * value * value * value)));
+}
+
 float gated_product(float gate, float up)
 {
     if (p.activation_limit > 0.0)
@@ -50,6 +63,8 @@ float gated_product(float gate, float up)
         gate = min(gate, p.activation_limit);
         up = clamp(up, -p.activation_limit, p.activation_limit);
     }
+    if (p.activation == 1u)
+        return gelu_tanh(gate) * up;
     return gate * sigmoid(gate) * up;
 }
 

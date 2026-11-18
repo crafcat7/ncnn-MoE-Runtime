@@ -284,15 +284,38 @@ static void router_linear(const CompiledModel& model,
         add_bias_inplace(logits, model.weights.at(moe.router_bias));
 }
 
+static float scalar_value(const TensorData& tensor)
+{
+    if (tensor.dtype == DType::Float32)
+        return tensor.float32_values().empty() ? 1.0f : tensor.float32_values()[0];
+    if (tensor.dtype == DType::BFloat16)
+        return tensor.bfloat16_values().empty() ? 1.0f : bfloat16_to_float(tensor.bfloat16_values()[0]);
+    return 1.0f;
+}
+
+static void scale_rows(ActivationBuffer& hidden, float scale)
+{
+    if (scale == 1.0f)
+        return;
+    for (size_t row = 0; row < hidden.rows(); ++row)
+    {
+        float* values = hidden.row(row);
+        for (uint32_t column = 0; column < hidden.columns(); ++column)
+            values[column] *= scale;
+    }
+}
+
 [[nodiscard]] static Result<void> router_fwd(const CompiledModel& model,
                                              const CompiledLayerPlan& layer,
                                              const MoeBlockPlan& moe,
                                              const ActivationBuffer& input,
                                              ActivationBuffer& normalized,
+                                             ActivationBuffer& router_normalized,
                                              ActivationBuffer& logits,
                                              HyperConnectionMix& mix,
                                              HyperConnectionScratch& hyper)
 {
+    const ActivationBuffer* source = &input;
     if (model.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
     {
         auto mixed = hc_pre(input,
@@ -308,15 +331,11 @@ static void router_linear(const CompiledModel& model,
                             model.opt.optimization_flags);
         if (!mixed)
             return mixed.error();
-        forward_rms_norm(mix.reduced,
-                         model.weights.at(moe.pre_ffn_norm_weight),
-                         model.descriptor.norm_epsilon,
-                         normalized,
-                         model.descriptor.norm_weight_offset);
+        source = &mix.reduced;
     }
-    else if (moe.pre_ffn_norm_bias != invalid_tensor_handle)
+    if (moe.pre_ffn_norm_bias != invalid_tensor_handle)
     {
-        forward_layer_norm(input,
+        forward_layer_norm(*source,
                            model.weights.at(moe.pre_ffn_norm_weight),
                            model.weights.at(moe.pre_ffn_norm_bias),
                            model.descriptor.norm_epsilon,
@@ -324,13 +343,25 @@ static void router_linear(const CompiledModel& model,
     }
     else
     {
-        forward_rms_norm(input,
+        forward_rms_norm(*source,
                          model.weights.at(moe.pre_ffn_norm_weight),
                          model.descriptor.norm_epsilon,
                          normalized,
                          model.descriptor.norm_weight_offset);
     }
-    router_linear(model, moe, normalized, logits);
+    if (moe.router_norm != invalid_tensor_handle)
+    {
+        forward_rms_norm(*source,
+                         model.weights.at(moe.router_norm),
+                         model.descriptor.norm_epsilon,
+                         router_normalized,
+                         0.0f);
+        router_linear(model, moe, router_normalized, logits);
+    }
+    else
+    {
+        router_linear(model, moe, normalized, logits);
+    }
     return {};
 }
 
@@ -405,6 +436,16 @@ static Result<void> fwd_dense(const CompiledModel& model,
     {
         return Error{ErrorCode::InternalError, error.what()};
     }
+    if (layer.moe.parallel_ffn)
+    {
+        forward_rms_norm(scratch.shared_expert_output,
+                         model.weights.at(layer.moe.dense_post_norm),
+                         model.descriptor.norm_epsilon,
+                         scratch.normalized,
+                         0.0f);
+        scratch.shared_expert_output.swap(scratch.normalized);
+        return {};
+    }
     add_batch_inplace(hidden, scratch.shared_expert_output);
     scratch.reset();
     return {};
@@ -426,6 +467,8 @@ static ExpertDispatchOptions route_opt(const CompiledModel& model,
     options.jitter = moe.jitter;
     if (moe.router_selection_bias != invalid_tensor_handle)
         options.selection_bias = model.weights.at(moe.router_selection_bias).float32_values();
+    if (moe.expert_scale != invalid_tensor_handle)
+        options.expert_scale = model.weights.at(moe.expert_scale).float32_values();
     explicit_ids.clear();
     if (moe.token_experts != invalid_tensor_handle)
     {
@@ -585,6 +628,16 @@ static void norm_fwd(const CompiledModel& model,
                        model.opt.optimization_flags,
                        op,
                        node.backend);
+    }
+    if (model.descriptor.logit_softcap > 0.0f)
+    {
+        const float cap = model.descriptor.logit_softcap;
+        for (size_t row = 0; row < logits.rows(); ++row)
+        {
+            float* values = logits.row(row);
+            for (uint32_t column = 0; column < logits.columns(); ++column)
+                values[column] = cap * std::tanh(values[column] / cap);
+        }
     }
     return {};
 }
@@ -778,6 +831,7 @@ Result<void> forward_model(const CompiledModel& model,
         forward_embedding(model.weights.at(node->weights[0]),
                           input_ids,
                           hidden);
+        scale_rows(hidden, model.descriptor.embed_scale);
         hyper_connection_expand(hidden, model.descriptor.hyper_connection_multiplier, state.expert_scratch.staged_output);
         if (model.resident_submission_rows != 0)
         {
@@ -1216,7 +1270,8 @@ Result<void> forward_model(const CompiledModel& model,
         else
         {
             auto projected = router_fwd(model, layer, moe, hidden,
-                                        layer_state.normalized, layer_state.router_logits,
+                                        layer_state.normalized, layer_state.router_normalized,
+                                        layer_state.router_logits,
                                         layer_state.ffn_hyper_mix,
                                         state.hyper_connection_scratch);
             if (!projected)
@@ -1400,7 +1455,24 @@ Result<void> forward_model(const CompiledModel& model,
                                                moe_output, hidden.rows());
             if (!accumulated)
                 return accumulated.error();
-            if (router_fused)
+            if (moe.parallel_ffn)
+            {
+                forward_rms_norm(moe_output,
+                                 model.weights.at(moe.route_post_norm),
+                                 model.descriptor.norm_epsilon,
+                                 layer_state.router_normalized,
+                                 0.0f);
+                moe_output.swap(layer_state.router_normalized);
+                add_batch_inplace(moe_output, layer_state.shared_expert_output);
+                forward_rms_norm(moe_output,
+                                 model.weights.at(moe.post_norm),
+                                 model.descriptor.norm_epsilon,
+                                 layer_state.router_normalized,
+                                 0.0f);
+                layer_state.router_normalized.swap(moe_output);
+                add_batch_inplace(hidden, moe_output);
+            }
+            else if (router_fused)
             {
                 if (!LatentLayer_vulkan::defer_combine(moe_output, layer_workspace))
                     return Error{ErrorCode::InternalError, "cannot defer latent FFN post"};
@@ -1435,6 +1507,9 @@ Result<void> forward_model(const CompiledModel& model,
             }
         }
         if (device_combined) router_fused = false;
+        if (moe.parallel_ffn)
+            if (moe.output_scale != invalid_tensor_handle)
+                scale_rows(hidden, scalar_value(model.weights.at(moe.output_scale)));
 
         if (use_speculative_context)
         {
@@ -1751,6 +1826,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         forward_embedding(model.weights.at(node->weights[0]),
                           input_ids,
                           scratch.staged_output);
+        scale_rows(scratch.staged_output, model.descriptor.embed_scale);
         if (hyper_multiplier > 1)
         {
             hyper_connection_expand(scratch.staged_output, hyper_multiplier, scratch.staged_merged);
@@ -2620,6 +2696,11 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         {
         case LayerKind::DenseFfn:
         {
+            if (layer.moe.parallel_ffn)
+            {
+                stepped = Error{ErrorCode::UnsupportedModel, "batched execution does not support parallel FFN/MoE FFNs"};
+                break;
+            }
             ActivationBuffer& merged = batch_scratch.staged_merged;
             if (!workspace.gpu_segment.active() && !layer_workspace.active() && !merge_hidden_rows(merged))
             {
@@ -2647,7 +2728,8 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                     break;
                 }
                 stepped = router_fwd(model, layer, moe, merged_hyper,
-                                     combined.normalized, workspace.staged_router_logits,
+                                     combined.normalized, combined.router_normalized,
+                                     workspace.staged_router_logits,
                                      combined.ffn_hyper_mix, workspace.hyper_connection);
             }
             break;

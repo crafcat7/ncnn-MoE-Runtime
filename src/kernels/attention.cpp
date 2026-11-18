@@ -31,6 +31,9 @@ namespace moe {
 static void apply_rope(float* vector, uint32_t dimension, uint64_t position, const AttentionBlockPlan& plan)
 {
     const uint32_t half_dimension = dimension / 2;
+    const uint32_t active_half_dimension = plan.rope_active != 0
+                                               ? plan.rope_active / 2
+                                               : half_dimension;
     const float base = plan.rope_theta;
     const float factor = plan.rope_scaling_factor;
     float concentration = 1.0f;
@@ -44,7 +47,7 @@ static void apply_rope(float* vector, uint32_t dimension, uint64_t position, con
         high = half * std::log(static_cast<float>(plan.initial_context_length) / (plan.rope_ntk_alpha * 2.0f * std::numbers::pi_v<float>)) / std::log(base);
     }
 
-    for (uint32_t index = 0; index < half_dimension; ++index)
+    for (uint32_t index = 0; index < active_half_dimension; ++index)
     {
         const float frequency = std::pow(base, static_cast<float>(2 * index) / static_cast<float>(dimension));
         float inverse_frequency = 1.0f / frequency;
@@ -74,6 +77,9 @@ static void prepare_rope_coefficients(uint32_t dimension,
                                       std::vector<float>& sine)
 {
     const uint32_t half_dimension = dimension / 2;
+    const uint32_t active_half_dimension = plan.rope_active != 0
+                                               ? plan.rope_active / 2
+                                               : half_dimension;
     cosine.resize(half_dimension);
     sine.resize(half_dimension);
     const float base = plan.rope_theta;
@@ -88,7 +94,7 @@ static void prepare_rope_coefficients(uint32_t dimension,
         low = half * std::log(static_cast<float>(plan.initial_context_length) / (plan.rope_ntk_beta * 2.0f * std::numbers::pi_v<float>)) / std::log(base);
         high = half * std::log(static_cast<float>(plan.initial_context_length) / (plan.rope_ntk_alpha * 2.0f * std::numbers::pi_v<float>)) / std::log(base);
     }
-    for (uint32_t index = 0; index < half_dimension; ++index)
+    for (uint32_t index = 0; index < active_half_dimension; ++index)
     {
         const float frequency = std::pow(base, static_cast<float>(2 * index) / static_cast<float>(dimension));
         float inverse_frequency = 1.0f / frequency;
@@ -102,6 +108,12 @@ static void prepare_rope_coefficients(uint32_t dimension,
         const float angle = static_cast<float>(position) * inverse_frequency;
         cosine[index] = std::cos(angle) * concentration;
         sine[index] = std::sin(angle) * concentration;
+    }
+    // Inactive rotary pairs pass through untouched.
+    for (uint32_t index = active_half_dimension; index < half_dimension; ++index)
+    {
+        cosine[index] = 1.0f;
+        sine[index] = 0.0f;
     }
 }
 
@@ -260,7 +272,9 @@ static void sdpa_into(const AttentionBlockPlan& plan, const TensorData* sinks, u
     const uint32_t kv_head_count = plan.kv_head_count;
     const uint32_t head_dimension = plan.head_dimension;
     const uint32_t heads_per_group = head_count / kv_head_count;
-    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dimension));
+    const float scale = plan.attn_scale > 0.0f
+                            ? plan.attn_scale
+                            : 1.0f / std::sqrt(static_cast<float>(head_dimension));
     const bool has_selected_keys = selected_offsets.size() == query.rows() + 1;
     // Decode can use the short SDPA path only when the cache has no future key.
     const bool decode_all_keys_valid = query.rows() == 1
@@ -1696,6 +1710,13 @@ Result<void> append_attention_context(const WeightStore& weights,
                             plan.norm_epsilon,
                             plan.norm_weight_offset);
     }
+    if (has_flag(plan.flags, AttentionBlockValueNorm))
+        apply_head_rms_norm(value,
+                            plan.kv_head_count,
+                            plan.head_dimension,
+                            weights.at(plan.v_norm),
+                            plan.norm_epsilon,
+                            0.0f);
 
     const uint32_t rope_dimension = plan.rope_head_dimension == 0 ? plan.head_dimension : plan.rope_head_dimension;
     for (size_t token_index = 0; token_index < hidden.rows(); ++token_index)
@@ -1968,6 +1989,13 @@ Result<void> forward_attention(const WeightStore& weights,
                             plan.norm_epsilon,
                             plan.norm_weight_offset);
     }
+    if (has_flag(plan.flags, AttentionBlockValueNorm))
+        apply_head_rms_norm(value,
+                            plan.kv_head_count,
+                            plan.head_dimension,
+                            weights.at(plan.v_norm),
+                            plan.norm_epsilon,
+                            0.0f);
 
     const uint32_t rope_dimension = plan.rope_head_dimension == 0 ? plan.head_dimension : plan.rope_head_dimension;
     for (size_t token_index = 0; token_index < hidden.rows(); ++token_index)
@@ -2052,6 +2080,15 @@ Result<void> forward_attention(const WeightStore& weights,
                           projected,
                           optimization_flags,
                           backend, quantized_input);
+    if (has_flag(plan.flags, AttentionBlockPostNorm))
+    {
+        forward_rms_norm(projected,
+                         weights.at(plan.attn_post_norm),
+                         plan.norm_epsilon,
+                         scratch.normalized,
+                         0.0f);
+        projected.swap(scratch.normalized);
+    }
     if (!has_flag(plan.flags, AttentionBlockExternalResidual))
         add_batch_inplace(projected, hidden);
     if (&projected != &output)

@@ -61,6 +61,8 @@ struct ExpertState
 struct LayerState
 {
     ActivationBuffer normalized;
+    // Lazy: allocated on first use, only for layers with their own router RMSNorm.
+    ActivationBuffer router_normalized;
     std::shared_ptr<ResidentFfnRegion_vulkan> region;
     std::shared_ptr<const DeviceTensor_vulkan> normalized_device;
     std::shared_ptr<const DeviceTensor_vulkan> combined_device;

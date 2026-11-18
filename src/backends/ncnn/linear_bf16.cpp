@@ -1916,7 +1916,8 @@ bool Bfloat16Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
     const Implementation& down = *down_operator.d;
     const uint64_t expected_fused_columns = static_cast<uint64_t>(intermediate_columns) * 2
                                             + (apply_router_gate ? 1u : 0u);
-    if ((activation != ExpertActivation::Silu && activation != ExpertActivation::DeepSeekSwiGlu)
+    if ((activation != ExpertActivation::Silu && activation != ExpertActivation::DeepSeekSwiGlu
+         && activation != ExpertActivation::GeluTanh)
         || !first.vulkan_context
         || !down.vulkan_context
         || first.vulkan_context.get() != down.vulkan_context.get()
@@ -2016,13 +2017,15 @@ bool Bfloat16Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
         down.packed,
         down.bias,
         output_gpu};
-    constants.resize(6);
+    constants.resize(7);
     constants[0].u32 = intermediate_columns;
     constants[1].u32 = first.output_columns;
     constants[2].u32 = down.output_columns;
     constants[3].u32 = static_cast<uint32_t>(input.rows());
     constants[4].u32 = apply_router_gate ? 1u : 0u;
     constants[5].f = activation == ExpertActivation::DeepSeekSwiGlu ? activation_limit : 0.0f;
+    // Gated-down shader activation code: 0 = SiLU, 1 = GELU-tanh.
+    constants[6].u32 = activation == ExpertActivation::GeluTanh ? 1u : 0u;
     ncnn::VkMat swiglu_dispatcher;
     swiglu_dispatcher.w = static_cast<int>(down.output_columns * 32);
     swiglu_dispatcher.h = static_cast<int>(input.rows());

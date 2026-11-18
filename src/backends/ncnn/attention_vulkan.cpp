@@ -79,6 +79,8 @@ std::vector<uint64_t> Attention_vulkan::scratch_elements(const AttentionConfig_v
     std::vector<uint64_t> columns = {config.hidden_size,
                                      saturating_add_u64(query, saturating_add_u64(saturating_multiply_u64(key, 2), gate ? query : 0)),
                                      query, query, config.hidden_size, 1, 1}; // RMSNorm mean and coefficient.
+    if (has_flag(config.flags, AttentionPostNorm))
+        columns.push_back(config.hidden_size); // Post-attention RMSNorm result retains its own plane.
     if (!direct_ring) columns.insert(columns.end(), {key, key});
     if (gate) columns.push_back(query);
     // Mask-free decode: the single-workgroup kernel covers short caches with up
@@ -158,6 +160,7 @@ public:
         {
             norm.reset();
             layer_norm.reset();
+            post_attention_norm.reset();
             qkv_rope_pipeline.reset();
             qkv_norm_rope_pipeline.reset();
             output_gate_pipeline.reset();
@@ -185,6 +188,7 @@ public:
 
     std::shared_ptr<RmsNorm_vulkan> norm;
     std::shared_ptr<LayerNorm_vulkan> layer_norm;
+    std::shared_ptr<RmsNorm_vulkan> post_attention_norm;
     ncnn::Layer* slice_qkv = nullptr;
     ncnn::Layer* reshape_query = nullptr;
     ncnn::Layer* reshape_key_value = nullptr;
@@ -834,7 +838,8 @@ bool Attention_vulkan::record_qkv_norm_rope(const ncnn::VkMat& fused_qkv,
     if (!pipeline || fused_qkv.empty() || cosine.empty() || sine.empty()
         || (implementation.query_key_norm
             && (implementation.query_norm_weight.empty()
-                || implementation.key_norm_weight.empty())))
+                || implementation.key_norm_weight.empty()))
+        || (has_flag(config.flags, AttentionValueNorm) && !implementation.query_key_norm))
         return false;
     if (token_count == 0
         || token_count > static_cast<size_t>(std::numeric_limits<int>::max())
@@ -942,7 +947,7 @@ bool Attention_vulkan::record_qkv_norm_rope(const ncnn::VkMat& fused_qkv,
         value,
         gate,
     };
-    std::vector<ncnn::vk_constant_type> constants(23);
+    std::vector<ncnn::vk_constant_type> constants(24);
     constants[0].u32 = static_cast<uint32_t>(total_columns);
     constants[1].u32 = query_columns;
     constants[2].u32 = key_value_columns;
@@ -966,6 +971,7 @@ bool Attention_vulkan::record_qkv_norm_rope(const ncnn::VkMat& fused_qkv,
     constants[20].u32 = implementation.output_gate ? 1 : 0;
     constants[21].u32 = config.kv_cache_dtype == DType::BFloat16 ? 1 : 0;
     constants[22].u32 = pipeline->local_size_x();
+    constants[23].u32 = has_flag(config.flags, AttentionValueNorm) ? 1u : 0u; // Matches the shader push_constant order.
     ncnn::VkMat dispatcher;
     dispatcher.w = static_cast<int>(work_items * pipeline->local_size_x());
     dispatcher.h = 1;
@@ -1048,7 +1054,7 @@ static bool record_attention_decode_sdpa(const ncnn::Pipeline* pipeline, const n
     constants[5].u32 = static_cast<uint32_t>(key.cstep);
     constants[6].u32 = static_cast<uint32_t>(value.cstep);
     constants[7].u32 = has_flag(config.flags, AttentionSink) ? 1 : 0;
-    constants[8].f = 1.0f / std::sqrt(static_cast<float>(config.head_dimension));
+    constants[8].f = config.attn_scale;
     ncnn::VkMat dispatcher;
     dispatcher.w = 256;
     dispatcher.h = 1;
@@ -1108,7 +1114,7 @@ static bool record_attention_decode_split(const ncnn::Pipeline* split_pipeline, 
     constants[5].u32 = static_cast<uint32_t>(key.cstep);
     constants[6].u32 = static_cast<uint32_t>(value.cstep);
     constants[7].u32 = has_flag(config.flags, AttentionSink) ? 1u : 0u;
-    constants[8].f = 1.0f / std::sqrt(static_cast<float>(config.head_dimension));
+    constants[8].f = config.attn_scale;
     constants[9].u32 = static_cast<uint32_t>(split_count);
     constants[10].u32 = static_cast<uint32_t>(aligned_tokens);
     // One dispatch: the workgroup index selects the KV range.
@@ -1417,7 +1423,8 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_native(const TensorDa
                                                                   const std::array<CompiledOperator, 5>& projections,
                                                                   const AttentionConfig_vulkan& config,
                                                                   std::shared_ptr<QnkLinear_vulkan> fused_native_qkv,
-                                                                  const TensorData* norm_bias)
+                                                                  const TensorData* norm_bias,
+                                                                  const TensorData* attn_post_norm)
 {
     return create_impl(norm_weight,
                        query_norm_weight,
@@ -1428,7 +1435,7 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_native(const TensorDa
                        {},
                        {},
                        projections,
-                       config, std::move(fused_native_qkv), norm_bias);
+                       config, std::move(fused_native_qkv), norm_bias, attn_post_norm);
 }
 
 std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData& norm_weight,
@@ -1442,7 +1449,8 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
                                                                 std::array<CompiledOperator, 5> native_projections,
                                                                 const AttentionConfig_vulkan& config,
                                                                 std::shared_ptr<QnkLinear_vulkan> fused_native_qkv,
-                                                                const TensorData* norm_bias)
+                                                                const TensorData* norm_bias,
+                                                                const TensorData* attn_post_norm)
 {
 #if NCNN_MOE_WITH_VULKAN
 #if !NCNN_BATCH
@@ -1467,6 +1475,12 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
             && (!sinks || sinks->shape != std::vector<uint32_t>{config.head_count}))
         || (query_norm_weight == nullptr) != (key_norm_weight == nullptr)
         || has_flag(config.flags, AttentionQueryKeyNorm) != (query_norm_weight != nullptr)
+        || (has_flag(config.flags, AttentionValueNorm) && query_norm_weight == nullptr)
+        || (attn_post_norm != nullptr)
+               != has_flag(config.flags, AttentionPostNorm)
+        || (attn_post_norm != nullptr
+            && attn_post_norm->shape != std::vector<uint32_t>{config.hidden_size})
+        || !(config.attn_scale > 0.0f) || !std::isfinite(config.attn_scale)
         || (use_native && has_flag(config.flags, AttentionOutputGate) != static_cast<bool>(native_projections[4].qnk || native_projections[4].float8))
         || (!use_native && has_flag(config.flags, AttentionOutputGate) && !fused_qkv_gate)
         || (!use_native && !has_flag(config.flags, AttentionSink) && config.sliding_window > 0)
@@ -1492,6 +1506,8 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
     if (rope_dimension == 0
         || rope_dimension > config.head_dimension
         || (rope_dimension & 1) != 0
+        || config.rope_active > rope_dimension
+        || (config.rope_active & 1) != 0
         || (query_key_norm
             && (query_norm_weight->shape != std::vector<uint32_t>{config.head_dimension}
                 || key_norm_weight->shape != std::vector<uint32_t>{config.head_dimension})))
@@ -1663,6 +1679,13 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
     }
     for (uint32_t index = 0; index < half_dimension; ++index)
     {
+        // Proportional RoPE keeps the inactive pairs at identity: a zero
+        // inverse frequency yields cos=1/sin=0 and passes the channels through.
+        if (config.rope_active != 0 && index * 2 >= config.rope_active)
+        {
+            implementation.rope_inverse_frequencies[index] = 0.0f;
+            continue;
+        }
         const uint32_t frequency_dimension = index < rope_half_dimension
                                                  ? rope_dimension
                                                  : config.head_dimension;
@@ -1760,7 +1783,7 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
 
     ncnn::ParamDict sdpa_parameters;
     sdpa_parameters.set(5, 1);
-    sdpa_parameters.set(6, 1.0f / std::sqrt(static_cast<float>(config.head_dimension)));
+    sdpa_parameters.set(6, config.attn_scale);
     sdpa_parameters.set(7, 0);
     if (!create_vulkan_layer(ncnn::LayerType::SDPA,
                              sdpa_parameters,
@@ -1816,6 +1839,17 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
                                                      config.norm_weight_offset, implementation.vulkan_context,
                                                      implementation.option, implementation.weight_allocator.get());
         if (!implementation.norm)
+            return {};
+    }
+    if (attn_post_norm)
+    {
+        implementation.post_attention_norm = RmsNorm_vulkan::create(*attn_post_norm,
+                                                                    config.norm_epsilon,
+                                                                    0.0f,
+                                                                    implementation.vulkan_context,
+                                                                    implementation.option,
+                                                                    implementation.weight_allocator.get());
+        if (!implementation.post_attention_norm)
             return {};
     }
     {
@@ -2143,7 +2177,8 @@ bool Attention_vulkan::record_decode(const ncnn::VkMat& query, const ncnn::VkMat
         ncnn::VkMat real_key = key, real_value = value;
         real_key.h = real_value.h = static_cast<int>(shape.kv_tokens);
         return d->decode_matrix->record(plan, query, real_key, real_value, d->attention_sinks,
-                                        has_flag(d->config.flags, AttentionSink), output, command,
+                                        has_flag(d->config.flags, AttentionSink),
+                                        d->config.attn_scale, output, command,
                                         d->option.blob_vkallocator, workspace);
     }
     const uint64_t split_count = decode_split_count(destination_count, d->decode_split_pipeline && d->decode_merge_pipeline);
@@ -2730,6 +2765,17 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
             return false;
         }
     }
+    if (implementation.post_attention_norm)
+    {
+        // Post-attention RMSNorm belongs to the attention block: it normalizes
+        // the output projection before the residual add.
+        if (projected_gpu.empty() || projected_gpu.elempack != 1 || projected_gpu.elemsize != sizeof(float))
+            return false;
+        auto& post_attention_normalized = ticket.keep_buffer();
+        if (!implementation.post_attention_norm->record(projected_gpu, post_attention_normalized, command))
+            return false;
+        projected_gpu = post_attention_normalized;
+    }
     if (add_residual)
     {
         auto& residual_input_gpu = ticket.keep_buffer(input_gpu);
@@ -3150,6 +3196,10 @@ Attention_vulkan::forward_batch(std::span<const AttentionBatchEntry_vulkan> entr
     if (entries.size() < 2
         || !has_flag(optimization_flags, OptimizationVulkanAttention)
         || !has_flag(optimization_flags, OptimizationVulkanAttentionBatch))
+        return AttentionBatchResult_vulkan::NotExecuted;
+    // The batched recorder has no post-attention normalization stage yet. The
+    // executor falls back to the per-session path, which implements it.
+    if (d->post_attention_norm)
         return AttentionBatchResult_vulkan::NotExecuted;
 
     const Implementation& implementation = *d;

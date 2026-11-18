@@ -254,6 +254,7 @@ enum class ExpertActivation
     Relu,
     Silu,
     Gelu,
+    GeluTanh,
     ClampedSilu,
     DeepSeekSwiGlu,
     GptOssSwiGlu

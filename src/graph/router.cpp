@@ -165,6 +165,8 @@ static Result<void> dispatch_experts_general(std::span<const float> router_logit
     }
     if (!options.selection_bias.empty() && options.selection_bias.size() != options.expert_count)
         return Error{ErrorCode::InvalidArgument, "router selection bias must match expert_count"};
+    if (!options.expert_scale.empty() && options.expert_scale.size() != options.expert_count)
+        return Error{ErrorCode::InvalidArgument, "router Expert scale must match expert_count"};
     if (options.group_count != 0
         && (options.top_k_groups == 0 || options.top_k_groups > options.group_count
             || options.expert_count % options.group_count != 0
@@ -234,10 +236,12 @@ static Result<void> dispatch_experts_general(std::span<const float> router_logit
                     id1 = i;
                 }
             }
+            const float scale0 = options.expert_scale.empty() ? 1.0f : options.expert_scale[id0];
+            const float scale1 = options.expert_scale.empty() ? 1.0f : options.expert_scale[id1];
             const float w0 = mixer_weight(logits, options.expert_count, id0, options.expert_count, options.jitter)
-                             * options.routed_scaling_factor;
+                             * options.routed_scaling_factor * scale0;
             const float w1 = mixer_weight(logits, options.expert_count, id1, id0, options.jitter)
-                             * options.routed_scaling_factor;
+                             * options.routed_scaling_factor * scale1;
             result.route_scratch[id0].push_back({token_index, 0, w0});
             result.route_scratch[id1].push_back({token_index, 1, w1});
             continue;
@@ -287,7 +291,9 @@ static Result<void> dispatch_experts_general(std::span<const float> router_logit
         {
             const RouteCandidate& candidate = selected[rank];
             const float score = softmax_topk || explicit_scores ? candidate.score : scores[candidate.expert_id];
-            const float weight = (renormalize ? score / selected_sum : score) * options.routed_scaling_factor;
+            float weight = (renormalize ? score / selected_sum : score) * options.routed_scaling_factor;
+            if (!options.expert_scale.empty())
+                weight *= options.expert_scale[candidate.expert_id];
             result.route_scratch[candidate.expert_id].push_back({token_index, rank, weight});
         }
     }
@@ -344,6 +350,8 @@ Result<void> forward_router(std::span<const float> router_logits,
     }
     if (!options.selection_bias.empty() && options.selection_bias.size() != options.expert_count)
         return Error{ErrorCode::InvalidArgument, "router selection bias must match expert_count"};
+    if (!options.expert_scale.empty() && options.expert_scale.size() != options.expert_count)
+        return Error{ErrorCode::InvalidArgument, "router Expert scale must match expert_count"};
     if (!options.explicit_expert_ids.empty() && options.explicit_expert_ids.size() != options.top_k)
         return Error{ErrorCode::InvalidArgument, "explicit expert ids must match token_count * top_k"};
     if (!std::isfinite(options.routed_scaling_factor) || options.routed_scaling_factor <= 0.0f)
@@ -486,11 +494,14 @@ Result<void> forward_router(std::span<const float> router_logits,
         if (batch.routes.capacity() == 0 && batch.expert_id < result.route_scratch.size())
             batch.routes.swap(result.route_scratch[batch.expert_id]);
         batch.routes.resize(1);
+        float weight = (renormalize ? selected[index].score / denominator : selected[index].score)
+                       * options.routed_scaling_factor;
+        if (!options.expert_scale.empty())
+            weight *= options.expert_scale[selected[index].expert_id];
         batch.routes.front() = {
             0,
             selected[index].rank,
-            (renormalize ? selected[index].score / denominator : selected[index].score)
-                * options.routed_scaling_factor,
+            weight,
         };
     }
     return {};

@@ -101,7 +101,7 @@ void normalize_expert_storage(MoeModelDescriptor& descriptor, const WeightMappin
     for (uint32_t index = 0; index < descriptor.layers.size(); ++index)
     {
         LayerDescriptor& layer = descriptor.layers[index];
-        if (!layer.dense.enabled())
+        if (layer.moe.expert_count != 0)
             normalize(layer.moe, layer_prefix(index));
     }
     if (!descriptor.layers.empty())

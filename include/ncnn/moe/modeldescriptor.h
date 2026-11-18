@@ -18,6 +18,8 @@ namespace moe {
 #define NCNN_MOE_ATTN_SIGMOID_GATE_BIT 5
 #define NCNN_MOE_ATTN_LATENT_VALUE_BIT 6
 #define NCNN_MOE_ATTN_DELTA_GATE_BIT   7
+#define NCNN_MOE_ATTN_VALUE_NORM_BIT   8
+#define NCNN_MOE_ATTN_POST_NORM_BIT    9
 
 enum AttentionDescriptorFlag : uint32_t
 {
@@ -31,7 +33,11 @@ enum AttentionDescriptorFlag : uint32_t
     // cached KV latent instead of reusing it as the value vector.
     AttentionDescriptorLatentValue = UINT32_C(1) << NCNN_MOE_ATTN_LATENT_VALUE_BIT,
     // Bounded per-channel DeltaNet decay: lower_bound * sigmoid(exp(A) * (f + dt_bias)).
-    AttentionDescriptorDeltaGate = UINT32_C(1) << NCNN_MOE_ATTN_DELTA_GATE_BIT
+    AttentionDescriptorDeltaGate = UINT32_C(1) << NCNN_MOE_ATTN_DELTA_GATE_BIT,
+    // Weight-less value RMS normalization applied per KV head before RoPE.
+    AttentionDescriptorValueNorm = UINT32_C(1) << NCNN_MOE_ATTN_VALUE_NORM_BIT,
+    // RMS normalization of the attention output before the residual add.
+    AttentionDescriptorPostNorm = UINT32_C(1) << NCNN_MOE_ATTN_POST_NORM_BIT
 };
 
 enum class AttentionKind
@@ -55,6 +61,8 @@ struct AttentionDescriptor
     uint32_t kv_lora_rank = 0;
     uint32_t qk_nope_head_dimension = 0;
     uint32_t qk_rope_head_dimension = 0;
+    // Number of rotary dimensions with non-zero frequencies; zero rotates all.
+    uint32_t rope_active = 0;
     uint32_t value_head_dimension = 0;
     uint32_t output_lora_rank = 0;
     uint32_t output_group_count = 0;
@@ -71,21 +79,32 @@ struct AttentionDescriptor
     float rope_ntk_alpha = 1.0f;
     float rope_ntk_beta = 32.0f;
     float delta_lower_bound = 0.0f;
+    // Zero keeps the conventional 1/sqrt(head_dimension) attention scale.
+    float attn_scale = 0.0f;
     DType projection_weight_dtype = DType::Float32;
     uint32_t flags = 0;
 };
 
-#define NCNN_MOE_DESC_ROUTER_BIAS_BIT     0
-#define NCNN_MOE_DESC_PROJECTION_BIAS_BIT 1
-#define NCNN_MOE_DESC_SHARED_GATE_BIT     2
-#define NCNN_MOE_DESC_FILE_BACKED_BIT     3
+#define NCNN_MOE_DESC_ROUTER_BIAS_BIT      0
+#define NCNN_MOE_DESC_PROJECTION_BIAS_BIT  1
+#define NCNN_MOE_DESC_SHARED_GATE_BIT      2
+#define NCNN_MOE_DESC_FILE_BACKED_BIT      3
+#define NCNN_MOE_DESC_PARALLEL_FFN_BIT     4
+#define NCNN_MOE_DESC_ROUTER_NORM_BIT      5
+#define NCNN_MOE_DESC_PER_EXPERT_SCALE_BIT 6
 
 enum MoeDescriptorFlag : uint32_t
 {
     MoeDescriptorRouterBias = UINT32_C(1) << NCNN_MOE_DESC_ROUTER_BIAS_BIT,
     MoeDescriptorProjectionBias = UINT32_C(1) << NCNN_MOE_DESC_PROJECTION_BIAS_BIT,
     MoeDescriptorSharedExpertGate = UINT32_C(1) << NCNN_MOE_DESC_SHARED_GATE_BIT,
-    MoeDescriptorFileBackedExperts = UINT32_C(1) << NCNN_MOE_DESC_FILE_BACKED_BIT
+    MoeDescriptorFileBackedExperts = UINT32_C(1) << NCNN_MOE_DESC_FILE_BACKED_BIT,
+    // This MoE block runs beside a dense FFN branch in the same layer.
+    MoeDescriptorParallelFfn = UINT32_C(1) << NCNN_MOE_DESC_PARALLEL_FFN_BIT,
+    // Route through a scale-free RMSNorm before the router projection.
+    MoeDescriptorRouterNorm = UINT32_C(1) << NCNN_MOE_DESC_ROUTER_NORM_BIT,
+    // Multiply selected route weights by a per-Expert scale vector.
+    MoeDescriptorPerExpertScale = UINT32_C(1) << NCNN_MOE_DESC_PER_EXPERT_SCALE_BIT
 };
 
 struct MoeDescriptor
@@ -191,6 +210,11 @@ struct MoeModelDescriptor
     uint32_t hyper_connection_iterations = 0;
     float hyper_connection_epsilon = 1e-6f;
     uint32_t hash_routing_layer_count = 0;
+    // Layers may use different head_dimension / kv_head_count values; the
+    // per-layer AttentionDescriptor fields win over the model-level defaults.
+    bool varied_attn = false;
+    float embed_scale = 1.0f;
+    float logit_softcap = 0.0f;
     // None requires zero speculative layers and no target layer IDs.
     SpeculativeModelKind speculative_kind = SpeculativeModelKind::None;
     uint32_t speculative_layer_count = 0;

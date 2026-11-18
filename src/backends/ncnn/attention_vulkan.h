@@ -66,12 +66,18 @@ class AttentionCache_vulkan;
 #define NCNN_MOE_VULKAN_ATTN_SINK_BIT        0
 #define NCNN_MOE_VULKAN_ATTN_QK_NORM_BIT     1
 #define NCNN_MOE_VULKAN_ATTN_OUTPUT_GATE_BIT 2
+#define NCNN_MOE_VULKAN_ATTN_VALUE_NORM_BIT  3
+#define NCNN_MOE_VULKAN_ATTN_POST_NORM_BIT   4
 
 enum AttentionFlag : uint32_t
 {
     AttentionSink = UINT32_C(1) << NCNN_MOE_VULKAN_ATTN_SINK_BIT,
     AttentionQueryKeyNorm = UINT32_C(1) << NCNN_MOE_VULKAN_ATTN_QK_NORM_BIT,
-    AttentionOutputGate = UINT32_C(1) << NCNN_MOE_VULKAN_ATTN_OUTPUT_GATE_BIT
+    AttentionOutputGate = UINT32_C(1) << NCNN_MOE_VULKAN_ATTN_OUTPUT_GATE_BIT,
+    // Weight-less per-KV-head RMS normalization of the value projection output.
+    AttentionValueNorm = UINT32_C(1) << NCNN_MOE_VULKAN_ATTN_VALUE_NORM_BIT,
+    // Learned RMS normalization of the attention output before the residual add.
+    AttentionPostNorm = UINT32_C(1) << NCNN_MOE_VULKAN_ATTN_POST_NORM_BIT
 };
 
 struct AttentionConfig_vulkan
@@ -89,6 +95,10 @@ struct AttentionConfig_vulkan
     float rope_scaling_factor = 1.0f;
     float rope_ntk_alpha = 1.0f;
     float rope_ntk_beta = 32.0f;
+    // Effective attention logit scale, already resolved from the plan.
+    float attn_scale = 1.0f;
+    // Number of rotary dimensions with non-zero frequencies; zero rotates all.
+    uint32_t rope_active = 0;
     DType activation_dtype = DType::Float32;
     DType kv_cache_dtype = DType::Float32;
     uint32_t flags = 0;
@@ -147,7 +157,8 @@ public:
                                                                          const std::array<CompiledOperator, 5>& projections,
                                                                          const AttentionConfig_vulkan& config,
                                                                          std::shared_ptr<QnkLinear_vulkan> fused_native_qkv = {},
-                                                                         const TensorData* norm_bias = nullptr);
+                                                                         const TensorData* norm_bias = nullptr,
+                                                                         const TensorData* attn_post_norm = nullptr);
     // One upload, one submission, and one download per Attention block.
     [[nodiscard]] bool forward(uint64_t position_offset, LayerCache& cache, const ActivationBuffer& input, ActivationBuffer& output) const;
     // Materializes an otherwise valid device KV ring into the CPU cache.  This
@@ -227,7 +238,8 @@ private:
                                                                        std::array<CompiledOperator, 5> native_projections,
                                                                        const AttentionConfig_vulkan& config,
                                                                        std::shared_ptr<QnkLinear_vulkan> fused_native_qkv = {},
-                                                                       const TensorData* norm_bias = nullptr);
+                                                                       const TensorData* norm_bias = nullptr,
+                                                                       const TensorData* attn_post_norm = nullptr);
     std::unique_ptr<Implementation> d;
 };
 

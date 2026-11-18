@@ -166,6 +166,11 @@ def _decode_deepseek(text: str, thinking: bool) -> Completion:
     return Completion(split.reasoning.strip(), split.answer.strip())
 
 
+_GEMMA4_OPEN = "<|channel>"
+_GEMMA4_THOUGHT_OPEN = _GEMMA4_OPEN + "thought"
+_GEMMA4_CLOSE = "<channel|>"
+
+
 class ModelAdapter:
     """A small model profile; tokenization and decoding stay in the worker."""
 
@@ -183,6 +188,7 @@ class ModelAdapter:
         self._weight_files = model_weight_files(self.model)
         self._gguf = bool(self._weight_files and self._weight_files[0].suffix.lower() == ".gguf")
         self.config = _load_json(self._config_path) if self._config_path.is_file() else {}
+        self.generation_config = self._read_generation_config()
         self._native_model_info = native_model_info or {}
         if not self.config and not self._gguf:
             raise AdapterError(f"config.json is missing from: {self._asset_root}")
@@ -199,6 +205,16 @@ class ModelAdapter:
         self._stop_tokens = self._validate_stop_tokens(native_stop_tokens)
         self.model_fingerprint, self.legacy_model_fingerprints = self._fingerprints()
 
+    def _read_generation_config(self) -> dict[str, Any]:
+        path = self._asset_root / "generation_config.json"
+        if not path.is_file():
+            return {}
+        try:
+            value = _load_json(path)
+        except AdapterError:
+            return {}
+        return value if isinstance(value, dict) else {}
+
     @staticmethod
     def _model_name(model_type: str) -> str:
         if model_type in {"gpt_oss", "gpt-oss", "gpt_oss_moe"}:
@@ -211,6 +227,8 @@ class ModelAdapter:
             return "qwen3"
         if model_type in {"qwen3_5_moe", "qwen3_6", "qwen3.6", "qwen3_5", "qwen35", "qwen35moe"}:
             return "qwen3.6"
+        if model_type in {"gemma4", "gemma4_text"}:
+            return "gemma4"
         if model_type == "phimoe":
             return "phimoe"
         if model_type == "bailing_hybrid":
@@ -338,7 +356,79 @@ class ModelAdapter:
             return Completion("", text.strip())
         if self.name == "deepseek-v4":
             return _decode_deepseek(text, self.thinking)
+        if self.name == "gemma4":
+            normalized = self._gemma4_normalize(text)
+            if self.thinking and "<think" not in normalized:
+                # The model answered without opening a thought channel.
+                return Completion("", normalized.strip())
+            return _split_thinking(normalized, self.thinking)
         return _split_thinking(text, self.thinking)
+
+    def _gemma4_normalize(self, text: str) -> str:
+        if not self.thinking:
+            return re.sub(re.escape(_GEMMA4_THOUGHT_OPEN) + ".*?" + re.escape(_GEMMA4_CLOSE),
+                          "", text, flags=re.S)
+        return (text.replace(_GEMMA4_THOUGHT_OPEN + "\n", "<think")
+                    .replace(_GEMMA4_THOUGHT_OPEN, "<think")
+                    .replace(_GEMMA4_CLOSE, "</think"))
+
+    @staticmethod
+    def _marker_suffix(text: str, marker: str) -> str:
+        """Longest tail of text that could still grow into marker."""
+        for length in range(min(len(marker) - 1, len(text)), 0, -1):
+            if text.endswith(marker[:length]):
+                return text[-length:]
+        return ""
+
+    def _gemma4_stream(self, text: str, streamed: dict[str, Any]) -> str:
+        state = streamed.setdefault(
+            "gemma4_state",
+            {"buffer": "", "in_thought": False, "opened": False},
+        )
+        state["buffer"] += text
+        output: list[str] = []
+        while True:
+            buffer = state["buffer"]
+            if state["in_thought"]:
+                marker_at = buffer.find(_GEMMA4_CLOSE)
+                if marker_at < 0:
+                    # Hold back a possible marker prefix so a chunk boundary
+                    # cannot hide the close marker; drop thought text meanwhile.
+                    keep = self._marker_suffix(buffer, _GEMMA4_CLOSE)
+                    if self.thinking:
+                        output.append(buffer[:-len(keep)] if keep else buffer)
+                    state["buffer"] = keep
+                    break
+                if self.thinking:
+                    output.append(buffer[:marker_at])
+                    output.append("</think")
+                state["buffer"] = buffer[marker_at + len(_GEMMA4_CLOSE):]
+                state["in_thought"] = False
+                continue
+            if state["opened"]:
+                output.append(buffer)
+                state["buffer"] = ""
+                break
+            marker_at = buffer.find(_GEMMA4_OPEN)
+            if marker_at < 0:
+                keep = self._marker_suffix(buffer, _GEMMA4_OPEN)
+                output.append(buffer[:-len(keep)] if keep else buffer)
+                state["buffer"] = keep
+                break
+            output.append(buffer[:marker_at])
+            rest = buffer[marker_at + len(_GEMMA4_OPEN):]
+            if "\n" not in rest:
+                state["buffer"] = _GEMMA4_OPEN + rest
+                break
+            channel, state["buffer"] = rest.split("\n", 1)
+            if channel == "thought":
+                if self.thinking:
+                    output.append("<think")
+                state["in_thought"] = True
+                state["opened"] = True
+            else:
+                output.append(_GEMMA4_OPEN + channel + "\n")
+        return "".join(output)
 
     @staticmethod
     def visible_completion(completion: Completion, *, final_only: bool = False) -> str:
@@ -1491,19 +1581,32 @@ def open_worker(
     return client, merged, profile_record, adapter
 
 
+def _config_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 def default_generation_values(adapter: ModelAdapter, arguments: argparse.Namespace) -> tuple[float, int, float]:
-    if arguments.temperature is None:
-        temperature = 1.0
-    else:
-        temperature = arguments.temperature
-    if arguments.top_k is None:
-        top_k = 0 if adapter.name in {"gpt-oss", "deepseek-v4"} else 20
-    else:
-        top_k = arguments.top_k
-    if arguments.top_p is None:
-        top_p = 1.0 if adapter.name in {"gpt-oss", "deepseek-v4"} else 0.95
-    else:
-        top_p = arguments.top_p
+    config = adapter.generation_config
+
+    temperature = arguments.temperature
+    if temperature is None:
+        value = _config_number(config.get("temperature"))
+        temperature = value if value is not None and value > 0.0 else 1.0
+
+    top_k = arguments.top_k
+    if top_k is None:
+        fallback = 0 if adapter.name in {"gpt-oss", "deepseek-v4"} else 20
+        value = _config_number(config.get("top_k"))
+        top_k = int(value) if value is not None and value >= 0.0 else fallback
+
+    top_p = arguments.top_p
+    if top_p is None:
+        fallback = 1.0 if adapter.name in {"gpt-oss", "deepseek-v4"} else 0.95
+        value = _config_number(config.get("top_p"))
+        top_p = value if value is not None and 0.0 < value <= 1.0 else fallback
+
     return temperature, top_k, top_p
 
 
@@ -2071,6 +2174,16 @@ class ConversationApp:
         text = event.get("text")
         if not isinstance(text, str):
             raise WorkerError("native worker token event did not include decoded text", event)
+        token_id = event.get("token_id")
+        token_is_stop = event.get("is_stop_token") is True or (
+            isinstance(token_id, int)
+            and not isinstance(token_id, bool)
+            and token_id in self.adapter.stop_tokens
+        )
+        if self.adapter.name == "gemma4" and token_is_stop:
+            # Stop tokens are protocol markers, not answer text.
+            streamed["ended_with_stop_token"] = True
+            return
         if self.adapter.name == "deepseek-v4":
             token_id = event.get("token_id")
             if isinstance(token_id, bool) or not isinstance(token_id, int):
@@ -2094,8 +2207,11 @@ class ConversationApp:
             streamed["ended_with_stop_token"] = token_id in self.adapter.stop_tokens
 
         streamed.setdefault("decoded_chunks", []).append(text)
+        stream_text = text
+        if self.adapter.name == "gemma4":
+            stream_text = self.adapter._gemma4_stream(text, streamed)
         if display and self.arguments.stream:
-            self._stream_thinking_text(text, streamed)
+            self._stream_thinking_text(stream_text, streamed)
 
     def _decode_completion(self, streamed: dict[str, Any]) -> Completion:
         if self.adapter.name == "gpt-oss":
@@ -2105,6 +2221,18 @@ class ConversationApp:
                 "".join(state.get("answer_parts", [])).strip(),
             )
         text = "".join(streamed.get("decoded_chunks", []))
+        if self.adapter.name == "gemma4":
+            # Defensive: older worker events could have appended the stop
+            # marker before it was filtered.
+            text = text.rstrip()
+            stripping = True
+            while stripping:
+                stripping = False
+                for marker in ("<turn|>", "<end_of_turn>", "<eos>"):
+                    if text.endswith(marker):
+                        text = text[: -len(marker)].rstrip()
+                        stripping = True
+                        break
         if self.adapter.name.startswith("qwen") and streamed.get("ended_with_stop_token"):
             text = text.rstrip().rstrip("\ufffd").rstrip()
         return self.adapter.decode_completion_text(text)

@@ -261,6 +261,7 @@ bool AttentionDecodeVulkan::record(const AttentionDecodePlan& plan,
                                    const ncnn::VkMat& value,
                                    const ncnn::VkMat& sinks,
                                    bool attention_sink,
+                                   float scale,
                                    ncnn::VkMat& output,
                                    ncnn::VkCompute& command,
                                    ncnn::VkAllocator* allocator,
@@ -302,7 +303,7 @@ bool AttentionDecodeVulkan::record(const AttentionDecodePlan& plan,
     constants[5].u32 = static_cast<uint32_t>(key.cstep);
     constants[6].u32 = static_cast<uint32_t>(value.cstep);
     constants[7].u32 = attention_sink ? 1 : 0;
-    constants[8].f = 1.0f / std::sqrt(static_cast<float>(shape.head_dimension));
+    constants[8].f = scale;
     constants[9].u32 = plan.split_count;
     constants[10].u32 = plan.split_tokens;
     ncnn::VkMat dispatcher;

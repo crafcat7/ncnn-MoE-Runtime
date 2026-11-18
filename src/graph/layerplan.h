@@ -36,14 +36,16 @@ struct ExpertPlan
     bool use_gpu_cache = false;
 };
 
-#define NCNN_MOE_ATTN_PLAN_SINK_BIT     0
-#define NCNN_MOE_ATTN_PLAN_QK_NORM_BIT  1
-#define NCNN_MOE_ATTN_PLAN_GATE_BIT     2
-#define NCNN_MOE_ATTN_PLAN_QSA_BIT      3
-#define NCNN_MOE_ATTN_PLAN_EXTERNAL_BIT 4
-#define NCNN_MOE_ATTN_PLAN_SIGMOID_BIT  5
-#define NCNN_MOE_ATTN_PLAN_LATENT_BIT   6
-#define NCNN_MOE_ATTN_PLAN_DELTA_BIT    7
+#define NCNN_MOE_ATTN_PLAN_SINK_BIT       0
+#define NCNN_MOE_ATTN_PLAN_QK_NORM_BIT    1
+#define NCNN_MOE_ATTN_PLAN_GATE_BIT       2
+#define NCNN_MOE_ATTN_PLAN_QSA_BIT        3
+#define NCNN_MOE_ATTN_PLAN_EXTERNAL_BIT   4
+#define NCNN_MOE_ATTN_PLAN_SIGMOID_BIT    5
+#define NCNN_MOE_ATTN_PLAN_LATENT_BIT     6
+#define NCNN_MOE_ATTN_PLAN_DELTA_BIT      7
+#define NCNN_MOE_ATTN_PLAN_VALUE_NORM_BIT 8
+#define NCNN_MOE_ATTN_PLAN_POST_NORM_BIT  9
 
 enum AttentionBlockFlag : uint32_t
 {
@@ -54,7 +56,9 @@ enum AttentionBlockFlag : uint32_t
     AttentionBlockExternalResidual = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_EXTERNAL_BIT,
     AttentionBlockSigmoidGate = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_SIGMOID_BIT,
     AttentionBlockLatentValue = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_LATENT_BIT,
-    AttentionBlockDeltaGate = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_DELTA_BIT
+    AttentionBlockDeltaGate = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_DELTA_BIT,
+    AttentionBlockValueNorm = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_VALUE_NORM_BIT,
+    AttentionBlockPostNorm = UINT32_C(1) << NCNN_MOE_ATTN_PLAN_POST_NORM_BIT
 };
 
 struct AttentionBlockPlan
@@ -77,9 +81,11 @@ struct AttentionBlockPlan
     TensorHandle key_norm_weight = invalid_tensor_handle;
     TensorHandle value_weight = invalid_tensor_handle;
     TensorHandle value_bias = invalid_tensor_handle;
+    TensorHandle v_norm = invalid_tensor_handle;
     TensorHandle output_weight = invalid_tensor_handle;
     TensorHandle output_bias = invalid_tensor_handle;
     TensorHandle output_gate_weight = invalid_tensor_handle;
+    TensorHandle attn_post_norm = invalid_tensor_handle;
     TensorHandle sinks = invalid_tensor_handle;
 
     // Gated DeltaNet weights.
@@ -131,6 +137,7 @@ struct AttentionBlockPlan
     uint32_t kv_lora_rank = 0;
     uint32_t qk_nope_head_dimension = 0;
     uint32_t rope_head_dimension = 0;
+    uint32_t rope_active = 0;
     uint32_t output_lora_rank = 0;
     uint32_t output_group_count = 0;
     uint32_t compression_ratio = 0;
@@ -143,6 +150,8 @@ struct AttentionBlockPlan
     float rope_scaling_factor = 1.0f;
     float rope_ntk_alpha = 1.0f;
     float rope_ntk_beta = 32.0f;
+    // Zero keeps the conventional 1/sqrt(head_dimension) attention scale.
+    float attn_scale = 0.0f;
     float norm_weight_offset = 0.0f;
     float norm_epsilon = 1e-5f;
     DType kv_cache_dtype = DType::Float32;
@@ -199,6 +208,8 @@ struct MoeBlockPlan
     TensorHandle router_weight = invalid_tensor_handle;
     TensorHandle router_bias = invalid_tensor_handle;
     TensorHandle router_selection_bias = invalid_tensor_handle;
+    TensorHandle router_norm = invalid_tensor_handle;
+    TensorHandle expert_scale = invalid_tensor_handle;
     TensorHandle token_experts = invalid_tensor_handle;
     TensorHandle shared_expert_gate_weight = invalid_tensor_handle;
     CompiledOperatorHandle fused_shared_input_bfloat16_operator = invalid_compiled_operator_handle;
@@ -213,6 +224,12 @@ struct MoeBlockPlan
     float routed_scaling_factor = 1.0f;
     float jitter = 0.0f;
     bool has_shared_expert = false;
+    // Dense FFN branch running beside the routed MoE block.
+    bool parallel_ffn = false;
+    TensorHandle dense_post_norm = invalid_tensor_handle;
+    TensorHandle route_post_norm = invalid_tensor_handle;
+    TensorHandle post_norm = invalid_tensor_handle;
+    TensorHandle output_scale = invalid_tensor_handle;
 };
 
 struct CompiledLayerPlan

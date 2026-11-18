@@ -31,8 +31,12 @@ Result<void> validate_model_descriptor(const MoeModelDescriptor& descriptor)
     {
         return Error{ErrorCode::InvalidModel, "model descriptor dimensions must be non-zero"};
     }
+    if (!std::isfinite(descriptor.embed_scale) || descriptor.embed_scale <= 0.0f)
+        return Error{ErrorCode::InvalidModel, "embedding scale must be finite and positive"};
+    if (!std::isfinite(descriptor.logit_softcap) || descriptor.logit_softcap < 0.0f)
+        return Error{ErrorCode::InvalidModel, "final logit softcap must be finite and non-negative"};
     const bool has_moe = std::any_of(descriptor.layers.begin(), descriptor.layers.end(), [](const LayerDescriptor& layer) {
-        return !layer.dense.enabled();
+        return layer.moe.expert_count != 0;
     });
     if (has_moe ? descriptor.expert_count == 0 || descriptor.experts_per_token == 0
                 : descriptor.expert_count != 0 || descriptor.experts_per_token != 0)
@@ -71,15 +75,22 @@ Result<void> validate_model_descriptor(const MoeModelDescriptor& descriptor)
     for (const LayerDescriptor& layer : descriptor.layers)
     {
         const MoeDescriptor& moe = layer.moe;
-        if (layer.dense.enabled())
+        const bool dense_enabled = layer.dense.enabled();
+        const bool moe_enabled = moe.expert_count != 0;
+        if (!dense_enabled && !moe_enabled)
+            return Error{ErrorCode::InvalidModel, "layer must declare a dense or MoE FFN"};
+        if (dense_enabled)
         {
-            if (moe.expert_count != 0 || moe.top_k != 0 || moe.shared_expert_count != 0 || moe.flags != 0)
+            if (moe_enabled && !has_flag(moe.flags, MoeDescriptorParallelFfn))
                 return Error{ErrorCode::InvalidModel, "dense FFN cannot also declare MoE experts"};
+            if (moe_enabled && moe.shared_expert_count != 0)
+                return Error{ErrorCode::InvalidModel, "parallel FFN FFN cannot also declare a shared Expert"};
             if (descriptor.hyper_connection_kind != HyperConnectionKind::None || descriptor.speculative_layer_count != 0)
                 return Error{ErrorCode::UnsupportedModel, "dense FFN requires standard residual connections and target-only execution"};
             if (layer.dense.activation != ExpertActivation::Silu
                 && layer.dense.activation != ExpertActivation::Relu
-                && layer.dense.activation != ExpertActivation::Gelu)
+                && layer.dense.activation != ExpertActivation::Gelu
+                && layer.dense.activation != ExpertActivation::GeluTanh)
                 return Error{ErrorCode::InvalidModel, "dense FFN has an invalid activation"};
             for (DType dtype : {layer.dense.gate_weight_dtype, layer.dense.up_weight_dtype, layer.dense.down_weight_dtype})
             {
@@ -88,9 +99,9 @@ Result<void> validate_model_descriptor(const MoeModelDescriptor& descriptor)
                     return Error{ErrorCode::UnsupportedModel, "dense FFN weights must use float32, bfloat16, INT4, FP8, MXFP4, or native GGML blocks"};
             }
         }
-        else
+        if (moe_enabled)
         {
-            if (moe.expert_count == 0 || moe.top_k == 0 || moe.top_k > moe.expert_count)
+            if (moe.top_k == 0 || moe.top_k > moe.expert_count)
                 return Error{ErrorCode::InvalidModel, "invalid expert_count/top_k"};
             if (moe.router_group_count != 0 || moe.router_top_k_groups != 0)
             {
@@ -116,7 +127,10 @@ Result<void> validate_model_descriptor(const MoeModelDescriptor& descriptor)
             const uint32_t known_flags = MoeDescriptorRouterBias
                                          | MoeDescriptorProjectionBias
                                          | MoeDescriptorSharedExpertGate
-                                         | MoeDescriptorFileBackedExperts;
+                                         | MoeDescriptorFileBackedExperts
+                                         | MoeDescriptorParallelFfn
+                                         | MoeDescriptorRouterNorm
+                                         | MoeDescriptorPerExpertScale;
             if ((moe.flags & ~known_flags) != 0)
                 return Error{ErrorCode::InvalidModel, "model descriptor layer has unknown MoE flags"};
             if (moe.score_function != RouterScoreFunction::Softmax
@@ -127,6 +141,7 @@ Result<void> validate_model_descriptor(const MoeModelDescriptor& descriptor)
             if (moe.activation != ExpertActivation::Relu
                 && moe.activation != ExpertActivation::Silu
                 && moe.activation != ExpertActivation::Gelu
+                && moe.activation != ExpertActivation::GeluTanh
                 && moe.activation != ExpertActivation::ClampedSilu
                 && moe.activation != ExpertActivation::DeepSeekSwiGlu
                 && moe.activation != ExpertActivation::GptOssSwiGlu)
@@ -162,9 +177,10 @@ Result<void> validate_model_descriptor(const MoeModelDescriptor& descriptor)
                 || attention.head_count % attention.kv_head_count != 0
                 || attention.head_dimension % 2 != 0)
                 return Error{ErrorCode::InvalidModel, "invalid attention dimensions"};
-            if (attention.head_count != descriptor.attention_head_count
-                || attention.kv_head_count != descriptor.kv_head_count
-                || attention.head_dimension != descriptor.head_dimension)
+            if (!descriptor.varied_attn
+                && (attention.head_count != descriptor.attention_head_count
+                    || attention.kv_head_count != descriptor.kv_head_count
+                    || attention.head_dimension != descriptor.head_dimension))
                 return Error{ErrorCode::InvalidModel, "layer attention dimensions do not match the model descriptor"};
         }
         if (layer.attention.kind != AttentionKind::None)
@@ -177,7 +193,9 @@ Result<void> validate_model_descriptor(const MoeModelDescriptor& descriptor)
                                          | AttentionDescriptorQsa
                                          | AttentionDescriptorSigmoidGate
                                          | AttentionDescriptorLatentValue
-                                         | AttentionDescriptorDeltaGate;
+                                         | AttentionDescriptorDeltaGate
+                                         | AttentionDescriptorValueNorm
+                                         | AttentionDescriptorPostNorm;
             if ((attention.flags & ~known_flags) != 0)
                 return Error{ErrorCode::InvalidModel, "model descriptor layer has unknown attention flags"};
 
@@ -189,7 +207,9 @@ Result<void> validate_model_descriptor(const MoeModelDescriptor& descriptor)
                                 | AttentionDescriptorSinks
                                 | AttentionDescriptorQueryKeyNorm
                                 | AttentionDescriptorOutputGate
-                                | AttentionDescriptorQsa;
+                                | AttentionDescriptorQsa
+                                | AttentionDescriptorValueNorm
+                                | AttentionDescriptorPostNorm;
             }
             else if (attention.kind == AttentionKind::GatedDeltaNet)
             {
@@ -199,6 +219,17 @@ Result<void> validate_model_descriptor(const MoeModelDescriptor& descriptor)
                 allowed_flags |= AttentionDescriptorOutputGate;
             if ((attention.flags & ~allowed_flags) != 0)
                 return Error{ErrorCode::InvalidModel, "model descriptor layer has incompatible attention flags"};
+            if (has_flag(attention.flags, AttentionDescriptorValueNorm)
+                && !has_flag(attention.flags, AttentionDescriptorQueryKeyNorm))
+                return Error{ErrorCode::InvalidModel, "value attention norm requires query/key norm"};
+            const uint32_t rotary_dimension = attention.qk_rope_head_dimension == 0
+                                                  ? attention.head_dimension
+                                                  : attention.qk_rope_head_dimension;
+            if (!std::isfinite(attention.attn_scale) || attention.attn_scale < 0.0f)
+                return Error{ErrorCode::InvalidModel, "attention scale must be finite and non-negative"};
+            if ((attention.rope_active & 1) != 0
+                || attention.rope_active > rotary_dimension)
+                return Error{ErrorCode::InvalidModel, "invalid rotary active dimension"};
         }
     }
     if (descriptor.hyper_connection_kind != HyperConnectionKind::None
@@ -878,12 +909,14 @@ static Result<void> compile_standard_attention(const WeightStore& weights, const
     plan.kv_head_count = attention.kv_head_count;
     plan.head_dimension = attention.head_dimension;
     plan.rope_head_dimension = attention.qk_rope_head_dimension;
+    plan.rope_active = attention.rope_active;
     plan.sliding_window = attention.sliding_window;
     plan.initial_context_length = attention.initial_context_length;
     plan.rope_theta = attention.rope_theta;
     plan.rope_scaling_factor = attention.rope_scaling_factor;
     plan.rope_ntk_alpha = attention.rope_ntk_alpha;
     plan.rope_ntk_beta = attention.rope_ntk_beta;
+    plan.attn_scale = attention.attn_scale;
     plan.norm_weight_offset = descriptor.norm_weight_offset;
     if (has_flag(attention.flags, AttentionDescriptorSinks))
         plan.flags |= AttentionBlockSink;
@@ -980,6 +1013,20 @@ static Result<void> compile_standard_attention(const WeightStore& weights, const
     ret = bind_linear_tensor(weights, layer_name + "attention.value.weight", {key_value_size, descriptor.hidden_size}, descriptor.activation_dtype, plan.value_weight);
     if (!ret)
         return ret.error();
+    if (has_flag(attention.flags, AttentionDescriptorValueNorm))
+    {
+        plan.flags |= AttentionBlockValueNorm;
+        ret = assign_required_tensor(weights, layer_name + "attention.value_norm.weight", {attention.head_dimension}, descriptor.activation_dtype, plan.v_norm);
+        if (!ret)
+            return ret.error();
+    }
+    if (has_flag(attention.flags, AttentionDescriptorPostNorm))
+    {
+        plan.flags |= AttentionBlockPostNorm;
+        ret = assign_required_tensor(weights, layer_name + "post_attention_norm.weight", {descriptor.hidden_size}, descriptor.activation_dtype, plan.attn_post_norm);
+        if (!ret)
+            return ret.error();
+    }
     if (has_flag(attention.flags, AttentionDescriptorBias))
     {
         ret = assign_required_tensor(weights, layer_name + "attention.value.bias", {key_value_size}, descriptor.activation_dtype, plan.value_bias);
@@ -1815,6 +1862,28 @@ static Result<void> compile_moe_layer(CompiledModel& compiled, const std::string
     auto ret = bind_linear_tensor(compiled.weights, layer_name + "router.weight", {moe.expert_count, compiled.descriptor.hidden_size}, compiled.descriptor.activation_dtype, layer_plan.moe.router_weight);
     if (!ret)
         return ret.error();
+    if (has_flag(moe.flags, MoeDescriptorRouterNorm))
+    {
+        // Scale-free RMSNorm followed by the checkpoint's router scale and
+        // hidden_size^-0.5. The adapter folds both scales into this weight.
+        ret = assign_required_tensor(compiled.weights,
+                                     layer_name + "router.norm.weight",
+                                     {compiled.descriptor.hidden_size},
+                                     DType::Float32,
+                                     layer_plan.moe.router_norm);
+        if (!ret)
+            return ret.error();
+    }
+    if (has_flag(moe.flags, MoeDescriptorPerExpertScale))
+    {
+        ret = assign_required_tensor(compiled.weights,
+                                     layer_name + "router.expert_scale",
+                                     {moe.expert_count},
+                                     DType::Float32,
+                                     layer_plan.moe.expert_scale);
+        if (!ret)
+            return ret.error();
+    }
 
     if (has_flag(moe.flags, MoeDescriptorRouterBias))
     {
@@ -1916,17 +1985,18 @@ static Result<void> compile_moe_layer(CompiledModel& compiled, const std::string
 
 static Result<void> compile_dense_layer(CompiledModel& compiled, const std::string& layer_name,
                                         const LayerDescriptor& layer, CompiledLayerPlan& layer_plan,
-                                        bool use_vulkan_experts)
+                                        bool use_vulkan_experts, bool parallel_ffn = false)
 {
     const uint32_t hidden_size = compiled.descriptor.hidden_size;
-    auto status = assign_required_tensor(compiled.weights, layer_name + "pre_ffn_norm.weight",
+    const std::string norm_prefix = parallel_ffn ? "dense_pre_ffn_norm." : "pre_ffn_norm.";
+    auto status = assign_required_tensor(compiled.weights, layer_name + norm_prefix + "weight",
                                          {hidden_size}, compiled.descriptor.activation_dtype,
                                          layer_plan.dense_pre_ffn_norm_weight);
     if (!status)
         return status.error();
     if (layer.pre_ffn_norm == NormType::LayerNorm)
     {
-        status = assign_required_tensor(compiled.weights, layer_name + "pre_ffn_norm.bias",
+        status = assign_required_tensor(compiled.weights, layer_name + norm_prefix + "bias",
                                         {hidden_size}, compiled.descriptor.activation_dtype,
                                         layer_plan.dense_pre_ffn_norm_bias);
         if (!status)
@@ -2271,12 +2341,60 @@ Result<void> compile_model_validated(MoeModelDescriptor descriptor, WeightMappin
         if (!ple_status)
             return ple_status.error();
 
-        auto ret = layer.dense.enabled()
-                       ? compile_dense_layer(compiled, layer_name, layer, layer_plan,
-                                             has_flag(opt.flags, BackendVulkanExperts))
-                       : compile_moe_layer(compiled, layer_name, layer, layer_plan, use_file_backed_experts);
-        if (!ret)
-            return ret.error();
+        Result<void> ret;
+        const bool parallel_ffn = layer.dense.enabled() && layer.moe.expert_count != 0;
+        if (parallel_ffn)
+        {
+            ret = compile_dense_layer(compiled, layer_name, layer, layer_plan,
+                                      has_flag(opt.flags, BackendVulkanExperts), true);
+            if (!ret)
+                return ret.error();
+            ret = compile_moe_layer(compiled, layer_name, layer, layer_plan, use_file_backed_experts);
+            if (!ret)
+                return ret.error();
+            layer_plan.moe.parallel_ffn = true;
+            ret = assign_required_tensor(compiled.weights,
+                                         layer_name + "dense_post_ffn_norm.weight",
+                                         {compiled.descriptor.hidden_size},
+                                         compiled.descriptor.activation_dtype,
+                                         layer_plan.moe.dense_post_norm);
+            if (!ret)
+                return ret.error();
+            ret = assign_required_tensor(compiled.weights,
+                                         layer_name + "moe_post_ffn_norm.weight",
+                                         {compiled.descriptor.hidden_size},
+                                         compiled.descriptor.activation_dtype,
+                                         layer_plan.moe.route_post_norm);
+            if (!ret)
+                return ret.error();
+            ret = assign_required_tensor(compiled.weights,
+                                         layer_name + "post_ffn_norm.weight",
+                                         {compiled.descriptor.hidden_size},
+                                         compiled.descriptor.activation_dtype,
+                                         layer_plan.moe.post_norm);
+            if (!ret)
+                return ret.error();
+            ret = assign_required_tensor(compiled.weights,
+                                         layer_name + "output_scale",
+                                         {1},
+                                         compiled.descriptor.activation_dtype,
+                                         layer_plan.moe.output_scale);
+            if (!ret)
+                return ret.error();
+        }
+        else if (layer.dense.enabled())
+        {
+            ret = compile_dense_layer(compiled, layer_name, layer, layer_plan,
+                                      has_flag(opt.flags, BackendVulkanExperts));
+            if (!ret)
+                return ret.error();
+        }
+        else
+        {
+            ret = compile_moe_layer(compiled, layer_name, layer, layer_plan, use_file_backed_experts);
+            if (!ret)
+                return ret.error();
+        }
     }
 
     auto speculative = compile_speculative_model(compiled, use_file_backed_experts);

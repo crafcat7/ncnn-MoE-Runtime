@@ -35,7 +35,7 @@ static bool support_cpu_packed_weights(const MoeModelDescriptor& descriptor,
 {
     for (const LayerDescriptor& layer : descriptor.layers)
     {
-        if (layer.dense.enabled())
+        if (layer.moe.expert_count == 0)
             continue;
         const DType dtype = layer.moe.expert_weight_dtype;
         if (is_qnk_dtype(dtype))
@@ -415,7 +415,7 @@ Result<void> ModelLoader::plan_memory()
                                        && std::all_of(descriptor.layers.begin(),
                                                       descriptor.layers.end(),
                                                       [](const LayerDescriptor& layer) {
-                                                          return layer.dense.enabled()
+                                                          return layer.moe.expert_count == 0
                                                                  || layer.moe.expert_weight_dtype == DType::MxFp4;
                                                       });
     const bool native_file_backed_qnk_experts = native_weights
@@ -481,7 +481,7 @@ Result<void> ModelLoader::plan_memory()
                                    && std::all_of(descriptor.layers.begin(),
                                                   descriptor.layers.end(),
                                                   [](const LayerDescriptor& layer) {
-                                                      if (layer.dense.enabled())
+                                                      if (layer.moe.expert_count == 0)
                                                           return true;
                                                       return has_flag(layer.moe.flags, MoeDescriptorFileBackedExperts);
                                                   });
@@ -811,6 +811,19 @@ Result<void> ModelLoader::configure_expert_cache()
     model.opt.flags = opt.flags;
     if (model.memory_plan.selected_mode != ExpertMemoryMode::OnDemand)
         return {};
+    // BF16 Expert banks stay zero-copy mmap slices. For that storage the
+    // mapped-file loader feeds compute straight from the page cache and is
+    // substantially faster than the adaptive/buffered file reads used for
+    // deferred quantized blocks; keep the adaptive policy for those.
+    if (model.opt.expert_io_mode == ExpertIoMode::Auto
+        && std::all_of(descriptor.layers.begin(), descriptor.layers.end(), [](const LayerDescriptor& layer) {
+               return layer.moe.expert_count == 0
+                      || (layer.moe.expert_weight_dtype == DType::BFloat16
+                          && has_flag(layer.moe.flags, MoeDescriptorFileBackedExperts));
+           }))
+    {
+        model.opt.expert_io_mode = ExpertIoMode::Mmap;
+    }
 
     const uint32_t num_io_threads = resolve_expert_io_threads();
     model.opt.num_expert_io_threads = num_io_threads;

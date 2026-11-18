@@ -76,12 +76,17 @@ private:
         Qwen36,
         Qwen38,
         Phi,
+        Gemma4,
         Ling
     };
 
     bool load_impl(const std::string& model_directory, size_t vocabulary_size);
     bool load_phi(std::string_view tokenizer, std::string_view config, std::string_view model_config,
                   size_t vocabulary_size);
+    bool load_gemma4(std::string_view tokenizer, std::string_view config, std::string_view model_config,
+                     size_t vocabulary_size);
+    bool load_sentencepiece(std::string_view tokenizer, std::string_view config, std::string_view model_config,
+                            size_t vocabulary_size, Family target_family);
     bool load_gguf_impl(const std::string& model_path, size_t vocabulary_size);
     void encode_impl(std::string_view text,
                      bool use_added,

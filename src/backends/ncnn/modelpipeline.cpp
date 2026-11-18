@@ -334,7 +334,8 @@ static bool attn_needs_native(const CompiledModel& compiled,
                                        || (attention.norm_weight_offset != 0.0f
                                            && !legacy_bfloat16_qk_gate)
                                        || (attention.sliding_window != 0
-                                           && !has_flag(attention.flags, AttentionBlockSink));
+                                           && !has_flag(attention.flags, AttentionBlockSink))
+                                       || has_flag(attention.flags, AttentionBlockValueNorm | AttentionBlockPostNorm);
     return has_native_quantized_projection || generalized_semantics;
 }
 
@@ -473,6 +474,8 @@ void release_host_copies(CompiledModel& compiled)
         {
             release_vulkan_dense_handle(compiled, attention.pre_attention_norm_weight);
             release_vulkan_dense_handle(compiled, attention.sinks);
+            if (has_flag(attention.flags, AttentionBlockPostNorm))
+                release_vulkan_dense_handle(compiled, attention.attn_post_norm);
             if (has_flag(attention.flags, AttentionBlockQueryKeyNorm))
             {
                 release_vulkan_dense_handle(compiled, attention.query_norm_weight);
@@ -565,7 +568,8 @@ static Result<void> prepare_ffn_operators(WeightStore& weights,
     if (gate.dtype == DType::BFloat16 && up.dtype == DType::BFloat16
         && down.dtype == DType::BFloat16
         && (ffn.activation == ExpertActivation::Silu
-            || ffn.activation == ExpertActivation::DeepSeekSwiGlu)
+            || ffn.activation == ExpertActivation::DeepSeekSwiGlu
+            || ffn.activation == ExpertActivation::GeluTanh)
         && up.shape.size() == 2
         && up.shape[0] % 128 == 0)
     {
@@ -1087,6 +1091,10 @@ static AttentionConfig_vulkan attn_vk_config(const CompiledModel& compiled,
     config.rope_scaling_factor = plan.rope_scaling_factor;
     config.rope_ntk_alpha = plan.rope_ntk_alpha;
     config.rope_ntk_beta = plan.rope_ntk_beta;
+    config.attn_scale = plan.attn_scale > 0.0f
+                            ? plan.attn_scale
+                            : 1.0f / std::sqrt(static_cast<float>(plan.head_dimension));
+    config.rope_active = plan.rope_active;
     config.activation_dtype = compiled.descriptor.activation_dtype;
     config.kv_cache_dtype = plan.kv_cache_dtype;
     config.optimization_flags = compiled.opt.optimization_flags;
@@ -1094,6 +1102,10 @@ static AttentionConfig_vulkan attn_vk_config(const CompiledModel& compiled,
         config.flags |= AttentionSink;
     if (has_flag(plan.flags, AttentionBlockQueryKeyNorm))
         config.flags |= AttentionQueryKeyNorm;
+    if (has_flag(plan.flags, AttentionBlockValueNorm))
+        config.flags |= AttentionValueNorm;
+    if (has_flag(plan.flags, AttentionBlockPostNorm))
+        config.flags |= AttentionPostNorm;
     if (has_flag(plan.flags, AttentionBlockOutputGate))
         config.flags |= AttentionOutputGate;
     return config;
@@ -1200,12 +1212,16 @@ static Result<void> prepare_native_attention(CompiledModel& compiled,
     const TensorData* norm_bias = plan.pre_attention_norm_bias == invalid_tensor_handle
                                       ? nullptr
                                       : &compiled.weights.at(plan.pre_attention_norm_bias);
+    const TensorData* post_attention_norm = plan.attn_post_norm == invalid_tensor_handle
+                                                ? nullptr
+                                                : &compiled.weights.at(plan.attn_post_norm);
     auto attention_operator = Attention_vulkan::create_native(compiled.weights.at(plan.pre_attention_norm_weight),
                                                               query_norm,
                                                               key_norm,
                                                               sinks,
                                                               projections,
-                                                              attn_vk_config(compiled, plan), fused_qkv, norm_bias);
+                                                              attn_vk_config(compiled, plan), fused_qkv, norm_bias,
+                                                              post_attention_norm);
     if (!attention_operator)
         return Error{ErrorCode::InternalError,
                      "failed to create native Vulkan Standard Attention at layer "
@@ -1575,12 +1591,15 @@ uint64_t attn_vk_size(const CompiledModel& compiled,
                     return 0;
                 input = saturating_add_u64(input, projection);
             }
-            constants = const_buf_size({static_cast<uint64_t>(compiled.descriptor.hidden_size) * sizeof(float),
+            const uint64_t hidden_bytes = static_cast<uint64_t>(compiled.descriptor.hidden_size) * sizeof(float);
+            constants = const_buf_size({hidden_bytes,
                                         static_cast<uint64_t>(attention.head_dimension) * sizeof(float),
                                         static_cast<uint64_t>(attention.head_dimension) * sizeof(float),
                                         static_cast<uint64_t>(attention.head_dimension / 2) * sizeof(float),
                                         static_cast<uint64_t>(attention.head_count) * sizeof(float)},
                                        alignment);
+            if (has_flag(attention.flags, AttentionBlockPostNorm))
+                constants = saturating_add_u64(constants, const_buf_size({hidden_bytes}, alignment));
             state = attn_init_size(compiled, attention, device_index);
             return saturating_add_u64(saturating_add_u64(input, constants), state);
         }
@@ -2400,7 +2419,8 @@ static bool ffn_kernel_ready(const CompiledModel& model, const CompiledLayerPlan
         != 0)
         return true;
     const uint64_t alignment = gpu_buffer_alignment(model, layer.vulkan_device_index);
-    return (ffn.activation == ExpertActivation::Silu || ffn.activation == ExpertActivation::DeepSeekSwiGlu)
+    return (ffn.activation == ExpertActivation::Silu || ffn.activation == ExpertActivation::DeepSeekSwiGlu
+            || ffn.activation == ExpertActivation::GeluTanh)
            && up.shape.size() == 2 && up.shape[0] % 128 == 0
            && bf16_fused_storage_size(model, {ffn.gate_weight, ffn.up_weight}, alignment, layer.vulkan_device_index) != 0
            && bf16_projection_supported(model, down, alignment, layer.vulkan_device_index);
@@ -2552,7 +2572,11 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
     {
         const bool dense_chain = !compiled.net.layer_plans.empty() && GpuSegment_vulkan::supports_head(compiled)
                                  && std::all_of(compiled.net.layer_plans.begin(), compiled.net.layer_plans.end(), [&](const auto& layer) {
-                                        return layer.dense_ffn.down_weight != invalid_tensor_handle
+                                        // The resident dense chain models pure dense
+                                        // models; parallel FFN+MoE layers keep the
+                                        // per-node hybrid path.
+                                        return layer.moe.experts.empty()
+                                               && layer.dense_ffn.down_weight != invalid_tensor_handle
                                                && layer.vulkan_device_index == device && GpuSegment_vulkan::supports(compiled, layer);
                                     });
         if (dense_chain)
@@ -2588,6 +2612,9 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
         {
             CompiledLayerPlan& layer = compiled.net.layer_plans[index];
             if (layer.dense_ffn.down_weight == invalid_tensor_handle || compiled.gpu_segments[index]) continue;
+            // Parallel dense+MoE layers run as independent per-node segments and
+            // must not take the dense-only segment path.
+            if (!layer.moe.experts.empty()) continue;
             if (!GpuSegment_vulkan::supports(compiled, layer)) continue;
             const uint32_t dense_device = layer.vulkan_device_index;
             const uint64_t dense_alignment = gpu_buffer_alignment(compiled, dense_device);

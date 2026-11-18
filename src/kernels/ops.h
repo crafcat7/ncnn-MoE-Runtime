@@ -2,13 +2,13 @@
 #define NCNN_MOE_OPS_H
 
 #include "activationbuffer.h"
+#include "bfloat16.h"
 #include "mxfp4.h"
 
 #include "ncnn/moe/types.h"
 #include "graph/graph.h"
 
 #include <cstdint>
-#include <cstring>
 #include <initializer_list>
 #include <memory>
 #include <span>
@@ -57,21 +57,6 @@ struct Mxfp4Scratch
     std::vector<std::shared_ptr<const Mxfp4Q8PackedMatrix>> q8_down_packed;
 };
 
-[[nodiscard]] inline float bfloat16_to_float(uint16_t value) noexcept
-{
-    uint32_t bits = static_cast<uint32_t>(value) << 16;
-    float result = 0.0f;
-    std::memcpy(&result, &bits, sizeof(result));
-    return result;
-}
-
-[[nodiscard]] inline uint16_t float_to_bfloat16(float value) noexcept
-{
-    uint32_t bits = 0;
-    std::memcpy(&bits, &value, sizeof(bits));
-    const uint32_t rounding = 0x7fffu + ((bits >> 16) & 1u);
-    return static_cast<uint16_t>((bits + rounding) >> 16);
-}
 [[nodiscard]] float scaled_silu(float value,
                                 float sigmoid_scale,
                                 uint64_t optimization_flags) noexcept;
