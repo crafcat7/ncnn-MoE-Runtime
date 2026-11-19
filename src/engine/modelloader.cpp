@@ -1,3 +1,7 @@
+#include "kernels/bfloat16.h"
+#include "kernels/qnk.h"
+
+#include <array>
 #include "modelloader.h"
 
 #include "cpu.h"
@@ -386,6 +390,50 @@ Result<void> ModelLoader::plan_memory()
         return mapped.error();
     native_weights = std::move(mapped).value();
     normalize_expert_storage(descriptor, *native_weights);
+    if (opt.hybrid_mode == HybridMode::HybridExperts
+        && has_flag(info.flags, RuntimeVulkan))
+    {
+        size_t converted = 0;
+        for (auto& item : *native_weights)
+        {
+            TensorData& tensor = item.second;
+            if (!is_qnk_dtype(tensor.dtype) || tensor.shape.size() != 2)
+                continue;
+            if (item.first.find(".experts.") != std::string::npos)
+                continue;
+            const uint32_t rows = tensor.shape[0];
+            const uint32_t columns = tensor.shape[1];
+            const uint32_t block_elements = qnk_block_size(tensor.dtype);
+            const uint32_t block_count = columns / block_elements;
+            const size_t block_bytes = qnk_block_bytes(tensor.dtype);
+            const std::span<const uint8_t> raw = tensor.qnk_values();
+            if (block_elements == 0 || block_bytes == 0
+                || columns % block_elements != 0
+                || raw.size() < static_cast<size_t>(rows) * block_count * block_bytes)
+                continue;
+            std::vector<uint16_t> converted_values(static_cast<size_t>(rows) * columns);
+            std::array<float, qnk_block_elements> decoded{};
+            for (uint32_t row = 0; row < rows; ++row)
+                for (uint32_t block = 0; block < block_count; ++block)
+                {
+                    const uint8_t* encoded = raw.data()
+                                             + (static_cast<size_t>(row) * block_count + block) * block_bytes;
+                    qnk_dequantize_block(tensor.dtype, encoded, decoded.data());
+                    for (uint32_t index = 0; index < block_elements; ++index)
+                        converted_values[static_cast<size_t>(row) * columns
+                                         + static_cast<size_t>(block) * block_elements + index] =
+                            ncnn::moe::float_to_bfloat16(decoded[index]);
+                }
+            tensor.dtype = DType::BFloat16;
+            tensor.bfloat16_data = std::move(converted_values);
+            tensor.quantized_data.clear();
+            tensor.mapped_data.reset();
+            tensor.mapped_size = 0;
+            ++converted;
+        }
+        if (converted != 0)
+            std::fprintf(stderr, "[nmr] converted %zu QnK tensors to BF16 for Vulkan\n", converted);
+    }
     native_quantized_experts = std::any_of(native_weights->begin(), native_weights->end(), [](const auto& item) {
         return item.first.find(".experts.") != std::string::npos
                && (item.second.dtype == DType::Int4 || is_qnk_dtype(item.second.dtype));
