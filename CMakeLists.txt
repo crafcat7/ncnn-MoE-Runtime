@@ -182,6 +182,8 @@ set(NCNN_MOE_SOURCES
     src/kernels/ops.cpp
     src/kernels/ple.cpp
     src/kernels/qnk.cpp
+    src/kernels/qnk_neon.cpp
+    src/kernels/qnk_neon_i8mm.cpp
     src/kernels/int4.cpp
     src/kernels/statecache.cpp
     src/kernels/vector.cpp
@@ -209,6 +211,11 @@ set(NCNN_MOE_SOURCES
     src/storage/mappedfile.cpp
     src/storage/weightstore.cpp
 )
+if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    set_source_files_properties(src/kernels/qnk_neon_i8mm.cpp PROPERTIES
+        COMPILE_OPTIONS "-march=armv8.6-a+dotprod+i8mm;-fno-lto")
+endif()
+
 add_library(ncnn_moe STATIC ${NCNN_MOE_SOURCES})
 ncnn_moe_optimize_target(ncnn_moe)
 

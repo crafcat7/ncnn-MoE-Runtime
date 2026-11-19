@@ -219,6 +219,25 @@ static void test_paired_and_rejections()
             }
         }
     }
+    ActivationBuffer single(1, 96);
+    for (uint32_t column = 0; column < single.columns(); ++column)
+        single.row(0)[column] = static_cast<float>(static_cast<int>((column * 7) % 31) - 15) * 0.0625f;
+    ActivationBuffer exact_left;
+    ActivationBuffer exact_right;
+    ActivationBuffer q8_left;
+    ActivationBuffer q8_right;
+    q8_check(forward_linear_qnk({&first, &second}, single, {&exact_left, &exact_right}, false, {}, false),
+             "Q8_0 paired exact path");
+    q8_check(forward_linear_qnk({&first, &second}, single, {&q8_left, &q8_right}, false, {}, true),
+             "Q8_0 paired int8 activation path");
+    for (uint32_t row = 0; row < first.shape[0]; ++row)
+        q8_check(std::fabs(q8_left.row(0)[row] - exact_left.row(0)[row])
+                     <= 0.08 * std::max(1.0f, std::fabs(exact_left.row(0)[row])),
+                 "Q8_0 paired int8 activation drift (left)");
+    for (uint32_t row = 0; row < second.shape[0]; ++row)
+        q8_check(std::fabs(q8_right.row(0)[row] - exact_right.row(0)[row])
+                     <= 0.08 * std::max(1.0f, std::fabs(exact_right.row(0)[row])),
+                 "Q8_0 paired int8 activation drift (right)");
     ActivationBuffer output;
     TensorData truncated = first;
     truncated.quantized_data.pop_back();
@@ -233,6 +252,240 @@ static void test_paired_and_rejections()
         q8_check(qnk_block_size(dtype) == 256 && !qnk_shape_supported(dtype, 1, 32), "Qn_K block contract changed");
 }
 
+static TensorData make_small_qnk(DType dtype, uint32_t rows, uint32_t columns)
+{
+    TensorData tensor;
+    tensor.dtype = dtype;
+    tensor.shape = {rows, columns};
+    const uint32_t blocks = columns / 32;
+    const size_t block_bytes = qnk_block_bytes(dtype);
+    tensor.quantized_data.resize(static_cast<size_t>(rows) * blocks * block_bytes);
+    for (uint32_t row = 0; row < rows; ++row)
+        for (uint32_t block = 0; block < blocks; ++block)
+        {
+            uint8_t* encoded = tensor.quantized_data.data()
+                               + (static_cast<size_t>(row) * blocks + block) * block_bytes;
+            const uint16_t one = 0x3c00;
+            std::memcpy(encoded, &one, sizeof(one));
+            const uint8_t pattern = static_cast<uint8_t>(row * 31 + block * 17 + 5);
+            switch (dtype)
+            {
+            case DType::Q4_0:
+                for (uint32_t index = 0; index < 16; ++index)
+                    encoded[2 + index] = static_cast<uint8_t>(pattern + index * 13);
+                break;
+            case DType::Q4_1:
+                encoded[2] = 0; encoded[3] = 0;
+                for (uint32_t index = 0; index < 16; ++index)
+                    encoded[4 + index] = static_cast<uint8_t>(pattern + index * 11);
+                break;
+            case DType::Q5_0:
+                for (uint32_t index = 0; index < 4; ++index)
+                    encoded[2 + index] = static_cast<uint8_t>(pattern + index * 7);
+                for (uint32_t index = 0; index < 16; ++index)
+                    encoded[6 + index] = static_cast<uint8_t>(pattern + index * 5);
+                break;
+            case DType::Q5_1:
+                encoded[2] = 0; encoded[3] = 0;
+                for (uint32_t index = 0; index < 4; ++index)
+                    encoded[4 + index] = static_cast<uint8_t>(pattern + index * 3);
+                for (uint32_t index = 0; index < 16; ++index)
+                    encoded[8 + index] = static_cast<uint8_t>(pattern + index * 9);
+                break;
+            case DType::IQ4NL:
+                for (uint32_t index = 0; index < 16; ++index)
+                    encoded[2 + index] = static_cast<uint8_t>(pattern + index * 15);
+                break;
+            default:
+                throw std::runtime_error("unsupported test dtype");
+            }
+        }
+    return tensor;
+}
+
+static void test_q8_rows8_prefill()
+{
+    // The 8-row kernel is selected for row counts divisible by 8; make sure the
+    // model-shaped path agrees with the exact float path and the 4-row kernel.
+    TensorData matrix = make_q8_0(8, 256, 3);
+    for (size_t token_count : {size_t{4}, size_t{5}, size_t{8}, size_t{32}, size_t{48}})
+    {
+        ActivationBuffer input(token_count, 256);
+        for (size_t token = 0; token < token_count; ++token)
+            for (uint32_t column = 0; column < input.columns(); ++column)
+                input.row(token)[column] = static_cast<float>(static_cast<int>((column * 11 + token * 5) % 37) - 18)
+                                           * 0.03125f;
+        ActivationBuffer exact;
+        ActivationBuffer quantized;
+        q8_check(forward_linear_qnk({&matrix}, input, {&exact}, false, {}, false), "Q8_0 rows8 exact path");
+        q8_check(forward_linear_qnk({&matrix}, input, {&quantized}, false, {}, true), "Q8_0 rows8 int8 path");
+        for (size_t token = 0; token < token_count; ++token)
+            for (uint32_t row = 0; row < matrix.shape[0]; ++row)
+            {
+                q8_check(std::fabs(quantized.row(token)[row] - exact.row(token)[row])
+                             <= 0.12 * std::max(1.0f, std::fabs(exact.row(token)[row])),
+                         "Q8_0 rows8 int8 drift");
+            }
+    }
+}
+
+static void test_qnk_rows8_equivalence()
+{
+    // Compare the 8-row kernel against the 4-row kernel with the same q8
+    // activations; this isolates row-tiling from quantization noise.
+    for (DType dtype : {DType::Q4_0, DType::Q4_1, DType::Q5_0, DType::Q5_1, DType::IQ4NL})
+    {
+        TensorData matrix = make_small_qnk(dtype, 8, 64);
+        const uint32_t blocks = 2;
+        ActivationBuffer input(4, 64);
+        for (size_t token = 0; token < 4; ++token)
+            for (uint32_t column = 0; column < 64; ++column)
+                input.row(token)[column] = static_cast<float>(static_cast<int>((column * 5 + token * 7) % 23) - 11)
+                                           * 0.25f;
+        std::vector<int8_t> codes(4 * 64);
+        std::vector<float> scales(4 * blocks);
+        std::vector<int32_t> sums(4 * blocks);
+        for (size_t token = 0; token < 4; ++token)
+            neon_qnk_q8_quant(input.row(token), codes.data() + token * 64,
+                              scales.data() + token * blocks, sums.data() + token * blocks, 64);
+        ActivationBuffer rows4(4, 8);
+        ActivationBuffer rows8(4, 8);
+        neon_qnk_prefill_q8(dtype, matrix.quantized_data.data(), 8, 64,
+                            codes.data(), scales.data(), sums.data(), 4,
+                            rows4.row(0), rows4.columns());
+        neon_qnk_prefill_q8_rows8(dtype, matrix.quantized_data.data(), 8, 64,
+                                  codes.data(), scales.data(), sums.data(), 4,
+                                  rows8.row(0), rows8.columns());
+        for (size_t token = 0; token < 4; ++token)
+            for (uint32_t row = 0; row < 8; ++row)
+            {
+                const float a = rows4.row(token)[row];
+                const float b = rows8.row(token)[row];
+                q8_check(std::fabs(a - b) <= 1e-5f * std::max(1.0f, std::fabs(a)),
+                         "QnK rows8 differs from rows4 kernel");
+            }
+    }
+}
+
+static TensorData make_q8k_matrix(uint32_t rows, uint32_t columns)
+{
+    TensorData tensor;
+    tensor.dtype = DType::Q8K;
+    tensor.shape = {rows, columns};
+    const uint32_t blocks = columns / 256;
+    tensor.quantized_data.resize(static_cast<size_t>(rows) * blocks * 292);
+    for (uint32_t row = 0; row < rows; ++row)
+        for (uint32_t block = 0; block < blocks; ++block)
+        {
+            uint8_t* encoded = tensor.quantized_data.data()
+                               + (static_cast<size_t>(row) * blocks + block) * 292;
+            const float scale = 1.0f;
+            std::memcpy(encoded, &scale, sizeof(scale));
+            uint32_t state = row * 2654435761u + block * 40503u + 1u;
+            for (uint32_t index = 0; index < 256; ++index)
+            {
+                state = state * 1664525u + 1013904223u;
+                encoded[4 + index] = static_cast<uint8_t>(static_cast<int8_t>(state >> 24));
+            }
+            std::memset(encoded + 260, 0, 32);
+        }
+    return tensor;
+}
+
+static void test_q8k_fallback()
+{
+    TensorData matrix = make_q8k_matrix(8, 256);
+    ActivationBuffer input(4, 256);
+    for (size_t token = 0; token < 4; ++token)
+        for (uint32_t column = 0; column < 256; ++column)
+        {
+            uint32_t state = token * 2246822519u + column * 3266489917u + 7u;
+            state = state * 1664525u + 1013904223u;
+            input.row(token)[column] = (static_cast<float>(static_cast<int8_t>(state >> 24)) / 127.0f);
+        }
+    ActivationBuffer exact;
+    ActivationBuffer quantized;
+    q8_check(forward_linear_qnk({&matrix}, input, {&exact}, false, {}, false), "Q8K exact path");
+    q8_check(forward_linear_qnk({&matrix}, input, {&quantized}, false, {}, true), "Q8K fallback path");
+    for (size_t token = 0; token < 4; ++token)
+        for (uint32_t row = 0; row < 8; ++row)
+        {
+            q8_check(std::fabs(quantized.row(token)[row] - exact.row(token)[row])
+                         <= 0.08 * std::max(1.0f, std::fabs(exact.row(token)[row])),
+                     "Q8K fallback drift");
+        }
+
+    ActivationBuffer decode_input(1, 256);
+    for (uint32_t column = 0; column < 256; ++column)
+        decode_input.row(0)[column] = input.row(0)[column];
+    ActivationBuffer decode_exact;
+    ActivationBuffer decode_quantized;
+    q8_check(forward_linear_qnk({&matrix}, decode_input, {&decode_exact}, false, {}, false), "Q8K decode exact path");
+    q8_check(forward_linear_qnk({&matrix}, decode_input, {&decode_quantized}, false, {}, true), "Q8K decode fallback path");
+    for (uint32_t row = 0; row < 8; ++row)
+        q8_check(std::fabs(decode_quantized.row(0)[row] - decode_exact.row(0)[row])
+                     <= 0.08 * std::max(1.0f, std::fabs(decode_exact.row(0)[row])),
+                 "Q8K decode fallback drift");
+}
+
+static void test_all_qnk_prefill_types()
+{
+    for (DType dtype : {DType::Q4_0, DType::Q4_1, DType::Q5_0, DType::Q5_1, DType::IQ4NL})
+    {
+        for (uint32_t rows : {4u})
+        {
+        TensorData matrix = make_small_qnk(dtype, rows, 64);
+        for (size_t token_count : {size_t{1}, size_t{4}})
+        {
+            ActivationBuffer input(token_count, 64);
+            for (size_t token = 0; token < token_count; ++token)
+                for (uint32_t column = 0; column < input.columns(); ++column)
+                    input.row(token)[column] = static_cast<float>(static_cast<int>((column * 9 + token * 3) % 19) - 9)
+                                               * 0.25f;
+            ActivationBuffer exact;
+            ActivationBuffer quantized;
+            q8_check(forward_linear_qnk({&matrix}, input, {&exact}, false, {}, false), "QnK exact path");
+            q8_check(forward_linear_qnk({&matrix}, input, {&quantized}, false, {}, true), "QnK int8 path");
+            for (size_t token = 0; token < token_count; ++token)
+                for (uint32_t row = 0; row < matrix.shape[0]; ++row)
+                {
+                    q8_check(std::fabs(quantized.row(token)[row] - exact.row(token)[row])
+                                 <= 0.15 * std::max(1.0f, std::fabs(exact.row(token)[row])),
+                             "QnK int8 prefill drift");
+                }
+        }
+        }
+    }
+}
+
+static void test_q8_activation_path()
+{
+    // The int8-activation path is opt-in and quantizes the activation rows. It
+    // must stay within a small tolerance of the exact float32 path for both
+    // single-token decode and multi-token prefill, including tail tokens.
+    TensorData matrix = make_q8_0(9, 256, 3);
+    for (size_t token_count : {size_t{1}, size_t{2}, size_t{4}, size_t{5}})
+    {
+        ActivationBuffer input(token_count, 256);
+        for (size_t token = 0; token < token_count; ++token)
+            for (uint32_t column = 0; column < input.columns(); ++column)
+                input.row(token)[column] = static_cast<float>(static_cast<int>((column * 13 + token * 7) % 41) - 20)
+                                           * 0.03125f;
+        ActivationBuffer exact;
+        ActivationBuffer quantized;
+        q8_check(forward_linear_qnk({&matrix}, input, {&exact}, false, {}, false), "Q8_0 exact path");
+        q8_check(forward_linear_qnk({&matrix}, input, {&quantized}, false, {}, true), "Q8_0 int8 activation path");
+        for (size_t token = 0; token < token_count; ++token)
+            for (uint32_t row = 0; row < matrix.shape[0]; ++row)
+            {
+                const double reference = q8_reference(matrix, row, input.row(token));
+                const double value = quantized.row(token)[row];
+                q8_check(std::isfinite(value), "Q8_0 int8 activation produced non-finite value");
+                q8_check(std::fabs(value - reference) <= 0.08 * std::max(1.0, std::fabs(reference)),
+                         "Q8_0 int8 activation drift");
+            }
+    }
+}
 } // namespace moe
 } // namespace ncnn
 
@@ -243,6 +496,11 @@ int main()
         ncnn::moe::test_block_decoder();
         ncnn::moe::test_linear_and_embedding();
         ncnn::moe::test_paired_and_rejections();
+        ncnn::moe::test_q8_activation_path();
+        ncnn::moe::test_q8_rows8_prefill();
+        ncnn::moe::test_qnk_rows8_equivalence();
+        ncnn::moe::test_q8k_fallback();
+        ncnn::moe::test_all_qnk_prefill_types();
         std::cout << "native Q8_0 CPU tests passed\n";
         return 0;
     }

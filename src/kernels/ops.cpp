@@ -29,6 +29,7 @@
 
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
+#include <sys/sysctl.h>
 #if defined(__has_include)
 #if __has_include(<vecLib/cblas_new.h>) && !defined(ACCELERATE_NEW_LAPACK)
 #define ACCELERATE_NEW_LAPACK
@@ -127,12 +128,29 @@ static bool allow_openmp_parallel_region() noexcept
 #endif
 }
 
+static uint32_t performance_core_count() noexcept
+{
+#if defined(__APPLE__)
+    uint32_t count = 0;
+    size_t size = sizeof(count);
+    if (sysctlbyname("hw.perflevel0.logicalcpu", &count, &size, nullptr, 0) == 0)
+        return count;
+#endif
+    return 0;
+}
+
 uint32_t cpu_linear_num_threads() noexcept
 {
 #if defined(_OPENMP)
     const uint32_t maximum_threads = cpu_openmp_thread_limit();
     static const uint32_t core_count = get_physical_cpu_count();
-    return core_count == 0 ? maximum_threads : std::min(maximum_threads, core_count);
+    static const uint32_t performance_cores = performance_core_count();
+    // Apple Silicon performance cores are the fast path; spilling onto the
+    // efficiency cluster costs far more than the extra workers gain.
+    const uint32_t usable_cores = performance_cores == 0
+                                      ? core_count
+                                      : std::min(core_count, performance_cores);
+    return usable_cores == 0 ? maximum_threads : std::min(maximum_threads, usable_cores);
 #else
     return 1;
 #endif
