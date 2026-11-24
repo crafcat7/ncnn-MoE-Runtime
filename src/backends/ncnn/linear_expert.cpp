@@ -58,29 +58,15 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertRequest> requests,
 {
     if (selected.empty())
         return true;
-    if (selected.front().request_index >= requests.size()
-        || !selected.front().entry || !selected.front().entry->operation)
-        return false;
     const Mxfp4Expert_vulkan::Implementation& first_expert = *selected.front().entry->operation->d;
-    if (!first_expert.gate_up || !first_expert.down || !first_expert.gate_up_pipeline)
-    {
-        return false;
-    }
     const Mxfp4Linear_vulkan::Implementation& first_gate = *first_expert.gate_up->d;
     const Mxfp4Linear_vulkan::Implementation& first_down = *first_expert.down->d;
-    if (!first_gate.vulkan_context || first_gate.vulkan_context != first_down.vulkan_context)
-    {
-        return false;
-    }
 
     const uint32_t input_columns = first_gate.input_columns;
     const uint32_t output_columns = first_down.output_columns;
     const auto region = requests[selected.front().request_index].region;
     if (region)
     {
-        if (region->columns() != input_columns || region->rows() == 0
-            || activation_variant(first_gate.option) != 0)
-            return false;
         if (!resident_combiner) resident_combiner = MoeCombine_vulkan::create(first_gate.vulkan_context);
         if (!region->bind_context(first_gate.vulkan_context, resident_combiner)) return false;
     }
@@ -102,52 +88,7 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertRequest> requests,
     size_t maximum_request_rows = 0;
     for (const Selection& selection : selected)
     {
-        if (selection.request_index >= requests.size()
-            || !selection.entry
-            || !selection.entry->operation)
-        {
-            return false;
-        }
         const ExpertRequest& request = requests[selection.request_index];
-        const auto& expert = *selection.entry->operation->d;
-        if (!expert.gate_up || !expert.down)
-            return false;
-        const auto& gate = *expert.gate_up->d;
-        const auto& down = *expert.down->d;
-        if (!request.output || request.rows() == 0 || request.columns() != input_columns
-            || request.region != region || (region && !request.device_output)
-            || gate.vulkan_context != first_gate.vulkan_context || down.vulkan_context != first_gate.vulkan_context
-            || gate.input_columns != input_columns
-            || gate.output_columns % 2 != 0 || down.input_columns != gate.output_columns / 2
-            || down.output_columns != output_columns
-            || request.rows() > static_cast<size_t>(std::numeric_limits<int>::max()) - total_rows)
-        {
-            return false;
-        }
-
-        if (use_indexed)
-        {
-            if (expert.activation != first_expert.activation
-                || expert.activation_limit != first_expert.activation_limit
-                || !gate.indexed_storage || !down.indexed_storage
-                || gate.storage.empty() || down.storage.empty()
-                || gate.output_columns != first_gate.output_columns
-                || gate.block_count != first_gate.block_count
-                || down.block_count != first_down.block_count
-                || gate.indexed_scales_word_offset != first_gate.indexed_scales_word_offset
-                || gate.indexed_bias_word_offset != first_gate.indexed_bias_word_offset
-                || down.indexed_scales_word_offset != first_down.indexed_scales_word_offset
-                || down.indexed_bias_word_offset != first_down.indexed_bias_word_offset)
-            {
-                use_indexed = false;
-            }
-            else
-            {
-                maximum_request_rows = std::max(maximum_request_rows, request.rows());
-            }
-        }
-        retain_output = retain_output || request.device_output != nullptr;
-        download_output = download_output || request.device_output == nullptr;
         total_rows += request.rows();
     }
     bool use_tiled_indexed = false;
@@ -294,10 +235,6 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertRequest> requests,
     ncnn::Mat mapped_input;
     if (!use_device_input)
         mapped_input = transfer_slot.upload.mapped();
-    if (!use_device_input && (mapped_input.empty() || mapped_input.dims != 2 || mapped_input.w != static_cast<int>(input_columns) || mapped_input.h != static_cast<int>(total_rows) || mapped_input.elemsize != sizeof(float) || mapped_input.elempack != 1))
-    {
-        return false;
-    }
 
     size_t row_offset = 0;
     auto* mapped_input_data = static_cast<std::byte*>(mapped_input.data);

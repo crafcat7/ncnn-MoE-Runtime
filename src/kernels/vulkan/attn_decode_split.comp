@@ -2,7 +2,7 @@
 
 // Split decode with subgroup reductions.
 //
-// Same split/merge contract as attention_decode_split.comp, but the QK dot,
+// One KV range per workgroup; the merge shader combines the partial states.
 // block maximum and block sum reduce through 32-lane subgroup shuffles instead
 // of shared-memory barriers. One block covers 32 KV rows.
 

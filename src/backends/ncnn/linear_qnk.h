@@ -56,7 +56,7 @@ private:
 
     friend class LatentAttention_vulkan;
     [[nodiscard]] bool record_forward(const ncnn::VkMat& input, ncnn::VkMat& output,
-                                      ncnn::VkCompute& command, std::vector<ncnn::VkMat>& workspace) const;
+                                      ncnn::VkCompute& command) const;
     void record(const ncnn::VkMat& input, ncnn::VkMat& output, ncnn::VkCompute& command, uint32_t output_column_offset = 0) const;
     void record(const ncnn::VkMat& input,
                 ncnn::VkMat& output,

@@ -113,6 +113,8 @@ struct LayerCache
     uint64_t token_count = 0;
     uint64_t first_slot = 0;
     uint64_t capacity_tokens = 0;
+    // Planned context rows; the first contiguous allocation reserves this many.
+    uint64_t reserved_tokens = 0;
     uint32_t columns = 0;
     DType dtype = DType::Float32;
     bool vulkan_attention_promotion_disabled = false;

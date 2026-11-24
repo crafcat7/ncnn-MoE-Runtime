@@ -214,6 +214,7 @@ Result<void> Session::prefill_unlocked(std::span<const int32_t> input_ids)
         return valid_tokens.error();
 
     const CompiledModel& compiled = model_compiled(*model);
+    state->planned_context = std::max<uint64_t>(state->planned_context, token_count + input_ids.size());
     state->execution_failed = true;
     stats_scratch = stats;
     SessionStatistics& updated_statistics = stats_scratch;

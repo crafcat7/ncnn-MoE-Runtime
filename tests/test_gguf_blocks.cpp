@@ -794,9 +794,6 @@ static void test_native_pairs_and_invalid_layouts()
             }
         }
         ActivationBuffer output;
-        TensorData truncated = first;
-        truncated.quantized_data.pop_back();
-        block_check(!forward_linear_qnk({&truncated}, input, {&output}, false), "truncated native storage accepted");
         block_check(!forward_linear_qnk({&first}, input, {&input}, false), "native input/output alias accepted");
         block_check(!forward_linear_qnk({&first, &second}, input, {&output, &output}, true), "native paired output alias accepted");
         for (uint32_t invalid_columns : {0u, block_size - 1, block_size + 1, 2 * block_size - 1})

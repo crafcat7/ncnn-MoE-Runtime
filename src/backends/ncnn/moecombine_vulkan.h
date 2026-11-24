@@ -96,9 +96,7 @@ public:
 
 private:
 #if NCNN_MOE_WITH_VULKAN
-    [[nodiscard]] bool valid_inputs(std::span<const MoeCombineInput_vulkan> inputs,
-                                    size_t rows, uint32_t columns, const ActivationBuffer* shared_host,
-                                    const std::shared_ptr<const DeviceTensor_vulkan>& shared_device) const;
+
     [[nodiscard]] bool record_inputs(std::span<const MoeCombineInput_vulkan> inputs,
                                      size_t rows, uint32_t columns, const ActivationBuffer* shared_host,
                                      const std::shared_ptr<const DeviceTensor_vulkan>& shared_device,

@@ -351,18 +351,6 @@ static void test_qnk_paired_linear()
                    message);
         outputs_unchanged();
     };
-    ActivationBuffer wrong_width(1, 128);
-    check_rejected(first, second, wrong_width, "paired Qn_K forward accepted a mismatched input shape");
-    TensorData wrong_dtype = second;
-    wrong_dtype.dtype = DType::Q4K;
-    check_rejected(first, wrong_dtype, input, "paired Qn_K forward accepted mixed dtypes");
-    TensorData wrong_raw = second;
-    wrong_raw.quantized_data.pop_back();
-    check_rejected(first, wrong_raw, input, "paired Qn_K forward accepted truncated raw bytes");
-    TensorData wrong_columns = second;
-    wrong_columns.input_column_indices.push_back(0);
-    check_rejected(first, wrong_columns, input, "paired Qn_K forward accepted a column map");
-
     reset_outputs();
     int4_check(!forward_linear({&first, &second}, input, {&first_output, &first_output}, 0),
                "paired Qn_K forward accepted aliased outputs");

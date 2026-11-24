@@ -512,39 +512,8 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
     const bool dense = matrix.dtype == DType::BFloat16 || matrix.dtype == DType::Float32;
     const bool mxfp4 = matrix.dtype == DType::MxFp4;
     const uint64_t mxfp4_size = mxfp4 ? qnk_mxfp4_native_size(matrix) : 0;
-    if ((!int4 && !dense && !mxfp4 && !is_qnk_dtype(matrix.dtype))
-        || matrix.shape.size() != 2
-        || input_group_count == 0
-        || matrix.shape[0] % input_group_count != 0
-        || static_cast<uint64_t>(matrix.shape[1]) * input_group_count > static_cast<uint32_t>(std::numeric_limits<int>::max())
-        || matrix.shape[0] == 0
-        || matrix.shape[1] == 0
-        || matrix.shape[1] > static_cast<uint32_t>(std::numeric_limits<int>::max())
-        || (int4 && !validate_int4_tensor(matrix))
-        || (mxfp4 && mxfp4_size == 0)
-        || (!int4 && !dense && !mxfp4 && !qnk_shape_supported(matrix.dtype, matrix.shape[0], matrix.shape[1]))
-        || (!int4 && !check_input_columns(matrix)))
-    {
-        return {};
-    }
-    if (extra
-        && (!(is_qnk_dtype(matrix.dtype) || mxfp4)
-            || extra->dtype != matrix.dtype
-            || extra->shape != matrix.shape
-            || input_group_count != 1
-            || bias
-            || qnk_has_metadata(matrix)
-            || qnk_has_metadata(*extra)
-            || (mxfp4 && qnk_mxfp4_native_size(*extra) != mxfp4_size)))
-    {
-        return {};
-    }
     const uint64_t rows = static_cast<uint64_t>(matrix.shape[0])
                           + (extra ? matrix.shape[0] : 0u);
-    if (rows > static_cast<uint64_t>(std::numeric_limits<int>::max() / 32))
-    {
-        return {};
-    }
     const std::span<const uint8_t> raw_values = mxfp4 ? std::span<const uint8_t>{}
                                                       : qnk_projection_values(matrix);
     const uint64_t first_size = int4    ? static_cast<uint64_t>(matrix.shape[0]) * (matrix.shape[1] / 2 + matrix.shape[1] % 2)
@@ -852,14 +821,9 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
 }
 
 bool QnkLinear_vulkan::record_forward(const ncnn::VkMat& input, ncnn::VkMat& output,
-                                      ncnn::VkCompute& command, std::vector<ncnn::VkMat>& workspace) const
+                                      ncnn::VkCompute& command) const
 {
 #if NCNN_MOE_WITH_VULKAN
-    (void)workspace;
-    if (!d->vulkan_context || !d->pipeline || input.empty() || input.dims != 2
-        || input.elempack != 1 || input.elemsize != sizeof(float) || input.h <= 0
-        || input.w != static_cast<int>(d->input_columns * d->input_group_count) || activation_variant(d->option) != 0)
-        return false;
     output.create(static_cast<int>(d->output_columns), input.h, sizeof(float), d->vulkan_context->blob_allocator());
     if (output.empty())
         return false;
@@ -869,7 +833,6 @@ bool QnkLinear_vulkan::record_forward(const ncnn::VkMat& input, ncnn::VkMat& out
     (void)input;
     (void)output;
     (void)command;
-    (void)workspace;
     return false;
 #endif
 }
@@ -995,15 +958,6 @@ bool QnkLinear_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& 
 {
 #if NCNN_MOE_WITH_VULKAN
     const Implementation& implementation = *d;
-    if (!implementation.vulkan_context
-        || !implementation.pipeline
-        || input.dtype() != DType::Float32
-        || input.rows() == 0
-        || input.columns() != implementation.input_columns * implementation.input_group_count
-        || input.rows() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
-    {
-        return false;
-    }
     VulkanRuntimeState& runtime_state = implementation.vulkan_context->runtime_state();
     VulkanTransferLease transfer_lease = implementation.vulkan_context->acquire_transfer_slot();
     VulkanTransferSlot& transfer_slot = transfer_lease.slot();
@@ -1297,12 +1251,9 @@ std::shared_ptr<QnkExpert_vulkan> QnkExpert_vulkan::create_impl(const TensorData
 bool QnkExpert_vulkan::prepare_router_gate(const TensorData& weight)
 {
 #if NCNN_MOE_WITH_VULKAN
-    if (!d->vulkan_context || !d->gate_up || weight.shape.size() != 2
-        || weight.shape[0] != 1 || weight.shape[1] != d->gate_up->input_columns())
-        return false;
     auto prepared = QnkLinear_vulkan::create(weight, nullptr, d->device_index,
                                              d->vulkan_context->runtime(), d->vulkan_context->optimization_flags());
-    if (!prepared || prepared->vulkan_context() != d->vulkan_context)
+    if (!prepared)
         return false;
     d->router_gate = std::move(prepared);
     return true;
@@ -1410,14 +1361,6 @@ bool QnkExpert_vulkan::record(const ncnn::VkMat& input, ncnn::VkMat& output,
 {
 #if NCNN_MOE_WITH_VULKAN
     const Implementation& implementation = *d;
-    if (&input == &output || !implementation.vulkan_context || !implementation.gate_up || !implementation.down
-        || input.empty() || input.dims != 2 || input.elempack != 1 || input.elemsize != sizeof(float)
-        || input.h <= 0 || input.w != static_cast<int>(input_columns())
-        || !input.allocator || input.allocator->vkdev != implementation.vulkan_context->device()
-        || output.empty() || output.dims != 2 || output.elempack != 1 || output.elemsize != sizeof(float)
-        || output.h != input.h || output.w != static_cast<int>(implementation.output_columns)
-        || !output.allocator || output.allocator->vkdev != implementation.vulkan_context->device())
-        return false;
     const QnkLinear_vulkan::Implementation& gate = *implementation.gate_up->d;
     const uint32_t rows = input.dims == 1 ? 1u : static_cast<uint32_t>(input.h);
     uint64_t scratch_columns[5]{};
@@ -1505,9 +1448,6 @@ bool QnkExpert_vulkan::forward_batch(std::span<const QnkExpert_vulkan*> experts,
                                      std::span<ActivationBuffer*> outputs)
 {
 #if NCNN_MOE_WITH_VULKAN
-    if (experts.empty() || experts.size() != inputs.size() || experts.size() != outputs.size())
-        return false;
-
     const Implementation* first_expert_ptr = nullptr;
     const QnkLinear_vulkan::Implementation* first_gate_ptr = nullptr;
     const QnkLinear_vulkan::Implementation* first_down_ptr = nullptr;
@@ -1522,76 +1462,11 @@ bool QnkExpert_vulkan::forward_batch(std::span<const QnkExpert_vulkan*> experts,
         const QnkExpert_vulkan* operator_instance = experts[index];
         const ActivationBuffer* input = inputs[index];
         const ActivationBuffer* output = outputs[index];
-        if (!operator_instance
-            || !operator_instance->d
-            || !input
-            || !output
-            || input->rows() == 0
-            || input->rows() > static_cast<size_t>(std::numeric_limits<uint32_t>::max())
-            || input->rows() > static_cast<size_t>(std::numeric_limits<int>::max())
-            || input->dtype() != DType::Float32
-            || output->element_size() == 0)
-        {
-            return false;
-        }
         if (output->dtype() != DType::Float32)
             batch_compatible = false;
         const Implementation& expert = *operator_instance->d;
-        if (!expert.gate_up
-            || !expert.down
-            || !expert.vulkan_context
-            || !expert.swiglu_pipeline
-            || !expert.gate_up->d
-            || !expert.down->d
-            || (expert.up && !expert.up->d))
-        {
-            return false;
-        }
         const QnkLinear_vulkan::Implementation& gate = *expert.gate_up->d;
         const QnkLinear_vulkan::Implementation& down = *expert.down->d;
-        if (!gate.pipeline
-            || !down.pipeline
-            || gate.vulkan_context != expert.vulkan_context
-            || down.vulkan_context != expert.vulkan_context
-            || gate.input_columns == 0
-            || gate.output_columns == 0
-            || expert.intermediate_columns == 0
-            || expert.output_columns == 0
-            || down.input_columns != expert.intermediate_columns
-            || down.output_columns != expert.output_columns)
-        {
-            return false;
-        }
-        if (expert.up)
-        {
-            const QnkLinear_vulkan::Implementation& up = *expert.up->d;
-            if (!up.pipeline
-                || up.vulkan_context != expert.vulkan_context
-                || gate.output_columns != expert.intermediate_columns
-                || up.input_columns != gate.input_columns
-                || up.output_columns != expert.intermediate_columns)
-            {
-                return false;
-            }
-        }
-        else if (gate.output_columns % 2 != 0
-                 || gate.output_columns / 2 != expert.intermediate_columns)
-        {
-            return false;
-        }
-
-        if (input->columns() != gate.input_columns
-            || static_cast<size_t>(gate.input_columns) > std::numeric_limits<size_t>::max() / sizeof(float))
-        {
-            return false;
-        }
-        const size_t input_row_bytes = static_cast<size_t>(gate.input_columns) * sizeof(float);
-        if (input->rows() > std::numeric_limits<size_t>::max() / input_row_bytes
-            || input->bytes().size() != input->rows() * input_row_bytes)
-        {
-            return false;
-        }
-
         if (!first_expert_ptr)
         {
             first_expert_ptr = &expert;
@@ -1600,39 +1475,13 @@ bool QnkExpert_vulkan::forward_batch(std::span<const QnkExpert_vulkan*> experts,
             input_columns = gate.input_columns;
             output_columns = down.output_columns;
         }
-        else if (expert.vulkan_context != first_expert_ptr->vulkan_context
-                 || expert.intermediate_columns != first_expert_ptr->intermediate_columns
-                 || expert.output_columns != first_expert_ptr->output_columns
-                 || expert.activation != first_expert_ptr->activation
-                 || expert.activation_limit != first_expert_ptr->activation_limit
-                 || static_cast<bool>(expert.up) != static_cast<bool>(first_expert_ptr->up)
-                 || expert.interleave_gate_up_rows != first_expert_ptr->interleave_gate_up_rows
-                 || gate.input_columns != first_gate_ptr->input_columns
-                 || gate.output_columns != first_gate_ptr->output_columns
-                 || down.input_columns != first_down_ptr->input_columns
-                 || down.output_columns != first_down_ptr->output_columns)
-        {
-            // These Experts are individually valid, but cannot share the
-            // single upload/output geometry used by the batched path.
-            batch_compatible = false;
-        }
-
         int4_ops += gate.dtype == DType::Int4 ? 1 : 0;
         int4_ops += down.dtype == DType::Int4 ? 1 : 0;
         if (expert.up && expert.up->d->dtype == DType::Int4)
             ++int4_ops;
-        if (batch_compatible)
-        {
-            const size_t uint32_max = static_cast<size_t>(std::numeric_limits<uint32_t>::max());
-            if (input->rows() > uint32_max - total_rows)
-                batch_compatible = false;
-            else
-                total_rows += input->rows();
-        }
+        total_rows += input->rows();
         shared_input = shared_input && input == inputs.front();
     }
-    if (batch_compatible && total_rows > static_cast<size_t>(std::numeric_limits<int>::max()))
-        batch_compatible = false;
     if (!batch_compatible)
     {
         // Complete the inexpensive validation pass before allowing any
@@ -1667,15 +1516,8 @@ bool QnkExpert_vulkan::forward_batch(std::span<const QnkExpert_vulkan*> experts,
     }
 
     ncnn::Mat mapped_input = transfer_slot.upload.mapped();
-    if (mapped_input.empty()
-        || mapped_input.dims != 2
-        || mapped_input.w != static_cast<int>(input_columns)
-        || mapped_input.h != static_cast<int>(upload_rows)
-        || mapped_input.elemsize != sizeof(float)
-        || mapped_input.elempack != 1)
-    {
+    if (mapped_input.empty())
         return false;
-    }
     auto* mapped_input_data = static_cast<std::byte*>(mapped_input.data);
     size_t row_offset = 0;
     for (const ActivationBuffer* input : inputs)
@@ -1793,25 +1635,8 @@ bool QnkExpert_vulkan::forward(const ActivationBuffer& input, ActivationBuffer& 
 {
 #if NCNN_MOE_WITH_VULKAN
     const Implementation& implementation = *d;
-    if (!implementation.gate_up
-        || !implementation.down
-        || !implementation.vulkan_context
-        || !implementation.swiglu_pipeline
-        || input.rows() == 0
-        || input.rows() > static_cast<size_t>(std::numeric_limits<uint32_t>::max())
-        || input.columns() != implementation.gate_up->input_columns())
-    {
-        return false;
-    }
     const QnkLinear_vulkan::Implementation& gate = *implementation.gate_up->d;
     const QnkLinear_vulkan::Implementation& down = *implementation.down->d;
-    if ((!implementation.up && gate.output_columns % 2 != 0)
-        || down.input_columns != implementation.intermediate_columns
-        || down.output_columns != implementation.output_columns)
-    {
-        return false;
-    }
-
     VulkanRuntimeState& runtime_state = implementation.vulkan_context->runtime_state();
     VulkanTransferLease transfer_lease = implementation.vulkan_context->acquire_transfer_slot();
     VulkanTransferSlot& transfer_slot = transfer_lease.slot();
@@ -1907,14 +1732,6 @@ bool QnkExpert_vulkan::forward_device(const DeviceTensor_vulkan& input, DeviceTe
 #if NCNN_MOE_WITH_VULKAN
     const Implementation& implementation = *d;
     const ncnn::VkMat* source = input.value();
-    if (&input == &output || !implementation.gate_up || !implementation.down
-        || !implementation.vulkan_context || !implementation.swiglu_pipeline
-        || !source || source->dims != 2 || source->elemsize / source->elempack != sizeof(float)
-        || input.vulkan_context() != implementation.vulkan_context
-        || input.rows() == 0 || input.columns() != implementation.gate_up->input_columns()
-        || input.rows() > implementation.vulkan_context->device()->info.max_workgroup_count_y()
-        || activation_variant(implementation.option) != 0)
-        return false;
     const ncnn::VkMat retained_input = *source;
     auto lease = implementation.vulkan_context->acquire_transfer_slot();
     auto& slot = lease.slot();

@@ -699,11 +699,6 @@ std::shared_ptr<Linear> Linear::create(const TensorData& matrix, const TensorDat
                                        uint64_t optimization_flags)
 {
 #if NCNN_MOE_USE_NCNN && NCNN_MOE_WITH_VULKAN
-    if (matrix.shape.size() != 2 || (matrix.dtype != DType::Float32 && matrix.dtype != DType::BFloat16))
-        return {};
-    if (matrix.element_count() > static_cast<uint64_t>(std::numeric_limits<int>::max()))
-        return {};
-
     std::shared_ptr<Linear> linear(new Linear);
     Implementation& implementation = *linear->d;
     implementation.input_columns = matrix.shape[1];
@@ -889,7 +884,7 @@ bool Linear::forward(const ActivationBuffer& input, ActivationBuffer& output) co
 {
 #if NCNN_MOE_USE_NCNN && NCNN_MOE_WITH_VULKAN
     const Implementation& implementation = *d;
-    if (!implementation.layer || input.columns() != implementation.input_columns)
+    if (!implementation.layer)
         return false;
 
     VulkanRuntimeState& runtime_state = implementation.vulkan_context->runtime_state();
@@ -959,19 +954,10 @@ int Linear::forward(const ncnn::VkMat& input,
                     const ncnn::Option& opt) const
 {
 #if NCNN_MOE_USE_NCNN && NCNN_MOE_WITH_VULKAN
-    if (!d || !d->layer)
-        return -1;
-#if NCNN_BATCH
-    if (input.n != 1) return -1;
-#endif
-    if (input.empty()
-        || (input.dims == 2 && input.buffer_capacity() < static_cast<uint64_t>(input.w) * input.h * input.elemsize)) return -1;
     if (d->single_row_pipeline && single_row_input(input, d->input_columns))
     {
-        if (&input == &output) return -1;
         ncnn::VkMat destination(static_cast<int>(d->output_columns), 1, sizeof(float), opt.blob_vkallocator);
         if (destination.empty()) return -100;
-        if (destination.buffer_capacity() < static_cast<uint64_t>(d->output_columns) * sizeof(float)) return -1;
         const auto& inner_product = *static_cast<const ncnn::InnerProduct_vulkan*>(d->layer);
         record_matvec(d->single_row_pipeline.get(), false, d->input_columns, d->output_columns, d->has_bias,
                       input, inner_product.weight_data_gpu, inner_product.bias_data_gpu, destination, cmd);

@@ -203,26 +203,8 @@ std::shared_ptr<HyperConnection_vulkan> HyperConnection_vulkan::create(const Ten
     const bool native_projection = function.dtype == DType::Int4 || is_qnk_dtype(function.dtype)
                                    || function.dtype == DType::BFloat16
                                    || (function.dtype == DType::Float32 && !function.input_column_indices.empty());
-    if (multiplier == 0 || multiplier > 8 || norm_epsilon <= 0.0f || hyper_epsilon <= 0.0f
-        || !std::isfinite(norm_epsilon) || !std::isfinite(hyper_epsilon)
-        || (!native_projection && function.dtype != DType::Float32) || function.shape.size() != 2 || function.shape[1] == 0
-        || function.shape[1] % multiplier != 0 || function.shape[1] > static_cast<uint32_t>(std::numeric_limits<int>::max())
-        || (!native_projection && function.float32_values().size() != function.element_count())
-        || base.dtype != DType::Float32 || base.shape.size() != 1
-        || base.shape[0] != function.shape[0] || base.float32_values().size() != function.shape[0]
-        || scale.dtype != DType::Float32)
-        return {};
     const bool head = function.shape[0] == multiplier;
-    if ((!head && function.shape[0] != multiplier * (multiplier + 2))
-        || scale.shape != std::vector<uint32_t>{head ? 1u : 3u}
-        || scale.float32_values().size() != (head ? 1u : 3u)
-        || (!head && sinkhorn_iterations == 0)
-        || function.element_count() > std::numeric_limits<uint32_t>::max())
-        return {};
     std::shared_ptr<VulkanContext> context = VulkanContext::acquire(vulkan_device_index, vulkan_runtime, optimization_flags);
-    if (!context
-        || (static_cast<uint64_t>(function.shape[1]) + 127) / 128 > context->device()->info.max_workgroup_count_x())
-        return {};
     auto result = std::shared_ptr<HyperConnection_vulkan>(new HyperConnection_vulkan);
     Implementation& implementation = *result->d;
     implementation.context = context;

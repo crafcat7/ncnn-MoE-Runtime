@@ -266,14 +266,6 @@ std::shared_ptr<Float8Linear_vulkan> Float8Linear_vulkan::create(const TensorDat
                                                                  uint64_t optimization_flags)
 {
 #if NCNN_MOE_WITH_VULKAN
-    if (matrix.dtype != DType::Float8E4M3 || matrix.shape.size() != 2 || matrix.shape[0] == 0 || matrix.shape[1] == 0
-        || (matrix.float8_scale_row_size != 1 && matrix.float8_scale_row_size != 128)
-        || matrix.shape[1] % 128 != 0 || input_group_count == 0 || matrix.shape[0] % input_group_count != 0
-        || matrix.shape[0] > static_cast<uint32_t>(std::numeric_limits<int>::max() / 32)
-        || matrix.shape[1] > static_cast<uint32_t>(std::numeric_limits<int>::max()))
-    {
-        return {};
-    }
     const uint32_t output_columns = matrix.shape[0];
     const uint32_t input_columns = matrix.shape[1];
     const uint32_t block_count = input_columns / 128;
@@ -285,13 +277,7 @@ std::shared_ptr<Float8Linear_vulkan> Float8Linear_vulkan::create(const TensorDat
     {
         return {};
     }
-    if (bias && (bias->shape.size() != 1 || bias->shape[0] != output_columns || (bias->dtype != DType::Float32 && bias->dtype != DType::BFloat16)))
-    {
-        return {};
-    }
     const uint64_t logical_input_columns = static_cast<uint64_t>(input_columns) * input_group_count;
-    if (logical_input_columns > std::numeric_limits<uint32_t>::max())
-        return {};
 
     std::shared_ptr<Float8Linear_vulkan> result(new Float8Linear_vulkan);
     Implementation& implementation = *result->d;
@@ -412,13 +398,6 @@ bool Float8Linear_vulkan::prepare_rms_norm_weight(const TensorData& weight,
 {
 #if NCNN_MOE_WITH_VULKAN
     Implementation& implementation = *d;
-    if (!implementation.vulkan_context || epsilon <= 0.0f
-        || expected_columns == 0
-        || weight.shape.size() != 1 || weight.shape[0] != expected_columns
-        || (weight.dtype != DType::Float32 && weight.dtype != DType::BFloat16))
-    {
-        return false;
-    }
     ncnn::Mat values;
     values.create(static_cast<int>(expected_columns), sizeof(float));
     if (values.empty())
@@ -548,15 +527,6 @@ static bool fill_float8_quantized_staging(const ActivationBuffer& input,
     }
 
     ncnn::Mat mapped = staging.mapped();
-    if (mapped.empty()
-        || mapped.dims != 2
-        || mapped.w != static_cast<int>(columns)
-        || mapped.h != static_cast<int>(input.rows())
-        || mapped.elempack != 1
-        || mapped.elemsize != sizeof(float))
-    {
-        return false;
-    }
     for (size_t row_index = 0; row_index < input.rows(); ++row_index)
     {
         float* destination = mapped.row<float>(static_cast<int>(row_index));
@@ -695,19 +665,9 @@ bool Float8Linear_vulkan::record_forward(const ncnn::VkMat& input,
 {
     uint32_t scratch_columns = 0;
     const uint64_t rows = input.h > 0 ? static_cast<uint64_t>(input.h) : 0;
-    if (!d->vulkan_context || !d->pipeline || !d->quantize_pipeline
-        || input.empty() || input.dims != 2 || input.elempack != 1
-        || input.elemsize != sizeof(float) || input.h <= 0
-        || input.w != static_cast<int>(d->logical_input_columns)
-        || !float8_linear_scratch_shape(d->logical_input_columns, rows, scratch_columns)
-        || d->logical_input_columns % 128 != 0)
-        return false;
+    float8_linear_scratch_shape(d->logical_input_columns, rows, scratch_columns);
     if (output_stride == 0)
         output_stride = d->output_columns;
-    if (output_stride > static_cast<uint32_t>(std::numeric_limits<int>::max())
-        || output_column_offset > output_stride
-        || d->output_columns > output_stride - output_column_offset)
-        return false;
     ncnn::VkMat quantized;
     command.record_clone(input, quantized, d->option);
     if (output_column_offset == 0 && output_stride == d->output_columns)
@@ -785,12 +745,6 @@ bool Float8Linear_vulkan::forward(const ActivationBuffer& input, ActivationBuffe
 {
 #if NCNN_MOE_WITH_VULKAN
     const Implementation& implementation = *d;
-    if (!implementation.vulkan_context || !implementation.pipeline || input.rows() == 0
-        || input.columns() != implementation.logical_input_columns
-        || input.rows() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
-    {
-        return false;
-    }
     VulkanRuntimeState& runtime_state = implementation.vulkan_context->runtime_state();
 
     VulkanTransferLease transfer_lease = implementation.vulkan_context->acquire_transfer_slot();
@@ -872,15 +826,8 @@ bool Float8Linear_vulkan::forward_chain(const ActivationBuffer& input, const Flo
 #if NCNN_MOE_WITH_VULKAN
     const Implementation& first = *d;
     const Implementation& second = *next.d;
-    if (!first.vulkan_context || !second.vulkan_context || first.vulkan_context.get() != second.vulkan_context.get()
-        || !first.pipeline || !second.pipeline || !first.quantize_pipeline || input.rows() == 0
-        || input.columns() != first.logical_input_columns
-        || first.output_columns != second.logical_input_columns
-        || first.output_columns % 128 != 0
-        || input.rows() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
-    {
+    if (!first.rms_norm_quantize_pipeline || first.rms_norm_weight.empty())
         return false;
-    }
     VulkanRuntimeState& runtime_state = first.vulkan_context->runtime_state();
     VulkanTransferLease transfer_lease = first.vulkan_context->acquire_transfer_slot();
     VulkanTransferSlot& transfer_slot = transfer_lease.slot();
@@ -981,16 +928,8 @@ bool Float8Linear_vulkan::forward_rms_norm_chain(const ActivationBuffer& input,
 #if NCNN_MOE_WITH_VULKAN
     const Implementation& first = *d;
     const Implementation& second = *next.d;
-    if (!first.vulkan_context || !second.vulkan_context || first.vulkan_context.get() != second.vulkan_context.get()
-        || !first.pipeline || !second.pipeline || !first.rms_norm_quantize_pipeline || first.rms_norm_weight.empty()
-        || first.rms_norm_epsilon <= 0.0f || input.rows() == 0
-        || input.columns() != first.logical_input_columns
-        || first.output_columns != second.logical_input_columns
-        || first.output_columns % 128 != 0
-        || input.rows() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
-    {
+    if (!first.rms_norm_quantize_pipeline || first.rms_norm_weight.empty())
         return false;
-    }
     VulkanRuntimeState& runtime_state = first.vulkan_context->runtime_state();
 
     VulkanTransferLease transfer_lease = first.vulkan_context->acquire_transfer_slot();
@@ -1107,22 +1046,9 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_impl(const ActivationB
     {
         return false;
     }
-    if (!first.vulkan_context || !second.vulkan_context || !parallel.vulkan_context
-        || first.vulkan_context.get() != second.vulkan_context.get()
-        || first.vulkan_context.get() != parallel.vulkan_context.get()
-        || !first.pipeline || !second.pipeline || !parallel.pipeline
-        || !first.rms_norm_quantize_pipeline || first.rms_norm_weight.empty()
-        || (normalize_input && first.input_rms_norm_weight.empty())
-        || first.rms_norm_epsilon <= 0.0f || input.rows() == 0
-        || (normalize_input && first.input_rms_norm_epsilon <= 0.0f)
-        || input.columns() != first.logical_input_columns
-        || input.columns() != parallel.logical_input_columns
-        || first.output_columns != second.logical_input_columns
-        || first.output_columns % 128 != 0
-        || input.rows() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
-    {
+    if (!first.rms_norm_quantize_pipeline || first.rms_norm_weight.empty()
+        || (normalize_input && first.input_rms_norm_weight.empty()))
         return false;
-    }
     VulkanRuntimeState& runtime_state = first.vulkan_context->runtime_state();
 
     VulkanTransferLease transfer_lease = first.vulkan_context->acquire_transfer_slot();
@@ -1334,48 +1260,9 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const Activat
     const Implementation& first = *d;
     const Implementation& second = *next.d;
     const Implementation& parallel = *parallel_operator.d;
-    if (!first.vulkan_context || !second.vulkan_context || !parallel.vulkan_context
-        || first.vulkan_context.get() != second.vulkan_context.get()
-        || first.vulkan_context.get() != parallel.vulkan_context.get()
-        || !first.pipeline || !second.pipeline || !parallel.pipeline
-        || !first.quantize_pipeline
-        || !first.rms_norm_quantize_pipeline || first.rms_norm_weight.empty()
-        || first.rms_norm_epsilon <= 0.0f || input.rows() == 0
-        || input.columns() != first.logical_input_columns
-        || input.columns() != parallel.logical_input_columns
-        || first.output_columns != second.logical_input_columns
-        || first.output_columns % 128 != 0
-        || input.rows() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
-    {
+    if (!first.quantize_pipeline || !first.rms_norm_quantize_pipeline
+        || first.rms_norm_weight.empty())
         return false;
-    }
-
-    size_t extra_storage_variant = 0;
-    for (size_t index = 0; index < extra_operators.size(); ++index)
-    {
-        const Bfloat16Linear_vulkan* extra_operator = extra_operators[index];
-        ActivationBuffer* extra_output = extra_outputs[index];
-        if (!extra_operator || !extra_output)
-            return false;
-        const Bfloat16Linear_vulkan::Implementation& extra = *extra_operator->d;
-        if (!extra.vulkan_context
-            || extra.vulkan_context.get() != first.vulkan_context.get()
-            || !extra.pipeline
-            || extra.input_columns != input.columns())
-        {
-            return false;
-        }
-        const size_t variant = activation_variant(extra.option);
-        if (index == 0)
-            extra_storage_variant = variant;
-        else if (variant != extra_storage_variant)
-            return false;
-    }
-    if (extra_storage_variant != activation_variant(first.option)
-        || extra_storage_variant != 0)
-    {
-        return false;
-    }
     VulkanRuntimeState& runtime_state = first.vulkan_context->runtime_state();
 
     VulkanTransferLease transfer_lease = first.vulkan_context->acquire_transfer_slot();
@@ -1624,20 +1511,8 @@ bool Float8Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
     const Implementation& gate = *d;
     const Implementation& up = *up_operator.d;
     const Implementation& down = *down_operator.d;
-    if (activation != ExpertActivation::DeepSeekSwiGlu
-        || !gate.vulkan_context || !up.vulkan_context || !down.vulkan_context
-        || gate.vulkan_context.get() != up.vulkan_context.get()
-        || gate.vulkan_context.get() != down.vulkan_context.get()
-        || !gate.pipeline || !up.pipeline || !down.pipeline || !gate.swiglu_quantize_pipeline
-        || input.rows() == 0 || input.columns() != gate.logical_input_columns
-        || input.columns() != up.logical_input_columns
-        || gate.output_columns != up.output_columns
-        || gate.output_columns != down.logical_input_columns
-        || gate.output_columns % 128 != 0
-        || input.rows() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
-    {
+    if (!gate.swiglu_quantize_pipeline)
         return false;
-    }
     VulkanRuntimeState& runtime_state = gate.vulkan_context->runtime_state();
 
     VulkanTransferLease transfer_lease = gate.vulkan_context->acquire_transfer_slot();
@@ -1766,18 +1641,6 @@ bool Float8Linear_vulkan::record_swiglu_chain(const ncnn::VkMat& input,
                                                    input.h > 0 ? static_cast<uint64_t>(input.h) : 0,
                                                    true,
                                                    scratch_columns);
-    if (&input == &output || activation != ExpertActivation::DeepSeekSwiGlu
-        || !gate.vulkan_context || gate.vulkan_context != up.vulkan_context || gate.vulkan_context != down.vulkan_context
-        || !gate.pipeline || !gate.quantize_pipeline || !up.pipeline || !down.pipeline || !gate.swiglu_quantize_pipeline
-        || gate.input_group_count != 1 || up.input_group_count != 1 || down.input_group_count != 1
-        || input.empty() || input.dims != 2 || input.elempack != 1 || input.elemsize != sizeof(float)
-        || input.h <= 0 || scratch_count != 3 || input.w != static_cast<int>(scratch_columns[0])
-        || !input.allocator || input.allocator->vkdev != gate.vulkan_context->device()
-        || static_cast<uint32_t>(input.h) > gate.vulkan_context->device()->info.max_workgroup_count_y()
-        || gate.logical_input_columns != up.logical_input_columns || gate.output_columns != up.output_columns
-        || gate.output_columns != down.logical_input_columns || gate.output_columns != scratch_columns[1]
-        || up.output_columns != scratch_columns[2] || gate.output_columns % 128 != 0)
-        return false;
     workspace.reserve(workspace.size() + 4);
     ncnn::VkMat gate_gpu, up_gpu, result;
     if (!record_forward(input, gate_gpu, command, workspace)) return false;
@@ -1817,10 +1680,6 @@ bool Float8Linear_vulkan::forward_swiglu_chain_device(const DeviceTensor_vulkan&
 #if NCNN_MOE_WITH_VULKAN
     const auto& context = d->vulkan_context;
     const auto* source = input.value();
-    if (&input == &output || !context || !source || source->dims != 2
-        || source->elempack <= 0 || source->elemsize != sizeof(float) * static_cast<size_t>(source->elempack)
-        || input.vulkan_context() != context)
-        return false;
     const ncnn::VkMat retained_input = *source;
     auto lease = context->acquire_transfer_slot();
     auto& slot = lease.slot();

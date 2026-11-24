@@ -220,6 +220,7 @@ public:
     std::vector<int32_t> speculative_direct_alignment_ids;
     uint64_t speculative_main_hidden_position = 0;
     uint64_t mtp_pending_target_position = 0;
+    uint64_t planned_context = 0;
     bool use_speculative_context = true;
     // Conservative marker armed before execution and cleared after commit/reset.
     bool execution_failed = false;

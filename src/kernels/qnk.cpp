@@ -582,29 +582,13 @@ static bool qnk_linear_impl(std::initializer_list<const TensorData*> matrices,
                             QnkQ8Input* q8_input)
 {
     const size_t matrix_count = matrices.size();
-    if ((matrix_count != 1 && matrix_count != 2)
-        || outputs.size() != matrix_count
-        || (sidecars.size() != 0 && sidecars.size() != matrix_count))
-        return false;
-
     const TensorData* const* weights = matrices.begin();
     ActivationBuffer* const* results = outputs.begin();
     bool convert_activations = input.dtype() == DType::BFloat16;
     for (size_t index = 0; index < matrix_count; ++index)
-    {
-        if (!weights[index] || !results[index] || results[index] == &input)
-            return false;
         convert_activations = convert_activations || results[index]->dtype() == DType::BFloat16;
-        if (index != 0 && results[index] == results[0])
-            return false;
-    }
     if (convert_activations)
     {
-        if (input.dtype() != DType::Float32 && input.dtype() != DType::BFloat16)
-            return false;
-        for (size_t index = 0; index < matrix_count; ++index)
-            if (results[index]->dtype() != DType::Float32 && results[index]->dtype() != DType::BFloat16)
-                return false;
         // Only activations are widened. Immutable GGML weights and
         // optional packed sidecars retain their original native bytes.
         ActivationBuffer prepared;
@@ -684,15 +668,9 @@ static bool qnk_linear_impl(std::initializer_list<const TensorData*> matrices,
     if (matrix_count == 1)
     {
         const TensorData& matrix = *weights[0];
-        if (!is_qnk_dtype(matrix.dtype) || matrix.shape.size() != 2)
-            return false;
         const size_t rows = matrix.shape[0];
         const uint32_t columns = matrix.shape[1];
-        if (!qnk_shape_supported(matrix.dtype, rows, columns) || input.columns() != columns)
-            return false;
         const std::span<const uint8_t> raw = matrix.qnk_values();
-        if (raw.size() != qnk_storage_bytes(matrix.dtype, rows, columns))
-            return false;
         results[0]->reset(input.rows(), static_cast<uint32_t>(rows), false);
         if (input.rows() == 0)
             return true;
@@ -860,23 +838,11 @@ static bool qnk_linear_impl(std::initializer_list<const TensorData*> matrices,
 
     const TensorData& matrix0 = *weights[0];
     const TensorData& matrix1 = *weights[1];
-    if (!is_qnk_dtype(matrix0.dtype) || matrix0.dtype != matrix1.dtype
-        || matrix0.shape.size() != 2 || matrix1.shape.size() != 2
-        || !matrix0.input_column_indices.empty() || !matrix1.input_column_indices.empty())
-        return false;
     const size_t rows0 = matrix0.shape[0];
     const size_t rows1 = matrix1.shape[0];
     const uint32_t columns = matrix0.shape[1];
-    if (matrix1.shape[1] != columns || input.columns() != columns
-        || rows0 > std::numeric_limits<size_t>::max() - rows1
-        || !qnk_shape_supported(matrix0.dtype, rows0, columns)
-        || !qnk_shape_supported(matrix1.dtype, rows1, columns))
-        return false;
     const std::span<const uint8_t> raw0 = matrix0.qnk_values();
     const std::span<const uint8_t> raw1 = matrix1.qnk_values();
-    if (raw0.size() != qnk_storage_bytes(matrix0.dtype, rows0, columns)
-        || raw1.size() != qnk_storage_bytes(matrix1.dtype, rows1, columns))
-        return false;
 
     if (input.rows() == 0)
     {

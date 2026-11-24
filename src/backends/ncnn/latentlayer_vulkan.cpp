@@ -89,8 +89,6 @@ public:
                        ncnn::VkMat& staging, ncnn::VkCompute& cmd,
                        std::vector<ncnn::VkMat>& combine_storage, uint64_t& combine_uploads)
     {
-        if (!context || !ffn_post || residual.empty() || pending_rows() == 0)
-            return false;
         auto& state = context->runtime_state();
         if (pending_combine)
         {
@@ -261,11 +259,6 @@ bool LatentLayer_vulkan::forward(const ActivationBuffer& initial_hidden,
     auto& previous = *workspace.d;
     const auto previous_post_owner = previous.ffn_post;
     const auto previous_combiner_owner = previous.combiner;
-    if (positions.empty() || positions.size() != caches.size()
-        || normalized.dtype() != DType::Float32
-        || (previous.context && (previous.context != context || previous.pending_rows() != positions.size()))
-        || (!previous.context && (initial_hidden.rows() != positions.size() || initial_hidden.dtype() != DType::Float32)))
-        return false;
     auto lease = context->acquire_transfer_slot();
     auto& slot = lease.slot();
     auto& state = context->runtime_state();
@@ -429,10 +422,6 @@ bool LatentLayer_vulkan::defer_combine(std::shared_ptr<const DeviceTensor_vulkan
                                        LatentLayerWorkspace_vulkan& workspace)
 {
 #if NCNN_MOE_WITH_VULKAN
-    if (!workspace.active() || !combined || combined->empty()
-        || combined->vulkan_context() != workspace.d->context
-        || combined->rows() != static_cast<size_t>(workspace.d->residual.h)
-        || combined->columns() * workspace.d->ffn_post->multiplier() != static_cast<uint32_t>(workspace.d->residual.w)) return false;
     const std::lock_guard<std::mutex> lock(workspace.d->context->command_mutex());
     workspace.d->pending.clear();
     workspace.d->pending_combine.reset();

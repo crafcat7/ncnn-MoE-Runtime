@@ -168,16 +168,6 @@ static std::shared_ptr<ncnn::Pipeline> qsa_pipeline(const std::shared_ptr<Vulkan
     return result;
 }
 
-static bool qsa_shape(const WeightStore& weights, TensorHandle handle, uint32_t rows, uint32_t columns)
-{
-    return handle < weights.size() && weights.at(handle).shape == std::vector<uint32_t>{rows, columns};
-}
-
-static bool qsa_vector(const WeightStore& weights, TensorHandle handle, uint32_t columns)
-{
-    return handle < weights.size() && weights.at(handle).shape == std::vector<uint32_t>{columns};
-}
-
 static bool qsa_matrix(ncnn::VkMat& target, uint32_t columns, uint32_t rows, VulkanContext& context)
 {
     // Shader offsets use uint32_t. Keep allocation and shader products checked
@@ -202,37 +192,10 @@ std::shared_ptr<QsaAttention_vulkan> QsaAttention_vulkan::create(const WeightSto
     const uint64_t kv_columns64 = static_cast<uint64_t>(plan.kv_head_count) * plan.head_dimension;
     const uint64_t index_columns64 = static_cast<uint64_t>(plan.index_head_count + 1) * plan.index_head_dimension;
     const uint32_t rope_dimension = plan.rope_head_dimension == 0 ? plan.head_dimension : plan.rope_head_dimension;
-    if (plan.kind != AttentionKind::Standard || !has_flag(plan.flags, AttentionBlockQsa)
-        || !has_flag(plan.flags, AttentionBlockQueryKeyNorm)
-        || !has_flag(plan.flags, AttentionBlockExternalResidual)
-        || plan.sliding_window != 0 || plan.sinks != invalid_tensor_handle
-        || plan.head_count == 0 || plan.kv_head_count == 0 || plan.head_count % plan.kv_head_count != 0
-        || plan.head_dimension == 0 || plan.head_dimension > 256 || (plan.head_dimension & 1) != 0
-        || plan.index_head_count == 0 || plan.index_head_dimension == 0 || plan.index_head_dimension > 512
-        || plan.compression_ratio == 0 || plan.index_top_k == 0
-        || rope_dimension == 0 || (rope_dimension & 1) != 0
-        || rope_dimension > plan.head_dimension || rope_dimension > plan.index_head_dimension
-        || query_columns64 > INT32_MAX || kv_columns64 > INT32_MAX || index_columns64 > INT32_MAX
-        || plan.norm_epsilon <= 0.0f || plan.rope_theta <= 1.0f
-        || (plan.kv_cache_dtype != DType::Float32 && plan.kv_cache_dtype != DType::BFloat16)
-        || plan.query_weight >= weights.size() || weights.at(plan.query_weight).shape.size() != 2)
-        return {};
     const uint32_t hidden = weights.at(plan.query_weight).shape[1];
     const uint32_t query_columns = static_cast<uint32_t>(query_columns64);
     const uint32_t kv_columns = static_cast<uint32_t>(kv_columns64);
     const uint32_t index_columns = static_cast<uint32_t>(index_columns64);
-    if (hidden == 0 || !qsa_shape(weights, plan.query_weight, query_columns, hidden)
-        || !qsa_shape(weights, plan.key_weight, kv_columns, hidden)
-        || !qsa_shape(weights, plan.value_weight, kv_columns, hidden)
-        || !qsa_shape(weights, plan.output_weight, hidden, query_columns)
-        || !qsa_shape(weights, plan.qsa_query_key_weight, index_columns, hidden)
-        || !qsa_vector(weights, plan.query_norm_weight, plan.head_dimension)
-        || !qsa_vector(weights, plan.key_norm_weight, plan.head_dimension)
-        || !qsa_vector(weights, plan.qsa_query_norm_weight, plan.index_head_dimension)
-        || !qsa_vector(weights, plan.qsa_key_norm_weight, plan.index_head_dimension)
-        || (has_flag(plan.flags, AttentionBlockOutputGate) && !qsa_shape(weights, plan.output_gate_weight, query_columns, hidden))
-        || (plan.pre_attention_norm_weight != invalid_tensor_handle && !qsa_vector(weights, plan.pre_attention_norm_weight, hidden)))
-        return {};
     auto result = std::shared_ptr<QsaAttention_vulkan>(new QsaAttention_vulkan);
     auto& impl = *result->d;
     impl.plan = plan;
@@ -248,13 +211,8 @@ std::shared_ptr<QsaAttention_vulkan> QsaAttention_vulkan::create(const WeightSto
     impl.output = projection(plan.output_weight, plan.output_bias);
     if (has_flag(plan.flags, AttentionBlockOutputGate))
         impl.gate = projection(plan.output_gate_weight, invalid_tensor_handle);
-    if (!impl.query || !impl.key || !impl.value || !impl.index || !impl.output
-        || (has_flag(plan.flags, AttentionBlockOutputGate) && !impl.gate))
-        return {};
     impl.context = impl.query->vulkan_context();
     impl.opt = impl.query->option();
-    if (!impl.context || activation_variant(impl.opt) != 0)
-        return {};
     if (plan.pre_attention_norm_weight != invalid_tensor_handle)
     {
         impl.norm = RmsNorm_vulkan::create(weights.at(plan.pre_attention_norm_weight), plan.norm_epsilon,
@@ -391,13 +349,6 @@ bool QsaAttention_vulkan::record_forward(const ncnn::VkMat& input,
 {
     const auto& impl = *d;
     const auto& plan = impl.plan;
-    if (!impl.context || work.d->cache || input.empty() || input.dims != 2 || input.elemsize != sizeof(float)
-        || input.elempack != 1 || input.w != static_cast<int>(impl.hidden) || input.h <= 0
-        || cache.transaction.active || cache.vulkan_attention_state_unknown
-        || position_offset > UINT32_MAX || static_cast<uint64_t>(input.h) - 1 > UINT32_MAX - position_offset
-        || cache.token_count > UINT32_MAX - static_cast<uint32_t>(input.h)
-        || (cache.token_count != 0 && (!cache.qsa_device_state || cache.start_position + cache.token_count != position_offset)))
-        return false;
     const uint32_t previous = static_cast<uint32_t>(cache.token_count);
     const uint32_t rows = static_cast<uint32_t>(input.h);
     const uint32_t total = previous + rows;
@@ -407,8 +358,6 @@ bool QsaAttention_vulkan::record_forward(const ncnn::VkMat& input,
     const uint32_t cache_columns = plan.kv_cache_dtype == DType::BFloat16 ? columns / 2 : columns;
     const uint32_t rope_dimension = plan.rope_head_dimension == 0 ? plan.head_dimension : plan.rope_head_dimension;
     auto original = cache.qsa_device_state;
-    if (original && (original->context != impl.context || original->token_count != previous || original->columns != columns || original->index_dimension != plan.index_head_dimension || original->compression_ratio != plan.compression_ratio || original->dtype != plan.kv_cache_dtype || original->start_position != cache.start_position))
-        return false;
     // Allocate persistent destinations and nonprojection scratch first. Once
     // recording begins, a false return requires the caller to discard the
     // command. Published cache metadata is only changed by work.commit().
@@ -516,11 +465,11 @@ bool QsaAttention_vulkan::record_forward(const ncnn::VkMat& input,
         copy(original->pooled_keys, next->pooled_keys, (previous / plan.compression_ratio) * plan.index_head_dimension);
     }
     if ((impl.norm && !impl.norm->record(input, normalized, command))
-        || !impl.query->record_forward(normalized, query, command, storage)
-        || !impl.key->record_forward(normalized, key, command, storage)
-        || !impl.value->record_forward(normalized, value, command, storage)
-        || !impl.index->record_forward(normalized, index, command, storage)
-        || (impl.gate && !impl.gate->record_forward(normalized, gate, command, storage)))
+        || !impl.query->record_forward(normalized, query, command)
+        || !impl.key->record_forward(normalized, key, command)
+        || !impl.value->record_forward(normalized, value, command)
+        || !impl.index->record_forward(normalized, index, command)
+        || (impl.gate && !impl.gate->record_forward(normalized, gate, command)))
         return false;
     ticket.dispatches += 4 + (impl.norm ? 1 : 0) + (impl.gate ? 1 : 0);
     if (!impl.gate)
@@ -570,7 +519,7 @@ bool QsaAttention_vulkan::record_forward(const ncnn::VkMat& input,
                   blocks, plan.index_top_k, plan.kv_cache_dtype == DType::BFloat16 ? 1u : 0u, impl.gate ? 1u : 0u}),
            plan.head_count, rows);
     ticket.dispatches += 2;
-    if (!impl.output->record_forward(attended, output, command, storage))
+    if (!impl.output->record_forward(attended, output, command))
         return false;
     ++ticket.dispatches;
     storage.insert(storage.end(), {input, normalized, query, key, value, index, gate, rotated_query, rotated_key,

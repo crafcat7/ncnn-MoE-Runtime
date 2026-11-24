@@ -148,8 +148,6 @@ std::shared_ptr<GatedResidual_vulkan> GatedResidual_vulkan::create(const WeightS
                                                                    const VulkanRuntimePtr& runtime, uint64_t flags)
 {
 #if NCNN_MOE_WITH_VULKAN
-    if (plan.norm_weight >= weights.size() || plan.mix_down_weight >= weights.size()
-        || plan.mix_up_weight >= weights.size() || descriptor.hidden_size == 0 || descriptor.hyper_connection_multiplier == 0) return {};
     auto result = std::shared_ptr<GatedResidual_vulkan>(new GatedResidual_vulkan);
     auto& impl = *result->d;
     impl.down = QnkLinear_vulkan::create(weights.at(plan.mix_down_weight), nullptr, device, runtime, flags);
@@ -157,7 +155,6 @@ std::shared_ptr<GatedResidual_vulkan> GatedResidual_vulkan::create(const WeightS
     if (!impl.down || !impl.up) return {};
     if (plan.inject_weight != invalid_tensor_handle)
     {
-        if (plan.inject_weight >= weights.size()) return {};
         impl.inject = QnkLinear_vulkan::create(weights.at(plan.inject_weight), nullptr, device, runtime, flags);
         if (!impl.inject) return {};
     }
@@ -167,12 +164,9 @@ std::shared_ptr<GatedResidual_vulkan> GatedResidual_vulkan::create(const WeightS
     impl.copies = descriptor.hyper_connection_multiplier;
     impl.epsilon = descriptor.norm_epsilon;
     impl.offset = descriptor.norm_weight_offset;
-    if (impl.down->input_columns() != impl.hidden * impl.copies
-        || impl.up->input_columns() != impl.down->output_columns() || impl.up->output_columns() != impl.hidden * impl.copies
-        || (impl.inject && (impl.inject->input_columns() != impl.hidden * impl.copies || impl.inject->output_columns() != impl.copies))) return {};
     const std::lock_guard<std::mutex> lock(impl.context->command_mutex());
     impl.pipeline = residual_pipeline(impl.context, impl.opt);
-    if (!impl.pipeline || weights.at(plan.norm_weight).element_count() != static_cast<uint64_t>(impl.hidden) * impl.copies) return {};
+    if (!impl.pipeline) return {};
     ncnn::VkCompute command(impl.context->device());
     if (!residual_float_weight(weights.at(plan.norm_weight), impl.norm, command, impl.opt)
         || submit_compute_and_wait(command, impl.context->device()) != 0) return {};
@@ -196,23 +190,22 @@ bool GatedResidual_vulkan::record_pre(const ncnn::VkMat& input, ncnn::VkMat& red
                                       ncnn::VkMat& injection, ncnn::VkCompute& cmd, std::vector<ncnn::VkMat>& storage) const
 {
     const auto& impl = *d;
-    if (input.dims != 2 || input.w != static_cast<int>(impl.hidden * impl.copies) || input.h <= 0 || input.elemsize != sizeof(float) || input.elempack != 1) return false;
     ncnn::VkMat normalized, projected, activated, mixed, raw_inject;
     if (!residual_allocate(normalized, input.w, input.h, impl.context)
         || !residual_allocate(reduced, impl.hidden, input.h, impl.context)) return false;
     residual_prepare_read(impl.norm);
     residual_record(impl.pipeline.get(), 0, impl.hidden, impl.copies, input.h, input.w,
                     impl.epsilon, impl.offset, {input, impl.norm, input, input, input, normalized}, cmd);
-    if (!impl.down->record_forward(normalized, projected, cmd, storage)
+    if (!impl.down->record_forward(normalized, projected, cmd)
         || !residual_allocate(activated, projected.w, input.h, impl.context)) return false;
     residual_record(impl.pipeline.get(), 1, impl.hidden, impl.copies, input.h, projected.w,
                     0, 0, {projected, projected, projected, projected, projected, activated}, cmd);
-    if (!impl.up->record_forward(activated, mixed, cmd, storage)) return false;
+    if (!impl.up->record_forward(activated, mixed, cmd)) return false;
     residual_record(impl.pipeline.get(), 3, impl.hidden, impl.copies, input.h, impl.hidden,
                     0, 0, {normalized, mixed, mixed, mixed, mixed, reduced}, cmd);
     if (impl.inject)
     {
-        if (!impl.inject->record_forward(normalized, raw_inject, cmd, storage)
+        if (!impl.inject->record_forward(normalized, raw_inject, cmd)
             || !residual_allocate(injection, impl.copies, input.h, impl.context)) return false;
         residual_record(impl.pipeline.get(), 2, impl.hidden, impl.copies, input.h, impl.copies,
                         0, 0, {raw_inject, raw_inject, raw_inject, raw_inject, raw_inject, injection}, cmd);

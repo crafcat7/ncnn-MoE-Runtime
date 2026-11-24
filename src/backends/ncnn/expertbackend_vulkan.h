@@ -124,8 +124,6 @@ private:
 
     static bool append_segment(uint64_t size, uint64_t alignment, uint64_t& cursor, uint64_t& offset);
 
-    static void copy_payload(const PendingAdmission& admission, uint8_t* destination);
-
     static MxFp4ByteBuffer copy_bytes(const uint8_t* source, uint64_t offset, uint64_t byte_count);
 
     static void materialize(const DeviceEntry& entry, const TensorData& gate_up_source, const TensorData& down_source, const uint8_t* source,

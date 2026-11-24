@@ -100,10 +100,6 @@ static Result<void> prepare_graph(CompiledModel& model,
 
 Result<void> prepare_graph(CompiledModel& model, uint32_t prefill_rows)
 {
-    // Above 128k the resident chain records too much work per fence for the
-    // device; fall back to the layer-scheduled path.
-    if (model.max_context > kv_full_tokens)
-        model.resident_submission_rows = 0;
     const uint32_t rows = std::max(1u, prefill_rows);
     const uint32_t sessions = std::max(1u, model.opt.num_concurrent_sessions);
     auto plan = plan_model_graph_memory(model, rows, sessions);
@@ -301,10 +297,6 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
             // for context-dependent buffers); row-independent per-layer scratch
             // would break that bound.
             uint32_t layers = 8;
-            // Long contexts make every per-row attention buffer large; record
-            // one layer per submission there so the graph plan stays bounded.
-            if (model.max_context > kv_fp16_tokens)
-                layers = 1;
             const uint32_t base_rows = std::max(1u, prefill_rows);
             for (;;)
             {
@@ -482,8 +474,6 @@ Result<uint64_t> ensure_graph(const CompiledModel& model, uint64_t rows, uint64_
         const std::lock_guard<std::mutex> lock(resources.mutex);
         return resources.plan.host_output_slot_size;
     }
-    if (rows > std::numeric_limits<uint32_t>::max() || context_tokens > std::numeric_limits<uint32_t>::max())
-        return Error{ErrorCode::InvalidArgument, "GPU graph shape exceeds uint32 range"};
     // The row count may decrease when context grows. Read the shape under one
     // lock so concurrent Sessions cannot combine dimensions from two plans.
     const std::lock_guard<std::mutex> lock(resources.mutex);

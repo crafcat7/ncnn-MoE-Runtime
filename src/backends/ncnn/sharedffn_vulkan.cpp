@@ -146,11 +146,6 @@ bool SharedFfn_vulkan::record(const ncnn::VkMat& normalized, ncnn::VkMat& output
                               ncnn::VkCompute& command, std::vector<ncnn::VkMat>& workspace,
                               FfnRecordStatistics_vulkan& statistics) const
 {
-    if (!d->context || &normalized == &output || normalized.empty()
-        || normalized.dims != 2 || normalized.elempack != 1 || normalized.elemsize != sizeof(float)
-        || normalized.h <= 0 || normalized.w != static_cast<int>(d->input_columns)
-        || !normalized.allocator || normalized.allocator->vkdev != d->context->device())
-        return false;
     if (d->qnk)
     {
         workspace.reserve(workspace.size() + 7);

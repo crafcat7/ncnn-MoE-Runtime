@@ -729,18 +729,17 @@ Result<void> forward_model(const CompiledModel& model,
     VulkanStatistics initial_vulkan_execution;
     if (model.vulkan_runtime)
         initial_vulkan_execution = get_vulkan_statistics(model.vulkan_runtime);
-    for (int32_t token_id : input_ids)
-    {
-        if (token_id < 0 || static_cast<uint32_t>(token_id) >= model.descriptor.vocabulary_size)
-            return Error{ErrorCode::InvalidArgument, "token id is outside the model vocabulary"};
-    }
-
-    if (input_ids.size() > std::numeric_limits<uint64_t>::max() - position_offset)
-        return Error{ErrorCode::InvalidArgument, "execution position overflows"};
-    auto planned = ensure_graph(model, input_ids.size(), position_offset + input_ids.size());
+    const uint64_t required_context = std::max<uint64_t>(position_offset + input_ids.size(),
+                                                         state.planned_context);
+    state.planned_context = required_context;
+    auto planned = ensure_graph(model, input_ids.size(), required_context);
     if (!planned)
         return planned.error();
     reset_state(model, state);
+    for (LayerCache& cache : state.layers)
+        cache.reserved_tokens = std::max(cache.reserved_tokens, required_context);
+    for (LayerCache& cache : state.speculative_layers)
+        cache.reserved_tokens = std::max(cache.reserved_tokens, required_context);
     state.gpu_segment.reserve_host_output(planned.value());
 
     const bool use_speculative_context = model.speculative.enabled()
@@ -1575,8 +1574,6 @@ Result<void> forward_model(const CompiledModel& model,
 
     if (logits_output != LogitsOutput::None && !logits_done)
         return Error{ErrorCode::InternalError, "execution graph did not produce logits"};
-    if (logits_output == LogitsOutput::Last && state.logits.rows() != 1)
-        return Error{ErrorCode::InternalError, "execution graph produced an invalid final logits row count"};
     if (model.vulkan_runtime)
     {
         const VulkanStatistics final_vulkan_execution = get_vulkan_statistics(model.vulkan_runtime);
@@ -1657,18 +1654,8 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                 return executed.error();
             if (entry.logits)
             {
-                if (entry.state->logits.rows() != 1
-                    || entry.state->logits.columns() != model.descriptor.vocabulary_size)
-                {
-                    return Error{ErrorCode::InternalError, "gated-residual decode produced an invalid row count"};
-                }
                 const std::span<const float> values = entry.state->logits.values();
                 entry.logits->assign(values.begin(), values.end());
-            }
-            else
-            {
-                if (entry.state->logits.rows() != 0)
-                    return Error{ErrorCode::InternalError, "gated-residual decode produced unexpected logits"};
             }
         }
         return {};
@@ -1736,16 +1723,10 @@ Result<void> forward_decode_batch(const CompiledModel& model,
 
     auto merge_hidden_rows = [&entries, session_count](ActivationBuffer& merged) {
         const ActivationBuffer& first_hidden = entries.front().state->hidden;
-        if (first_hidden.rows() != 1)
-            return false;
         merged.reset(session_count, first_hidden.columns(), false);
         for (size_t session_index = 0; session_index < session_count; ++session_index)
         {
             const ActivationBuffer& hidden = entries[session_index].state->hidden;
-            if (hidden.rows() != 1 || hidden.columns() != merged.columns())
-            {
-                return false;
-            }
             std::copy_n(hidden.row(0),
                         merged.columns(),
                         merged.row(session_index));
@@ -1753,8 +1734,6 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         return true;
     };
     auto split_hidden_rows = [&entries, session_count](const ActivationBuffer& merged) {
-        if (merged.rows() != session_count)
-            return false;
         for (size_t session_index = 0; session_index < session_count; ++session_index)
         {
             ActivationBuffer& hidden = entries[session_index].state->hidden;
@@ -2007,8 +1986,6 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             if (!entry.logits)
                 continue;
             const ActivationBuffer& hidden = entry.state->hidden;
-            if (hidden.rows() != 1 || hidden.columns() != first.columns())
-                return Error{ErrorCode::InternalError, "staged LM head rows have an invalid shape"};
             std::copy_n(hidden.row(0), hidden.columns(), merged.row(output_row++));
         }
         const CompiledOperator& lm_head_operator = model.operators.at_weight(node->weights[0]);
@@ -2018,10 +1995,6 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         if (!headed)
             return headed.error();
         norm_deferred = false;
-        if (scratch.staged_output.rows() != requested_count)
-        {
-            return Error{ErrorCode::InternalError, "LM head produced an invalid row count"};
-        }
         workspace.expert.staged_logits_ready = true;
         workspace.expert.staged_logits_full_rows = false;
         return {};
@@ -2290,12 +2263,6 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         {
             combined.normalized_device = layer_workspace.device_input();
         }
-        if (combined.normalized.rows() != session_count
-            || combined.normalized.columns() != model.descriptor.hidden_size)
-        {
-            return Error{ErrorCode::InternalError, "Expert group has no staged Router input"};
-        }
-
         ExpertDispatchPlan& plan = combined.dispatch_plan;
         if (router_fused)
         {

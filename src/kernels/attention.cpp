@@ -350,17 +350,6 @@ static Result<void> project_and_append_qsa_keys(const WeightStore& weights,
         return Error{ErrorCode::UnsupportedModel, "QSA cache transactions are not supported"};
     if (plan.compression_ratio == 0 || plan.index_head_dimension == 0)
         return Error{ErrorCode::InvalidModel, "invalid QSA key cache dimensions"};
-    const uint64_t maximum_token_count = std::numeric_limits<uint32_t>::max();
-    if (cache.token_count > maximum_token_count
-        || normalized.rows() > maximum_token_count - cache.token_count)
-    {
-        return Error{ErrorCode::InvalidModel, "QSA key index exceeds uint32 storage"};
-    }
-    if (normalized.rows() != 0
-        && normalized.rows() - 1 > std::numeric_limits<uint64_t>::max() - position_offset)
-    {
-        return Error{ErrorCode::InvalidModel, "QSA query position overflows"};
-    }
     const size_t key_dimension = plan.index_head_dimension;
     const uint64_t tail_capacity_tokens = plan.compression_ratio - 1;
     if (tail_capacity_tokens > std::numeric_limits<size_t>::max() / key_dimension)
@@ -391,9 +380,6 @@ static Result<void> project_and_append_qsa_keys(const WeightStore& weights,
                           invalid_tensor_handle, normalized, scratch.qsa_query_key,
                           optimization_flags, ExecutionBackend::Cpu, quantized_input, nullptr);
     const uint32_t query_columns = plan.index_head_count * plan.index_head_dimension;
-    const uint32_t expected_columns = query_columns + plan.index_head_dimension;
-    if (scratch.qsa_query_key.columns() != expected_columns)
-        return Error{ErrorCode::InvalidModel, "invalid QSA projection output"};
     scratch.qsa_query.reset(normalized.rows(), query_columns, false);
     const uint32_t ratio = plan.compression_ratio;
     const uint32_t rope_dimension = plan.rope_head_dimension == 0

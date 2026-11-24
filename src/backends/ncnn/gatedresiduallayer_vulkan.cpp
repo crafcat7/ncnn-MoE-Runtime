@@ -194,8 +194,6 @@ std::shared_ptr<GatedResidualLayer_vulkan> GatedResidualLayer_vulkan::create(con
         impl.delta = model.operators.at(layer.attention.gated_delta_vulkan_operator).gated_delta;
     else
         impl.qsa = model.operators.at(layer.attention.vulkan_attention_operator).qsa_attention;
-    if ((!impl.delta && !impl.qsa) || (impl.delta && impl.qsa)) return {};
-    if ((impl.delta && impl.delta->vulkan_context() != impl.context) || (impl.qsa && impl.qsa->vulkan_context() != impl.context)) return {};
     impl.router = Router_vulkan::create(model.weights.at(layer.moe.router_weight),
                                         layer.moe.router_bias == invalid_tensor_handle ? nullptr : &model.weights.at(layer.moe.router_bias),
                                         layer.moe.router_selection_bias == invalid_tensor_handle ? nullptr : &model.weights.at(layer.moe.router_selection_bias),
@@ -206,18 +204,7 @@ std::shared_ptr<GatedResidualLayer_vulkan> GatedResidualLayer_vulkan::create(con
     {
         impl.ple_key = QnkLinear_vulkan::create(model.weights.at(impl.ple.key_weight), nullptr, layer.vulkan_device_index, model.vulkan_runtime, model.opt.optimization_flags);
         impl.ple_value = QnkLinear_vulkan::create(model.weights.at(impl.ple.value_weight), nullptr, layer.vulkan_device_index, model.vulkan_runtime, model.opt.optimization_flags);
-        if (!impl.ple_key || !impl.ple_value || impl.ple.embedding_shards.empty()) return {};
-        const uint32_t heads = (impl.ple.ngram_size - 1) * impl.ple.heads_per_ngram;
-        if (heads == 0 || impl.ple.embedding_dimension % heads != 0) return {};
-        for (auto handle : impl.ple.embedding_shards)
-        {
-            const auto& table = model.weights.at(handle);
-            if (table.shape.size() != 2 || table.shape[1] != impl.ple.embedding_dimension / heads
-                || (table.dtype != DType::IQ4NL && table.dtype != DType::IQ4XS && table.dtype != DType::Q4_0
-                    && table.dtype != DType::Q4_1 && table.dtype != DType::Q5_0 && table.dtype != DType::Q5_1
-                    && table.dtype != DType::Q8_0 && table.dtype != DType::MxFp4 && table.dtype != DType::NvFp4
-                    && table.dtype != DType::BFloat16 && table.dtype != DType::Float32)) return {};
-        }
+        if (!impl.ple_key || !impl.ple_value) return {};
         const std::lock_guard<std::mutex> lock(impl.context->command_mutex());
         impl.pipeline = residual_pipeline(impl.context, impl.opt);
         if (!impl.pipeline) return {};
@@ -271,8 +258,7 @@ static bool ple_rows(const WeightStore& weights, const PleBlockPlan& plan,
                      std::span<const int32_t> tokens, const LayerCache& cache, ActivationBuffer& packed,
                      uint32_t& encoding, uint32_t& stride, std::vector<int32_t>& next_history)
 {
-    if (plan.ngram_size < 2 || plan.heads_per_ngram == 0 || plan.embedding_shards.empty()
-        || cache.ple_token_history.size() > plan.ngram_size - 1) return false;
+    if (cache.ple_token_history.size() > plan.ngram_size - 1) return false;
     const uint32_t heads = (plan.ngram_size - 1) * plan.heads_per_ngram;
     const uint32_t dimension = plan.embedding_dimension / heads;
     const auto& first = weights.at(plan.embedding_shards.front());
@@ -401,9 +387,6 @@ bool GatedResidualLayer_vulkan::forward(const ActivationBuffer& initial_hidden, 
     const auto& impl = *d;
     auto& previous = *workspace.d;
     const bool has_previous = static_cast<bool>(previous.context);
-    if (tokens.empty() || tokens.size() > static_cast<size_t>(std::numeric_limits<int>::max())
-        || cache.transaction.active || cache.vulkan_attention_state_unknown
-        || (has_previous && (previous.context != impl.context || !previous.pending || previous.pending->rows() != tokens.size()))) return fail("invalid cache, token shape or device transition");
     uint32_t encoding = 0, stride = 0;
     auto& packed = previous.packed;
     auto& history = previous.history;
@@ -466,8 +449,8 @@ bool GatedResidualLayer_vulkan::forward(const ActivationBuffer& initial_hidden, 
         residual_record(impl.pipeline.get(), 7, impl.ple.embedding_dimension, heads, input.h, impl.ple.embedding_dimension,
                         0, 0, {packed_gpu, packed_gpu, packed_gpu, packed_gpu, packed_gpu, ple_norm}, cmd,
                         encoding, impl.ple.embedding_dimension / heads, stride);
-        if (!impl.ple_key->record_forward(ple_norm, ple_key, cmd, buffers)
-            || !impl.ple_value->record_forward(ple_norm, ple_value, cmd, buffers)) return fail("PLE key/value projection");
+        if (!impl.ple_key->record_forward(ple_norm, ple_key, cmd)
+            || !impl.ple_value->record_forward(ple_norm, ple_value, cmd)) return fail("PLE key/value projection");
         ncnn::VkMat key_normalized, query_normalized;
         if (!residual_allocate(key_normalized, expanded, input.h, impl.context)
             || !residual_allocate(query_normalized, expanded, input.h, impl.context)
@@ -640,7 +623,7 @@ bool GatedResidualLayer_vulkan::finish(const CompiledModel& model, bool produce_
     }
     else
         normalized = reduced;
-    if (!head.lm_head->record_forward(normalized, output, cmd, buffers)) return false;
+    if (!head.lm_head->record_forward(normalized, output, cmd)) return false;
     if (!prepare_staging_batch(slot.download, output.h, output.w, slot.staging_allocator)
         || !record_staging_download(output, output.h, output.w, slot.download, cmd, head.context->device(), head.opt)
         || submit_compute_and_wait(cmd, head.context->device()) != 0) return false;

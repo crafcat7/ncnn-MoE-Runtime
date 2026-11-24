@@ -134,23 +134,12 @@ std::shared_ptr<Mxfp4Linear_vulkan> Mxfp4Linear_vulkan::create_with_allocator(co
                                                                               VulkanWeightUploadBatch* upload_batch)
 {
 #if NCNN_MOE_WITH_VULKAN
-    if (matrix.dtype != DType::MxFp4 || matrix.shape.size() != 2 || matrix.shape[0] == 0 || matrix.shape[1] == 0 || matrix.shape[1] % 32 != 0
-        || !matrix.input_column_indices.empty()
-        || matrix.shape[0] > static_cast<uint32_t>(std::numeric_limits<int>::max() / 64)
-        || matrix.shape[1] > static_cast<uint32_t>(std::numeric_limits<int>::max()))
-    {
-        return {};
-    }
     const uint32_t output_columns = matrix.shape[0];
     const uint32_t input_columns = matrix.shape[1];
     const uint32_t block_count = input_columns / 32;
     const uint64_t expected_blocks = static_cast<uint64_t>(output_columns) * block_count * 16;
     const uint64_t expected_scales = static_cast<uint64_t>(output_columns) * block_count;
     if (matrix.mxfp4_blocks.size() != expected_blocks || matrix.mxfp4_scales.size() != expected_scales)
-    {
-        return {};
-    }
-    if (bias && (bias->shape.size() != 1 || bias->shape[0] != output_columns || (bias->dtype != DType::Float32 && bias->dtype != DType::BFloat16)))
     {
         return {};
     }
@@ -356,12 +345,6 @@ bool Mxfp4Linear_vulkan::forward(const ActivationBuffer& input, ActivationBuffer
 {
 #if NCNN_MOE_WITH_VULKAN
     const Implementation& implementation = *d;
-    if (!implementation.vulkan_context || !implementation.pipeline || input.rows() == 0 || input.dtype() != DType::Float32
-        || input.columns() != implementation.input_columns
-        || input.rows() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
-    {
-        return false;
-    }
     VulkanRuntimeState& runtime_state = implementation.vulkan_context->runtime_state();
 
     VulkanTransferLease transfer_lease = implementation.vulkan_context->acquire_transfer_slot();
@@ -1163,23 +1146,9 @@ bool Mxfp4Expert_vulkan::forward(const ActivationBuffer& input, ActivationBuffer
 {
 #if NCNN_MOE_WITH_VULKAN
     const Implementation& implementation = *d;
-    if (!implementation.gate_up || !implementation.down || !implementation.gate_up_pipeline)
-    {
-        return false;
-    }
     const Mxfp4Linear_vulkan::Implementation& gate = *implementation.gate_up->d;
     const Mxfp4Linear_vulkan::Implementation& down = *implementation.down->d;
-    if (!gate.vulkan_context || gate.vulkan_context != down.vulkan_context || input.rows() == 0
-        || input.dtype() != DType::Float32 || input.columns() != gate.input_columns
-        || input.rows() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
-    {
-        return false;
-    }
     const uint32_t intermediate_columns = gate.output_columns / 2;
-    if (down.input_columns != intermediate_columns)
-    {
-        return false;
-    }
     VulkanRuntimeState& runtime_state = gate.vulkan_context->runtime_state();
 
     VulkanTransferLease transfer_lease = gate.vulkan_context->acquire_transfer_slot();

@@ -572,15 +572,6 @@ bool Bfloat16Linear_vulkan::prepare_rms_norm(const TensorData& weight,
 {
 #if NCNN_MOE_WITH_VULKAN
     Implementation& implementation = *d;
-    if (!implementation.vulkan_context
-        || implementation.rms_norm_projection_pipeline
-        || epsilon <= 0.0f
-        || weight.shape.size() != 1 || weight.shape[0] != implementation.input_columns
-        || (weight.dtype != DType::Float32
-            && weight.dtype != DType::BFloat16))
-    {
-        return false;
-    }
 
     ncnn::Mat values;
     values.create(static_cast<int>(implementation.input_columns), sizeof(float));
@@ -654,8 +645,6 @@ bool Bfloat16Linear_vulkan::has_rms_norm_chain() const noexcept
 bool Bfloat16Linear_vulkan::prepare_input_rms_norm(const TensorData& weight, float epsilon, float weight_offset)
 {
 #if NCNN_MOE_WITH_VULKAN
-    if (!d->vulkan_context || weight.shape.size() != 1 || weight.shape[0] != d->input_columns || d->input_rms_norm)
-        return false;
     d->input_rms_norm = RmsNorm_vulkan::create(weight, epsilon, weight_offset, d->vulkan_context, d->option);
     return static_cast<bool>(d->input_rms_norm);
 #else
@@ -668,8 +657,6 @@ bool Bfloat16Linear_vulkan::prepare_input_rms_norm(const TensorData& weight, flo
 bool Bfloat16Linear_vulkan::prepare_output_rms_norm(const TensorData& weight, float epsilon)
 {
 #if NCNN_MOE_WITH_VULKAN
-    if (!d->vulkan_context || weight.shape.size() != 1 || weight.shape[0] != d->output_columns || d->output_rms_norm)
-        return false;
     d->output_rms_norm = RmsNorm_vulkan::create(weight, epsilon, 0.0f, d->vulkan_context, d->option);
     return static_cast<bool>(d->output_rms_norm);
 #else
@@ -685,20 +672,6 @@ bool Bfloat16Linear_vulkan::record_rms_norm_chain(const ncnn::VkMat& input,
                                                   ncnn::VkCompute& command) const
 {
     const Implementation& implementation = *d;
-    if (&input == &output || !implementation.vulkan_context || !implementation.pipeline
-        || !has_rms_norm_chain() || implementation.rms_norm_output_subgroups == 0
-        || input.empty() || input.dims != 2 || input.w != static_cast<int>(implementation.input_columns)
-        || input.h <= 0 || input.elempack != 1 || input.elemsize != sizeof(float)
-        || !input.allocator || input.allocator->vkdev != implementation.vulkan_context->device()
-        || activation_variant(implementation.option) != 0)
-        return false;
-    const uint64_t dispatch_width = ((static_cast<uint64_t>(implementation.output_columns)
-                                      + implementation.rms_norm_output_subgroups - 1)
-                                     / implementation.rms_norm_output_subgroups)
-                                    * implementation.rms_norm_output_subgroups * 32;
-    if (dispatch_width > static_cast<uint64_t>(std::numeric_limits<int>::max()))
-        return false;
-
     // Keep a distinct destination even if a caller supplies another view of
     // input. The fused shader still needs the original input while writing.
     ncnn::VkMat destination;
@@ -724,11 +697,7 @@ bool Bfloat16Linear_vulkan::record_rms_norm_chain_parallel(const ncnn::VkMat& in
                                                            ncnn::VkCompute& cmd,
                                                            std::vector<ncnn::VkMat>& workspace) const
 {
-    if (!d->output_rms_norm || d->vulkan_context != next.d->vulkan_context
-        || d->vulkan_context != parallel.d->vulkan_context
-        || activation_variant(d->option) != 0
-        || activation_variant(next.d->option) != 0
-        || activation_variant(parallel.d->option) != 0)
+    if (!d->output_rms_norm)
         return false;
     ncnn::VkMat intermediate;
     if (forward(input, intermediate, cmd, d->option) != 0
@@ -746,18 +715,10 @@ bool Bfloat16Linear_vulkan::forward_rms_norm_chain(const ActivationBuffer& input
 {
 #if NCNN_MOE_WITH_VULKAN
     const Implementation& implementation = *d;
-    if (!implementation.vulkan_context
-        || !implementation.pipeline
-        || !implementation.rms_norm_projection_pipeline
+    if (!implementation.rms_norm_projection_pipeline
         || implementation.rms_norm_weight.empty()
-        || implementation.rms_norm_output_subgroups == 0
-        || input.rows() == 0
-        || input.columns() != implementation.input_columns
-        || input.rows() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
-    {
+        || implementation.rms_norm_output_subgroups == 0)
         return false;
-    }
-
     VulkanRuntimeState& runtime_state = implementation.vulkan_context->runtime_state();
 
     VulkanTransferLease transfer_lease = implementation.vulkan_context->acquire_transfer_slot();
@@ -1383,16 +1344,6 @@ bool Bfloat16Linear_vulkan::record_coop(const ncnn::VkMat& input,
 {
 #if NCNN_MOE_WITH_VULKAN
     const Implementation& implementation = *d;
-    if (!implementation.coop_gemm || !implementation.vulkan_context
-        || (normalize && !implementation.input_rms_norm)
-        || input.dims != 2 || input.elemsize != sizeof(float) || input.elempack != 1
-        || input.h < 32 || input.w != static_cast<int>(implementation.input_columns)
-        || output.dims != 2 || output.elemsize != sizeof(float) || output.elempack != 1
-        || output.w != static_cast<int>(implementation.output_columns)
-        || output.h != input.h)
-    {
-        return false;
-    }
     // The Gemm path cannot fold the norm into its tile loads, so the prepared
     // normalization is materialized first when the caller asks for it.
     ncnn::VkMat source = input;
@@ -1440,7 +1391,7 @@ void Bfloat16Linear_vulkan::record_scalar_projection(const ncnn::VkMat& input,
                       implementation.bias, output, cmd);
         return;
     }
-    if (record_coop(input, output, cmd))
+    if (implementation.coop_gemm && record_coop(input, output, cmd))
         return;
     const std::vector<ncnn::VkMat> bindings = {
         input,
@@ -1469,6 +1420,17 @@ void Bfloat16Linear_vulkan::record_scalar_projection(const ncnn::VkMat& input,
     (void)output;
     (void)cmd;
 #endif
+}
+
+void Bfloat16Linear_vulkan::record_norm_projection(const ncnn::VkMat& input,
+                                                   ncnn::VkMat& output,
+                                                   ncnn::VkCompute& cmd,
+                                                   ncnn::VkMat* row_scale_workspace) const
+{
+    const Implementation& implementation = *d;
+    if (implementation.coop_gemm && record_coop(input, output, cmd, true))
+        return;
+    record_rms_norm_projection(input, output, cmd, row_scale_workspace);
 }
 
 void Bfloat16Linear_vulkan::record_rms_norm_projection(const ncnn::VkMat& input,
@@ -1551,30 +1513,12 @@ int Bfloat16Linear_vulkan::forward(const ncnn::VkMat& input,
 {
 #if NCNN_MOE_WITH_VULKAN
     const Implementation& implementation = *d;
-    if (!implementation.vulkan_context
-        || !implementation.pipeline
-        || input.empty()
-        || input.dims != 2
-        || input.w != static_cast<int>(implementation.input_columns)
-        || input.h <= 0
-        || input.elempack != 1
-        || input.elemsize != sizeof(float))
-    {
-        return -1;
-    }
-#if NCNN_BATCH
-    if (input.n != 1) return -1;
-#endif
-    if (input.buffer_capacity() < static_cast<uint64_t>(input.w) * input.h * sizeof(float)) return -1;
-    if (&input == &output) return -1;
-
     output.create(static_cast<int>(implementation.output_columns),
                   input.h,
                   sizeof(float),
                   opt.blob_vkallocator);
     if (output.empty())
         return -100;
-    if (output.data == input.data || output.buffer_capacity() < static_cast<uint64_t>(implementation.output_columns) * input.h * sizeof(float)) return -1;
 
     if (implementation.single_row_pipeline && single_row_input(input, implementation.input_columns))
     {
@@ -1585,7 +1529,7 @@ int Bfloat16Linear_vulkan::forward(const ncnn::VkMat& input,
     }
     // Prefill takes the cooperative-matrix Gemm when the weights and shape fit;
     // this is the same reuse record_scalar_projection already applies.
-    if (record_coop(input, output, cmd))
+    if (implementation.coop_gemm && record_coop(input, output, cmd))
         return 0;
     if (implementation.record_tile(input, output, static_cast<uint32_t>(input.h),
                                    ncnn::VkMat(), ncnn::VkMat(), cmd))
@@ -1645,15 +1589,6 @@ bool Bfloat16Linear_vulkan::forward(const ActivationBuffer& input,
 {
 #if NCNN_MOE_WITH_VULKAN
     const Implementation& implementation = *d;
-    if (!implementation.vulkan_context
-        || !implementation.pipeline
-        || input.rows() == 0
-        || input.columns() != implementation.input_columns
-        || input.rows()
-               > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
-    {
-        return false;
-    }
 
     VulkanRuntimeState& runtime_state = implementation.vulkan_context->runtime_state();
     VulkanTransferLease transfer_lease = implementation.vulkan_context->acquire_transfer_slot();
@@ -1889,8 +1824,8 @@ bool Bfloat16Linear_vulkan::forward_parallel(const ActivationBuffer& input,
     ++runtime_state.batch_uploads;
     runtime_state.batch_downloads += 2;
     if (first_used_cooperative_matrix)
-    if (parallel_used_cooperative_matrix)
-    return true;
+        if (parallel_used_cooperative_matrix)
+            return true;
 #else
     (void)input;
     (void)parallel_operator;
@@ -2098,19 +2033,6 @@ bool Bfloat16Linear_vulkan::record_swiglu_chain(const ncnn::VkMat& input,
 {
     const auto& first = *d;
     const auto& down = *down_operator.d;
-    uint64_t fused_columns = 0;
-    if (&input == &output || (activation != ExpertActivation::Silu && activation != ExpertActivation::DeepSeekSwiGlu)
-        || !first.vulkan_context || first.vulkan_context != down.vulkan_context || !first.pipeline
-        || input.empty() || input.dims != 2 || input.elempack != 1 || input.elemsize != sizeof(float)
-        || input.h <= 0 || input.w != static_cast<int>(first.input_columns)
-        || !input.allocator || input.allocator->vkdev != first.vulkan_context->device()
-        || static_cast<uint32_t>(input.h) > first.vulkan_context->device()->info.max_workgroup_count_y()
-        || activation_variant(first.option) != 0 || activation_variant(down.option) != 0
-        || !swiglu_shape(intermediate_columns, apply_router_gate,
-                         static_cast<uint64_t>(input.h), fused_columns)
-        || first.output_columns != fused_columns || down.input_columns != intermediate_columns
-        || intermediate_columns % 128 != 0 || down.packed.empty() || down.bias.empty())
-        return false;
     if (!first.swiglu_down_pipeline
         && !create_bfloat16_swiglu_down_pipeline(first.vulkan_context, first.option, first.swiglu_down_pipeline))
         return false;
@@ -2123,7 +2045,7 @@ bool Bfloat16Linear_vulkan::record_swiglu_chain(const ncnn::VkMat& input,
     workspace.push_back(result);
     std::vector<ncnn::VkMat> bindings;
     std::vector<ncnn::vk_constant_type> constants;
-    const bool cooperative = first.record_projection(input, fused, static_cast<uint32_t>(input.h), command, bindings, constants);
+    (void)first.record_projection(input, fused, static_cast<uint32_t>(input.h), command, bindings, constants);
     bindings = {fused, down.packed, down.bias, result};
     constants.resize(6);
     constants[0].u32 = intermediate_columns;
@@ -2155,10 +2077,6 @@ bool Bfloat16Linear_vulkan::forward_swiglu_chain_device(const DeviceTensor_vulka
 #if NCNN_MOE_WITH_VULKAN
     const auto& context = d->vulkan_context;
     const auto* source = input.value();
-    if (&input == &output || !context || !source || source->dims != 2
-        || source->elempack <= 0 || source->elemsize != sizeof(float) * static_cast<size_t>(source->elempack)
-        || input.vulkan_context() != context)
-        return false;
     const ncnn::VkMat retained_input = *source;
     auto lease = context->acquire_transfer_slot();
     auto& slot = lease.slot();
@@ -2370,15 +2288,13 @@ bool Bfloat16Expert_vulkan::forward(const ActivationBuffer& input,
 {
 #if NCNN_MOE_WITH_VULKAN
     const Implementation& implementation = *d;
-    return implementation.gate_up
-           && implementation.down
-           && implementation.gate_up->forward_swiglu_chain(input,
-                                                           *implementation.down,
-                                                           implementation.intermediate_columns,
-                                                           implementation.activation,
-                                                           implementation.activation_limit,
-                                                           false,
-                                                           output);
+    return implementation.gate_up->forward_swiglu_chain(input,
+                                                        *implementation.down,
+                                                        implementation.intermediate_columns,
+                                                        implementation.activation,
+                                                        implementation.activation_limit,
+                                                        false,
+                                                        output);
 #else
     (void)input;
     (void)output;
@@ -2414,16 +2330,12 @@ bool Bfloat16Expert_vulkan::record(const ncnn::VkMat& input, ncnn::VkMat& output
     const auto& gate = *expert.gate_up->d;
     const auto& down = *expert.down->d;
     uint32_t fused_columns = 0;
-    if (input.empty() || input.dims != 2 || input.elempack != 1 || input.elemsize != sizeof(float)
-        || input.w != static_cast<int>(expert.input_columns) || input.h <= 0
-        || !gate.swiglu_down_pipeline || activation_variant(gate.option) != 0
-        || !expert_shape(gate.output_columns, static_cast<uint64_t>(input.h), fused_columns))
-        return false;
+    expert_shape(gate.output_columns, static_cast<uint64_t>(input.h), fused_columns);
     ncnn::VkMat fused;
     fused.create(static_cast<int>(fused_columns), input.h, sizeof(float), expert.vulkan_context->blob_allocator());
     if (fused.empty()) return false;
     workspace.push_back(fused);
-    if (gate.record_projection(input, fused, static_cast<uint32_t>(input.h), command, bindings, constants))
+    (void)gate.record_projection(input, fused, static_cast<uint32_t>(input.h), command, bindings, constants);
     bindings = {fused, down.packed, down.bias, output};
     constants.resize(6);
     constants[0].u32 = expert.intermediate_columns;
@@ -2454,109 +2366,19 @@ bool Bfloat16Expert_vulkan::forward_batch(std::span<const Bfloat16Expert_vulkan*
                                           std::span<ActivationBuffer*> outputs)
 {
 #if NCNN_MOE_WITH_VULKAN
-    if (experts.empty()
-        || experts.size() != inputs.size()
-        || experts.size() != outputs.size())
-    {
-        return false;
-    }
-
-    const Bfloat16Expert_vulkan* first_operator = experts.front();
-    if (!first_operator || !first_operator->d)
-        return false;
-    const Implementation& first_expert = *first_operator->d;
-    if (!first_expert.gate_up
-        || !first_expert.down
-        || !first_expert.vulkan_context)
-    {
-        return false;
-    }
+    const Implementation& first_expert = *experts.front()->d;
     const Bfloat16Linear_vulkan::Implementation& first_gate = *first_expert.gate_up->d;
     const Bfloat16Linear_vulkan::Implementation& first_down = *first_expert.down->d;
-    if (!first_gate.pipeline
-        || !first_gate.swiglu_down_pipeline
-        || first_down.packed.empty()
-        || first_down.bias.empty()
-        || first_gate.output_columns % 2 != 0
-        || first_down.input_columns != first_expert.intermediate_columns
-        || first_down.output_columns != first_expert.output_columns)
-    {
-        return false;
-    }
-
     const uint32_t input_columns = first_gate.input_columns;
     const uint32_t output_columns = first_down.output_columns;
-    if (input_columns == 0
-        || output_columns == 0
-        || first_expert.intermediate_columns == 0
-        || first_expert.intermediate_columns % 128 != 0)
-    {
-        return false;
-    }
 
     size_t total_rows = 0;
     bool shared_input = true;
     for (size_t index = 0; index < experts.size(); ++index)
     {
-        const Bfloat16Expert_vulkan* operator_instance = experts[index];
         const ActivationBuffer* input = inputs[index];
-        const ActivationBuffer* output = outputs[index];
-        if (!operator_instance
-            || !operator_instance->d
-            || !input
-            || !output
-            || input->rows() == 0
-            || input->rows() > static_cast<size_t>(std::numeric_limits<uint32_t>::max())
-            || input->rows() > static_cast<size_t>(std::numeric_limits<int>::max())
-            || input->dtype() != DType::Float32
-            || input->columns() != input_columns
-            || output->dtype() != DType::Float32)
-        {
-            return false;
-        }
-        const Implementation& expert = *operator_instance->d;
-        if (!expert.gate_up
-            || !expert.down
-            || !expert.vulkan_context
-            || expert.vulkan_context != first_expert.vulkan_context
-            || expert.intermediate_columns != first_expert.intermediate_columns
-            || expert.output_columns != output_columns
-            || expert.activation != first_expert.activation
-            || expert.activation_limit != first_expert.activation_limit)
-        {
-            return false;
-        }
-        const Bfloat16Linear_vulkan::Implementation& gate = *expert.gate_up->d;
-        const Bfloat16Linear_vulkan::Implementation& down = *expert.down->d;
-        if (!gate.pipeline
-            || !gate.swiglu_down_pipeline
-            || down.packed.empty()
-            || down.bias.empty()
-            || gate.vulkan_context != first_expert.vulkan_context
-            || down.vulkan_context != first_expert.vulkan_context
-            || gate.input_columns != input_columns
-            || gate.output_columns != first_gate.output_columns
-            || down.input_columns != first_down.input_columns
-            || down.output_columns != output_columns
-            || activation_variant(gate.option)
-                   != activation_variant(first_gate.option))
-        {
-            return false;
-        }
-        if (total_rows > static_cast<size_t>(std::numeric_limits<uint32_t>::max())
-                             - input->rows()
-            || total_rows > static_cast<size_t>(std::numeric_limits<int>::max())
-                                - input->rows())
-        {
-            return false;
-        }
         total_rows += input->rows();
         shared_input = shared_input && input == inputs.front();
-    }
-    if (total_rows == 0
-        || total_rows > static_cast<size_t>(std::numeric_limits<int>::max()))
-    {
-        return false;
     }
 
     const size_t upload_rows = shared_input ? inputs.front()->rows() : total_rows;
@@ -2578,22 +2400,13 @@ bool Bfloat16Expert_vulkan::forward_batch(std::span<const Bfloat16Expert_vulkan*
     }
 
     ncnn::Mat mapped_input = transfer_slot.upload.mapped();
-    if (mapped_input.empty()
-        || mapped_input.dims != 2
-        || mapped_input.w != static_cast<int>(input_columns)
-        || mapped_input.h != static_cast<int>(upload_rows)
-        || mapped_input.elemsize != sizeof(float)
-        || mapped_input.elempack != 1)
-    {
+    if (mapped_input.empty())
         return false;
-    }
     auto* mapped_input_data = static_cast<std::byte*>(mapped_input.data);
     size_t row_offset = 0;
     for (const ActivationBuffer* input : inputs)
     {
         const size_t input_size = input->rows() * static_cast<size_t>(input_columns) * sizeof(float);
-        if (input->bytes().size() != input_size)
-            return false;
         std::memcpy(mapped_input_data
                         + row_offset * static_cast<size_t>(input_columns) * sizeof(float),
                     input->bytes().data(),
@@ -2677,7 +2490,7 @@ bool Bfloat16Expert_vulkan::forward_batch(std::span<const Bfloat16Expert_vulkan*
                                                                     constants);
         if (used_cooperative_matrix)
 
-        bindings[0] = fused_gpu;
+            bindings[0] = fused_gpu;
         bindings[1] = down.packed;
         bindings[2] = down.bias;
         bindings[3] = output_view;

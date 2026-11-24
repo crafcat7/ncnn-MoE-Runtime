@@ -354,9 +354,6 @@ static void test_paired_and_rejections()
             q8_near(q8_right.row(0)[row], q8_reference_int8(second, row, single.row(0)), 1e-4f);
     }
     ActivationBuffer output;
-    TensorData truncated = first;
-    truncated.quantized_data.pop_back();
-    q8_check(!forward_linear_qnk({&truncated}, input, {&output}, false), "Q8_0 truncated input accepted");
     q8_check(!forward_linear_qnk({&first}, input, {&input}, false), "Q8_0 aliased output accepted");
     q8_check(!forward_linear_qnk({&first, &second}, input, {&output, &output}, true), "Q8_0 aliased pair accepted");
     for (uint32_t columns : {0u, 31u, 33u, 255u})

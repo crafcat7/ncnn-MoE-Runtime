@@ -117,12 +117,6 @@ struct AttentionConfig_vulkan
     DType kv_cache_dtype = DType::Float32;
     // Device storage; Float16 when the device cannot store BF16.
     DType kv_dtype = DType::Float32;
-    // Sliding-window caches wrap; contiguous caches keep one K/V copy.
-    bool kv_double = true;
-    // Long-KV policy: FP16 storage and full-window preallocation.
-    bool kv_fp16 = false;
-    bool kv_full = false;
-    uint32_t kv_tokens = 0;
     uint32_t flags = 0;
     uint64_t optimization_flags = OptimizationDefaultFlags;
 };

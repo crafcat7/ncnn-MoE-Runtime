@@ -97,10 +97,6 @@ struct SpeculativeModelPlan
 // public SessionOptions default is zero, which resolves to this value (or 128
 // for CPU Gated DeltaNet prefill) inside Session.
 inline constexpr uint32_t default_prefill_rows = 512;
-// KV switches: FP16 storage above 64k, full-window preallocation above 128k.
-inline constexpr uint32_t kv_fp16_tokens = 64 * 1024;
-inline constexpr uint32_t kv_full_tokens = 128 * 1024;
-
 struct CompiledModel
 {
     MoeModelDescriptor descriptor;

@@ -97,7 +97,6 @@ MoeCombine_vulkan::~MoeCombine_vulkan() = default;
 std::shared_ptr<MoeCombine_vulkan> MoeCombine_vulkan::create(std::shared_ptr<VulkanContext> context)
 {
 #if NCNN_MOE_WITH_VULKAN
-    if (!context) return {};
     // Declare the owner before locking: on failure its pipeline deleter must
     // run after the command lock is released.
     auto result = std::shared_ptr<MoeCombine_vulkan>(new MoeCombine_vulkan);
@@ -201,52 +200,12 @@ bool MoeCombine_vulkan::forward(std::span<const MoeCombineInput_vulkan> inputs,
 }
 
 #if NCNN_MOE_WITH_VULKAN
-bool MoeCombine_vulkan::valid_inputs(std::span<const MoeCombineInput_vulkan> inputs,
-                                     size_t rows, uint32_t columns, const ActivationBuffer* shared_host,
-                                     const std::shared_ptr<const DeviceTensor_vulkan>& shared_device) const
-{
-    if (rows == 0 || rows > static_cast<size_t>(std::numeric_limits<int>::max())
-        || columns == 0 || columns > static_cast<uint32_t>(std::numeric_limits<int>::max())
-        || rows > std::numeric_limits<uint32_t>::max() / columns) return false;
-    const auto& context = d->context;
-    const auto& pipeline = d->pipeline;
-    if (!context || !pipeline) return false;
-    for (const auto& input : inputs)
-    {
-        if (input.routes.empty() || input.routes.size() > static_cast<size_t>(std::numeric_limits<int>::max() / 2)
-            || input.routes.size() > std::numeric_limits<uint32_t>::max() / columns) return false;
-        if (input.device && !input.device->empty())
-        {
-            if (input.device->vulkan_context() != context) return false;
-            const auto* value = input.device->value();
-            if (!value || value->dims != 2 || value->elempack != 1 || value->elemsize != sizeof(float)
-                || input.device->rows() != input.routes.size() || input.device->columns() != columns) return false;
-        }
-        else if (!input.host || input.host->dtype() != DType::Float32
-                 || input.host->rows() != input.routes.size() || input.host->columns() != columns)
-            return false;
-        for (const auto& route : input.routes)
-            if (route.token_index >= rows) return false;
-    }
-    const bool has_shared_device = shared_device && !shared_device->empty();
-    const bool has_shared_host = shared_host && shared_host->rows() != 0;
-    if (has_shared_device)
-    {
-        const auto* value = shared_device->value();
-        if (!value || value->dims != 2 || value->elempack != 1 || value->elemsize != sizeof(float)
-            || shared_device->vulkan_context() != context || shared_device->rows() != rows || shared_device->columns() != columns) return false;
-    }
-    if (!has_shared_device && has_shared_host && (shared_host->dtype() != DType::Float32 || shared_host->rows() != rows || shared_host->columns() != columns)) return false;
-    return !inputs.empty() || has_shared_device || has_shared_host;
-}
-
 bool MoeCombine_vulkan::record_inputs(std::span<const MoeCombineInput_vulkan> inputs,
                                       size_t rows, uint32_t columns, const ActivationBuffer* shared_host,
                                       const std::shared_ptr<const DeviceTensor_vulkan>& shared_device,
                                       ncnn::VkMat& combined, ncnn::VkCompute& cmd,
                                       std::vector<ncnn::VkMat>& temporaries, uint64_t& uploads) const
 {
-    if (!valid_inputs(inputs, rows, columns, shared_host, shared_device)) return false;
     const auto& context = d->context;
     const auto& pipeline = d->pipeline;
     const auto& opt = d->opt;
@@ -352,26 +311,6 @@ bool MoeCombine_vulkan::record_device_inputs(std::span<const MoeCombineDeviceInp
                                              ncnn::VkCompute& command, std::vector<ncnn::VkMat>& storage,
                                              const ncnn::VkMat* shared, uint64_t* recorded_dispatches) const
 {
-    if (!d->context || !d->pipeline || (inputs.empty() && !shared) || rows == 0
-        || rows >= static_cast<size_t>(std::numeric_limits<int>::max()) || columns == 0
-        || columns > static_cast<uint32_t>(std::numeric_limits<int>::max())
-        || rows > std::numeric_limits<uint32_t>::max() / columns)
-        return false;
-    if (shared && (shared == &output || shared->empty() || shared->dims != 2 || shared->elempack != 1 || shared->elemsize != sizeof(float) || shared->w != static_cast<int>(columns) || shared->h != static_cast<int>(rows) || !shared->allocator || shared->allocator->vkdev != d->context->device()))
-        return false;
-    for (const auto& input : inputs)
-    {
-        const auto* value = input.value;
-        if (!value || value == &output || value->empty() || value->dims != 2 || value->elempack != 1
-            || value->elemsize != sizeof(float) || value->w != static_cast<int>(columns)
-            || value->h <= 0 || static_cast<size_t>(value->h) != input.routes.size()
-            || !value->allocator || value->allocator->vkdev != d->context->device()
-            || input.routes.size() > (static_cast<size_t>(std::numeric_limits<int>::max()) - rows - 1) / 2
-            || input.routes.size() > std::numeric_limits<uint32_t>::max() / columns)
-            return false;
-        for (const auto& route : input.routes)
-            if (route.token_index >= rows) return false;
-    }
     output.create(static_cast<int>(columns), static_cast<int>(rows), sizeof(float), d->context->blob_allocator());
     if (output.empty()) return false;
     const bool single_row = rows == 1 && !shared && d->single_row_pipeline
@@ -467,7 +406,6 @@ std::shared_ptr<MoeCombinePending_vulkan> MoeCombine_vulkan::prepare(std::span<c
                                                                      std::shared_ptr<const DeviceTensor_vulkan> shared_device) const
 {
 #if NCNN_MOE_WITH_VULKAN
-    if (!valid_inputs(inputs, rows, columns, shared_host, shared_device)) return {};
     try
     {
         auto pending = std::shared_ptr<MoeCombinePending_vulkan>(new MoeCombinePending_vulkan);
@@ -514,7 +452,6 @@ bool MoeCombine_vulkan::combine(std::span<const MoeCombineInput_vulkan> inputs,
                                 std::shared_ptr<DeviceTensor_vulkan>& output) const
 {
 #if NCNN_MOE_WITH_VULKAN
-    if (!valid_inputs(inputs, rows, columns, shared_host, shared_device)) return false;
     auto lease = d->context->acquire_transfer_slot();
     auto& slot = lease.slot();
     auto& state = d->context->runtime_state();

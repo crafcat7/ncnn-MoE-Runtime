@@ -537,12 +537,9 @@ endif()
 # Embed GLSL for runtime compilation.
 if(NCNN_MOE_WITH_VULKAN)
     set(NCNN_MOE_VULKAN_SHADER_SOURCES
-        src/kernels/vulkan/attention_decode_merge.comp
+        src/kernels/vulkan/attn_decode_merge.comp
         src/kernels/vulkan/attention_decode_sdpa.comp
-        src/kernels/vulkan/attention_decode_split.comp
-        src/kernels/vulkan/attention_decode_split_subgroup.comp
-        src/kernels/vulkan/attention_prefill_flash.comp
-        src/kernels/vulkan/attention_prefill_flash128.comp
+        src/kernels/vulkan/attn_decode_split.comp
         src/kernels/vulkan/attention_gqa_matrix.comp
         src/kernels/vulkan/attention_gqa_reduce.comp
         src/kernels/vulkan/attention_output_gate.comp
@@ -609,23 +606,52 @@ if(NCNN_MOE_WITH_VULKAN)
         src/kernels/vulkan/qnk_projection.comp
         src/kernels/vulkan/qnk_swiglu.comp
     )
+    set(NCNN_MOE_ATTN_PREFILL_TEMPLATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/vulkan/attn_prefill.comp.in")
+    set(NCNN_MOE_ATTN_PREFILL_HEAD_DIM 64)
+    set(NCNN_MOE_ATTN_PREFILL_QUERY_TILE 64)
+    set(NCNN_MOE_ATTN_PREFILL_KEY_TILE 64)
+    set(NCNN_MOE_ATTN_PREFILL_ROWS 8)
+    configure_file(
+        "${NCNN_MOE_ATTN_PREFILL_TEMPLATE}"
+        "${CMAKE_CURRENT_BINARY_DIR}/kernels/vulkan/attn_prefill64.comp"
+        @ONLY)
+    set(NCNN_MOE_ATTN_PREFILL_HEAD_DIM 128)
+    set(NCNN_MOE_ATTN_PREFILL_QUERY_TILE 32)
+    set(NCNN_MOE_ATTN_PREFILL_KEY_TILE 32)
+    set(NCNN_MOE_ATTN_PREFILL_ROWS 4)
+    configure_file(
+        "${NCNN_MOE_ATTN_PREFILL_TEMPLATE}"
+        "${CMAKE_CURRENT_BINARY_DIR}/kernels/vulkan/attn_prefill128.comp"
+        @ONLY)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${NCNN_MOE_ATTN_PREFILL_TEMPLATE}")
+    list(APPEND NCNN_MOE_VULKAN_SHADER_SOURCES
+        "${CMAKE_CURRENT_BINARY_DIR}/kernels/vulkan/attn_prefill64.comp"
+        "${CMAKE_CURRENT_BINARY_DIR}/kernels/vulkan/attn_prefill128.comp")
+
     set(NCNN_MOE_VULKAN_SHADER_HEADERS)
     foreach(NCNN_MOE_SHADER_SOURCE IN LISTS NCNN_MOE_VULKAN_SHADER_SOURCES)
         get_filename_component(
             NCNN_MOE_SHADER_NAME
             "${NCNN_MOE_SHADER_SOURCE}"
             NAME_WE)
+        if(IS_ABSOLUTE "${NCNN_MOE_SHADER_SOURCE}")
+            set(NCNN_MOE_SHADER_PATH "${NCNN_MOE_SHADER_SOURCE}")
+        else()
+            set(NCNN_MOE_SHADER_PATH "${CMAKE_CURRENT_SOURCE_DIR}/${NCNN_MOE_SHADER_SOURCE}")
+        endif()
         set(NCNN_MOE_SHADER_HEADER
             "${CMAKE_CURRENT_BINARY_DIR}/kernels/vulkan/${NCNN_MOE_SHADER_NAME}.comp.hex.h")
         add_custom_command(
             OUTPUT "${NCNN_MOE_SHADER_HEADER}"
             COMMAND ${CMAKE_COMMAND}
-                -DSHADER_SRC=${CMAKE_CURRENT_SOURCE_DIR}/${NCNN_MOE_SHADER_SOURCE}
+                -DSHADER_SRC=${NCNN_MOE_SHADER_PATH}
                 -DSHADER_COMP_HEADER=${NCNN_MOE_SHADER_HEADER}
                 -DSHADER_VARIABLE=${NCNN_MOE_SHADER_NAME}_shader
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ncnn_moe_generate_shader_comp_header.cmake"
             DEPENDS
-                "${CMAKE_CURRENT_SOURCE_DIR}/${NCNN_MOE_SHADER_SOURCE}"
+                "${NCNN_MOE_SHADER_PATH}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ncnn_moe_generate_shader_comp_header.cmake"
             COMMENT "Preprocessing MoE Vulkan shader ${NCNN_MOE_SHADER_NAME}.comp"
             VERBATIM
@@ -647,15 +673,6 @@ if(NCNN_MOE_WITH_VULKAN)
         ncnn-moe-generate-vulkan-shaders
         DEPENDS ${NCNN_MOE_VULKAN_SHADER_HEADERS})
     add_dependencies(ncnn_moe ncnn-moe-generate-vulkan-shaders)
-    source_group(
-        TREE "${CMAKE_CURRENT_SOURCE_DIR}/src"
-        FILES ${NCNN_MOE_VULKAN_SHADER_SOURCES})
-endif()
-
-if(MSVC)
-    target_compile_options(ncnn_moe PRIVATE /W4 /permissive-)
-else()
-    target_compile_options(ncnn_moe PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 # ==============================================================================

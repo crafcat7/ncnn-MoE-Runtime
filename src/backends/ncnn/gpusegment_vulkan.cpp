@@ -54,13 +54,6 @@ public:
     {
         const auto* aggregate = recorded_combined ? recorded_combined : combined ? combined->value()
                                                                                  : nullptr;
-        if (!context || !add || !normalized || !residual || !aggregate
-            || normalized->empty() || residual->empty() || aggregate->empty()
-            || !normalized->value() || !residual->value() || aggregate->dims != 2
-            || aggregate->elempack != 1 || aggregate->elemsize != sizeof(float)
-            || !aggregate->allocator || aggregate->allocator->vkdev != context->device()
-            || residual->rows() != static_cast<size_t>(aggregate->h)
-            || residual->columns() != static_cast<uint32_t>(aggregate->w)) return false;
         residual->prepare_read();
         // A just-recorded aggregate already carries its producer's access
         // state. Only completed operands need cross-command rearming.
@@ -788,7 +781,7 @@ public:
                     return false;
                 }
                 if (d->lm_head.qnk)
-                    recorded = d->lm_head.qnk->record_forward(normalized, output, command, storage);
+                    recorded = d->lm_head.qnk->record_forward(normalized, output, command);
                 else if (d->lm_head.float8)
                     recorded = d->lm_head.float8->record_forward(normalized, output, command, storage);
                 else if (d->lm_head.bfloat16)
@@ -1235,11 +1228,6 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
     for (size_t layer = 0; layer < limit; ++layer)
     {
         const auto& segment = model.gpu_segments[layer];
-        if (!context || !segment || segment->context() != context)
-        {
-            error = "resident graph chain has incompatible devices";
-            return false;
-        }
         const bool dense = model.net.layer_plans[layer].dense_ffn.down_weight != invalid_tensor_handle;
         if (dense)
         {
@@ -1296,15 +1284,17 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
     // recorded chunk heavier, so keep the command size roughly constant
     // instead of using the short-context divisor.
     const uint64_t context_tokens = caches.empty() ? 0 : caches.front()->token_count;
-    const double divisor = context->device()->info.type() == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
-                               ? (context_tokens < 2048
-                                      ? 64.0
-                                  : context_tokens < 8192
-                                      ? std::clamp(static_cast<double>(context_tokens) / 64.0,
-                                                   256.0, 512.0)
-                                      : std::clamp(static_cast<double>(context_tokens) / 64.0,
-                                                   512.0, 1024.0))
-                               : 40.0;
+    double divisor = 40.0;
+    if (context->device()->info.type() == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU)
+    {
+        const double scaled = static_cast<double>(context_tokens) / 64.0;
+        if (context_tokens < 2048)
+            divisor = 64.0;
+        else if (context_tokens < 8192)
+            divisor = std::clamp(scaled, 256.0, 512.0);
+        else
+            divisor = std::clamp(scaled, 512.0, 1024.0);
+    }
     GpuSubmissionBudget budget(total_work, divisor);
     bool successful = false, submitted = false, chunk_attempted = false;
     const auto cleanup = [&](void*) {

@@ -42,13 +42,6 @@ LayerNorm_vulkan::create(const TensorData& weight,
                          ncnn::VkAllocator* weight_allocator)
 {
 #if NCNN_MOE_WITH_VULKAN
-    if (!context || epsilon <= 0.0f
-        || weight.shape.size() != 1 || weight.shape[0] == 0
-        || weight.shape[0] > static_cast<uint32_t>(std::numeric_limits<int>::max())
-        || bias.shape != weight.shape || bias.dtype != weight.dtype
-        || activation_variant(opt) != 0)
-        return {};
-
     ncnn::Mat gamma;
     ncnn::Mat beta;
     if (!prepare_float_tensor_upload(weight, gamma)
@@ -122,11 +115,6 @@ bool LayerNorm_vulkan::record(const ncnn::VkMat& input,
 {
 #if NCNN_MOE_WITH_VULKAN
     const auto& impl = *d;
-    if (&input == &output || !impl.context || !impl.layer
-        || input.empty() || input.dims != 2 || input.elempack != 1
-        || input.elemsize != sizeof(float)
-        || input.w != static_cast<int>(impl.columns) || input.h <= 0)
-        return false;
     if (output.data && output.buffer() == input.buffer())
         output.release();
     output.create(input.w, input.h, sizeof(float), impl.context->blob_allocator());

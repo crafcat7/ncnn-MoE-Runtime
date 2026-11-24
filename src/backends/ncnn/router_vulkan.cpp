@@ -16,43 +16,6 @@
 namespace ncnn {
 namespace moe {
 
-static bool valid_router_options(const ExpertDispatchOptions& options,
-                                 size_t rows)
-{
-    const bool known_score = options.score_function == RouterScoreFunction::Softmax
-                             || options.score_function == RouterScoreFunction::Sigmoid
-                             || options.score_function == RouterScoreFunction::SqrtSoftplus
-                             || options.score_function == RouterScoreFunction::SparseMixer;
-    if (rows == 0 || options.expert_count == 0 || options.expert_count > 2048
-        || options.top_k == 0 || options.top_k > options.expert_count || options.top_k > 64
-        || !std::isfinite(options.routed_scaling_factor) || options.routed_scaling_factor <= 0.0f
-        || (options.normalization != RouterNormalization::None
-            && options.normalization != RouterNormalization::SelectedExperts)
-        || !known_score
-        || (!options.selection_bias.empty() && options.selection_bias.size() != options.expert_count)
-        || (!options.explicit_expert_ids.empty() && options.explicit_expert_ids.size() != rows * options.top_k))
-        return false;
-    if (options.group_count != 0
-        && (options.group_count > 64 || options.top_k_groups == 0
-            || options.top_k_groups > options.group_count
-            || options.expert_count % options.group_count != 0
-            || options.expert_count / options.group_count < 2
-            || options.top_k > options.expert_count / options.group_count * options.top_k_groups))
-        return false;
-    if (options.group_count == 0 && options.top_k_groups != 0)
-        return false;
-    if (options.score_function == RouterScoreFunction::SparseMixer
-        && (options.top_k != 2 || !std::isfinite(options.jitter) || options.jitter < 0.0f))
-        return false;
-    for (float value : options.selection_bias)
-        if (!std::isfinite(value))
-            return false;
-    for (uint32_t id : options.explicit_expert_ids)
-        if (id >= options.expert_count)
-            return false;
-    return true;
-}
-
 class Router_vulkan::Implementation
 {
 public:
@@ -140,13 +103,6 @@ Router_vulkan::create(const TensorData& weight, const TensorData* bias,
                       uint64_t optimization_flags)
 {
 #if NCNN_MOE_WITH_VULKAN
-    if (weight.shape.size() != 2 || weight.shape[0] == 0 || weight.shape[0] > 2048 || weight.shape[1] == 0 || (weight.dtype != DType::Float32 && weight.dtype != DType::BFloat16) || (weight.dtype == DType::Float32 && weight.float32_values().size() != weight.element_count()) || (weight.dtype == DType::BFloat16 && weight.bfloat16_values().size() != weight.element_count()))
-        return {};
-    for (const TensorData* vector : {bias, selection_bias})
-    {
-        if (vector && (vector->shape.size() != 1 || vector->shape[0] != weight.shape[0] || (vector->dtype != DType::Float32 && vector->dtype != DType::BFloat16) || (vector->dtype == DType::Float32 && vector->float32_values().size() != weight.shape[0]) || (vector->dtype == DType::BFloat16 && vector->bfloat16_values().size() != weight.shape[0])))
-            return {};
-    }
     const auto projection = Linear::create(weight, bias, device_index, runtime,
                                            optimization_flags);
     if (!projection)
@@ -220,31 +176,6 @@ Router_vulkan::decode_selected(const ActivationBuffer& selected,
                                const ExpertDispatchOptions& options,
                                ExpertDispatchPlan& result)
 {
-    if (selected.dtype() != DType::Float32 || selected.columns() != selected_columns(options.top_k) || !valid_router_options(options, selected.rows()))
-        return Error{ErrorCode::InvalidArgument,
-                     "GPU router selected shape or options are invalid"};
-    // Validate every row before touching the published plan or route scratch.
-    for (size_t row = 0; row < selected.rows(); ++row)
-    {
-        const float* values = selected.row(row);
-        const float status = values[options.top_k * 2];
-        if (status == 1.0f)
-            return Error{ErrorCode::InvalidArgument, "router logits must be finite"};
-        if (status == 2.0f)
-            return Error{ErrorCode::InvalidModel,
-                         "selected router weights have a non-positive sum"};
-        if (status != 0.0f)
-            return Error{ErrorCode::InternalError,
-                         "GPU router produced an invalid status"};
-        for (uint32_t rank = 0; rank < options.top_k; ++rank)
-        {
-            const float id = values[rank];
-            const float weight = values[options.top_k + rank];
-            if (!std::isfinite(id) || id < 0.0f || id >= static_cast<float>(options.expert_count) || std::floor(id) != id || !std::isfinite(weight) || weight < 0.0f)
-                return Error{ErrorCode::InternalError,
-                             "GPU router produced an invalid selected route"};
-        }
-    }
     if (result.route_scratch.size() < options.expert_count)
         result.route_scratch.resize(options.expert_count);
     for (uint32_t expert = 0; expert < options.expert_count; ++expert)
@@ -295,8 +226,6 @@ bool Router_vulkan::record(const ncnn::VkMat& input,
                            ncnn::VkCompute& cmd) const
 {
     const Implementation& implementation = *d;
-    if (input.empty() || input.dims != 2 || input.w != static_cast<int>(implementation.input_columns) || input.h <= 0 || input.elempack != 1 || input.elemsize != sizeof(float) || options.expert_count != implementation.expert_count || !valid_router_options(options, static_cast<size_t>(input.h)))
-        return false;
     workspace.context = implementation.context;
     workspace.selection_bias = implementation.dummy;
     workspace.explicit_ids = implementation.dummy;
@@ -335,8 +264,6 @@ bool Router_vulkan::record(const ncnn::VkMat& input,
     workspace.logits = workspace.projected;
     if (workspace.projected.elempack != 1)
         implementation.context->device()->convert_packing(workspace.projected, workspace.logits, 1, cmd, implementation.opt);
-    if (workspace.logits.empty() || workspace.logits.dims != 2 || workspace.logits.w != static_cast<int>(implementation.expert_count) || workspace.logits.h != input.h || workspace.logits.elempack != 1 || workspace.logits.elemsize != sizeof(float))
-        return false;
     workspace.selected.create(static_cast<int>(selected_columns(options.top_k)),
                               input.h, sizeof(float),
                               implementation.opt.blob_vkallocator);

@@ -1092,7 +1092,8 @@ static void prepare_gdn_ops(CompiledModel& compiled,
 }
 
 static AttentionConfig_vulkan attn_vk_config(const CompiledModel& compiled,
-                                             const AttentionBlockPlan& plan)
+                                             const AttentionBlockPlan& plan,
+                                             uint32_t device_index)
 {
     AttentionConfig_vulkan config;
     config.hidden_size = compiled.descriptor.hidden_size;
@@ -1114,10 +1115,7 @@ static AttentionConfig_vulkan attn_vk_config(const CompiledModel& compiled,
     config.rope_active = plan.rope_active;
     config.activation_dtype = compiled.descriptor.activation_dtype;
     config.kv_cache_dtype = plan.kv_cache_dtype;
-    config.kv_double = plan.sliding_window != 0;
-    config.kv_fp16 = compiled.max_context > kv_fp16_tokens;
-    config.kv_full = compiled.max_context > kv_full_tokens;
-    config.kv_tokens = compiled.max_context;
+    config.kv_dtype = kv_device_dtype(plan.kv_cache_dtype, device_index);
     config.optimization_flags = compiled.opt.optimization_flags;
     if (has_flag(plan.flags, AttentionBlockSink))
         config.flags |= AttentionSink;
@@ -1300,7 +1298,7 @@ static Result<void> prepare_native_attention(CompiledModel& compiled,
                                                               key_norm,
                                                               sinks,
                                                               projections,
-                                                              attn_vk_config(compiled, plan), fused_qkv, norm_bias,
+                                                              attn_vk_config(compiled, plan, layer_plan.vulkan_device_index), fused_qkv, norm_bias,
                                                               post_attention_norm,
                                                               ready ? &projections_q8 : nullptr,
                                                               std::move(fused_qkv_q8));
@@ -1389,7 +1387,7 @@ static Result<void> prepare_attn_ops(CompiledModel& compiled,
     const bool expected_vulkan_attention = fused_vulkan_attention_eligible || legacy_qk_gate_eligible;
     if (expected_vulkan_attention)
     {
-        const AttentionConfig_vulkan attention_config = attn_vk_config(compiled, plan);
+        const AttentionConfig_vulkan attention_config = attn_vk_config(compiled, plan, layer_plan.vulkan_device_index);
         std::shared_ptr<Attention_vulkan> attention_operator;
         if (fused_vulkan_attention_eligible)
         {
@@ -1616,13 +1614,10 @@ static uint64_t attn_init_size(const CompiledModel& compiled,
     uint64_t required_tokens = std::max<uint64_t>(1, context_tokens == 0 ? default_prefill_rows : context_tokens);
     if (has_flag(attention.flags, AttentionBlockSink))
         required_tokens = saturating_add_u64(required_tokens, 1);
-    uint64_t capacity = kv_capacity(attention.sliding_window != 0, required_tokens);
-    if (attention.sliding_window == 0 && compiled.max_context > kv_full_tokens)
-        capacity = std::max(capacity, kv_capacity(false, compiled.max_context));
+    const uint64_t capacity = kv_capacity(attention.sliding_window != 0, required_tokens);
     if (capacity == UINT64_MAX)
         return UINT64_MAX;
-    const DType kv_dtype = kv_device_dtype(attention.kv_cache_dtype, device_index,
-                                           compiled.max_context > kv_fp16_tokens);
+    const DType kv_dtype = kv_device_dtype(attention.kv_cache_dtype, device_index);
     const uint64_t element_size = vulkan_kv_size(kv_dtype, device_index);
     if (element_size == UINT64_MAX) return UINT64_MAX;
     // Sliding-window caches keep a second contiguous copy of each row; plain
@@ -1795,10 +1790,10 @@ static uint64_t attention_session_state_size(const CompiledModel& compiled,
             const uint64_t index = saturating_multiply_u64(saturating_multiply_u64(capacity + blocks, attention.index_head_dimension), sizeof(float));
             return saturating_add_u64(kv, index);
         }
-        // Above 128k contiguous K/V is allocated from the graph compute arena
-        // on first prefill; reserving it again as session state double-counts
-        // the cache and pushes the window past the device budget.
-        if (attention.sliding_window == 0 && compiled.max_context > kv_full_tokens)
+        // The planner sizes contiguous K/V from context_tokens and the runtime
+        // allocates it once from the staging arena. Reserving the same bytes as
+        // session state would back a second copy of the cache.
+        if (attention.sliding_window == 0)
             return 0;
         const uint64_t state = attn_init_size(compiled, attention, device_index,
                                               context_tokens);
@@ -2695,7 +2690,7 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
                 if (!resources.allocation_fits(device, request))
                     return Error{ErrorCode::InvalidArgument, "resident dense graph exceeds the live device budget"};
                 resources.commit(device, request);
-                compiled.resident_submission_rows = compiled.max_context > kv_full_tokens ? 0 : default_prefill_rows;
+                compiled.resident_submission_rows = default_prefill_rows;
             }
         }
         // A mixed graph may contain a dense FFN beside routed layers. The
@@ -2924,13 +2919,12 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
                 }
             }
 #endif
-            const DType kv_dtype = kv_device_dtype(attention.kv_cache_dtype, device,
-                                                   model.max_context > kv_fp16_tokens);
+            const DType kv_dtype = kv_device_dtype(attention.kv_cache_dtype, device);
             const uint64_t kv_size = vulkan_kv_size(kv_dtype, device);
             if (kv_size == UINT64_MAX)
                 return Error{ErrorCode::InvalidArgument, "Vulkan Attention KV device is invalid"};
             const bool flash = op && op->flash_ok();
-            elements = Attention_vulkan::scratch_elements(attn_vk_config(model, attention),
+            elements = Attention_vulkan::scratch_elements(attn_vk_config(model, attention, device),
                                                           rows, context_tokens, sequence_count, kv_size, direct_ring, flash);
             for (TensorHandle weight : {attention.query_weight, attention.key_weight, attention.value_weight,
                                         attention.output_gate_weight, attention.output_weight})

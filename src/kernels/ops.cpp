@@ -776,41 +776,9 @@ bool forward_linear(std::initializer_list<const TensorData*> matrices,
                     QnkQ8Input* q8_input)
 {
     const size_t matrix_count = matrices.size();
-    if ((matrix_count != 2 && matrix_count != 4)
-        || outputs.size() != matrix_count
-        || (ops.size() != 0 && ops.size() != matrix_count))
-    {
-        return false;
-    }
-
     const TensorData* const* weights = matrices.begin();
     ActivationBuffer* const* result = outputs.begin();
     const CompiledOperator* const* owners = ops.size() == 0 ? nullptr : ops.begin();
-    for (size_t i = 0; i < matrix_count; ++i)
-    {
-        if (!weights[i] || !result[i] || !weights[i]->input_column_indices.empty())
-            return false;
-    }
-
-    if (input.dtype() != DType::Float32)
-        return false;
-    for (size_t i = 0; i < matrix_count; ++i)
-    {
-        if (result[i]->dtype() != DType::Float32
-            || result[i] == &input
-            || (quantized_input_scratch && result[i] == quantized_input_scratch))
-        {
-            return false;
-        }
-        for (size_t j = 0; j < i; ++j)
-        {
-            if (result[i] == result[j])
-                return false;
-        }
-    }
-    if (quantized_input_scratch == &input)
-        return false;
-
     const DType dtype = weights[0]->dtype;
     if (is_qnk_dtype(dtype) && (qnk_block_size(dtype) == 32 || dtype == DType::IQ4XS || dtype == DType::NvFp4)
 #if defined(__aarch64__) || defined(_M_ARM64)

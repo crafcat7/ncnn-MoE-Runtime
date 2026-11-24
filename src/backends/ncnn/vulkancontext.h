@@ -47,11 +47,11 @@ inline constexpr uint64_t vulkan_weight_block_size = 64 * 1024;
 
 // Device storage for a logical KV dtype. Devices without BF16 storage use
 // FP16 instead of widening the cache to FP32.
-[[nodiscard]] inline DType kv_device_dtype(DType dtype, uint32_t device_index, bool fp16) noexcept
+[[nodiscard]] inline DType kv_device_dtype(DType dtype, uint32_t device_index) noexcept
 {
     if (dtype == DType::BFloat16 && vulkan_kv_size(dtype, device_index) != sizeof(uint16_t))
     {
-        if (fp16 && vulkan_kv_size(DType::Float16, device_index) == sizeof(uint16_t))
+        if (vulkan_kv_size(DType::Float16, device_index) == sizeof(uint16_t))
             return DType::Float16;
         return DType::Float32;
     }

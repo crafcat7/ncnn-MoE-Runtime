@@ -175,8 +175,6 @@ bool fill_staging_upload(const ActivationBuffer& input,
     }
 
     ncnn::Mat mapped = staging.mapped();
-    if (mapped.empty() || mapped.total() * mapped.elemsize < input.bytes().size())
-        return false;
     std::memcpy(mapped.data, input.bytes().data(), input.bytes().size());
     staging.allocator->flush(staging.data);
     staging.data->access_flags = VK_ACCESS_HOST_WRITE_BIT;
@@ -206,8 +204,6 @@ bool fill_staging_values(const void* source,
         return false;
     }
     ncnn::Mat mapped = staging.mapped();
-    if (mapped.empty() || mapped.total() < count)
-        return false;
     std::memcpy(mapped.data, source, count * element_size);
     staging.allocator->flush(staging.data);
     staging.data->access_flags = VK_ACCESS_HOST_WRITE_BIT;
@@ -322,15 +318,6 @@ bool copy_staging_to_cpu_batch(ncnn::VkMat& staging,
         return false;
     staging.allocator->invalidate(staging.data);
     const ncnn::Mat mapped = staging.mapped();
-    if (mapped.empty()
-        || mapped.dims != 2
-        || mapped.w != static_cast<int>(output.columns())
-        || mapped.h != static_cast<int>(output.rows())
-        || mapped.elempack != 1
-        || mapped.elemsize != element_size)
-    {
-        return false;
-    }
     const size_t row_bytes = static_cast<size_t>(output.columns()) * element_size;
     const auto* source = static_cast<const std::byte*>(mapped.data);
     for (size_t row_index = 0; row_index < output.rows(); ++row_index)
@@ -492,15 +479,6 @@ bool copy_staging_to_cpu_batches(ncnn::VkMat& staging,
 
     staging.allocator->invalidate(staging.data);
     const ncnn::Mat mapped = staging.mapped();
-    if (mapped.empty()
-        || mapped.dims != 2
-        || mapped.w != static_cast<int>(columns)
-        || mapped.h != static_cast<int>(total_rows)
-        || mapped.elempack != 1
-        || mapped.elemsize != element_size)
-    {
-        return false;
-    }
 
     for (size_t index = 0; index < outputs.size(); ++index)
         outputs[index]->reset(inputs[index]->rows(), columns, false);

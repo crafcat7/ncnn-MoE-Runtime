@@ -339,14 +339,6 @@ bool VulkanExpertVictimCache::append_segment(uint64_t size, uint64_t alignment, 
     return true;
 }
 
-void VulkanExpertVictimCache::copy_payload(const PendingAdmission& admission, uint8_t* destination)
-{
-    std::memcpy(destination + admission.gate_blocks_offset, admission.gate_up->mxfp4_blocks.data(), admission.gate_up->mxfp4_blocks.size());
-    std::memcpy(destination + admission.gate_scales_offset, admission.gate_up->mxfp4_scales.data(), admission.gate_up->mxfp4_scales.size());
-    std::memcpy(destination + admission.down_blocks_offset, admission.down->mxfp4_blocks.data(), admission.down->mxfp4_blocks.size());
-    std::memcpy(destination + admission.down_scales_offset, admission.down->mxfp4_scales.data(), admission.down->mxfp4_scales.size());
-}
-
 MxFp4ByteBuffer VulkanExpertVictimCache::copy_bytes(const uint8_t* source, uint64_t offset, uint64_t byte_count)
 {
     MxFp4ByteBuffer result;
@@ -402,7 +394,18 @@ std::shared_ptr<VulkanExpertVictimCache::DeviceEntry> VulkanExpertVictimCache::u
     const auto payload = command.prepare_storage(upload_size, independent_allocator);
     if (payload.size() != upload_size) return {};
     std::memset(payload.data(), 0, payload.size());
-    copy_payload(admission, payload.data());
+    std::memcpy(payload.data() + admission.gate_blocks_offset,
+                admission.gate_up->mxfp4_blocks.data(),
+                admission.gate_up->mxfp4_blocks.size());
+    std::memcpy(payload.data() + admission.gate_scales_offset,
+                admission.gate_up->mxfp4_scales.data(),
+                admission.gate_up->mxfp4_scales.size());
+    std::memcpy(payload.data() + admission.down_blocks_offset,
+                admission.down->mxfp4_blocks.data(),
+                admission.down->mxfp4_blocks.size());
+    std::memcpy(payload.data() + admission.down_scales_offset,
+                admission.down->mxfp4_scales.data(),
+                admission.down->mxfp4_scales.size());
     if (!command.record_prepared_storage(entry->data, independent_allocator) || !command.submit_and_wait()) return {};
     return entry;
 }
@@ -664,15 +667,9 @@ static uint64_t native_expert_storage_bytes(const TensorData& gate_up, const Ten
                                             uint64_t optimization_flags)
 {
     const auto quantized = [](DType dtype) { return dtype == DType::Int4 || dtype == DType::MxFp4 || is_qnk_dtype(dtype); };
-    if (gate_up.shape.size() != 2 || down.shape.size() != 2
-        || (!up && !quantized(gate_up.dtype) && !quantized(down.dtype)
-            && gate_up.dtype != DType::Float32 && down.dtype != DType::Float32)
-        || (up ? up->shape != gate_up.shape || down.shape[1] != gate_up.shape[0]
-               : gate_up.shape[0] % 2 != 0 || down.shape[1] != gate_up.shape[0] / 2)
-        || down.shape[1] > static_cast<uint32_t>(std::numeric_limits<int>::max() / 128))
-    {
+    if (!up && !quantized(gate_up.dtype) && !quantized(down.dtype)
+        && gate_up.dtype != DType::Float32 && down.dtype != DType::Float32)
         return 0;
-    }
     const uint64_t alignment = std::max<uint64_t>(4, context.device()->info.buffer_offset_alignment());
     const uint64_t maximum_range = context.device()->info.physicalDeviceProperties().limits.maxStorageBufferRange;
     const uint32_t projection_lanes = std::max<uint32_t>(32, context.device()->info.subgroup_size());
@@ -748,10 +745,6 @@ static uint64_t exec_expert_bytes(const TensorData& gate_up, const TensorData* u
                                   const TensorData* up_bias, const TensorData* down_bias,
                                   ExpertActivation activation, float activation_limit)
 {
-    if (gate_up.shape.size() != 2 || down.shape.size() != 2
-        || gate_up.shape[0] == 0 || gate_up.shape[1] == 0 || down.shape[0] == 0 || down.shape[1] == 0
-        || (up && up->shape != gate_up.shape))
-        return 0;
     const auto valid_mxfp4_matrix = [](const TensorData& matrix) {
         if (matrix.shape[1] % 32 != 0
             || matrix.shape[0] > static_cast<uint32_t>(std::numeric_limits<int>::max() / 64)

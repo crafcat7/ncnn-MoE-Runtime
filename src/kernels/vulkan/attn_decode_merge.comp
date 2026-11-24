@@ -1,7 +1,7 @@
 #version 450
 
 // Merge phase of the split decode attention: combines the per-split online
-// softmax states written by attention_decode_split.comp into the final output.
+// softmax states written by attn_decode_split.comp into the final output.
 //
 // One workgroup owns one head, one invocation per head dimension (at most 256).
 

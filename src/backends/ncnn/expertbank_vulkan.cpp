@@ -452,19 +452,6 @@ bool ExpertBank_vulkan::record(const ncnn::VkMat& normalized, const ncnn::VkMat&
                                const ncnn::VkMat* shared, const ncnn::VkMat* residual) const
 {
     const auto& plan = d->plan;
-    const auto valid_tensor = [&](const ncnn::VkMat& tensor) {
-        return !tensor.empty() && tensor.elempack == 1 && tensor.elemsize == sizeof(float) && tensor.allocator
-               && tensor.allocator->vkdev == d->context->device();
-    };
-    if (!d->context || !d->gate_up || !d->down || !d->combine || top_k == 0 || top_k > 64 || top_k > plan.expert_count
-        || &combined == &normalized || &combined == &selected || &combined == &validation
-        || !valid_tensor(normalized) || normalized.dims != 2 || normalized.w != static_cast<int>(plan.input_columns) || normalized.h <= 0
-        || !valid_tensor(selected) || selected.dims != 2 || selected.w != static_cast<int>(2 * top_k + 1) || selected.h != normalized.h
-        || !valid_tensor(validation) || validation.w != 1
-        || (validation.dims != 1 && !(validation.dims == 2 && validation.h == 1))
-        || validation.data == normalized.data || validation.data == selected.data
-        || (shared && (shared == &combined || shared == &validation || !valid_tensor(*shared) || shared->dims != 2 || shared->w != static_cast<int>(plan.output_columns) || shared->h != normalized.h || shared->data == validation.data))
-        || (residual && (residual == &combined || residual == &validation || !valid_tensor(*residual) || residual->dims != 2 || residual->w != static_cast<int>(plan.output_columns) || residual->h != normalized.h || residual->data == validation.data))) return false;
     const uint32_t rows = static_cast<uint32_t>(normalized.h);
     const auto& limits = d->context->device()->info.physicalDeviceProperties().limits;
     uint32_t scratch_columns[3];

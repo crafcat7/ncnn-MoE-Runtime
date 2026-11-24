@@ -46,23 +46,11 @@ std::shared_ptr<RmsNorm_vulkan> RmsNorm_vulkan::create(const TensorData& weight,
                                                        bool add_norm)
 {
 #if NCNN_MOE_WITH_VULKAN
-    if (!context || epsilon <= 0.0f || weight.shape.size() != 1
-        || weight.shape[0] == 0 || weight.shape[0] > 0x7fffffff
-        || activation_variant(opt) != 0)
-        return {};
     const auto& limits = context->device()->info.physicalDeviceProperties().limits;
     const uint32_t workgroup_size = limits.maxComputeWorkGroupInvocations >= 256
                                             && limits.maxComputeWorkGroupSize[0] >= 256
                                         ? 256
                                         : 128;
-    if (limits.maxComputeWorkGroupInvocations < workgroup_size
-        || limits.maxComputeWorkGroupSize[0] < workgroup_size
-        || limits.maxComputeSharedMemorySize < 256 * sizeof(float)
-        || static_cast<uint64_t>(weight.shape[0]) * sizeof(float) > limits.maxStorageBufferRange
-        || (add_norm
-            && (limits.maxPerStageDescriptorStorageBuffers < 5
-                || limits.maxDescriptorSetStorageBuffers < 5)))
-        return {};
     ncnn::Mat values;
     if (!prepare_float_tensor_upload(weight, values))
         return {};
@@ -193,10 +181,6 @@ bool RmsNorm_vulkan::record(const ncnn::VkMat& input,
 {
 #if NCNN_MOE_WITH_VULKAN
     const auto& impl = *d;
-    if (&input == &output || !impl.context || !impl.pipeline || input.empty() || input.dims != 2
-        || input.elempack != 1 || input.elemsize != sizeof(float)
-        || input.w != static_cast<int>(impl.columns) || input.h <= 0)
-        return false;
     if (impl.add_norm)
     {
         if (!branch || !residual)

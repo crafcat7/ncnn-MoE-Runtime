@@ -110,41 +110,6 @@ static bool create_pipeline(const std::shared_ptr<VulkanContext>& context,
     return true;
 }
 
-static bool same_pipeline_shape(const AttentionDecodePlan& left, const AttentionDecodePlan& right)
-{
-    return left.shape.head_dimension == right.shape.head_dimension
-           && left.shape.kv_storage_bfloat16 == right.shape.kv_storage_bfloat16
-           && left.query_tile == right.query_tile && left.kv_tile == right.kv_tile
-           && left.workgroup_size == right.workgroup_size && left.subgroup_size == right.subgroup_size;
-}
-
-static bool valid_matrix_plan(const AttentionDecodePlan& plan)
-{
-    const auto& shape = plan.shape;
-    if (plan.path != AttentionDecodePath::Matrix || shape.query_heads == 0 || shape.kv_heads == 0
-        || shape.query_heads % shape.kv_heads != 0 || shape.query_heads / shape.kv_heads < 2
-        || shape.head_dimension == 0 || shape.head_dimension > 128 || shape.head_dimension % 16 != 0
-        || !shape.bfloat16_kv || shape.kv_tokens == 0 || plan.query_tile != 32 || plan.kv_tile != 32
-        || plan.workgroup_size != 256 || plan.subgroup_size == 0 || 256 % plan.subgroup_size != 0
-        || plan.group_size != shape.query_heads / shape.kv_heads
-        || plan.query_groups != (static_cast<uint64_t>(plan.group_size) + 31) / 32
-        || plan.split_count == 0 || plan.split_count > plan.scratch_split_capacity
-        || plan.split_tokens == 0 || plan.split_tokens % 32 != 0)
-        return false;
-    const uint64_t row_elements = static_cast<uint64_t>(shape.query_heads) * (shape.head_dimension + 2);
-    if (row_elements > static_cast<uint64_t>(std::numeric_limits<int>::max())
-        || plan.scratch_split_capacity > static_cast<uint64_t>(std::numeric_limits<int>::max()) / row_elements)
-        return false;
-    const uint64_t coverage = static_cast<uint64_t>(plan.split_count) * plan.split_tokens;
-    const uint64_t elements = static_cast<uint64_t>(plan.scratch_split_capacity)
-                              * shape.query_heads * (shape.head_dimension + 2);
-    return coverage >= shape.kv_tokens && coverage <= std::numeric_limits<uint32_t>::max()
-           && elements <= static_cast<uint64_t>(std::numeric_limits<int>::max())
-           && plan.scratch_elements == elements && plan.scratch_bytes == elements * sizeof(float)
-           && static_cast<uint64_t>(shape.query_heads) * shape.head_dimension
-                  <= static_cast<uint64_t>(std::numeric_limits<int>::max());
-}
-
 AttentionDecodeCapabilities query_attention_decode_capabilities(const ncnn::GpuInfo& info)
 {
     AttentionDecodeCapabilities capabilities;
@@ -186,15 +151,6 @@ bool AttentionDecodeVulkan::create(const std::shared_ptr<VulkanContext>& request
                                    const ncnn::Option& option,
                                    const AttentionDecodePlan& plan)
 {
-    if (!requested_context || !requested_context->device() || !valid_matrix_plan(plan))
-        return false;
-    if (context && (context != requested_context || !same_pipeline_shape(plan, pipeline_plan)))
-        return false;
-    const auto capabilities = query_attention_decode_capabilities(requested_context->device()->info);
-    AttentionDecodePlan supported_plan;
-    if (!make_attention_decode_plan(capabilities, plan.shape, supported_plan)
-        || supported_plan.path != AttentionDecodePath::Matrix || !same_pipeline_shape(plan, supported_plan))
-        return false;
     context = requested_context;
     pipeline_plan = plan;
     ncnn::Option compile_option = option;
@@ -239,9 +195,6 @@ bool AttentionDecodeVulkan::record(const AttentionDecodePlan& plan,
                                    std::vector<ncnn::VkMat>& workspace) const
 {
     const auto& shape = plan.shape;
-    if (!context || !matrix_pipeline || !reduce_pipeline || !allocator)
-        return false;
-
     ncnn::VkMat partial;
     partial.create(static_cast<int>(plan.scratch_elements), sizeof(float), 1, allocator);
     output.create(static_cast<int>(static_cast<uint64_t>(shape.query_heads) * shape.head_dimension), 1, sizeof(float), 1, allocator);

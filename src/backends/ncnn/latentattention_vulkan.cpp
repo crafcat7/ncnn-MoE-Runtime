@@ -375,7 +375,7 @@ bool LatentAttention_vulkan::record_projection(const CompiledOperator& op,
     if (op.bfloat16)
         return op.bfloat16->forward(input, output, cmd, d->opt) == 0;
     if (op.qnk)
-        return op.qnk->record_forward(input, output, cmd, storage);
+        return op.qnk->record_forward(input, output, cmd);
     return op.linear && op.linear->forward(input, output, cmd, d->opt) == 0;
 }
 #endif
@@ -400,18 +400,6 @@ std::shared_ptr<LatentAttention_vulkan> LatentAttention_vulkan::create(const Att
 #if NCNN_MOE_WITH_VULKAN
     const bool latent_value = has_flag(plan.flags, AttentionBlockLatentValue);
     const uint64_t query_columns = static_cast<uint64_t>(plan.head_count) * plan.head_dimension;
-    if (plan.kind != AttentionKind::MultiHeadLatent || plan.head_dimension == 0
-        || plan.head_dimension > (latent_value ? 640u : 512u)
-        || plan.head_count == 0 || (!latent_value && plan.sliding_window == 0) || plan.norm_epsilon <= 0.0f
-        || plan.rope_head_dimension > plan.head_dimension || plan.rope_head_dimension % 2 != 0
-        || query_columns > static_cast<uint64_t>(std::numeric_limits<int>::max())
-        || (sinks && (sinks->dtype != DType::Float32 || sinks->float32_values().size() != plan.head_count))
-        || (latent_value && (plan.output_group_count == 0 || plan.output_lora_rank == 0))
-        || !projection_context(output_a) || !projection_option(output_a)
-        || projection_context(output_a) != projection_context(output_b)
-        || projection_input_columns(output_a) != query_columns
-        || projection_output_columns(output_a) != projection_input_columns(output_b))
-        return {};
     auto result = std::shared_ptr<LatentAttention_vulkan>(new LatentAttention_vulkan);
     Implementation& implementation = *result->d;
     implementation.plan = plan;
@@ -476,16 +464,6 @@ bool LatentAttention_vulkan::forward_batch(std::span<const uint64_t> positions,
         || rows > static_cast<size_t>(std::numeric_limits<int>::max()))
         return false;
     const ncnn::VkMat* retained_query = device_query ? device_query->value() : nullptr;
-    if (retained_query)
-    {
-        if (device_query->vulkan_context() != implementation.context
-            || retained_query->dims != 2 || retained_query->w != static_cast<int>(query_columns)
-            || retained_query->h != static_cast<int>(rows) || retained_query->elempack != 1
-            || retained_query->elemsize != sizeof(float))
-            return false;
-    }
-    else if (query.rows() != rows || query.columns() != query_columns || query.dtype() != DType::Float32)
-        return false;
     const uint64_t window_elements = static_cast<uint64_t>(plan.sliding_window) * plan.head_dimension;
     if (window_elements > static_cast<uint64_t>(std::numeric_limits<int>::max()))
         return false;
@@ -768,8 +746,6 @@ static bool read_latent_shadow(ncnn::VkMat& staging, std::vector<float>& destina
         return true;
     staging.allocator->invalidate(staging.data);
     const ncnn::Mat mapped = staging.mapped();
-    if (mapped.empty() || mapped.elemsize != sizeof(float) || mapped.elempack != 1)
-        return false;
     const float* values = static_cast<const float*>(mapped.data);
     // mapped.total() includes padding; packed shadows carry logical counts.
     destination.assign(values, values + static_cast<size_t>(staging.w) * staging.h);
@@ -1017,8 +993,6 @@ bool LatentAttentionWork_vulkan::commit()
         {
             row.selected_shadow.allocator->invalidate(row.selected_shadow.data);
             const ncnn::Mat mapped = row.selected_shadow.mapped();
-            if (mapped.empty() || mapped.w != static_cast<int>(row.selected_count) || mapped.h != 1)
-                return false;
             const uint32_t* values = static_cast<const uint32_t*>(mapped.data);
             row.selected_indices.assign(values, values + row.selected_count);
             row.selected_shadow.data->access_flags = VK_ACCESS_HOST_READ_BIT;
@@ -1296,8 +1270,6 @@ bool LatentAttention_vulkan::forward_projected_batch(const ActivationBuffer& inp
                                                      ActivationBuffer& output) const
 {
 #if NCNN_MOE_WITH_VULKAN
-    if (!d->prepared || input.rows() == 0 || input.rows() != positions.size() || input.rows() != caches.size())
-        return false;
     const std::lock_guard<std::mutex> lock(d->context->command_mutex());
     ncnn::VkCompute cmd(d->context->device());
     ncnn::VkMat input_staging;
@@ -1547,12 +1519,6 @@ bool LatentAttention_vulkan::record_value_forward(const ncnn::VkMat& input,
     const uint32_t width = plan.head_dimension;
     const uint32_t lora = plan.kv_lora_rank;
     const uint32_t rope = plan.rope_head_dimension;
-    if (!implementation.prepared || rows == 0 || rows != caches.size()
-        || input.empty() || input.dims != 2 || input.elempack != 1
-        || input.elemsize != sizeof(float)
-        || input.w != static_cast<int>(projection_input_columns(implementation.query_a))
-        || input.h != static_cast<int>(rows))
-        return false;
     const auto allocate = [&](ncnn::VkMat& destination, uint64_t columns, size_t row_count) {
         if (columns == 0 || row_count == 0
             || columns > static_cast<uint64_t>(std::numeric_limits<int>::max())
@@ -1729,11 +1695,6 @@ bool LatentAttention_vulkan::record_batch(const ncnn::VkMat& input,
     const AttentionBlockPlan& plan = implementation.plan;
     LatentAttentionWork_vulkan::Implementation& recording = *work.d;
     const size_t rows = positions.size();
-    if (!implementation.prepared || recording.context || input.empty() || input.dims != 2
-        || input.elemsize != sizeof(float) || input.elempack != 1
-        || input.w != static_cast<int>(projection_input_columns(implementation.query_a))
-        || rows == 0 || rows != caches.size() || rows != static_cast<size_t>(input.h))
-        return false;
     std::vector<std::pair<LayerCache*, uint64_t>> next_positions;
     for (size_t row = 0; row < rows; ++row)
     {

@@ -58,10 +58,6 @@ std::shared_ptr<LayerHead_vulkan> LayerHead_vulkan::create(const TensorData& fun
                                                            uint64_t optimization_flags)
 {
 #if NCNN_MOE_WITH_VULKAN
-    if (multiplier == 0 || function.shape.size() != 2 || function.shape[0] != multiplier
-        || function.shape[1] == 0 || function.shape[1] % multiplier != 0
-        || norm_weight.shape.size() != 1 || norm_weight.shape[0] != function.shape[1] / multiplier)
-        return {};
     const uint32_t hidden_size = function.shape[1] / multiplier;
     auto result = std::shared_ptr<LayerHead_vulkan>(new LayerHead_vulkan);
     Implementation& implementation = *result->d;
@@ -150,9 +146,6 @@ bool LayerHead_vulkan::record_hidden(const ncnn::VkMat& input,
                                      std::vector<ncnn::VkMat>& temporaries,
                                      ncnn::VkCompute& cmd) const
 {
-    if (&normalized == &input || &normalized == &hc_workspace.normalized
-        || &normalized == &hc_workspace.projection || &normalized == &hc_workspace.pre)
-        return false;
     ncnn::VkMat headed;
     if (!d->hyper->record_head(input, headed, hc_workspace, cmd))
         return false;
@@ -170,10 +163,6 @@ bool LayerHead_vulkan::record_logits(const ncnn::VkMat& normalized,
                                      std::vector<ncnn::VkMat>& temporaries,
                                      ncnn::VkCompute& cmd) const
 {
-    if (&normalized == &logits || normalized.empty() || normalized.dims != 2
-        || normalized.w != static_cast<int>(d->columns) || normalized.h <= 0
-        || normalized.elempack != 1 || normalized.elemsize != sizeof(float))
-        return false;
     // The input may be an element of temporaries. Recording FP8 projection appends its
     // quantized workspace, so keep a separate owner before vector reallocation.
     const ncnn::VkMat input = normalized;
@@ -197,9 +186,7 @@ bool LayerHead_vulkan::record_logits(const ncnn::VkMat& normalized,
         if (d->bfloat16->forward(input, next, cmd, d->opt) != 0)
             return false;
     }
-    else if (!d->linear || d->linear->forward(input, next, cmd, d->opt) != 0)
-        return false;
-    if (next.empty() || next.dims != 2 || next.h != input.h || next.elempack != 1 || next.elemsize != sizeof(float))
+    else if (d->linear->forward(input, next, cmd, d->opt) != 0)
         return false;
     logits = std::move(next);
     return true;

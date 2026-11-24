@@ -111,6 +111,13 @@ private:
     void record_scalar_projection(const ncnn::VkMat& input,
                                   ncnn::VkMat& output,
                                   ncnn::VkCompute& cmd) const;
+    // Input RMSNorm + projection with the operator-owned cooperative/tiled fallback.
+    void record_norm_projection(const ncnn::VkMat& input,
+                                ncnn::VkMat& output,
+                                ncnn::VkCompute& cmd,
+                                ncnn::VkMat* row_scale_workspace = nullptr) const;
+
+private:
     // Prefill projection through ncnn's cooperative-matrix Gemm, optionally after
     // materializing the prepared input RMSNorm (the fused shader below folds the
     // norm into its tile load, which the Gemm path cannot do). On success `output`
@@ -126,6 +133,8 @@ private:
                                     ncnn::VkMat& output,
                                     ncnn::VkCompute& cmd,
                                     ncnn::VkMat* row_scale_workspace = nullptr) const;
+
+public:
     [[nodiscard]] const std::shared_ptr<VulkanContext>& vulkan_context() const noexcept;
     [[nodiscard]] const ncnn::Option& option() const noexcept;
     [[nodiscard]] uint32_t input_columns() const noexcept;

@@ -1,14 +1,8 @@
 #version 450
 
-// Flash attention for the multi-row (prefill) path with head_dimension 128.
-//
-// Same streaming scheme as the 64-wide kernel, but the query tile and the K/V
-// tile are reduced to 32 to keep the fp16 staging inside the 32 KB shared
-// memory limit: query 32x128, keys 32x128, values 32x128 and the per-subgroup
-// weight plane.
-//
-// Q/K/V arrive as fp32 and are rounded to fp16 in shared memory; dot products
-// and the softmax accumulator stay fp32.
+// Flash attention for the multi-row prefill path. The query tile and K/V tiles
+// are generated for head_dimension 64 (64x64) and 128 (32x32); both variants
+// stage fp16 K/V in shared memory and evaluate the mask inline.
 
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_KHR_shader_subgroup_basic : require
@@ -61,11 +55,14 @@ layout(push_constant) uniform parameter
 }
 p;
 
-const uint D = 128u;
-const uint M = 32u;
-const uint N = 32u;
-const uint ROWS = 4u;
+const uint D = @NCNN_MOE_ATTN_PREFILL_HEAD_DIM@;
+const uint M = @NCNN_MOE_ATTN_PREFILL_QUERY_TILE@;
+const uint N = @NCNN_MOE_ATTN_PREFILL_KEY_TILE@;
+const uint ROWS = @NCNN_MOE_ATTN_PREFILL_ROWS@;
 const uint PAIRS = D / 2u;
+const uint KEYS = N / 32u;
+const uint VALUE_PAIRS = PAIRS / 32u;
+const uint WORDS = D / 4u;
 
 shared uint shared_query[M * PAIRS];
 shared uint shared_key[PAIRS * N];
@@ -74,28 +71,27 @@ shared float shared_weights[8u * N];
 
 void load_tile(uint key_base, uint value_base, uint key_offset)
 {
-    // 32 vec4 rows per key for head_dimension 128.
-    for (uint index = gl_LocalInvocationIndex; index < N * 32u; index += 256u)
+    for (uint index = gl_LocalInvocationIndex; index < N * WORDS; index += 256u)
     {
-        const uint row = index / 32u;
-        const uint column = index % 32u;
+        const uint row = index / WORDS;
+        const uint column = index % WORDS;
         const uint global_key = key_offset + row;
         const uint safe_key = min(global_key, p.destination_count - 1u);
-        const uint key_index = key_base + safe_key * D + column * 4u;
-        const uint value_index = value_base + safe_key * D + column * 4u;
+        const uint key_index = (key_base + safe_key * D + column * 4u) / 4u;
+        const uint value_index = (value_base + safe_key * D + column * 4u) / 4u;
 #if NCNN_fp16_storage
-        const uvec2 key_word = key_data[key_index / 4u];
-        const uvec2 value_word = value_data[value_index / 4u];
-        vec4 key = vec4(unpackHalf2x16(key_word.x), unpackHalf2x16(key_word.y));
-        vec4 value = vec4(unpackHalf2x16(value_word.x), unpackHalf2x16(value_word.y));
+        const uvec2 key_pair = key_data[key_index];
+        const uvec2 value_pair = value_data[value_index];
+        vec4 key = vec4(unpackHalf2x16(key_pair.x), unpackHalf2x16(key_pair.y));
+        vec4 value = vec4(unpackHalf2x16(value_pair.x), unpackHalf2x16(value_pair.y));
 #elif NCNN_bf16_storage
-        const uvec2 key_word = key_data[key_index / 4u];
-        const uvec2 value_word = value_data[value_index / 4u];
-        vec4 key = vec4(unpackBFloat2x16(key_word.x), unpackBFloat2x16(key_word.y));
-        vec4 value = vec4(unpackBFloat2x16(value_word.x), unpackBFloat2x16(value_word.y));
+        const uvec2 key_pair = key_data[key_index];
+        const uvec2 value_pair = value_data[value_index];
+        vec4 key = vec4(unpackBFloat2x16(key_pair.x), unpackBFloat2x16(key_pair.y));
+        vec4 value = vec4(unpackBFloat2x16(value_pair.x), unpackBFloat2x16(value_pair.y));
 #else
-        vec4 key = key_data[key_index / 4u];
-        vec4 value = value_data[value_index / 4u];
+        vec4 key = key_data[key_index];
+        vec4 value = value_data[value_index];
 #endif
         if (global_key >= p.destination_count)
         {
@@ -124,10 +120,10 @@ void main()
     const uint key_base = key_value_head * p.key_cstep;
     const uint value_base = key_value_head * p.value_cstep;
 
-    for (uint index = gl_LocalInvocationIndex; index < M * 32u; index += 256u)
+    for (uint index = gl_LocalInvocationIndex; index < M * WORDS; index += 256u)
     {
-        const uint row = index / 32u;
-        const uint column = index % 32u;
+        const uint row = index / WORDS;
+        const uint column = index % WORDS;
         const uint global_row = query_base_row + row;
         vec4 query = vec4(0.0);
         if (global_row < p.query_count)
@@ -137,20 +133,19 @@ void main()
     }
     barrier();
 
-    float accumulator_even0[ROWS];
-    float accumulator_odd0[ROWS];
-    float accumulator_even1[ROWS];
-    float accumulator_odd1[ROWS];
+    float acc_even[ROWS * VALUE_PAIRS];
+    float acc_odd[ROWS * VALUE_PAIRS];
     float running_max[ROWS];
     float running_sum[ROWS];
     [[unroll]] for (uint r = 0u; r < ROWS; ++r)
     {
-        accumulator_even0[r] = 0.0;
-        accumulator_odd0[r] = 0.0;
-        accumulator_even1[r] = 0.0;
-        accumulator_odd1[r] = 0.0;
         running_max[r] = -3.402823466e+38;
         running_sum[r] = 0.0;
+    }
+    [[unroll]] for (uint index = 0u; index < ROWS * VALUE_PAIRS; ++index)
+    {
+        acc_even[index] = 0.0;
+        acc_odd[index] = 0.0;
     }
 
     const uint last_query_row = min(query_base_row + M, p.query_count);
@@ -176,52 +171,57 @@ void main()
             const uint query_position = p.position_offset + global_row;
             const bool row_valid = global_row < p.query_count;
 
-            float score = 0.0;
-            [[unroll]] for (uint pair = 0u; pair < PAIRS; ++pair)
+            float score[KEYS];
+            [[unroll]] for (uint k = 0u; k < KEYS; ++k)
             {
-                const vec2 query = unpackHalf2x16(shared_query[row * PAIRS + pair]);
-                const vec2 key = unpackHalf2x16(shared_key[pair * N + lane]);
-                score += dot(query, key);
+                const uint key_index = lane + 32u * k;
+                float value = 0.0;
+                [[unroll]] for (uint pair = 0u; pair < PAIRS; ++pair)
+                {
+                    const vec2 query = unpackHalf2x16(shared_query[row * PAIRS + pair]);
+                    const vec2 key = unpackHalf2x16(shared_key[pair * N + key_index]);
+                    value += dot(query, key);
+                }
+                const uint key_position = p.cache_start + key_offset + key_index;
+                const bool masked = !row_valid || key_offset + key_index >= p.destination_count
+                                    || key_position > query_position
+                                    || (p.sliding_window != 0u && key_position + p.sliding_window <= query_position);
+                score[k] = masked ? -3.402823466e+38 : value * p.scale;
             }
 
-            const uint key_index = key_offset + lane;
-            const uint key_position = p.cache_start + key_index;
-            const bool masked = !row_valid || key_index >= p.destination_count
-                                || key_position > query_position
-                                || (p.sliding_window != 0u && key_position + p.sliding_window <= query_position);
-            score = masked ? -3.402823466e+38 : score * p.scale;
-
-            const float tile_maximum = subgroupMax(score);
+            float tile_maximum = score[0];
+            [[unroll]] for (uint k = 1u; k < KEYS; ++k)
+                tile_maximum = max(tile_maximum, score[k]);
+            tile_maximum = subgroupMax(tile_maximum);
             const float next_maximum = max(running_max[r], tile_maximum);
             const float correction = running_sum[r] == 0.0 ? 0.0 : exp(running_max[r] - next_maximum);
-            const float weight = masked ? 0.0 : exp(score - next_maximum);
-            running_sum[r] = running_sum[r] * correction + subgroupAdd(weight);
+            float tile_sum = 0.0;
+            [[unroll]] for (uint k = 0u; k < KEYS; ++k)
+            {
+                const float weight = score[k] == -3.402823466e+38 ? 0.0 : exp(score[k] - next_maximum);
+                shared_weights[subgroup * N + lane + 32u * k] = weight;
+                tile_sum += weight;
+            }
+            running_sum[r] = running_sum[r] * correction + subgroupAdd(tile_sum);
             running_max[r] = next_maximum;
-            accumulator_even0[r] *= correction;
-            accumulator_odd0[r] *= correction;
-            accumulator_even1[r] *= correction;
-            accumulator_odd1[r] *= correction;
-            shared_weights[subgroup * N + lane] = weight;
+            [[unroll]] for (uint pair = 0u; pair < VALUE_PAIRS; ++pair)
+            {
+                acc_even[r * VALUE_PAIRS + pair] *= correction;
+                acc_odd[r * VALUE_PAIRS + pair] *= correction;
+            }
             barrier();
 
-            float numerator_even0 = 0.0;
-            float numerator_odd0 = 0.0;
-            float numerator_even1 = 0.0;
-            float numerator_odd1 = 0.0;
             [[unroll]] for (uint index = 0u; index < N; ++index)
             {
-                const float w = shared_weights[subgroup * N + index];
-                const vec2 value0 = unpackHalf2x16(shared_value[index * PAIRS + lane]);
-                const vec2 value1 = unpackHalf2x16(shared_value[index * PAIRS + lane + 32u]);
-                numerator_even0 += w * value0.x;
-                numerator_odd0 += w * value0.y;
-                numerator_even1 += w * value1.x;
-                numerator_odd1 += w * value1.y;
+                const float weight = shared_weights[subgroup * N + index];
+                [[unroll]] for (uint pair = 0u; pair < VALUE_PAIRS; ++pair)
+                {
+                    const uint pair_index = lane + 32u * pair;
+                    const vec2 value = unpackHalf2x16(shared_value[index * PAIRS + pair_index]);
+                    acc_even[r * VALUE_PAIRS + pair] += weight * value.x;
+                    acc_odd[r * VALUE_PAIRS + pair] += weight * value.y;
+                }
             }
-            accumulator_even0[r] += numerator_even0;
-            accumulator_odd0[r] += numerator_odd0;
-            accumulator_even1[r] += numerator_even1;
-            accumulator_odd1[r] += numerator_odd1;
             barrier();
         }
         barrier();
@@ -234,10 +234,12 @@ void main()
         if (global_row >= p.query_count)
             continue;
         const float inverse = running_sum[r] > 0.0 ? 1.0 / running_sum[r] : 0.0;
-        const uint base = global_row * p.output_columns + head * D;
-        output_data[base + lane * 2u] = accumulator_even0[r] * inverse;
-        output_data[base + lane * 2u + 1u] = accumulator_odd0[r] * inverse;
-        output_data[base + (lane + 32u) * 2u] = accumulator_even1[r] * inverse;
-        output_data[base + (lane + 32u) * 2u + 1u] = accumulator_odd1[r] * inverse;
+        [[unroll]] for (uint pair = 0u; pair < VALUE_PAIRS; ++pair)
+        {
+            const uint pair_index = lane + 32u * pair;
+            const uint base = global_row * p.output_columns + head * D + pair_index * 2u;
+            output_data[base] = acc_even[r * VALUE_PAIRS + pair] * inverse;
+            output_data[base + 1u] = acc_odd[r * VALUE_PAIRS + pair] * inverse;
+        }
     }
 }
