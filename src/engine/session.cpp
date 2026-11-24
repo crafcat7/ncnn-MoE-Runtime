@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <numeric>
@@ -220,7 +221,8 @@ Result<void> Session::prefill_unlocked(std::span<const int32_t> input_ids)
     while (processed_tokens < input_ids.size())
     {
         const size_t remaining_tokens = input_ids.size() - processed_tokens;
-        const size_t chunk_size = prefill_chunk_size == 0 ? remaining_tokens : std::min<size_t>(remaining_tokens, prefill_chunk_size);
+        const size_t chunk_size = prefill_chunk_size == 0 ? remaining_tokens
+                                                          : std::min<size_t>(remaining_tokens, prefill_chunk_size);
         const std::span<const int32_t> chunk = input_ids.subspan(processed_tokens, chunk_size);
         const LogitsOutput logits_output = processed_tokens + chunk_size == input_ids.size()
                                                ? LogitsOutput::Last
@@ -259,17 +261,28 @@ Result<void> Session::prefill_unlocked(std::span<const int32_t> input_ids)
 Result<PrefillResult> Session::prefill(std::span<const int32_t> input_ids)
 {
     const std::lock_guard<std::mutex> lock(mutex);
-    PrefillResult result;
-    // Reserve the public result before execution arms the failure marker.
-    result.logits.reserve(model->descriptor().vocabulary_size);
-    auto executed = prefill_unlocked(input_ids);
-    if (!executed)
-        return executed.error();
-    const std::span<const float> logits = state->logits.values();
-    result.logits.assign(logits.begin(), logits.end());
-    result.processed_tokens = static_cast<uint32_t>(input_ids.size());
-    metrics_valid = false;
-    return result;
+    try
+    {
+        PrefillResult result;
+        // Reserve the public result before execution arms the failure marker.
+        result.logits.reserve(model->descriptor().vocabulary_size);
+        auto executed = prefill_unlocked(input_ids);
+        if (!executed)
+            return executed.error();
+        const std::span<const float> logits = state->logits.values();
+        result.logits.assign(logits.begin(), logits.end());
+        result.processed_tokens = static_cast<uint32_t>(input_ids.size());
+        metrics_valid = false;
+        return result;
+    }
+    catch (const std::exception& error)
+    {
+        return Error{ErrorCode::InternalError, error.what()};
+    }
+    catch (...)
+    {
+        return Error{ErrorCode::InternalError, "prefill failed"};
+    }
 }
 
 Result<void> Session::decode_unlocked(int32_t input_id)
@@ -288,7 +301,8 @@ Result<void> Session::decode_unlocked(int32_t input_id)
     state->execution_failed = true;
     stats_scratch = stats;
     SessionStatistics& updated_statistics = stats_scratch;
-    auto executed = forward_model(compiled, input, updated_statistics, *state, token_count, LogitsOutput::All);
+    auto executed = forward_model(compiled, input, updated_statistics, *state, token_count,
+                                  LogitsOutput::All);
     if (!executed)
         return executed.error();
     if (state->logits.rows() != 1
@@ -310,53 +324,77 @@ Result<void> Session::decode_unlocked(int32_t input_id)
 Result<DecodeResult> Session::decode(int32_t input_id)
 {
     const std::lock_guard<std::mutex> lock(mutex);
-    DecodeResult result;
-    // Reserve the public result before execution arms the failure marker.
-    result.logits.reserve(model->descriptor().vocabulary_size);
-    auto executed = decode_unlocked(input_id);
-    if (!executed)
-        return executed.error();
-    const std::span<const float> logits = state->logits.values();
-    result.logits.assign(logits.begin(), logits.end());
-    result.sequence_length = token_count;
-    metrics_valid = false;
-    return result;
+    try
+    {
+        DecodeResult result;
+        // Reserve the public result before execution arms the failure marker.
+        result.logits.reserve(model->descriptor().vocabulary_size);
+        auto executed = decode_unlocked(input_id);
+        if (!executed)
+            return executed.error();
+        const std::span<const float> logits = state->logits.values();
+        result.logits.assign(logits.begin(), logits.end());
+        result.sequence_length = token_count;
+        metrics_valid = false;
+        return result;
+    }
+    catch (const std::exception& error)
+    {
+        return Error{ErrorCode::InternalError, error.what()};
+    }
+    catch (...)
+    {
+        return Error{ErrorCode::InternalError, "decode failed"};
+    }
 }
 
 Result<void> Session::reset()
 {
     const std::lock_guard<std::mutex> lock(mutex);
-    token_count = 0;
-    stats = {};
-    stats_scratch = {};
-    std::unique_ptr<SessionState> next(new SessionState);
-    if (!generation_active)
+    try
     {
-        next->expert_scratch.expert_workspaces = std::move(state->expert_scratch.expert_workspaces);
-        next->attention_scratch = std::move(state->attention_scratch);
-        next->attention_scratch.latent_row_contexts.clear();
-        next->attention_scratch.latent_projected_compressed_counts.clear();
-        next->attention_scratch.latent_caches.clear();
-        next->hidden.swap(state->hidden);
-        next->hidden.clear();
-        next->final_norm.swap(state->final_norm);
-        next->final_norm.clear();
-        next->logits.swap(state->logits);
-        next->logits.clear();
-        next->lm_head_input.swap(state->lm_head_input);
-        next->lm_head_input.clear();
+        // Allocate before touching the live state so a failed reset leaves the
+        // session usable instead of half-cleared.
+        std::unique_ptr<SessionState> next(new SessionState);
+        token_count = 0;
+        stats = {};
+        stats_scratch = {};
+        if (!generation_active)
+        {
+            next->expert_scratch.expert_workspaces = std::move(state->expert_scratch.expert_workspaces);
+            next->attention_scratch = std::move(state->attention_scratch);
+            next->attention_scratch.latent_row_contexts.clear();
+            next->attention_scratch.latent_projected_compressed_counts.clear();
+            next->attention_scratch.latent_caches.clear();
+            next->hidden.swap(state->hidden);
+            next->hidden.clear();
+            next->final_norm.swap(state->final_norm);
+            next->final_norm.clear();
+            next->logits.swap(state->logits);
+            next->logits.clear();
+            next->lm_head_input.swap(state->lm_head_input);
+            next->lm_head_input.clear();
+        }
+        state = std::move(next);
+        state->use_speculative_context = use_speculative_context;
+        metrics_base = {};
+        metrics_valid = false;
+        generation_active = false;
+        generation_input_tokens = 0;
+        generation_output_tokens = 0;
+        generation_elapsed_microseconds = 0;
+        generation_start_time = {};
+        generation_first_token_time = {};
+        return {};
     }
-    state = std::move(next);
-    state->use_speculative_context = use_speculative_context;
-    metrics_base = {};
-    metrics_valid = false;
-    generation_active = false;
-    generation_input_tokens = 0;
-    generation_output_tokens = 0;
-    generation_elapsed_microseconds = 0;
-    generation_start_time = {};
-    generation_first_token_time = {};
-    return {};
+    catch (const std::exception& error)
+    {
+        return Error{ErrorCode::InternalError, error.what()};
+    }
+    catch (...)
+    {
+        return Error{ErrorCode::InternalError, "session reset failed"};
+    }
 }
 
 static bool contains_token(const std::vector<int32_t>& tokens, int32_t token)
@@ -395,12 +433,19 @@ Result<GenerationResult> Session::generate(std::span<const int32_t> input_ids, c
         finish_generation();
         return ret;
     }
+    catch (const std::exception& error)
+    {
+        if (!lock.owns_lock())
+            lock.lock();
+        finish_generation();
+        return Error{ErrorCode::InternalError, error.what()};
+    }
     catch (...)
     {
         if (!lock.owns_lock())
             lock.lock();
         finish_generation();
-        throw;
+        return Error{ErrorCode::InternalError, "generation failed"};
     }
 }
 
@@ -1228,7 +1273,18 @@ Result<SampledToken> Session::sample_unlocked(std::span<const float> logits,
 Result<SampledToken> Session::sample(std::span<const float> logits, const SamplingOptions& opt)
 {
     const std::lock_guard<std::mutex> lock(mutex);
-    return sample_unlocked(logits, opt);
+    try
+    {
+        return sample_unlocked(logits, opt);
+    }
+    catch (const std::exception& error)
+    {
+        return Error{ErrorCode::InternalError, error.what()};
+    }
+    catch (...)
+    {
+        return Error{ErrorCode::InternalError, "sampling failed"};
+    }
 }
 
 void Session::begin_generation(uint64_t input_tokens)

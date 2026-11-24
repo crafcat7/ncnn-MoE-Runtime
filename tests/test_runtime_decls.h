@@ -80,6 +80,7 @@ void test_manifest_readers();
 void test_model_adapter_scopes();
 void test_loader_reports_adapter_and_weight_errors();
 void test_backend_capabilities_and_hybrid_execution();
+void test_attn_split_range();
 void test_flag_defaults();
 void test_cpu_task_worker();
 void test_float_scaled_add();

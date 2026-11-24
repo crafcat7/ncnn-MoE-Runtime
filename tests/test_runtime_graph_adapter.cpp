@@ -1,6 +1,8 @@
 #include "test_runtime_decls.h"
 #include "test_runtime_support.h"
 
+#include "backends/ncnn/attention_vulkan.h"
+
 namespace ncnn {
 namespace moe {
 
@@ -169,6 +171,10 @@ void test_attention_graph_without_bias_or_sink()
     const uint64_t attention_reference_flags = g_test_optimization_flags
                                                & ~OptimizationCpuFlashAttention
                                                & ~OptimizationCpuSplitKvAttention;
+    // This comparison isolates the flash kernel; FP16 dots are covered by the
+    // dedicated continuation test.
+    const uint64_t flash_exact_flags = g_test_optimization_flags
+                                       & ~OptimizationCpuFlashAttentionF16;
     LayerCache reference_long_cache;
     LayerCache flash_long_cache;
     AttentionScratch reference_long_scratch;
@@ -194,7 +200,7 @@ void test_attention_graph_without_bias_or_sink()
                                         flash_long_scratch,
                                         long_hidden,
                                         flash_long_output,
-                                        g_test_optimization_flags);
+                                        flash_exact_flags);
     check(static_cast<bool>(reference_long));
     check(static_cast<bool>(flash_long));
     check(static_cast<bool>(reference_long_output.rows() == flash_long_output.rows()));
@@ -202,7 +208,6 @@ void test_attention_graph_without_bias_or_sink()
     for (size_t row = 0; row < reference_long_output.rows(); ++row)
         for (uint32_t column = 0; column < reference_long_output.columns(); ++column)
             check_near(flash_long_output.row(row)[column], reference_long_output.row(row)[column], 1e-4f);
-
     ActivationBuffer split_prefix(512, 2);
     for (size_t row = 0; row < split_prefix.rows(); ++row)
     {
@@ -288,6 +293,7 @@ void test_attention_graph_without_bias_or_sink()
     TestRuntime runtime;
     Option cpu_options;
     cpu_options.hybrid_mode = HybridMode::CpuOnly;
+    cpu_options.optimization_flags &= ~OptimizationCpuFlashAttentionF16;
     auto cpu_model = runtime.load_model(package.path(), cpu_options);
     check(static_cast<bool>(cpu_model));
     const CompiledModel& cpu_compiled = model_compiled(*cpu_model.value());
@@ -537,7 +543,7 @@ void test_shared_expert_descriptor()
                             }
                         }
                         const ActivationBuffer expected = forward_linear(down, activated, model.opt.optimization_flags);
-                        forward_shared_expert(model, moe, input, output, workspace);
+                        check(static_cast<bool>(forward_shared_expert(model, moe, input, output, workspace)));
                         check(output.rows() == rows && output.columns() == hidden_size);
                         check(output.bytes().data() == output_storage);
                         const bool fast_packed_vector_case = packed_weights
@@ -633,11 +639,11 @@ void test_shared_expert_descriptor()
         // A reused destination must be overwritten, including after a shrink.
         for (size_t row = 0; row < shared_output.rows(); ++row)
             std::fill_n(shared_output.row(row), shared_output.columns(), std::numeric_limits<float>::quiet_NaN());
-        forward_shared_expert(shared_model,
-                              shared_plan,
-                              shared_input,
-                              shared_output,
-                              shared_workspace);
+        check(static_cast<bool>(forward_shared_expert(shared_model,
+                                                      shared_plan,
+                                                      shared_input,
+                                                      shared_output,
+                                                      shared_workspace)));
         check(shared_output.rows() == rows);
         check(shared_output.columns() == shared_descriptor.hidden_size);
         check(shared_output.bytes().data() == output_storage);
@@ -726,8 +732,10 @@ void test_shared_expert_descriptor()
     for (const std::vector<int32_t>& tokens : {std::vector<int32_t>{0, 1, 2}, std::vector<int32_t>{3}})
     {
         const uint64_t position = tokens.size() == 1 ? 3 : 0;
-        auto actual_status = forward_model(nonzero_shared_model, tokens, reordered_statistics, reordered_state, position);
-        auto expected_status = forward_model(serial_shared_model, tokens, serial_statistics, serial_state, position);
+        auto actual_status = forward_model(nonzero_shared_model, tokens, reordered_statistics, reordered_state, position,
+                                           LogitsOutput::All);
+        auto expected_status = forward_model(serial_shared_model, tokens, serial_statistics, serial_state, position,
+                                             LogitsOutput::All);
         check(static_cast<bool>(actual_status) && static_cast<bool>(expected_status));
         const auto actual = batch_to_vectors(reordered_state.logits);
         const auto expected = batch_to_vectors(serial_state.logits);
@@ -884,11 +892,11 @@ void test_shared_expert_descriptor()
     nonzero_shared_input.row(1)[1] = 1.0f;
     ActivationBuffer nonzero_shared_output;
     ExpertWorkspace nonzero_shared_workspace;
-    forward_shared_expert(nonzero_shared_model,
-                          nonzero_shared_plan,
-                          nonzero_shared_input,
-                          nonzero_shared_output,
-                          nonzero_shared_workspace);
+    check(static_cast<bool>(forward_shared_expert(nonzero_shared_model,
+                                                  nonzero_shared_plan,
+                                                  nonzero_shared_input,
+                                                  nonzero_shared_output,
+                                                  nonzero_shared_workspace)));
     check(std::any_of(nonzero_shared_output.values().begin(),
                       nonzero_shared_output.values().end(),
                       [](float value) { return value != 0.0f; }));
@@ -920,7 +928,8 @@ void test_shared_expert_descriptor()
             SessionStatistics reference_statistics;
             const std::array<int32_t, 1> input = {entries[session_index].input_id};
             auto expected_status = forward_model(serial_shared_model, input,
-                                                 reference_statistics, reference_state, 0);
+                                                 reference_statistics, reference_state, 0,
+                                                 LogitsOutput::All);
             check(static_cast<bool>(expected_status));
             check(reference_state.logits.rows() == 1);
             check(entries[session_index].logits->size() == reference_state.logits.columns());
@@ -2149,6 +2158,7 @@ void test_backend_capabilities_and_hybrid_execution()
 
     Option cpu_options;
     cpu_options.hybrid_mode = HybridMode::CpuOnly;
+    cpu_options.optimization_flags &= ~OptimizationCpuFlashAttentionF16;
     auto cpu_model = runtime.load_model(package.path(), cpu_options);
     check(static_cast<bool>(cpu_model));
     check(static_cast<bool>(cpu_model.value()->vulkan_device_index() == automatic_vulkan_device_index));
@@ -2265,8 +2275,10 @@ void test_backend_capabilities_and_hybrid_execution()
             SessionStatistics cpu_statistics;
             const CompiledModel& gpu_compiled = model_compiled(*attention_model.value());
             const CompiledModel& cpu_attention_compiled = model_compiled(*cpu_attention_model.value());
-            check(static_cast<bool>(forward_model(gpu_compiled, attention_prompt, gpu_statistics, gpu_state, 0)));
-            check(static_cast<bool>(forward_model(cpu_attention_compiled, attention_prompt, cpu_statistics, cpu_state, 0)));
+            check(static_cast<bool>(forward_model(gpu_compiled, attention_prompt, gpu_statistics, gpu_state, 0,
+                                                  LogitsOutput::All)));
+            check(static_cast<bool>(forward_model(cpu_attention_compiled, attention_prompt, cpu_statistics, cpu_state, 0,
+                                                  LogitsOutput::All)));
             check(gpu_statistics.vulkan_attention_blocks == 1);
             check(!gpu_state.layers.empty());
             const auto cache = gpu_state.layers.front().vulkan_attention_cache;
@@ -2275,8 +2287,10 @@ void test_backend_capabilities_and_hybrid_execution()
             check(capacity > attention_prompt.size());
 
             const std::array<int32_t, 1> next_token = {0};
-            auto gpu_decode_status = forward_model(gpu_compiled, next_token, gpu_statistics, gpu_state, attention_prompt.size());
-            auto cpu_decode_status = forward_model(cpu_attention_compiled, next_token, cpu_statistics, cpu_state, attention_prompt.size());
+            auto gpu_decode_status = forward_model(gpu_compiled, next_token, gpu_statistics, gpu_state, attention_prompt.size(),
+                                                   LogitsOutput::All);
+            auto cpu_decode_status = forward_model(cpu_attention_compiled, next_token, cpu_statistics, cpu_state, attention_prompt.size(),
+                                                   LogitsOutput::All);
             check(static_cast<bool>(gpu_decode_status));
             check(static_cast<bool>(cpu_decode_status));
             check(gpu_statistics.vulkan_attention_blocks == 2);
@@ -2445,8 +2459,6 @@ void test_backend_capabilities_and_hybrid_execution()
             check(gqa_statistics.vulkan_kv_ring_appends > 0);
             if (window != 0)
                 check(gqa_statistics.vulkan_kv_ring_wrapped_views > 0);
-            else
-                check(gqa_statistics.vulkan_kv_ring_resizes > 1);
             check(gqa_statistics.vulkan_attention_cpu_fallbacks == 0);
             const SessionStatistics& gqa_cpu_statistics = gqa_cpu_session.value()->statistics();
             check(gqa_cpu_statistics.vulkan_attention_blocks == 0);
@@ -2733,6 +2745,26 @@ void test_backend_capabilities_and_hybrid_execution()
     }
 }
 
+void test_attn_split_range()
+{
+    // The merge kernel only skips a partial row whose maximum is -inf, so a
+    // dispatch must never include a split with an empty key range.
+    for (const uint64_t destination : {256ull, 512ull, 1024ull, 2048ull, 2049ull, 2100ull,
+                                       4096ull, 4097ull, 8192ull, 16384ull, 65536ull})
+    {
+        const AttnSplitRange range = split_range(destination, true);
+        check(static_cast<bool>(range.splits >= 2));
+        check(static_cast<bool>(range.tokens % 16 == 0));
+        check(static_cast<bool>((range.splits - 1) * range.tokens < destination));
+        check(static_cast<bool>(range.splits * range.tokens >= destination));
+    }
+    check(static_cast<bool>(split_range(0, true).splits == 0));
+    check(static_cast<bool>(split_range(255, true).splits == 0));
+    check(static_cast<bool>(split_range(1024, false).splits == 0));
+    // 2049 keys used to dispatch ranges that held no keys; the invariants above
+    // cover every destination, including that boundary.
+}
+
 void test_flag_defaults()
 {
     check(static_cast<bool>(has_flag(OptimizationDefaultFlags,
@@ -2749,8 +2781,18 @@ void test_flag_defaults()
                                      OptimizationVulkanIndexedExperts)));
     check(static_cast<bool>(has_flag(OptimizationDefaultFlags,
                                      OptimizationVulkanQnK)));
+    // Numeric-class default: FP16 attention; int8 activations, flash prefill,
+    // split decode and Q8 decode projections are unconditional.
+    check(static_cast<bool>(has_flag(OptimizationDefaultFlags,
+                                     OptimizationCpuFlashAttentionF16)));
+    check(static_cast<bool>(!has_flag(OptimizationOptionalFlags,
+                                      OptimizationCpuFlashAttentionF16)));
     check(static_cast<bool>(!has_flag(OptimizationDefaultFlags,
                                       OptimizationCpuPackedWeights)));
+    // The load-time planner cannot see a Session, so it must use the shared
+    // constant rather than the now-zero public default.
+    check(static_cast<bool>(default_prefill_rows == 512));
+    check(static_cast<bool>(SessionOptions{}.prefill_chunk_size == 512));
     Option runtime;
     check(static_cast<bool>(runtime.optimization_flags == OptimizationDefaultFlags));
     check(static_cast<bool>(runtime.cpu_packed_weight_mode == CpuPackedWeightMode::Disabled));

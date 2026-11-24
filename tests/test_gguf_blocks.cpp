@@ -675,12 +675,18 @@ static void test_native_linear_and_embedding()
                         block_check(forward_linear_qnk({&matrix}, bf_input, {&bf_float_output}, packed, sidecars), "native BF16 activation failed");
                         block_check(forward_linear_qnk({&matrix}, bf_input, {&bf_output}, packed, sidecars), "native BF16 output failed");
                         block_check(output.rows() == tokens && output.columns() == rows, "native linear output shape mismatch");
+                        const bool auto_int8 = dtype == DType::Q4_0 || dtype == DType::Q4_1
+                                               || dtype == DType::Q5_0 || dtype == DType::Q5_1
+                                               || dtype == DType::IQ4NL;
+                        ActivationBuffer int8_reference;
+                        block_check(forward_linear_qnk({&matrix}, input, {&int8_reference}, packed, sidecars, auto_int8),
+                                    "native dispatched reference failed");
                         for (size_t token = 0; token < tokens; ++token)
                             for (uint32_t row = 0; row < rows; ++row)
                             {
                                 const double expected = reference_dot(matrix, row, input.row(token));
                                 block_near(output.row(token)[row], expected);
-                                block_near(dispatched.row(token)[row], expected);
+                                block_near(dispatched.row(token)[row], int8_reference.row(token)[row], 1e-6f);
                                 block_near(bf_float_output.row(token)[row], expected);
                                 uint16_t bf;
                                 std::memcpy(&bf, bf_output.row_bytes(token).data() + row * sizeof(bf), sizeof(bf));
@@ -717,16 +723,15 @@ static void test_native_linear_and_embedding()
                     mapped.input_column_indices[column] = columns - column - 1;
                 ActivationBuffer mapped_output;
                 forward_linear(mapped, map_input, mapped_output, 0, nullptr, ExecutionBackend::Cpu);
-                const uint8_t* encoded = original.data();
+                // The mapping gathers the reversed activation; compare against
+                // the same projection fed the reversed row directly.
+                ActivationBuffer reversed_input(1, columns);
+                for (uint32_t column = 0; column < columns; ++column)
+                    reversed_input.row(0)[column] = map_input.row(0)[columns - column - 1];
+                ActivationBuffer reversed_output;
+                forward_linear(matrix, reversed_input, reversed_output, 0, nullptr, ExecutionBackend::Cpu);
                 for (uint32_t row = 0; row < rows; ++row)
-                {
-                    double expected = 0.0;
-                    const uint8_t* row_data = encoded + static_cast<size_t>(row) * (columns / block_size) * bytes;
-                    for (uint32_t column = 0; column < columns; ++column)
-                        expected += static_cast<double>(reference_value(dtype, row_data + (column / block_size) * bytes, column % block_size))
-                                    * map_input.row(0)[columns - column - 1];
-                    block_near(mapped_output.row(0)[row], expected);
-                }
+                    block_near(mapped_output.row(0)[row], reversed_output.row(0)[row], 1e-6);
                 block_check(matrix.float32_data.empty() && matrix.bfloat16_data.empty() && matrix.quantized_data.empty()
                                 && std::memcmp(matrix.qnk_values().data(), original.data(), original.size()) == 0,
                             "execution expanded or modified immutable mapped native weights");
@@ -760,6 +765,13 @@ static void test_native_pairs_and_invalid_layouts()
             block_check(forward_linear_qnk({&first, &second}, input, {&left, &right}, packed), "native paired Float32 projection failed");
             block_check(forward_linear({&first, &second}, input, {&dispatched_left, &dispatched_right}, packed ? uint64_t{OptimizationCpuPackedWeights} : uint64_t{0}),
                         "native paired CPU dispatch failed");
+            const bool auto_int8 = dtype == DType::Q4_0 || dtype == DType::Q4_1
+                                   || dtype == DType::Q5_0 || dtype == DType::Q5_1
+                                   || dtype == DType::IQ4NL;
+            ActivationBuffer int8_left;
+            ActivationBuffer int8_right;
+            block_check(forward_linear_qnk({&first, &second}, input, {&int8_left, &int8_right}, packed, {}, auto_int8),
+                        "native paired dispatch reference failed");
             block_check(forward_linear_qnk({&first, &second}, bf_input, {&bf_left, &bf_right}, packed), "native paired BF16 projection failed");
             for (size_t token = 0; token < input.rows(); ++token)
             {
@@ -767,7 +779,7 @@ static void test_native_pairs_and_invalid_layouts()
                 {
                     const double expected = reference_dot(first, row, input.row(token));
                     block_near(left.row(token)[row], expected);
-                    block_near(dispatched_left.row(token)[row], expected);
+                    block_near(dispatched_left.row(token)[row], int8_left.row(token)[row], 1e-6);
                     uint16_t bf;
                     std::memcpy(&bf, bf_left.row_bytes(token).data() + row * sizeof(bf), sizeof(bf));
                     block_near(bfloat16_to_float(bf), expected, 0.004);
@@ -776,7 +788,7 @@ static void test_native_pairs_and_invalid_layouts()
                 {
                     const double expected = reference_dot(second, row, input.row(token));
                     block_near(right.row(token)[row], expected);
-                    block_near(dispatched_right.row(token)[row], expected);
+                    block_near(dispatched_right.row(token)[row], int8_right.row(token)[row], 1e-6);
                     block_near(bf_right.row(token)[row], expected);
                 }
             }
@@ -819,11 +831,17 @@ int main()
 {
     try
     {
+        std::cout << "[test_native_block_decoders]" << std::endl;
         ncnn::moe::test_native_block_decoders();
+        std::cout << "[test_nvfp4_block_codec]" << std::endl;
         ncnn::moe::test_nvfp4_block_codec();
+        std::cout << "[test_mxfp4_gguf_codec_and_embedding]" << std::endl;
         ncnn::moe::test_mxfp4_gguf_codec_and_embedding();
+        std::cout << "[test_mxfp4_scale255_cpu_paths]" << std::endl;
         ncnn::moe::test_mxfp4_scale255_cpu_paths();
+        std::cout << "[test_native_linear_and_embedding]" << std::endl;
         ncnn::moe::test_native_linear_and_embedding();
+        std::cout << "[test_native_pairs_and_invalid_layouts]" << std::endl;
         ncnn::moe::test_native_pairs_and_invalid_layouts();
         std::cout << "native GGUF block CPU tests passed\n";
         return 0;

@@ -6,6 +6,13 @@
 namespace ncnn {
 namespace moe {
 
+// Rebuild a tensor from the block-quantized payload retained when the loader
+// expanded a dense projection to BF16. It copies the shape, block layout and
+// input-column map, and aliases the payload bytes; it is only valid while the
+// source tensor is alive. Block scales live inside the payload, so metadata
+// fields only used by other quantized formats are intentionally not copied.
+[[nodiscard]] TensorData qnk_view(const TensorData& matrix);
+
 class QnkLinear_vulkan
 {
 public:

@@ -2245,15 +2245,12 @@ void test_cpu_resource_coordination()
 #if defined(NCNN_MOE_WITH_NCNN) && NCNN_MOE_WITH_NCNN \
     && defined(_OPENMP)                               \
     && (defined(__clang__) || defined(_OPENMP_LLVM_RUNTIME))
-    const bool explicit_wait_policy = std::getenv("KMP_BLOCKTIME")
-                                      || std::getenv("OMP_WAIT_POLICY")
-                                      || std::getenv("KMP_LIBRARY");
     const int original_blocktime = ncnn::get_kmp_blocktime();
     ncnn::set_kmp_blocktime(13);
     // ncnn may be built without LLVM OpenMP even when this test uses it.
     if (ncnn::get_kmp_blocktime() == 13)
     {
-        const int scoped_blocktime = explicit_wait_policy || cpu_openmp_thread_limit() <= 1 ? 13 : 1;
+        const int scoped_blocktime = cpu_openmp_thread_limit() <= 1 ? 13 : 1;
         {
             CpuOpenMpThreadLimitScope outer;
             check(ncnn::get_kmp_blocktime() == scoped_blocktime);

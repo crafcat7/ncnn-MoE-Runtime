@@ -58,6 +58,7 @@ int main(int argc, char** argv)
             std::cerr << "unknown test argument: " << argument << '\n';
             return 2;
         }
+        ncnn::moe::test_attn_split_range();
         ncnn::moe::test_flag_defaults();
         ncnn::moe::test_cpu_task_worker();
         ncnn::moe::test_cpu_resource_coordination();

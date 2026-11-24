@@ -5,7 +5,6 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <iomanip>
 #include <optional>
 #include <sstream>
@@ -78,28 +77,6 @@ inline std::optional<int64_t> json_integer(std::string_view object, std::string_
     int64_t result = 0;
     const auto parsed = std::from_chars(object.data() + *offset_result, object.data() + end, result);
     if (parsed.ec != std::errc() || parsed.ptr != object.data() + end)
-        return std::nullopt;
-    return result;
-}
-
-inline std::optional<double> json_number(std::string_view object, std::string_view key)
-{
-    const auto offset_result = json_value_offset(object, key);
-    if (!offset_result)
-        return std::nullopt;
-    std::size_t end = *offset_result;
-    while (end < object.size()
-           && object[end] != ','
-           && object[end] != '}'
-           && object[end] != ']'
-           && !is_space(object[end]))
-    {
-        ++end;
-    }
-    const std::string token(object.substr(*offset_result, end - *offset_result));
-    char* parsed_end = nullptr;
-    const double result = std::strtod(token.c_str(), &parsed_end);
-    if (parsed_end == token.c_str() || *parsed_end != '\0')
         return std::nullopt;
     return result;
 }

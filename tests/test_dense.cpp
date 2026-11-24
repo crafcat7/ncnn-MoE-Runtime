@@ -246,7 +246,9 @@ static void test_native_expert_layouts()
                         input.row(row)[column] = (static_cast<int>(row * 3 + column) - 2) * 0.5f;
                 ActivationBuffer actual;
                 ExpertWorkspace workspace;
-                forward_dense_ffn(model, expert, input, actual, workspace, ExecutionBackend::Cpu);
+                dense_check(static_cast<bool>(forward_dense_ffn(model, expert, input, actual, workspace,
+                                                                ExecutionBackend::Cpu)),
+                            "CPU dense FFN execution failed");
                 for (size_t row = 0; row < input.rows(); ++row)
                 {
                     const std::vector<float> token(input.row(row), input.row(row) + input.columns());
@@ -316,17 +318,12 @@ static void test_gated_activation_projection_contract()
         ActivationBuffer unavailable_vulkan_output;
         ExpertWorkspace cpu_workspace;
         ExpertWorkspace unavailable_workspace;
-        forward_dense_ffn(model, expert, input, cpu_output, cpu_workspace, ExecutionBackend::Cpu);
-        bool rejected = false;
-        try
-        {
-            forward_dense_ffn(model, expert, input, unavailable_vulkan_output, unavailable_workspace, ExecutionBackend::Vulkan);
-        }
-        catch (const std::runtime_error&)
-        {
-            rejected = true;
-        }
-        dense_check(rejected, "selected Vulkan projection without a GPU operator must report an execution error");
+        dense_check(static_cast<bool>(forward_dense_ffn(model, expert, input, cpu_output, cpu_workspace,
+                                                        ExecutionBackend::Cpu)),
+                    "CPU dense FFN execution failed");
+        auto rejected = forward_dense_ffn(model, expert, input, unavailable_vulkan_output,
+                                          unavailable_workspace, ExecutionBackend::Vulkan);
+        dense_check(!rejected, "selected Vulkan projection without a GPU operator must report an execution error");
         dense_check(unavailable_vulkan_output.rows() == 0, "unavailable Vulkan projection must not publish CPU output");
         for (uint32_t column = 0; column < 2; ++column)
         {
@@ -369,7 +366,8 @@ void test_dense_ffn()
         const std::array<int32_t, 3> tokens = {1, 3, 5};
         SessionState state;
         SessionStatistics statistics;
-        auto prefilled = forward_model(model, tokens, statistics, state, 0);
+        auto prefilled = forward_model(model, tokens, statistics, state, 0,
+                                       LogitsOutput::All);
         dense_check(static_cast<bool>(prefilled), "prefill failed");
         for (size_t row = 0; row < tokens.size(); ++row)
         {

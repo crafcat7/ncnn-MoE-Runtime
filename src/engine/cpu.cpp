@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cstdlib>
 #include <fstream>
 #include <set>
 #include <string>
@@ -428,13 +427,8 @@ CpuOpenMpThreadLimitScope::CpuOpenMpThreadLimitScope() noexcept
 {
 #if defined(_OPENMP) && defined(NCNN_MOE_USE_NCNN) && NCNN_MOE_USE_NCNN \
     && (defined(__clang__) || defined(_OPENMP_LLVM_RUNTIME))
-    if (cpu_openmp_thread_limit() <= 1
-        || std::getenv("KMP_BLOCKTIME")
-        || std::getenv("OMP_WAIT_POLICY")
-        || std::getenv("KMP_LIBRARY"))
-    {
+    if (cpu_openmp_thread_limit() <= 1)
         return;
-    }
 
     previous_blocktime = ncnn::get_kmp_blocktime();
     if (previous_blocktime != 1)

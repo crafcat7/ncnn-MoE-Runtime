@@ -1,0 +1,109 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DNCNN_MOE_BUILD_TESTS=ON
+          -DNCNN_MOE_BUILD_EXAMPLES=ON
+          -DNCNN_MOE_USE_VULKAN=OFF
+      - name: Build
+        run: cmake --build build -j 4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j 2
+      - name: Python CLI tests
+        run: python -m unittest discover -s tests_py
+
+  linux-aarch64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DNCNN_MOE_BUILD_TESTS=ON
+          -DNCNN_MOE_BUILD_EXAMPLES=ON
+          -DNCNN_MOE_USE_VULKAN=OFF
+      - name: Build
+        run: cmake --build build -j 4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j 2
+      - name: Python CLI tests
+        run: python -m unittest discover -s tests_py
+
+  macOS:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DNCNN_MOE_BUILD_TESTS=ON
+          -DNCNN_MOE_BUILD_EXAMPLES=ON
+          -DNCNN_MOE_USE_VULKAN=OFF
+      - name: Build
+        run: cmake --build build -j 4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j 2
+      - name: Python CLI tests
+        run: python -m unittest discover -s tests_py
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DNCNN_MOE_BUILD_TESTS=ON
+          -DNCNN_MOE_BUILD_EXAMPLES=ON
+          -DNCNN_MOE_USE_VULKAN=OFF
+      - name: Build
+        run: cmake --build build --config Release -j 4
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure -j 2
+      - name: Python CLI tests
+        run: python -m unittest discover -s tests_py
+
+  # Vulkan compiles on the CPU runner; the tests skip when no device is
+  # available. A GPU runner runs the same suite with a loaded ICD.
+  vulkan-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Vulkan toolchain
+        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev glslc
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DNCNN_MOE_BUILD_TESTS=ON
+          -DNCNN_MOE_BUILD_EXAMPLES=ON
+          -DNCNN_MOE_USE_VULKAN=ON
+      - name: Build
+        run: cmake --build build -j 4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j 2

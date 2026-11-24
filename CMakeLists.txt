@@ -172,6 +172,7 @@ set(NCNN_MOE_SOURCES
     src/graph/router.cpp
     # Kernels
     src/kernels/attention.cpp
+    src/kernels/attention_sdpa.cpp
     src/kernels/bfloat16.cpp
     src/kernels/float8.cpp
     src/kernels/gateddeltanet.cpp
@@ -182,6 +183,7 @@ set(NCNN_MOE_SOURCES
     src/kernels/ops.cpp
     src/kernels/ple.cpp
     src/kernels/qnk.cpp
+    src/kernels/qnk_format.cpp
     src/kernels/qnk_neon.cpp
     src/kernels/qnk_neon_i8mm.cpp
     src/kernels/int4.cpp
@@ -211,9 +213,17 @@ set(NCNN_MOE_SOURCES
     src/storage/mappedfile.cpp
     src/storage/weightstore.cpp
 )
-if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
-    set_source_files_properties(src/kernels/qnk_neon_i8mm.cpp PROPERTIES
-        COMPILE_OPTIONS "-march=armv8.6-a+dotprod+i8mm;-fno-lto")
+if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$"
+   AND NOT (APPLE AND CMAKE_OSX_ARCHITECTURES MATCHES "x86_64|i386"))
+    # Universal builds apply per-source flags to every architecture slice, so the
+    # i8mm TU only gets -march when the whole build is ARM64. Without the flag
+    # the kernels degrade to stubs and neon_qnk_i8mm_supported() reports false.
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-march=armv8.6-a+dotprod+i8mm" NCNN_MOE_COMPILER_SUPPORTS_I8MM)
+    if(NCNN_MOE_COMPILER_SUPPORTS_I8MM)
+        set_source_files_properties(src/kernels/qnk_neon_i8mm.cpp PROPERTIES
+            COMPILE_OPTIONS "-march=armv8.6-a+dotprod+i8mm;-fno-lto")
+    endif()
 endif()
 
 add_library(ncnn_moe STATIC ${NCNN_MOE_SOURCES})
@@ -459,15 +469,22 @@ if(NCNN_MOE_USE_NCNN)
     set(NCNN_BF16 ON CACHE BOOL "Build ncnn with bfloat16 support")
     # Quantized runtime kernels do not use ncnn's INT8 operators.
     set(NCNN_INT8 OFF CACHE BOOL "Build ncnn with int8 inference" FORCE)
+    # The runtime never loads or draws images; drop ncnn's pixel pipeline.
+    set(NCNN_PIXEL OFF CACHE BOOL "Build ncnn with image pixel conversion" FORCE)
+    set(NCNN_PIXEL_ROTATE OFF CACHE BOOL "Build ncnn with image pixel rotate" FORCE)
+    set(NCNN_PIXEL_AFFINE OFF CACHE BOOL "Build ncnn with image pixel affine" FORCE)
+    set(NCNN_PIXEL_DRAWING OFF CACHE BOOL "Build ncnn with image pixel drawing" FORCE)
     # Runtime layers use numeric IDs and ParamDict entries, not text graphs.
     set(NCNN_STRING OFF CACHE BOOL "Build ncnn with string support" FORCE)
 
-    # Disable unneeded upstream layers to keep the dependency small.
+    # Disable unneeded upstream layers to keep the dependency small. Packing,
+    # Flatten and Softmax are instantiated by ncnn's Vulkan helpers; the other
+    # entries are created directly by the Vulkan operators.
     set(NCNN_MOE_REQUIRED_LAYERS
-        binaryop cast flatten gemm innerproduct packing permute rmsnorm
-        reshape rotaryembed sdpa slice softmax)
+        binaryop flatten gemm innerproduct packing permute reshape rotaryembed
+        sdpa slice softmax)
     if(NCNN_MOE_USE_VULKAN)
-        # RMSNorm reuses the LayerNorm Vulkan shaders.
+        # The RMSNorm path reuses the LayerNorm Vulkan shaders.
         list(APPEND NCNN_MOE_REQUIRED_LAYERS layernorm)
     endif()
     file(STRINGS "${NCNN_MOE_NCNN_SOURCE_DIR}/src/CMakeLists.txt"
@@ -523,6 +540,9 @@ if(NCNN_MOE_WITH_VULKAN)
         src/kernels/vulkan/attention_decode_merge.comp
         src/kernels/vulkan/attention_decode_sdpa.comp
         src/kernels/vulkan/attention_decode_split.comp
+        src/kernels/vulkan/attention_decode_split_subgroup.comp
+        src/kernels/vulkan/attention_prefill_flash.comp
+        src/kernels/vulkan/attention_prefill_flash128.comp
         src/kernels/vulkan/attention_gqa_matrix.comp
         src/kernels/vulkan/attention_gqa_reduce.comp
         src/kernels/vulkan/attention_output_gate.comp

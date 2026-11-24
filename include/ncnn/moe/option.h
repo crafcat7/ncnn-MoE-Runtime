@@ -68,7 +68,7 @@ enum OptionFlag : uint32_t
 #define NCNN_MOE_OPT_VULKAN_MXFP4_ROW_TILE_BIT         43
 #define NCNN_MOE_OPT_VULKAN_EXPERT_DIRECT_STAGING_BIT  44
 #define NCNN_MOE_OPT_VULKAN_SHARED_EXPERT_OVERLAP_BIT  45
-#define NCNN_MOE_OPT_CPU_QNK_Q8_BIT                    46
+#define NCNN_MOE_OPT_CPU_FLASH_ATTENTION_F16_BIT       46
 
 enum OptimizationFlag : uint64_t
 {
@@ -108,11 +108,8 @@ enum OptimizationFlag : uint64_t
     // Internal execution bit selected from CpuPackedWeightMode. It is not
     // part of OptimizationDefaultFlags.
     OptimizationCpuPackedWeights = UINT64_C(1) << NCNN_MOE_OPT_CPU_PACKED_WEIGHTS_BIT,
-    // Block-quantized CPU projections read int8 activations instead of float32
-    // ones: four times less activation traffic per output row. Activation
-    // quantization adds rounding that the exact-float parity tests reject, so
-    // this stays outside OptimizationDefaultFlags and is opt-in per measurement.
-    OptimizationCpuQnkQ8 = UINT64_C(1) << NCNN_MOE_OPT_CPU_QNK_Q8_BIT
+    // FP16 flash QK/PV dots, on by default; clear the bit for exact FP32 dots.
+    OptimizationCpuFlashAttentionF16 = UINT64_C(1) << NCNN_MOE_OPT_CPU_FLASH_ATTENTION_F16_BIT,
 };
 
 inline constexpr uint64_t OptimizationDefaultFlags = OptimizationCpuFastSilu
@@ -127,6 +124,7 @@ inline constexpr uint64_t OptimizationDefaultFlags = OptimizationCpuFastSilu
                                                      | OptimizationCpuSplitKvAttention
                                                      | OptimizationCpuLatentPreparedRope
                                                      | OptimizationCpuLatentOnlineSoftmax
+                                                     | OptimizationCpuFlashAttentionF16
                                                      | OptimizationCpuMxfp4Q8
                                                      | OptimizationVulkanBfloat16CoopMatrix
                                                      | OptimizationVulkanAttention
@@ -149,8 +147,7 @@ inline constexpr uint64_t OptimizationDefaultFlags = OptimizationCpuFastSilu
                                                      | OptimizationVulkanExpertDirectStaging
                                                      | OptimizationVulkanSharedExpertOverlap;
 
-inline constexpr uint64_t OptimizationOptionalFlags = OptimizationCpuPackedWeights
-                                                      | OptimizationCpuQnkQ8;
+inline constexpr uint64_t OptimizationOptionalFlags = OptimizationCpuPackedWeights;
 inline constexpr uint64_t OptimizationAllFlags = OptimizationDefaultFlags | OptimizationOptionalFlags;
 static_assert((OptimizationDefaultFlags & OptimizationOptionalFlags) == 0);
 

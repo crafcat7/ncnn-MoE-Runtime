@@ -185,16 +185,8 @@ static Result<void> forward_speculative_layer(const CompiledModel& model,
             return Error{ErrorCode::InternalError, "speculative execution graph has no shared Expert binding"};
         const bool require_gpu = graph.layers[execution.shared_expert_group].backend == ExecutionBackend::Vulkan
                                  && model.opt.hybrid_mode == HybridMode::HybridExperts;
-        try
-        {
-            forward_shared_expert(model, moe, layer_state.normalized, layer_state.shared_expert_output,
-                                  layer_state.shared_expert_workspace, {}, nullptr, false, require_gpu);
-        }
-        catch (const std::exception& error)
-        {
-            return Error{ErrorCode::InternalError, error.what()};
-        }
-        return {};
+        return forward_shared_expert(model, moe, layer_state.normalized, layer_state.shared_expert_output,
+                                     layer_state.shared_expert_workspace, {}, nullptr, false, require_gpu);
     };
 
     if (has_flag(graph.layers[execution.expert_dispatch].flags, LayerRequestExperts))

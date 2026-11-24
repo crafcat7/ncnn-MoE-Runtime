@@ -368,6 +368,7 @@ bool create_tile_gemm(const std::shared_ptr<VulkanContext>& context,
     compile_option.use_fp16_arithmetic = false;
     compile_option.use_bf16_packed = false;
     const size_t variant = (option.use_subgroup_ops ? 1u : 0u) * 3 + activation_variant(option);
+    const size_t pipeline_variant = variant;
     ncnn::VulkanDevice* device = context->device();
     bool any = false;
     for (size_t index = 0; index < 2; ++index)
@@ -376,14 +377,13 @@ bool create_tile_gemm(const std::shared_ptr<VulkanContext>& context,
         const std::shared_ptr<const std::vector<uint32_t>> spirv = context->shader_binary(item.source, item.length, compile_option, variant);
         if (!spirv || spirv->empty())
             continue;
-        std::shared_ptr<ncnn::Pipeline> pipeline = context->find_pipeline(item.source, variant);
+        std::shared_ptr<ncnn::Pipeline> pipeline = context->find_pipeline(item.source, pipeline_variant);
         if (!pipeline)
         {
             std::unique_ptr<ncnn::Pipeline> created(new ncnn::Pipeline(device));
             created->set_subgroup_size(32);
             created->set_local_size_xyz(static_cast<int>(item.wg), 1, 1);
-            const std::vector<ncnn::vk_specialization_type> specializations;
-            if (created->create(spirv->data(), spirv->size() * sizeof(uint32_t), specializations) != 0)
+            if (created->create(spirv->data(), spirv->size() * sizeof(uint32_t), {}) != 0)
                 continue;
             pipeline = std::shared_ptr<ncnn::Pipeline>(created.release(),
                                                        [context = context](ncnn::Pipeline* value) mutable {
@@ -393,7 +393,7 @@ bool create_tile_gemm(const std::shared_ptr<VulkanContext>& context,
                                                            }
                                                            context.reset();
                                                        });
-            context->cache_pipeline(item.source, variant, pipeline);
+            context->cache_pipeline(item.source, pipeline_variant, pipeline);
         }
         pipes[index].pipeline = std::move(pipeline);
         pipes[index].bm = item.bm;
@@ -1102,7 +1102,7 @@ Bfloat16Linear_vulkan::create_with_allocator(const TensorData& matrix,
         {
             return {};
         }
-        create_tile_gemm(implementation.vulkan_context, implementation.option, implementation.tile_gemm);
+        (void)create_tile_gemm(implementation.vulkan_context, implementation.option, implementation.tile_gemm);
         if (!implementation.row_rms_scale_pipeline)
         {
             constexpr size_t row_rms_variant = 0;
@@ -1740,7 +1740,6 @@ bool Bfloat16Linear_vulkan::forward(const ActivationBuffer& input,
     ++runtime_state.batch_downloads;
     if (used_cooperative_matrix)
     {
-        ++runtime_state.bfloat16_cooperative_matrix_dispatches;
     }
     return true;
 #else
@@ -1890,9 +1889,7 @@ bool Bfloat16Linear_vulkan::forward_parallel(const ActivationBuffer& input,
     ++runtime_state.batch_uploads;
     runtime_state.batch_downloads += 2;
     if (first_used_cooperative_matrix)
-        ++runtime_state.bfloat16_cooperative_matrix_dispatches;
     if (parallel_used_cooperative_matrix)
-        ++runtime_state.bfloat16_cooperative_matrix_dispatches;
     return true;
 #else
     (void)input;
@@ -2056,7 +2053,6 @@ bool Bfloat16Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
     ++runtime_state.batch_downloads;
     if (used_cooperative_matrix)
     {
-        ++runtime_state.bfloat16_cooperative_matrix_dispatches;
     }
     return true;
 #else
@@ -2144,7 +2140,6 @@ bool Bfloat16Linear_vulkan::record_swiglu_chain(const ncnn::VkMat& input,
     output = result;
     statistics.dispatches += 2;
     ++statistics.shared_expert_swiglu_fusions;
-    statistics.bfloat16_cooperative_matrix_dispatches += cooperative ? 1 : 0;
     return true;
 }
 #endif
@@ -2197,7 +2192,6 @@ bool Bfloat16Linear_vulkan::forward_swiglu_chain_device(const DeviceTensor_vulka
     state.dispatches += statistics.dispatches;
     state.int4_dispatches += statistics.int4_dispatches;
     state.shared_expert_swiglu_fusions += statistics.shared_expert_swiglu_fusions;
-    state.bfloat16_cooperative_matrix_dispatches += statistics.bfloat16_cooperative_matrix_dispatches;
     ++state.compute_submissions;
     successful = true;
     return true;
@@ -2430,7 +2424,6 @@ bool Bfloat16Expert_vulkan::record(const ncnn::VkMat& input, ncnn::VkMat& output
     if (fused.empty()) return false;
     workspace.push_back(fused);
     if (gate.record_projection(input, fused, static_cast<uint32_t>(input.h), command, bindings, constants))
-        ++expert.vulkan_context->runtime_state().bfloat16_cooperative_matrix_dispatches;
     bindings = {fused, down.packed, down.bias, output};
     constants.resize(6);
     constants[0].u32 = expert.intermediate_columns;
@@ -2683,7 +2676,6 @@ bool Bfloat16Expert_vulkan::forward_batch(std::span<const Bfloat16Expert_vulkan*
                                                                     bindings,
                                                                     constants);
         if (used_cooperative_matrix)
-            ++runtime_state.bfloat16_cooperative_matrix_dispatches;
 
         bindings[0] = fused_gpu;
         bindings[1] = down.packed;

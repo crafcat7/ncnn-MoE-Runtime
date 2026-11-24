@@ -187,18 +187,17 @@ static void forward_expert(const CompiledModel& model,
                            bool prefetch)
 {
     assert(&input != &output);
-    const WeightStore& weights = model.weights;
     const CompiledOperatorTable& operators = model.operators;
     const uint64_t optimization_flags = model.opt.optimization_flags;
     if (expert.gate_up_weight != invalid_tensor_handle)
     {
-        const TensorData& gate_up_weight = cached_weights && cached_weights->gate_up ? *cached_weights->gate_up : weights.at(expert.gate_up_weight);
+        const TensorData& gate_up_weight = cached_weights && cached_weights->gate_up ? *cached_weights->gate_up : model.weights.at(expert.gate_up_weight);
         const CompiledOperator* gate_up_operator = cached_weights && cached_weights->gate_up
                                                        ? cached_weights->gate_up_operator
                                                        : operators.find_weight(expert.gate_up_weight);
         if (prefetch)
             prefetch_tensor(gate_up_weight);
-        const TensorData* gate_up_bias = expert.gate_up_bias == invalid_tensor_handle ? nullptr : &weights.at(expert.gate_up_bias);
+        const TensorData* gate_up_bias = expert.gate_up_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.gate_up_bias);
         ActivationBuffer& activated = workspace.projection;
         if (gate_up_weight.dtype == DType::MxFp4 && gate_up_weight.input_column_indices.empty())
         {
@@ -222,7 +221,7 @@ static void forward_expert(const CompiledModel& model,
                                      && has_flag(optimization_flags, OptimizationCpuFastSilu)
                                      && (expert.activation == ExpertActivation::Silu
                                          || expert.activation == ExpertActivation::DeepSeekSwiGlu);
-            // Compact forward while source rows still use the full gate/up stride.
+            // Sequential: in-place compaction reuses row 0 storage.
             for (size_t token_index = 0; token_index < rows; ++token_index)
             {
                 const float* source = activated.row(token_index);
@@ -268,14 +267,14 @@ static void forward_expert(const CompiledModel& model,
             }
             activated.reset(rows, intermediate_size, false);
         }
-        const TensorData& down_weight = cached_weights && cached_weights->down ? *cached_weights->down : weights.at(expert.down_weight);
+        const TensorData& down_weight = cached_weights && cached_weights->down ? *cached_weights->down : model.weights.at(expert.down_weight);
         const CompiledOperator* down_operator = cached_weights && cached_weights->down
                                                     ? cached_weights->down_operator
                                                     : operators.find_weight(expert.down_weight);
         if (prefetch)
             prefetch_tensor(down_weight);
         expert_linear(down_weight,
-                      expert.down_bias == invalid_tensor_handle ? nullptr : &weights.at(expert.down_bias),
+                      expert.down_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.down_bias),
                       down_operator,
                       activated,
                       output,
@@ -285,13 +284,13 @@ static void forward_expert(const CompiledModel& model,
     }
 
     if (prefetch)
-        prefetch_weight(weights, expert.up_weight);
-    const TensorData& up_weight = weights.at(expert.up_weight);
+        prefetch_weight(model.weights, expert.up_weight);
+    const TensorData& up_weight = model.weights.at(expert.up_weight);
     bool gate_prefetched = false;
     if (expert.layout != ExpertLayout::UpDown && expert.gate_weight != invalid_tensor_handle)
     {
-        const TensorData& gate_weight = weights.at(expert.gate_weight);
-        const TensorData& down_weight = weights.at(expert.down_weight);
+        const TensorData& gate_weight = model.weights.at(expert.gate_weight);
+        const TensorData& down_weight = model.weights.at(expert.down_weight);
         const CompiledOperator* gate_operator = operators.find_weight(expert.gate_weight);
         const CompiledOperator* up_operator = operators.find_weight(expert.up_weight);
         const CompiledOperator* down_operator = operators.find_weight(expert.down_weight);
@@ -303,7 +302,7 @@ static void forward_expert(const CompiledModel& model,
         {
             if (prefetch)
             {
-                prefetch_weight(weights, expert.gate_weight);
+                prefetch_weight(model.weights, expert.gate_weight);
                 gate_prefetched = true;
             }
             ActivationBuffer& activated = workspace.projection;
@@ -320,7 +319,7 @@ static void forward_expert(const CompiledModel& model,
             {
                 if (prefetch)
                 {
-                    prefetch_weight(weights, expert.down_weight);
+                    prefetch_weight(model.weights, expert.down_weight);
                 }
                 expert_linear(down_weight,
                               nullptr,
@@ -335,7 +334,7 @@ static void forward_expert(const CompiledModel& model,
     }
     ActivationBuffer& up = workspace.projection;
     if (prefetch && !gate_prefetched && expert.layout != ExpertLayout::UpDown)
-        prefetch_weight(weights, expert.gate_weight);
+        prefetch_weight(model.weights, expert.gate_weight);
     const bool paired = expert.layout != ExpertLayout::UpDown
                         && expert.gate_bias == invalid_tensor_handle
                         && expert.up_bias == invalid_tensor_handle
@@ -344,25 +343,34 @@ static void forward_expert(const CompiledModel& model,
                             || is_qnk_dtype(up_weight.dtype)
 #endif
                                 )
-                        && forward_linear({&up_weight, &weights.at(expert.gate_weight)}, input,
+                        && forward_linear({&up_weight, &model.weights.at(expert.gate_weight)}, input,
                                           {&up, &workspace.gate}, optimization_flags,
                                           {operators.find_weight(expert.up_weight),
                                            operators.find_weight(expert.gate_weight)},
                                           &workspace.quantized_input);
     if (!paired)
         expert_linear(up_weight,
-                      expert.up_bias == invalid_tensor_handle ? nullptr : &weights.at(expert.up_bias),
+                      expert.up_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.up_bias),
                       operators.find_weight(expert.up_weight),
                       input,
                       up,
                       optimization_flags,
                       &workspace.quantized_input);
+    const size_t act_rows = up.rows();
+#if defined(_OPENMP)
+    const bool nested = omp_in_parallel() != 0;
+#else
+    const bool nested = false;
+#endif
+    const int act_threads = act_rows > 1 && !nested
+                                ? static_cast<int>(std::min<size_t>(act_rows, static_cast<size_t>(cpu_linear_num_threads())))
+                                : 1;
     if (expert.layout != ExpertLayout::UpDown)
     {
         ActivationBuffer& gate = workspace.gate;
         if (!paired)
-            expert_linear(weights.at(expert.gate_weight),
-                          expert.gate_bias == invalid_tensor_handle ? nullptr : &weights.at(expert.gate_bias),
+            expert_linear(model.weights.at(expert.gate_weight),
+                          expert.gate_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.gate_bias),
                           operators.find_weight(expert.gate_weight),
                           input,
                           gate,
@@ -373,10 +381,12 @@ static void forward_expert(const CompiledModel& model,
                                  && has_flag(optimization_flags, OptimizationCpuFastSilu)
                                  && (expert.activation == ExpertActivation::Silu
                                      || expert.activation == ExpertActivation::DeepSeekSwiGlu);
-        for (size_t token_index = 0; token_index < up.rows(); ++token_index)
+#pragma omp parallel for schedule(static) num_threads(act_threads) if (act_threads > 1)
+        for (int64_t index = 0; index < static_cast<int64_t>(act_rows); ++index)
         {
-            float* up_row = up.row(token_index);
-            const float* gate_row = gate.row(token_index);
+            const size_t token = static_cast<size_t>(index);
+            float* up_row = up.row(token);
+            const float* gate_row = gate.row(token);
             if (vector_silu)
             {
                 float_silu_mul(up_row,
@@ -396,9 +406,10 @@ static void forward_expert(const CompiledModel& model,
     }
     else
     {
-        for (size_t token_index = 0; token_index < up.rows(); ++token_index)
+#pragma omp parallel for schedule(static) num_threads(act_threads) if (act_threads > 1)
+        for (int64_t index = 0; index < static_cast<int64_t>(act_rows); ++index)
         {
-            float* token = up.row(token_index);
+            float* token = up.row(static_cast<size_t>(index));
             for (uint32_t column = 0; column < up.columns(); ++column)
                 token[column] = activate(token[column],
                                          expert.activation,
@@ -407,9 +418,9 @@ static void forward_expert(const CompiledModel& model,
         }
     }
     if (prefetch)
-        prefetch_weight(weights, expert.down_weight);
-    expert_linear(weights.at(expert.down_weight),
-                  expert.down_bias == invalid_tensor_handle ? nullptr : &weights.at(expert.down_bias),
+        prefetch_weight(model.weights, expert.down_weight);
+    expert_linear(model.weights.at(expert.down_weight),
+                  expert.down_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.down_bias),
                   operators.find_weight(expert.down_weight),
                   up,
                   output,
@@ -525,256 +536,282 @@ static bool forward_cached_dense_ffn(const CompiledModel& model,
     return execute() == ExpertStatus::Executed;
 }
 
-void forward_dense_ffn(const CompiledModel& model,
-                       const ExpertPlan& ffn,
-                       const ActivationBuffer& input,
-                       ActivationBuffer& output,
-                       ExpertWorkspace& workspace,
-                       ExecutionBackend backend)
+Result<void> forward_dense_ffn(const CompiledModel& model,
+                               const ExpertPlan& ffn,
+                               const ActivationBuffer& input,
+                               ActivationBuffer& output,
+                               ExpertWorkspace& workspace,
+                               ExecutionBackend backend)
 {
-    const bool require_gpu_execution = backend == ExecutionBackend::Vulkan
-                                       && model.opt.hybrid_mode == HybridMode::HybridExperts;
-    if (ffn.use_gpu_cache)
+    try
     {
-        if (backend == ExecutionBackend::Vulkan
-            && forward_cached_dense_ffn(model, ffn, input, output))
-            return;
-        if (require_gpu_execution)
-            throw std::runtime_error(gpu_expert_error(model, ffn.residency_group, "DenseFfn",
-                                                      "Vulkan dense FFN demand upload, execution or publication failed"));
-        forward_expert(model, ffn, nullptr, input, output, workspace, false);
-        return;
-    }
-    if (backend == ExecutionBackend::Vulkan)
-    {
-        const CompiledOperator& fused = model.operators.at(ffn.vulkan_operator);
-        if (fused.qnk_expert)
+        const bool require_gpu_execution = backend == ExecutionBackend::Vulkan
+                                           && model.opt.hybrid_mode == HybridMode::HybridExperts;
+        if (ffn.use_gpu_cache)
         {
-            if (fused.qnk_expert->forward(input, output))
-                return;
-            throw std::runtime_error(gpu_expert_error(model, ffn.residency_group, "DenseFfn", "Vulkan dense FFN execution failed"));
+            if (backend == ExecutionBackend::Vulkan
+                && forward_cached_dense_ffn(model, ffn, input, output))
+                return {};
+            if (require_gpu_execution)
+                return Error{ErrorCode::InternalError, gpu_expert_error(model, ffn.residency_group, "DenseFfn",
+                                                                        "Vulkan dense FFN demand upload, execution or publication failed")};
+            forward_expert(model, ffn, nullptr, input, output, workspace, false);
+            return {};
         }
-        const auto& float8_up = model.operators.at_weight(ffn.up_weight).float8;
-        const auto& float8_down = model.operators.at_weight(ffn.down_weight).float8;
-        if (fused.float8 && float8_up && float8_down)
+        if (backend == ExecutionBackend::Vulkan)
         {
-            // Unclamped SwiGLU has identical Silu and DeepSeek semantics.
-            const float limit = ffn.activation == ExpertActivation::Silu ? 0.f : ffn.activation_limit;
-            if (fused.float8->forward_swiglu_chain(input, *float8_up, *float8_down,
-                                                   ExpertActivation::DeepSeekSwiGlu, limit, output))
-                return;
-            throw std::runtime_error(gpu_expert_error(model, ffn.residency_group, "DenseFfn", "Vulkan FP8 FFN execution failed"));
-        }
-        const CompiledOperator& down = model.operators.at_weight(ffn.down_weight);
-        if (fused.bfloat16 && down.bfloat16)
-        {
-            if (fused.bfloat16->forward_swiglu_chain(input, *down.bfloat16,
-                                                     model.weights.at(ffn.up_weight).shape[0],
-                                                     ffn.activation, ffn.activation_limit, false, output))
-                return;
-            throw std::runtime_error(gpu_expert_error(model, ffn.residency_group, "DenseFfn", "Vulkan dense FFN execution failed"));
-        }
-        if (require_gpu_execution)
-            throw std::runtime_error(gpu_expert_error(model, ffn.residency_group, "DenseFfn", "Vulkan dense FFN has no complete GPU operator"));
-        if (ffn.gate_up_weight == invalid_tensor_handle)
-        {
-            const uint64_t flags = model.opt.optimization_flags;
-            forward_linear(model.weights.at(ffn.gate_weight), input, workspace.gate,
-                           flags, model.operators.find_weight(ffn.gate_weight), backend, &workspace.quantized_input);
-            forward_linear(model.weights.at(ffn.up_weight), input, workspace.projection,
-                           flags, model.operators.find_weight(ffn.up_weight), backend, &workspace.quantized_input);
-            for (size_t row = 0; row < input.rows(); ++row)
+            const CompiledOperator& fused = model.operators.at(ffn.vulkan_operator);
+            if (fused.qnk_expert)
             {
-                float* up = workspace.projection.row(row);
-                const float* gate = workspace.gate.row(row);
-                for (uint32_t column = 0; column < workspace.projection.columns(); ++column)
-                    up[column] = gated_product(gate[column], up[column], ffn.activation,
-                                               ffn.activation_limit, flags);
+                if (fused.qnk_expert->forward(input, output))
+                    return {};
+                return Error{ErrorCode::InternalError, gpu_expert_error(model, ffn.residency_group, "DenseFfn", "Vulkan dense FFN execution failed")};
             }
-            forward_linear(model.weights.at(ffn.down_weight), workspace.projection, output,
-                           flags, &down, backend, &workspace.quantized_input);
-            return;
+            const auto& float8_up = model.operators.at_weight(ffn.up_weight).float8;
+            const auto& float8_down = model.operators.at_weight(ffn.down_weight).float8;
+            if (fused.float8 && float8_up && float8_down)
+            {
+                // Unclamped SwiGLU has identical Silu and DeepSeek semantics.
+                const float limit = ffn.activation == ExpertActivation::Silu ? 0.f : ffn.activation_limit;
+                if (fused.float8->forward_swiglu_chain(input, *float8_up, *float8_down,
+                                                       ExpertActivation::DeepSeekSwiGlu, limit, output))
+                    return {};
+                return Error{ErrorCode::InternalError, gpu_expert_error(model, ffn.residency_group, "DenseFfn", "Vulkan FP8 FFN execution failed")};
+            }
+            const CompiledOperator& down = model.operators.at_weight(ffn.down_weight);
+            if (fused.bfloat16 && down.bfloat16)
+            {
+                if (fused.bfloat16->forward_swiglu_chain(input, *down.bfloat16,
+                                                         model.weights.at(ffn.up_weight).shape[0],
+                                                         ffn.activation, ffn.activation_limit, false, output))
+                    return {};
+                return Error{ErrorCode::InternalError, gpu_expert_error(model, ffn.residency_group, "DenseFfn", "Vulkan dense FFN execution failed")};
+            }
+            if (require_gpu_execution)
+                return Error{ErrorCode::InternalError, gpu_expert_error(model, ffn.residency_group, "DenseFfn", "Vulkan dense FFN has no complete GPU operator")};
+            if (ffn.gate_up_weight == invalid_tensor_handle)
+            {
+                const uint64_t flags = model.opt.optimization_flags;
+                forward_linear(model.weights.at(ffn.gate_weight), input, workspace.gate,
+                               flags, model.operators.find_weight(ffn.gate_weight), backend, &workspace.quantized_input);
+                forward_linear(model.weights.at(ffn.up_weight), input, workspace.projection,
+                               flags, model.operators.find_weight(ffn.up_weight), backend, &workspace.quantized_input);
+                for (size_t row = 0; row < input.rows(); ++row)
+                {
+                    float* up = workspace.projection.row(row);
+                    const float* gate = workspace.gate.row(row);
+                    for (uint32_t column = 0; column < workspace.projection.columns(); ++column)
+                        up[column] = gated_product(gate[column], up[column], ffn.activation,
+                                                   ffn.activation_limit, flags);
+                }
+                forward_linear(model.weights.at(ffn.down_weight), workspace.projection, output,
+                               flags, &down, backend, &workspace.quantized_input);
+                return {};
+            }
         }
+        forward_expert(model, ffn, nullptr, input, output, workspace, false);
+        return {};
     }
-    forward_expert(model, ffn, nullptr, input, output, workspace, false);
+    catch (const std::exception& error)
+    {
+        return Error{ErrorCode::InternalError, error.what()};
+    }
+    catch (...)
+    {
+        return Error{ErrorCode::InternalError, "dense FFN execution failed"};
+    }
 }
 
-void forward_shared_expert(const CompiledModel& model,
-                           const MoeBlockPlan& moe,
-                           const ActivationBuffer& input,
-                           ActivationBuffer& output,
-                           ExpertWorkspace& workspace,
-                           const std::shared_ptr<const DeviceTensor_vulkan>& device_input,
-                           std::shared_ptr<const DeviceTensor_vulkan>* device_output,
-                           bool require_device_execution,
-                           bool require_gpu_execution)
+Result<void> forward_shared_expert(const CompiledModel& model,
+                                   const MoeBlockPlan& moe,
+                                   const ActivationBuffer& input,
+                                   ActivationBuffer& output,
+                                   ExpertWorkspace& workspace,
+                                   const std::shared_ptr<const DeviceTensor_vulkan>& device_input,
+                                   std::shared_ptr<const DeviceTensor_vulkan>* device_output,
+                                   bool require_device_execution,
+                                   bool require_gpu_execution)
 {
-    assert(&input != &output);
-    if (device_output)
-        device_output->reset();
-    const ExpertPlan& expert = moe.shared_expert;
-    const uint64_t optimization_flags = model.opt.optimization_flags;
-    const bool has_router_gate = moe.shared_expert_gate_weight != invalid_tensor_handle;
-    const auto& qnk_shared = model.operators.at(expert.vulkan_operator).qnk_expert;
-    if (require_device_execution && (!device_output || !device_input || device_input->empty()))
-        throw std::runtime_error(gpu_expert_error(model, expert.residency_group, "SharedExpert", "Vulkan Shared Expert requires a completed device input and output"));
-    if (qnk_shared && (!has_router_gate || qnk_shared->has_router_gate()))
+    try
     {
-        if (device_output && device_input && !device_input->empty())
+        assert(&input != &output);
+        if (device_output)
+            device_output->reset();
+        const ExpertPlan& expert = moe.shared_expert;
+        const uint64_t optimization_flags = model.opt.optimization_flags;
+        const bool has_router_gate = moe.shared_expert_gate_weight != invalid_tensor_handle;
+        const auto& qnk_shared = model.operators.at(expert.vulkan_operator).qnk_expert;
+        if (require_device_execution && (!device_output || !device_input || device_input->empty()))
+            return Error{ErrorCode::InternalError, gpu_expert_error(model, expert.residency_group, "SharedExpert", "Vulkan Shared Expert requires a completed device input and output")};
+        if (qnk_shared && (!has_router_gate || qnk_shared->has_router_gate()))
         {
-            auto completed = std::make_shared<DeviceTensor_vulkan>();
-            if (qnk_shared->forward_device(*device_input, *completed))
-            {
-                output.clear();
-                *device_output = std::move(completed);
-                return;
-            }
-            throw std::runtime_error(gpu_expert_error(model, expert.residency_group, "SharedExpert", "Vulkan native Shared Expert device execution failed"));
-        }
-        if (!require_device_execution)
-        {
-            if (qnk_shared->forward(input, output))
-                return;
-            throw std::runtime_error(gpu_expert_error(model, expert.residency_group, "SharedExpert", "Vulkan native Shared Expert execution failed"));
-        }
-    }
-    const auto& float8_gate = model.operators.at_weight(expert.gate_weight).float8;
-    const auto& float8_up = model.operators.at_weight(expert.up_weight).float8;
-    const auto& float8_down = model.operators.at_weight(expert.down_weight).float8;
-    if (!has_router_gate && float8_gate && float8_up && float8_down && expert.activation == ExpertActivation::DeepSeekSwiGlu)
-    {
-        if (device_output && device_input && !device_input->empty())
-        {
-            auto completed = std::make_shared<DeviceTensor_vulkan>();
-            if (float8_gate->forward_swiglu_chain_device(*device_input, *float8_up, *float8_down, expert.activation, expert.activation_limit, *completed))
-            {
-                output.clear();
-                *device_output = std::move(completed);
-                return;
-            }
-        }
-        if (!require_device_execution && float8_gate->forward_swiglu_chain(input, *float8_up, *float8_down, expert.activation, expert.activation_limit, output))
-            return;
-    }
-    const CompiledOperator& fused_shared_operator = model.operators.at(moe.fused_shared_input_bfloat16_operator);
-    bool shared_bfloat_chain_attempted = false;
-    if (fused_shared_operator.bfloat16
-        && expert.down_weight != invalid_tensor_handle)
-    {
-        const CompiledOperator& down_operator = model.operators.at_weight(expert.down_weight);
-        if (down_operator.bfloat16)
-        {
-            shared_bfloat_chain_attempted = true;
-            const uint32_t intermediate = model.weights.at(expert.up_weight).shape[0];
             if (device_output && device_input && !device_input->empty())
             {
                 auto completed = std::make_shared<DeviceTensor_vulkan>();
-                if (fused_shared_operator.bfloat16->forward_swiglu_chain_device(*device_input,
-                                                                                *down_operator.bfloat16,
-                                                                                intermediate,
-                                                                                expert.activation,
-                                                                                expert.activation_limit,
-                                                                                has_router_gate,
-                                                                                *completed))
+                if (qnk_shared->forward_device(*device_input, *completed))
                 {
                     output.clear();
                     *device_output = std::move(completed);
-                    return;
+                    return {};
                 }
+                return Error{ErrorCode::InternalError, gpu_expert_error(model, expert.residency_group, "SharedExpert", "Vulkan native Shared Expert device execution failed")};
             }
-            if (!require_device_execution && fused_shared_operator.bfloat16->forward_swiglu_chain(input, *down_operator.bfloat16, intermediate, expert.activation, expert.activation_limit, has_router_gate, output))
+            if (!require_device_execution)
             {
-                return;
+                if (qnk_shared->forward(input, output))
+                    return {};
+                return Error{ErrorCode::InternalError, gpu_expert_error(model, expert.residency_group, "SharedExpert", "Vulkan native Shared Expert execution failed")};
             }
         }
-    }
-    if (require_gpu_execution || require_device_execution)
-        throw std::runtime_error(gpu_expert_error(model, expert.residency_group, "SharedExpert", "Vulkan Shared Expert has no completed GPU chain or router gate"));
-    if (fused_shared_operator.bfloat16)
-    {
-        ActivationBuffer& fused = workspace.projection;
-        if (fused_shared_operator.bfloat16->forward(input,
-                                                    fused))
+        const auto& float8_gate = model.operators.at_weight(expert.gate_weight).float8;
+        const auto& float8_up = model.operators.at_weight(expert.up_weight).float8;
+        const auto& float8_down = model.operators.at_weight(expert.down_weight).float8;
+        if (!has_router_gate && float8_gate && float8_up && float8_down && expert.activation == ExpertActivation::DeepSeekSwiGlu)
         {
-            const uint32_t intermediate = model.weights.at(expert.up_weight).shape[0];
-            const uint32_t expected_columns = intermediate * 2 + (has_router_gate ? 1 : 0);
-            if (fused.columns() == expected_columns)
+            if (device_output && device_input && !device_input->empty())
             {
-                ActivationBuffer& activated = workspace.gate;
-                activated.reset(fused.rows(), intermediate, false);
-                for (size_t token_index = 0;
-                     token_index < fused.rows();
-                     ++token_index)
+                auto completed = std::make_shared<DeviceTensor_vulkan>();
+                if (float8_gate->forward_swiglu_chain_device(*device_input, *float8_up, *float8_down, expert.activation, expert.activation_limit, *completed))
                 {
-                    const float* source = fused.row(token_index);
-                    float* destination = activated.row(token_index);
-                    for (uint32_t column = 0;
-                         column < intermediate;
-                         ++column)
+                    output.clear();
+                    *device_output = std::move(completed);
+                    return {};
+                }
+            }
+            if (!require_device_execution && float8_gate->forward_swiglu_chain(input, *float8_up, *float8_down, expert.activation, expert.activation_limit, output))
+                return {};
+        }
+        const CompiledOperator& fused_shared_operator = model.operators.at(moe.fused_shared_input_bfloat16_operator);
+        bool shared_bfloat_chain_attempted = false;
+        if (fused_shared_operator.bfloat16
+            && expert.down_weight != invalid_tensor_handle)
+        {
+            const CompiledOperator& down_operator = model.operators.at_weight(expert.down_weight);
+            if (down_operator.bfloat16)
+            {
+                shared_bfloat_chain_attempted = true;
+                const uint32_t intermediate = model.weights.at(expert.up_weight).shape[0];
+                if (device_output && device_input && !device_input->empty())
+                {
+                    auto completed = std::make_shared<DeviceTensor_vulkan>();
+                    if (fused_shared_operator.bfloat16->forward_swiglu_chain_device(*device_input,
+                                                                                    *down_operator.bfloat16,
+                                                                                    intermediate,
+                                                                                    expert.activation,
+                                                                                    expert.activation_limit,
+                                                                                    has_router_gate,
+                                                                                    *completed))
                     {
-                        destination[column] = gated_product(source[column],
-                                                            source[intermediate + column],
-                                                            expert.activation,
-                                                            expert.activation_limit,
-                                                            optimization_flags);
+                        output.clear();
+                        *device_output = std::move(completed);
+                        return {};
                     }
                 }
-                expert_linear(model.weights.at(expert.down_weight),
-                              nullptr,
-                              model.operators.find_weight(expert.down_weight),
-                              activated,
-                              output,
-                              optimization_flags,
-                              &workspace.quantized_input);
-                if (has_router_gate)
+                if (!require_device_execution && fused_shared_operator.bfloat16->forward_swiglu_chain(input, *down_operator.bfloat16, intermediate, expert.activation, expert.activation_limit, has_router_gate, output))
                 {
+                    return {};
+                }
+            }
+        }
+        if (require_gpu_execution || require_device_execution)
+            return Error{ErrorCode::InternalError, gpu_expert_error(model, expert.residency_group, "SharedExpert", "Vulkan Shared Expert has no completed GPU chain or router gate")};
+        if (fused_shared_operator.bfloat16)
+        {
+            ActivationBuffer& fused = workspace.projection;
+            if (fused_shared_operator.bfloat16->forward(input,
+                                                        fused))
+            {
+                const uint32_t intermediate = model.weights.at(expert.up_weight).shape[0];
+                const uint32_t expected_columns = intermediate * 2 + (has_router_gate ? 1 : 0);
+                if (fused.columns() == expected_columns)
+                {
+                    ActivationBuffer& activated = workspace.gate;
+                    activated.reset(fused.rows(), intermediate, false);
                     for (size_t token_index = 0;
-                         token_index < output.rows();
+                         token_index < fused.rows();
                          ++token_index)
                     {
-                        const float scale = 1.0f
-                                            / (1.0f
-                                               + float_approximate_exp(-fused.row(token_index)
-                                                                            [intermediate * 2]));
-                        float* token = output.row(token_index);
+                        const float* source = fused.row(token_index);
+                        float* destination = activated.row(token_index);
                         for (uint32_t column = 0;
-                             column < output.columns();
+                             column < intermediate;
                              ++column)
                         {
-                            token[column] *= scale;
+                            destination[column] = gated_product(source[column],
+                                                                source[intermediate + column],
+                                                                expert.activation,
+                                                                expert.activation_limit,
+                                                                optimization_flags);
                         }
                     }
+                    expert_linear(model.weights.at(expert.down_weight),
+                                  nullptr,
+                                  model.operators.find_weight(expert.down_weight),
+                                  activated,
+                                  output,
+                                  optimization_flags,
+                                  &workspace.quantized_input);
+                    if (has_router_gate)
+                    {
+                        for (size_t token_index = 0;
+                             token_index < output.rows();
+                             ++token_index)
+                        {
+                            const float scale = 1.0f
+                                                / (1.0f
+                                                   + float_approximate_exp(-fused.row(token_index)
+                                                                                [intermediate * 2]));
+                            float* token = output.row(token_index);
+                            for (uint32_t column = 0;
+                                 column < output.columns();
+                                 ++column)
+                            {
+                                token[column] *= scale;
+                            }
+                        }
+                    }
+                    return {};
                 }
-                return;
             }
         }
-    }
 
-    if (require_device_execution)
-        throw std::runtime_error("Vulkan Shared Expert has no executable device chain or router gate");
-    const ExecutionBackend backend = !shared_bfloat_chain_attempted
-                                             && support_vulkan_shared_experts(model.operators, moe)
-                                         ? ExecutionBackend::Vulkan
-                                         : ExecutionBackend::Cpu;
-    forward_dense_ffn(model, moe.shared_expert, input, output, workspace,
-                      backend);
-    if (moe.shared_expert_gate_weight == invalid_tensor_handle)
-        return;
-    ActivationBuffer& gate = workspace.gate;
-    forward_linear(model.weights.at(moe.shared_expert_gate_weight),
-                   input,
-                   gate,
-                   optimization_flags,
-                   model.operators.find_weight(moe.shared_expert_gate_weight),
-                   backend,
-                   &workspace.quantized_input);
-    assert(gate.columns() == 1);
-    for (size_t token_index = 0; token_index < output.rows(); ++token_index)
+        if (require_device_execution)
+            return Error{ErrorCode::InternalError, "Vulkan Shared Expert has no executable device chain or router gate"};
+        const ExecutionBackend backend = !shared_bfloat_chain_attempted
+                                                 && support_vulkan_shared_experts(model.operators, moe)
+                                             ? ExecutionBackend::Vulkan
+                                             : ExecutionBackend::Cpu;
+        auto dense = forward_dense_ffn(model, moe.shared_expert, input, output, workspace,
+                                       backend);
+        if (!dense)
+            return dense;
+        if (moe.shared_expert_gate_weight == invalid_tensor_handle)
+            return {};
+        ActivationBuffer& gate = workspace.gate;
+        forward_linear(model.weights.at(moe.shared_expert_gate_weight),
+                       input,
+                       gate,
+                       optimization_flags,
+                       model.operators.find_weight(moe.shared_expert_gate_weight),
+                       backend,
+                       &workspace.quantized_input);
+        assert(gate.columns() == 1);
+        for (size_t token_index = 0; token_index < output.rows(); ++token_index)
+        {
+            const float scale = 1.0f / (1.0f + float_approximate_exp(-gate.row(token_index)[0]));
+            float* token = output.row(token_index);
+            for (uint32_t column = 0; column < output.columns(); ++column)
+                token[column] *= scale;
+        }
+        return {};
+    }
+    catch (const std::exception& error)
     {
-        const float scale = 1.0f / (1.0f + float_approximate_exp(-gate.row(token_index)[0]));
-        float* token = output.row(token_index);
-        for (uint32_t column = 0; column < output.columns(); ++column)
-            token[column] *= scale;
+        return Error{ErrorCode::InternalError, error.what()};
+    }
+    catch (...)
+    {
+        return Error{ErrorCode::InternalError, "shared Expert execution failed"};
     }
 }
 

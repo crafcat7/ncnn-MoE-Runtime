@@ -10,6 +10,7 @@
 #include "engine/sessionstate.h"
 #include "backends/ncnn/expertbackend_vulkan.h"
 #include "backends/ncnn/modelpipeline.h"
+#include "backends/ncnn/linear_qnk.h"
 #include "backends/ncnn/vulkan.h"
 #include "ncnn/moe/runtime.h"
 #include "ncnn/moe/session.h"
@@ -118,7 +119,7 @@ struct DenseTestDimensions
 };
 
 static void write_weights(const std::filesystem::path& root, bool tied, bool missing_down, bool quantized = false,
-                          const DenseTestDimensions* dimensions = nullptr)
+                          const DenseTestDimensions* dimensions = nullptr, DType packed_dtype = DType::Q4K)
 {
     DenseTestDimensions defaults;
     if (quantized)
@@ -183,7 +184,9 @@ static void write_weights(const std::filesystem::path& root, bool tied, bool mis
         const bool packed = quantized && item.first.find(".mlp.") != std::string::npos;
         if (packed)
         {
-            const DType dtype = item.first.find("down_proj") != std::string::npos ? DType::Q6K : DType::Q4K;
+            const DType dtype = (packed_dtype == DType::Q4K && item.first.find("down_proj") != std::string::npos)
+                                    ? DType::Q6K
+                                    : packed_dtype;
             const size_t bytes = qnk_storage_bytes(dtype, item.second[0], item.second[1]);
             const size_t begin = data.size();
             data.insert(data.end(), bytes, 0);
@@ -744,29 +747,26 @@ static bool test_dynamic_gpu_cache(const std::filesystem::path& root, const GpuI
             actual_ffn.clear();
         ExpertWorkspace cpu_workspace;
         ExpertWorkspace failing_workspace;
-        forward_dense_ffn(cpu, first, input, expected_ffn, cpu_workspace, ExecutionBackend::Cpu);
-        bool raised = false;
-        try
-        {
-            forward_dense_ffn(model, model.net.layer_plans.front().dense_ffn, input, actual_ffn,
-                              failing_workspace, ExecutionBackend::Vulkan);
-        }
-        catch (const std::runtime_error&)
-        {
-            raised = true;
-        }
-        check(raised, "a failed GPU dense cache operation did not propagate its error");
+        auto cpu_dense = forward_dense_ffn(cpu, first, input, expected_ffn, cpu_workspace,
+                                           ExecutionBackend::Cpu);
+        check(static_cast<bool>(cpu_dense), "CPU dense FFN reference failed");
+        auto dense_failed = forward_dense_ffn(model, model.net.layer_plans.front().dense_ffn, input, actual_ffn,
+                                              failing_workspace, ExecutionBackend::Vulkan);
+        check(!dense_failed, "a failed GPU dense cache operation did not propagate its error");
         check(failing_workspace.gate.rows() == 0 && failing_workspace.projection.rows() == 0,
               "a failed GPU dense cache operation computed a CPU activation");
         check(std::all_of(actual_ffn.values().begin(), actual_ffn.values().end(), [](float value) { return value == 123.0f; }),
               "a failed GPU dense cache operation published uncommitted output");
         ExpertWorkspace explicit_cpu_workspace;
-        forward_dense_ffn(model, model.net.layer_plans.front().dense_ffn, input, actual_ffn,
-                          explicit_cpu_workspace, ExecutionBackend::Cpu);
+        auto explicit_dense = forward_dense_ffn(model, model.net.layer_plans.front().dense_ffn, input,
+                                                actual_ffn, explicit_cpu_workspace, ExecutionBackend::Cpu);
+        check(static_cast<bool>(explicit_dense), "explicit CPU dense FFN execution failed");
+        check(actual_ffn.rows() == expected_ffn.rows() && actual_ffn.columns() == expected_ffn.columns(),
+              context + " explicit CPU dense FFN shape mismatch");
         for (size_t row = 0; row < input.rows(); ++row)
             check_logits(std::vector<float>(actual_ffn.row(row), actual_ffn.row(row) + actual_ffn.columns()),
                          std::vector<float>(expected_ffn.row(row), expected_ffn.row(row) + expected_ffn.columns()),
-                         context + " explicit CPU execution row=" + std::to_string(row));
+                         context + " explicit CPU execution row=" + std::to_string(row), false);
         check(backend->demands > 0 && backend->submissions > 0 && backend->aborts > 0,
               "dense cache fault fixture did not exercise demand and failed submission cleanup");
         if (fault != DenseCacheFault::Demand)
@@ -836,7 +836,8 @@ static bool test_dynamic_gpu_cache(const std::filesystem::path& root, const GpuI
     return true;
 }
 
-static void run_dense_package(const std::filesystem::path& root, bool tied, bool quantized = false)
+static void run_dense_package(const std::filesystem::path& root, bool tied, bool quantized = false,
+                              DType packed_dtype = DType::Q4K)
 {
     std::filesystem::create_directories(root);
     ModelPackage package;
@@ -851,7 +852,7 @@ static void run_dense_package(const std::filesystem::path& root, bool tied, bool
         package.manifest.raw_json.replace(intermediate, 21, "\"intermediate_size\":256");
     }
     std::ofstream(root / "config.json") << package.manifest.raw_json;
-    write_weights(root, tied, false, quantized);
+    write_weights(root, tied, false, quantized, nullptr, packed_dtype);
     Qwen3_5MoeModelAdapter adapter;
     check(adapter.can_load(package.manifest), "dense model not recognized");
     auto descriptor = adapter.parse_model(package);
@@ -860,8 +861,11 @@ static void run_dense_package(const std::filesystem::path& root, bool tied, bool
     check(descriptor.value().layers.front().dense.intermediate_size == (quantized ? 256 : 8), "dense FFN size lost");
     if (quantized)
     {
-        check(descriptor.value().layers.front().dense.gate_weight_dtype == DType::Q4K, "dense Q4_K gate dtype lost");
-        check(descriptor.value().layers.front().dense.down_weight_dtype == DType::Q6K, "dense Q6_K down dtype lost");
+        const DType expected_down = packed_dtype == DType::Q4K ? DType::Q6K : packed_dtype;
+        check(descriptor.value().layers.front().dense.gate_weight_dtype == packed_dtype,
+              "dense packed gate dtype lost");
+        check(descriptor.value().layers.front().dense.down_weight_dtype == expected_down,
+              "dense packed down dtype lost");
     }
     auto mapping = adapter.map_weights(package, descriptor.value());
     check(static_cast<bool>(mapping), mapping ? "" : mapping.error().message);
@@ -947,10 +951,10 @@ static void run_dense_package(const std::filesystem::path& root, bool tied, bool
         check_logits(hybrid_prefill.value().logits, prefill.value().logits, context + " prefill");
         auto hybrid_decode = hybrid_session.value()->decode(3);
         check(static_cast<bool>(hybrid_decode), hybrid_decode ? "" : hybrid_decode.error().message);
-        check(hybrid_decode.value().logits.size() == decode.value().logits.size(), context + " decode logits size mismatch");
-        for (size_t index = 0; index < decode.value().logits.size(); ++index)
-            check(std::abs(hybrid_decode.value().logits[index] - decode.value().logits[index]) < 1e-3f,
-                  context + " decode differs from CPU");
+        // GPU/CPU numeric drift grows with the logit magnitude, so the hybrid
+        // comparison keeps the relative term of the Vulkan tolerance.
+        check_logits(hybrid_decode.value().logits, decode.value().logits, context + " decode");
+
         const SessionStatistics hybrid_statistics = hybrid_session.value()->statistics();
         check(hybrid_statistics.expert_assignments == 0, "hybrid dense FFN recorded routes");
         if (cached_ffn_count != 0)
@@ -1037,6 +1041,7 @@ int main()
         ncnn::moe::run_dense_package(root / "tied", true);
         ncnn::moe::run_dense_package(root / "untied", false);
         ncnn::moe::run_dense_package(root / "quantized", false, true);
+        ncnn::moe::run_dense_package(root / "q8", false, true, ncnn::moe::DType::Q8_0);
         const auto gpus = ncnn::moe::get_gpu_infos();
         size_t tested_devices = 0;
         size_t cached_devices = 0;

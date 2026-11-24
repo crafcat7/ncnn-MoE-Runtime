@@ -18,6 +18,7 @@ namespace ncnn {
 namespace moe {
 
 struct CompiledOperator;
+struct QnkQ8Input;
 
 struct Mxfp4Task
 {
@@ -70,13 +71,14 @@ void forward_embedding(const TensorData& embedding, std::span<const int32_t> inp
 [[nodiscard]] ActivationBuffer forward_linear(const TensorData& matrix, const ActivationBuffer& input, uint64_t optimization_flags, const CompiledOperator* op = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu);
 // A quantized input scratch, when supplied, must not alias input or output.
 // Float32 scratch also holds gathered inputs for quantized column permutations.
-void forward_linear(const TensorData& matrix, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, const CompiledOperator* op = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu, ActivationBuffer* quantized_input_scratch = nullptr);
+void forward_linear(const TensorData& matrix, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, const CompiledOperator* op = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu, ActivationBuffer* quantized_input_scratch = nullptr, QnkQ8Input* q8_input = nullptr);
 [[nodiscard]] bool forward_linear(std::initializer_list<const TensorData*> matrices,
                                   const ActivationBuffer& input,
                                   std::initializer_list<ActivationBuffer*> outputs,
                                   uint64_t optimization_flags,
                                   std::initializer_list<const CompiledOperator*> ops = {},
-                                  ActivationBuffer* quantized_input_scratch = nullptr);
+                                  ActivationBuffer* quantized_input_scratch = nullptr,
+                                  QnkQ8Input* q8_input = nullptr);
 [[nodiscard]] bool forward_linear_rms_norm_float8(const TensorData& matrix,
                                                   const ActivationBuffer& input,
                                                   const TensorData& norm_weight,
@@ -86,7 +88,7 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
                                                   const CompiledOperator* op = nullptr,
                                                   ActivationBuffer* quantized_input_scratch = nullptr);
 [[nodiscard]] ActivationBuffer forward_linear(const TensorData& matrix, const TensorData& bias, const ActivationBuffer& input, uint64_t optimization_flags, const CompiledOperator* op = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu);
-void forward_linear(const TensorData& matrix, const TensorData& bias, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, const CompiledOperator* op = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu, ActivationBuffer* quantized_input_scratch = nullptr);
+void forward_linear(const TensorData& matrix, const TensorData& bias, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, const CompiledOperator* op = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu, ActivationBuffer* quantized_input_scratch = nullptr, QnkQ8Input* q8_input = nullptr);
 [[nodiscard]] bool forward_gate_up_float8(const TensorData& gate, const TensorData& up, const ActivationBuffer& input,
                                           ExpertActivation activation, float activation_limit, ActivationBuffer& output, uint64_t optimization_flags,
                                           const CompiledOperator* gate_executable = nullptr,

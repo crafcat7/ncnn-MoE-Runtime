@@ -853,7 +853,8 @@ void test_batch_workspace_reuse()
             {
                 const size_t index = count - row - 1;
                 const std::array<int32_t, 1> input = {entries[row].input_id};
-                auto expected_status = forward_model(compiled, input, reference_statistics[index], references[index], positions[index]);
+                auto expected_status = forward_model(compiled, input, reference_statistics[index], references[index], positions[index],
+                                                     LogitsOutput::All);
                 check(static_cast<bool>(expected_status));
                 check(references[index].logits.rows() == 1);
                 if (entries[row].logits)
@@ -988,25 +989,17 @@ void test_generation_callback_errors()
     {
         check(static_cast<bool>(session.value()->reset()));
         bool callback_called = false;
-        bool caught = false;
-        try
-        {
-            auto result = session.value()->generate(std::vector<int32_t>{0}, opt, [&](const StreamToken&) -> bool {
-                    callback_called = true;
-                    check(session.value()->metrics().timing.active);
-                    throw std::runtime_error("callback failed"); }, [&](int32_t) -> std::string {
-                    check(session.value()->metrics().timing.active);
-                    if (throw_from_decoder)
-                        throw std::runtime_error("decoder failed");
-                    return "token"; });
-            (void)result;
-        }
-        catch (const std::runtime_error& error)
-        {
-            caught = true;
-            check(std::string(error.what()) == (throw_from_decoder ? "decoder failed" : "callback failed"));
-        }
-        check(caught);
+        auto result = session.value()->generate(std::vector<int32_t>{0}, opt, [&](const StreamToken&) -> bool {
+                callback_called = true;
+                check(session.value()->metrics().timing.active);
+                throw std::runtime_error("callback failed"); }, [&](int32_t) -> std::string {
+                check(session.value()->metrics().timing.active);
+                if (throw_from_decoder)
+                    throw std::runtime_error("decoder failed");
+                return "token"; });
+        // Callback exceptions are reported through the Result boundary.
+        check(!result);
+        check(result.error().message == (throw_from_decoder ? "decoder failed" : "callback failed"));
         check(callback_called == !throw_from_decoder);
         const SessionMetrics metrics = session.value()->metrics();
         check(!metrics.timing.active);

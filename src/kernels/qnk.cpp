@@ -1,5 +1,7 @@
 #include "qnk.h"
 
+#include "ncnn/moe/option.h"
+
 #include "mxfp4.h"
 #include "qnk_msvc.h"
 #include "activationbuffer.h"
@@ -8,571 +10,34 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <unordered_map>
 
 #if defined(_OPENMP)
 #include <omp.h>
 #endif
 
-#if defined(__aarch64__) || defined(_M_ARM64)
-#include <arm_neon.h>
-#endif
-
 namespace ncnn {
 namespace moe {
-
-static float half_to_float(uint16_t value) noexcept
+bool qnk_q8_act(const DType* dtypes, size_t count) noexcept
 {
-    const uint32_t sign = static_cast<uint32_t>(value & 0x8000u) << 16;
-    const uint32_t exponent = (value >> 10) & 0x1fu;
-    const uint32_t mantissa = value & 0x03ffu;
-    uint32_t bits = sign;
-    if (exponent == 0)
+    if (dtypes == nullptr || count == 0)
+        return false;
+    for (size_t index = 0; index < count; ++index)
     {
-        if (mantissa != 0)
-        {
-            uint32_t normalized = mantissa;
-            int32_t exponent_shift = 0;
-            while ((normalized & 0x0400u) == 0)
-            {
-                normalized <<= 1;
-                --exponent_shift;
-            }
-            normalized &= 0x03ffu;
-            bits |= static_cast<uint32_t>(127 - 15 + 1 + exponent_shift) << 23;
-            bits |= normalized << 13;
-        }
+        const DType dtype = dtypes[index];
+        if (dtype != DType::Q8_0 && dtype != DType::Q4_0 && dtype != DType::Q4_1
+            && dtype != DType::Q5_0 && dtype != DType::Q5_1 && dtype != DType::IQ4NL)
+            return false;
     }
-    else if (exponent == 0x1fu)
-    {
-        bits |= 0x7f800000u | (mantissa << 13);
-    }
-    else
-    {
-        bits |= (exponent + (127 - 15)) << 23;
-        bits |= mantissa << 13;
-    }
-    float result = 0.0f;
-    std::memcpy(&result, &bits, sizeof(result));
-    return result;
+    return true;
 }
 
-static uint16_t load_u16(const uint8_t* source) noexcept
-{
-    uint16_t value = 0;
-    std::memcpy(&value, source, sizeof(value));
-    return value;
-}
-
-static float load_f16(const uint8_t* source) noexcept
-{
-    return half_to_float(load_u16(source));
-}
-
-static uint32_t load_u32(const uint8_t* source) noexcept
-{
-    uint32_t value = 0;
-    std::memcpy(&value, source, sizeof(value));
-    return value;
-}
-
-struct QnKOutput
-{
-    float* output;
-    const float* input;
-#if defined(__aarch64__) || defined(_M_ARM64)
-    float32x4_t sum0;
-    float32x4_t sum1;
-    float32x4_t sum2;
-    float32x4_t sum3;
-#endif
-};
-
-static void get_scale_min_k4(int index,
-                             const uint8_t* scales,
-                             uint8_t& scale,
-                             uint8_t& minimum) noexcept
-{
-    if (index < 4)
-    {
-        scale = scales[index] & 63u;
-        minimum = scales[index + 4] & 63u;
-    }
-    else
-    {
-        scale = static_cast<uint8_t>((scales[index + 4] & 0x0fu) | ((scales[index - 4] >> 6) << 4));
-        minimum = static_cast<uint8_t>((scales[index + 4] >> 4) | ((scales[index] >> 6) << 4));
-    }
-}
-
-#if defined(__aarch64__) || defined(_M_ARM64)
-static inline void qnk_i8_to_f32(int8x8_t values,
-                                 float scale,
-                                 float minimum,
-                                 bool affine,
-                                 QnKOutput& output,
-                                 uint32_t index) noexcept
-{
-    const int16x8_t wide = vmovl_s8(values);
-    float32x4_t low = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(wide))), scale);
-    float32x4_t high = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(wide))), scale);
-    if (affine)
-    {
-        const float32x4_t min_values = vdupq_n_f32(minimum);
-        low = vsubq_f32(low, min_values);
-        high = vsubq_f32(high, min_values);
-    }
-    if (!output.input)
-    {
-        vst1q_f32(output.output + index, low);
-        vst1q_f32(output.output + index + 4, high);
-    }
-    else if ((index & 8u) == 0)
-    {
-        output.sum0 = vfmaq_f32(output.sum0, low, vld1q_f32(output.input + index));
-        output.sum1 = vfmaq_f32(output.sum1, high, vld1q_f32(output.input + index + 4));
-    }
-    else
-    {
-        output.sum2 = vfmaq_f32(output.sum2, low, vld1q_f32(output.input + index));
-        output.sum3 = vfmaq_f32(output.sum3, high, vld1q_f32(output.input + index + 4));
-    }
-}
-#endif
-
-static void dequantize_q2(const uint8_t* block, QnKOutput& output) noexcept
-{
-    const float d = load_f16(block + 80);
-    const float minimum = load_f16(block + 82);
-    const uint8_t* scales = block;
-    const uint8_t* q = block + 16;
-    int scale_index = 0;
-    for (uint32_t n = 0; n < qnk_block_elements; n += 128)
-    {
-        int shift = 0;
-        for (int group = 0; group < 4; ++group)
-        {
-            for (int half = 0; half < 2; ++half)
-            {
-                const uint8_t scale_min = scales[scale_index++];
-                const float dl = d * (scale_min & 0x0fu);
-                const float ml = minimum * (scale_min >> 4);
-                const uint8_t* source = q + n / 4 + half * 16;
-                const uint32_t index = n + group * 32 + half * 16;
-#if defined(__aarch64__) || defined(_M_ARM64)
-                for (int lane = 0; lane < 16; lane += 8)
-                {
-                    const int8x8_t shift_count = vdup_n_s8(static_cast<int8_t>(-shift));
-                    const uint8x8_t values = vand_u8(vshl_u8(vld1_u8(source + lane), shift_count),
-                                                     vdup_n_u8(3));
-                    qnk_i8_to_f32(vreinterpret_s8_u8(values), dl, ml, true,
-                                  output, index + lane);
-                }
-#else
-                for (int lane = 0; lane < 16; ++lane)
-                    output.output[index + lane] = dl * static_cast<float>((source[lane] >> shift) & 3u) - ml;
-#endif
-            }
-            shift += 2;
-        }
-    }
-}
-
-static void dequantize_q3(const uint8_t* block, QnKOutput& output) noexcept
-{
-    constexpr uint32_t kmask1 = 0x03030303u;
-    constexpr uint32_t kmask2 = 0x0f0f0f0fu;
-    uint32_t auxiliary[4] = {};
-    std::memcpy(auxiliary, block + 96, 12);
-    const uint32_t temporary = auxiliary[2];
-    auxiliary[2] = ((auxiliary[0] >> 4) & kmask2) | (((temporary >> 4) & kmask1) << 4);
-    auxiliary[3] = ((auxiliary[1] >> 4) & kmask2) | (((temporary >> 6) & kmask1) << 4);
-    auxiliary[0] = (auxiliary[0] & kmask2) | (((temporary >> 0) & kmask1) << 4);
-    auxiliary[1] = (auxiliary[1] & kmask2) | (((temporary >> 2) & kmask1) << 4);
-    int8_t scales[16] = {};
-    std::memcpy(scales, auxiliary, sizeof(scales));
-    const float d = load_f16(block + 108);
-    const uint8_t* q = block + 32;
-    const uint8_t* high_bits = block;
-    uint8_t mask = 1;
-    int scale_index = 0;
-    for (uint32_t n = 0; n < qnk_block_elements; n += 128)
-    {
-        int shift = 0;
-        for (int group = 0; group < 4; ++group)
-        {
-            for (int half = 0; half < 2; ++half)
-            {
-                const float scale = d * static_cast<float>(scales[scale_index++] - 32);
-#if defined(__aarch64__) || defined(_M_ARM64)
-                for (int lane = 0; lane < 16; lane += 8)
-                {
-                    const uint8_t* source = q + n / 4 + half * 16 + lane;
-                    const uint8x8_t values = vand_u8(vshl_u8(vld1_u8(source),
-                                                             vdup_n_s8(static_cast<int8_t>(-shift))),
-                                                     vdup_n_u8(3));
-                    const uint8x8_t bits = vand_u8(vld1_u8(high_bits + half * 16 + lane),
-                                                   vdup_n_u8(mask));
-                    const uint8x8_t high = vand_u8(vceq_u8(bits, vdup_n_u8(0)),
-                                                   vdup_n_u8(4));
-                    qnk_i8_to_f32(vreinterpret_s8_u8(vsub_u8(values, high)),
-                                  scale, 0.0f, false,
-                                  output, n + group * 32 + half * 16 + lane);
-                }
-#else
-                for (int lane = 0; lane < 16; ++lane)
-                {
-                    const int high = (high_bits[half * 16 + lane] & mask) != 0 ? 0 : 4;
-                    const int value = static_cast<int>((q[n / 4 + half * 16 + lane] >> shift) & 3u) - high;
-                    output.output[n + group * 32 + half * 16 + lane] = scale * value;
-                }
-#endif
-            }
-            shift += 2;
-            mask = static_cast<uint8_t>(mask << 1);
-        }
-    }
-}
-
-static void dequantize_q4(const uint8_t* block, QnKOutput& output) noexcept
-{
-    const float d = load_f16(block);
-    const float minimum = load_f16(block + 2);
-    const uint8_t* scales = block + 4;
-    const uint8_t* q = block + 16;
-    int scale_index = 0;
-    for (uint32_t n = 0; n < qnk_block_elements; n += 64)
-    {
-        const uint8_t* source = q + n / 2;
-        for (int half = 0; half < 2; ++half)
-        {
-            uint8_t scale_value = 0;
-            uint8_t min_value = 0;
-            get_scale_min_k4(scale_index++, scales, scale_value, min_value);
-            const float scale = d * scale_value;
-            const float minimum_value = minimum * min_value;
-            const uint32_t index = n + half * 32;
-#if defined(__aarch64__) || defined(_M_ARM64)
-            for (int lane = 0; lane < 32; lane += 8)
-            {
-                const uint8x8_t packed = vld1_u8(source + lane);
-                const uint8x8_t values = half == 0 ? vand_u8(packed, vdup_n_u8(0x0fu)) : vshr_n_u8(packed, 4);
-                qnk_i8_to_f32(vreinterpret_s8_u8(values), scale, minimum_value, true, output, index + lane);
-            }
-#else
-            for (int lane = 0; lane < 32; ++lane)
-            {
-                const uint8_t packed = source[lane];
-                const uint8_t value = half == 0 ? packed & 0x0fu : packed >> 4;
-                output.output[index + lane] = scale * static_cast<float>(value) - minimum_value;
-            }
-#endif
-        }
-    }
-}
-
-static void dequantize_q5(const uint8_t* block, QnKOutput& output) noexcept
-{
-    const float d = load_f16(block);
-    const float minimum = load_f16(block + 2);
-    const uint8_t* scales = block + 4;
-    const uint8_t* high_bits = block + 16;
-    const uint8_t* low_bits = block + 48;
-    int scale_index = 0;
-    uint8_t first_mask = 1;
-    uint8_t second_mask = 2;
-    for (uint32_t n = 0; n < qnk_block_elements; n += 64)
-    {
-        for (int half = 0; half < 2; ++half)
-        {
-            uint8_t scale_value = 0;
-            uint8_t min_value = 0;
-            get_scale_min_k4(scale_index++, scales, scale_value, min_value);
-            const float scale = d * scale_value;
-            const float minimum_value = minimum * min_value;
-            const uint8_t mask = half == 0 ? first_mask : second_mask;
-            const uint32_t index = n + half * 32;
-#if defined(__aarch64__) || defined(_M_ARM64)
-            for (int lane = 0; lane < 32; lane += 8)
-            {
-                const uint8x8_t low = vld1_u8(low_bits + n / 2 + lane);
-                const uint8x8_t high = vld1_u8(high_bits + lane);
-                const uint8x8_t unpacked = half == 0 ? vand_u8(low, vdup_n_u8(0x0fu)) : vshr_n_u8(low, 4);
-                const uint8x8_t high_value = vand_u8(vcgt_u8(vand_u8(high, vdup_n_u8(mask)),
-                                                             vdup_n_u8(0)),
-                                                     vdup_n_u8(16));
-                qnk_i8_to_f32(vreinterpret_s8_u8(vadd_u8(unpacked, high_value)),
-                              scale, minimum_value, true, output, index + lane);
-            }
-#else
-            for (int lane = 0; lane < 32; ++lane)
-            {
-                const uint8_t low = low_bits[n / 2 + lane];
-                const int high = (high_bits[lane] & mask) != 0 ? 16 : 0;
-                const uint8_t value = half == 0 ? low & 0x0fu : low >> 4;
-                output.output[index + lane] = scale * static_cast<float>(value + high) - minimum_value;
-            }
-#endif
-        }
-        first_mask = static_cast<uint8_t>(first_mask << 2);
-        second_mask = static_cast<uint8_t>(second_mask << 2);
-    }
-}
-
-// Keep the decoder in the caller so fused accumulators remain local.
-#if defined(_MSC_VER) && defined(_M_ARM64)
-static __forceinline void dequantize_q6(const uint8_t* block, QnKOutput& output) noexcept
-#else
-#if defined(__aarch64__)
-__attribute__((always_inline))
-#endif
-static inline void dequantize_q6(const uint8_t* block, QnKOutput& output) noexcept
-#endif
-{
-    const float d = load_f16(block + 208);
-    const uint8_t* low_bits = block;
-    const uint8_t* high_bits = block + 128;
-    const int8_t* scales = reinterpret_cast<const int8_t*>(block + 192);
-    for (uint32_t n = 0; n < qnk_block_elements; n += 128)
-    {
-        const uint8_t* low = low_bits + n / 2;
-        const uint8_t* high = high_bits + n / 4;
-        const int scale_base = static_cast<int>(n / 16);
-#if defined(__aarch64__) || defined(_M_ARM64)
-        for (int quarter = 0; quarter < 4; ++quarter)
-        {
-            for (int lane = 0; lane < 32; lane += 8)
-            {
-                const uint8x8_t packed_low = vld1_u8(low + (quarter & 1) * 32 + lane);
-                const uint8x8_t low_value = quarter < 2
-                                                ? vand_u8(packed_low, vdup_n_u8(0x0fu))
-                                                : vshr_n_u8(packed_low, 4);
-                const uint8x8_t high_value = vand_u8(vshl_u8(vld1_u8(high + lane),
-                                                             vdup_n_s8(static_cast<int8_t>(-2 * quarter))),
-                                                     vdup_n_u8(3));
-                const uint8x8_t value = vsub_u8(vorr_u8(low_value, vshl_n_u8(high_value, 4)), vdup_n_u8(32));
-                const float scale = d * scales[scale_base + 2 * quarter + lane / 16];
-                qnk_i8_to_f32(vreinterpret_s8_u8(value), scale, 0.0f, false, output,
-                              n + quarter * 32 + lane);
-            }
-        }
-#else
-        for (int lane = 0; lane < 32; ++lane)
-        {
-            const int q1 = static_cast<int>((low[lane] & 0x0fu) | (((high[lane] >> 0) & 3u) << 4)) - 32;
-            const int q2 = static_cast<int>((low[lane + 32] & 0x0fu) | (((high[lane] >> 2) & 3u) << 4)) - 32;
-            const int q3 = static_cast<int>((low[lane] >> 4) | (((high[lane] >> 4) & 3u) << 4)) - 32;
-            const int q4 = static_cast<int>((low[lane + 32] >> 4) | (((high[lane] >> 6) & 3u) << 4)) - 32;
-            output.output[n + lane] = d * scales[scale_base + lane / 16] * q1;
-            output.output[n + lane + 32] = d * scales[scale_base + lane / 16 + 2] * q2;
-            output.output[n + lane + 64] = d * scales[scale_base + lane / 16 + 4] * q3;
-            output.output[n + lane + 96] = d * scales[scale_base + lane / 16 + 6] * q4;
-        }
-#endif
-    }
-}
-
-static void dequantize_q8(const uint8_t* block, QnKOutput& output) noexcept
-{
-    float scale = 0.0f;
-    std::memcpy(&scale, block, sizeof(scale));
-    const int8_t* values = reinterpret_cast<const int8_t*>(block + 4);
-#if defined(__aarch64__) || defined(_M_ARM64)
-    for (uint32_t index = 0; index < qnk_block_elements; index += 16)
-    {
-        const int8x16_t packed = vld1q_s8(values + index);
-        qnk_i8_to_f32(vget_low_s8(packed), scale, 0.0f, false, output, index);
-        qnk_i8_to_f32(vget_high_s8(packed), scale, 0.0f, false, output, index + 8);
-    }
-#else
-    for (uint32_t index = 0; index < qnk_block_elements; ++index)
-        output.output[index] = scale * static_cast<float>(values[index]);
-#endif
-}
-
-static void dequantize_q8_0(const uint8_t* block, QnKOutput& output) noexcept
-{
-    const float scale = load_f16(block);
-    const int8_t* values = reinterpret_cast<const int8_t*>(block + 2);
-#if defined(__aarch64__) || defined(_M_ARM64)
-    for (uint32_t index = 0; index < 32; index += 16)
-    {
-        const int8x16_t packed = vld1q_s8(values + index);
-        qnk_i8_to_f32(vget_low_s8(packed), scale, 0.0f, false, output, index);
-        qnk_i8_to_f32(vget_high_s8(packed), scale, 0.0f, false, output, index + 8);
-    }
-#else
-    for (uint32_t index = 0; index < 32; ++index)
-        output.output[index] = scale * static_cast<float>(values[index]);
-#endif
-}
-
-static float ue4m3_to_float(uint8_t value) noexcept
-{
-    if (value == 0 || value == 0x7fu)
-        return 0.0f;
-    const uint32_t exponent = (value >> 3) & 15u;
-    const uint32_t mantissa = value & 7u;
-    if (exponent == 0)
-        return static_cast<float>(mantissa) * 0.0009765625f;
-    const uint32_t bits = (exponent + 119u) << 23;
-    float scale;
-    std::memcpy(&scale, &bits, sizeof(scale));
-    return scale * (1.0f + static_cast<float>(mantissa) * 0.125f);
-}
-
-static void dequantize_nvfp4(const uint8_t* block, QnKOutput& output) noexcept
-{
-    static constexpr float doubled_e2m1[16] = {0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f,
-                                               -0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f};
-    for (uint32_t subblock = 0; subblock < 4; ++subblock)
-    {
-        const float scale = ue4m3_to_float(block[subblock]);
-        const uint8_t* codes = block + 4 + subblock * 8;
-        float* decoded = output.output + subblock * 16;
-        for (uint32_t index = 0; index < 8; ++index)
-        {
-            const uint8_t byte = codes[index];
-            decoded[index] = doubled_e2m1[byte & 15u] * scale;
-            decoded[index + 8] = doubled_e2m1[byte >> 4] * scale;
-        }
-    }
-}
-
-static void dequantize_q4(DType dtype, const uint8_t* block, QnKOutput& output) noexcept
-{
-    const bool affine = dtype == DType::Q4_1;
-    const float scale = load_f16(block);
-    const float minimum = affine ? -load_f16(block + 2) : 0.0f;
-    const uint8_t* values = block + (affine ? 4 : 2);
-#if defined(__aarch64__) || defined(_M_ARM64)
-    std::array<int8_t, 16> low;
-    std::array<int8_t, 16> high;
-    for (uint32_t index = 0; index < 16; ++index)
-    {
-        low[index] = static_cast<int8_t>(static_cast<int>(values[index] & 15u) - (affine ? 0 : 8));
-        high[index] = static_cast<int8_t>(static_cast<int>(values[index] >> 4) - (affine ? 0 : 8));
-    }
-    for (uint32_t index = 0; index < 16; index += 8)
-    {
-        qnk_i8_to_f32(vld1_s8(low.data() + index), scale, minimum, affine, output, index);
-        qnk_i8_to_f32(vld1_s8(high.data() + index), scale, minimum, affine, output, index + 16);
-    }
-#else
-    for (uint32_t index = 0; index < 16; ++index)
-    {
-        const int low = static_cast<int>(values[index] & 15u) - (affine ? 0 : 8);
-        const int high = static_cast<int>(values[index] >> 4) - (affine ? 0 : 8);
-        output.output[index] = scale * static_cast<float>(low) - minimum;
-        output.output[index + 16] = scale * static_cast<float>(high) - minimum;
-    }
-#endif
-}
-
-static void dequantize_q5_0(const uint8_t* block, QnKOutput& output) noexcept
-{
-    const float scale = load_f16(block);
-    const uint32_t high_bits = load_u32(block + 2);
-    const uint8_t* values = block + 6;
-#if defined(__aarch64__) || defined(_M_ARM64)
-    std::array<int8_t, 16> low;
-    std::array<int8_t, 16> high;
-    for (uint32_t index = 0; index < 16; ++index)
-    {
-        low[index] = static_cast<int8_t>(static_cast<int>((values[index] & 15u) | (((high_bits >> index) & 1u) << 4)) - 16);
-        high[index] = static_cast<int8_t>(static_cast<int>((values[index] >> 4) | (((high_bits >> (index + 16)) & 1u) << 4)) - 16);
-    }
-    for (uint32_t index = 0; index < 16; index += 8)
-    {
-        qnk_i8_to_f32(vld1_s8(low.data() + index), scale, 0.0f, false, output, index);
-        qnk_i8_to_f32(vld1_s8(high.data() + index), scale, 0.0f, false, output, index + 16);
-    }
-#else
-    for (uint32_t index = 0; index < 16; ++index)
-    {
-        const int low = static_cast<int>((values[index] & 15u) | (((high_bits >> index) & 1u) << 4)) - 16;
-        const int high = static_cast<int>((values[index] >> 4) | (((high_bits >> (index + 16)) & 1u) << 4)) - 16;
-        output.output[index] = scale * static_cast<float>(low);
-        output.output[index + 16] = scale * static_cast<float>(high);
-    }
-#endif
-}
-
-static constexpr std::array<int8_t, 16> iq4_nl_values = {
-    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
-
-static void dequantize_iq4_nl(const uint8_t* block, QnKOutput& output) noexcept
-{
-    const float scale = load_f16(block);
-    const uint8_t* values = block + 2;
-#if defined(__aarch64__) || defined(_M_ARM64)
-    const int8x16_t table = vld1q_s8(iq4_nl_values.data());
-    const uint8x16_t packed = vld1q_u8(values);
-    const int8x16_t low = vqtbl1q_s8(table, vandq_u8(packed, vdupq_n_u8(15)));
-    const int8x16_t high = vqtbl1q_s8(table, vshrq_n_u8(packed, 4));
-    qnk_i8_to_f32(vget_low_s8(low), scale, 0.0f, false, output, 0);
-    qnk_i8_to_f32(vget_high_s8(low), scale, 0.0f, false, output, 8);
-    qnk_i8_to_f32(vget_low_s8(high), scale, 0.0f, false, output, 16);
-    qnk_i8_to_f32(vget_high_s8(high), scale, 0.0f, false, output, 24);
-#else
-    for (uint32_t index = 0; index < 16; ++index)
-    {
-        output.output[index] = scale * static_cast<float>(iq4_nl_values[values[index] & 15u]);
-        output.output[index + 16] = scale * static_cast<float>(iq4_nl_values[values[index] >> 4]);
-    }
-#endif
-}
-
-static void dequantize_iq4_xs(const uint8_t* block, QnKOutput& output) noexcept
-{
-    const float scale = load_f16(block);
-    const uint16_t scales_high = load_u16(block + 2);
-    const uint8_t* scales_low = block + 4;
-    const uint8_t* values = block + 8;
-    for (uint32_t group = 0; group < 8; ++group)
-    {
-        const uint32_t packed_scale = ((scales_low[group / 2] >> ((group & 1u) * 4)) & 15u)
-                                      | (((scales_high >> (group * 2)) & 3u) << 4);
-        const float group_scale = scale * static_cast<float>(static_cast<int>(packed_scale) - 32);
-        const uint8_t* packed = values + group * 16;
-        for (uint32_t index = 0; index < 16; ++index)
-        {
-            output.output[group * 32 + index] = group_scale * iq4_nl_values[packed[index] & 15u];
-            output.output[group * 32 + index + 16] = group_scale * iq4_nl_values[packed[index] >> 4];
-        }
-    }
-}
-
-static void dequantize_q5_1(const uint8_t* block, QnKOutput& output) noexcept
-{
-    const float scale = load_f16(block);
-    const float minimum = load_f16(block + 2);
-    const uint32_t high = load_u32(block + 4);
-    const uint8_t* values = block + 8;
-#if defined(__aarch64__) || defined(_M_ARM64)
-    std::array<int8_t, 32> decoded;
-    for (uint32_t index = 0; index < 32; ++index)
-        decoded[index] = static_cast<int8_t>(((values[index % 16] >> (index / 16 * 4)) & 15u)
-                                             | (((high >> index) & 1u) << 4));
-    for (uint32_t index = 0; index < 32; index += 8)
-        qnk_i8_to_f32(vld1_s8(decoded.data() + index), scale, -minimum, true, output, index);
-#else
-    for (uint32_t index = 0; index < 32; ++index)
-    {
-        const uint32_t value = ((values[index % 16] >> (index / 16 * 4)) & 15u)
-                               | (((high >> index) & 1u) << 4);
-        output.output[index] = scale * static_cast<float>(value) + minimum;
-    }
-#endif
-}
-
-// First block of one weight row plus the byte distance to the next block.
-// Packed tiles interleave eight rows, so their blocks are eight slots apart.
 static inline const uint8_t* qnk_row0(const uint8_t* raw, const QnKPack* pack, size_t row,
                                       uint32_t block_count, size_t block_bytes, size_t& stride) noexcept
 {
@@ -581,13 +46,13 @@ static inline const uint8_t* qnk_row0(const uint8_t* raw, const QnKPack* pack, s
                 : raw + row * static_cast<size_t>(block_count) * block_bytes;
 }
 
-// Quantized activation row shared by every output row of one projection, so
-// the int8 kernels reuse qnk_gemm's threading and packed-weight policy.
+// Non-owning view of a quantized activation row owned by QnkQ8Input (either the
+// caller's shared input or the thread-local scratch).
 struct QnkQ8Row
 {
-    std::vector<int8_t> codes;
-    std::vector<float> scales;
-    std::vector<int32_t> sums;
+    const int8_t* codes = nullptr;
+    const float* scales = nullptr;
+    const int32_t* sums = nullptr;
 };
 
 template<bool paired>
@@ -604,9 +69,14 @@ static void qnk_gemm(const uint8_t* raw,
                      const TensorData* matrix2 = nullptr,
                      const QnKPack* packed2 = nullptr,
                      ActivationBuffer* output2 = nullptr,
-                     const QnkQ8Row* q8 = nullptr) noexcept
+                     const QnkQ8Row* q8 = nullptr,
+                     // Paired K-quant decode converts each matrix to its own
+                     // Q8_0 buffer; pass matrix2's converted bytes here instead
+                     // of its native block payload.
+                     const uint8_t* raw2_override = nullptr) noexcept
 {
     static_cast<void>(q8);
+    assert(!q8 || token_count == 1);
     const uint32_t block_size = qnk_block_size(dtype);
     const uint32_t block_count = columns / block_size;
     const size_t block_bytes = qnk_block_bytes(dtype);
@@ -617,7 +87,7 @@ static void qnk_gemm(const uint8_t* raw,
     if constexpr (paired)
     {
         rows2 = matrix2->shape[0];
-        raw2 = matrix2->qnk_values().data();
+        raw2 = raw2_override != nullptr ? raw2_override : matrix2->qnk_values().data();
         output2_data = output2->row(0);
         output_stride2 = output2->columns();
     }
@@ -635,19 +105,6 @@ static void qnk_gemm(const uint8_t* raw,
     {
 #if defined(__aarch64__) || defined(_M_ARM64)
         static_cast<void>(stride);
-        if (q8 && token_count == 1)
-        {
-            size_t encoded_stride = 0;
-            const uint8_t* first = qnk_row0(data, pack, row, block_count, block_bytes, encoded_stride);
-            result[row] = neon_qnk_q8_row(dtype,
-                                          first,
-                                          encoded_stride,
-                                          block_count,
-                                          q8->codes.data(),
-                                          q8->scales.data(),
-                                          q8->sums.data());
-            return;
-        }
         float sum = 0.0f;
         for (uint32_t block = 0; block < block_count; ++block)
         {
@@ -661,19 +118,6 @@ static void qnk_gemm(const uint8_t* raw,
         result[row] = sum;
 #else
 #if defined(NCNN_MOE_MSVC_X86_SIMD)
-        if (q8 && token_count == 1)
-        {
-            size_t encoded_stride = 0;
-            const uint8_t* first = qnk_row0(data, pack, row, block_count, block_bytes, encoded_stride);
-            result[row] = msvc_avx2_qnk_q8_row(dtype,
-                                               first,
-                                               encoded_stride,
-                                               block_count,
-                                               q8->codes.data(),
-                                               q8->scales.data(),
-                                               q8->sums.data());
-            return;
-        }
         if (use_simd_block32)
         {
             size_t encoded_stride = 0;
@@ -706,6 +150,21 @@ static void qnk_gemm(const uint8_t* raw,
         }
 #endif
     };
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(NCNN_MOE_MSVC_X86_SIMD)
+    // Single-token int8 rows are selected once per call instead of branching
+    // inside the output-row loop.
+    const auto row_q8 = [&](const uint8_t* data, const QnKPack* pack, float* result, size_t row) {
+        size_t encoded_stride = 0;
+        const uint8_t* first = qnk_row0(data, pack, row, block_count, block_bytes, encoded_stride);
+#if defined(__aarch64__) || defined(_M_ARM64)
+        result[row] = neon_qnk_q8_row(dtype, first, encoded_stride, block_count,
+                                      q8->codes, q8->scales, q8->sums);
+#else
+        result[row] = msvc_avx2_qnk_q8_row(dtype, first, encoded_stride, block_count,
+                                           q8->codes, q8->scales, q8->sums);
+#endif
+    };
+#endif
 #if defined(__aarch64__) || defined(_M_ARM64)
     if (token_count == 1)
     {
@@ -716,7 +175,28 @@ static void qnk_gemm(const uint8_t* raw,
                                                                 static_cast<size_t>(cpu_linear_team_size(operation_count, dtype))));
         if (team_size > 1)
         {
-            if constexpr (paired)
+            if (q8)
+            {
+                if constexpr (paired)
+                {
+#pragma omp parallel num_threads(team_size)
+                    {
+#pragma omp for schedule(static) nowait
+                        for (int64_t row = 0; row < static_cast<int64_t>(rows); ++row)
+                            row_q8(raw, packed, output, static_cast<size_t>(row));
+#pragma omp for schedule(static) nowait
+                        for (int64_t row = 0; row < static_cast<int64_t>(rows2); ++row)
+                            row_q8(raw2, packed2, output2_data, static_cast<size_t>(row));
+                    }
+                }
+                else
+                {
+#pragma omp parallel for schedule(static) num_threads(team_size)
+                    for (int64_t row = 0; row < static_cast<int64_t>(rows); ++row)
+                        row_q8(raw, packed, output, static_cast<size_t>(row));
+                }
+            }
+            else if constexpr (paired)
             {
 #pragma omp parallel num_threads(team_size)
                 {
@@ -737,6 +217,15 @@ static void qnk_gemm(const uint8_t* raw,
             return;
         }
 #endif
+        if (q8)
+        {
+            for (size_t row = 0; row < rows; ++row)
+                row_q8(raw, packed, output, row);
+            if constexpr (paired)
+                for (size_t row = 0; row < rows2; ++row)
+                    row_q8(raw2, packed2, output2_data, row);
+            return;
+        }
         for (size_t row = 0; row < rows; ++row)
             dot(raw, packed, output, output_stride, row);
         if constexpr (paired)
@@ -747,6 +236,24 @@ static void qnk_gemm(const uint8_t* raw,
 #else
     if (token_count == 1)
     {
+#if defined(NCNN_MOE_MSVC_X86_SIMD)
+        if (q8)
+        {
+#if defined(_OPENMP)
+            const uint64_t q8_operation_count = static_cast<uint64_t>(rows + rows2) * columns;
+            const int q8_team_size = static_cast<int>(std::min<size_t>(rows + rows2, static_cast<size_t>(cpu_linear_team_size(q8_operation_count, dtype))));
+#pragma omp parallel for schedule(static) num_threads(q8_team_size) if (q8_team_size > 1)
+#endif
+            for (int64_t index = 0; index < static_cast<int64_t>(rows + rows2); ++index)
+            {
+                if (static_cast<size_t>(index) < rows)
+                    row_q8(raw, packed, output, static_cast<size_t>(index));
+                else if constexpr (paired)
+                    row_q8(raw2, packed2, output2_data, static_cast<size_t>(index) - rows);
+            }
+            return;
+        }
+#endif
 #if defined(_OPENMP)
         const uint64_t operation_count = static_cast<uint64_t>(rows + rows2) * columns;
         // Every block layout benefits from row parallelism; 32-value formats are
@@ -840,362 +347,187 @@ static void qnk_gemm(const uint8_t* raw,
     }
 }
 
+enum QnKNeed : uint32_t
+{
+    QnKNeedNative = 1u,
+    QnKNeedQ8 = 2u
+};
+
+// K-quant -> Q8_0 blocks for the int8-activation dots.
+static bool build_q8_compat(const uint8_t* raw, DType dtype, size_t rows, uint32_t columns,
+                            std::vector<uint8_t>& output)
+{
+    const uint32_t block_size = qnk_block_size(dtype);
+    const uint32_t source_blocks = block_size == 0 ? 0 : columns / block_size;
+    const uint32_t target_blocks = columns / 32;
+    const size_t source_bytes = qnk_block_bytes(dtype);
+    if (block_size < 32 || source_bytes == 0 || target_blocks == 0 || columns % block_size != 0)
+        return false;
+    output.resize(rows * static_cast<size_t>(target_blocks) * 34);
+    alignas(64) float decoded[256];
+    for (size_t row = 0; row < rows; ++row)
+        for (uint32_t block = 0; block < source_blocks; ++block)
+        {
+            const uint8_t* source = raw
+                                    + (row * static_cast<size_t>(source_blocks) + block) * source_bytes;
+            qnk_dequantize_block(dtype, source, decoded);
+            for (uint32_t sub = 0; sub < block_size / 32; ++sub)
+            {
+                const float* values = decoded + sub * 32;
+                float maximum = 0.0f;
+                for (uint32_t index = 0; index < 32; ++index)
+                    maximum = std::max(maximum, std::fabs(values[index]));
+                const float scale = maximum > 0.0f ? maximum / 127.0f : 1.0f;
+                uint8_t* destination = output.data()
+                                       + (row * static_cast<size_t>(target_blocks)
+                                          + block * (block_size / 32) + sub)
+                                             * 34;
+                const uint16_t half = float_to_f16(scale);
+                std::memcpy(destination, &half, sizeof(half));
+                const float inverse = 1.0f / scale;
+                for (uint32_t index = 0; index < 32; ++index)
+                {
+                    const float scaled = std::max(-127.0f, std::min(127.0f, values[index] * inverse));
+                    destination[2 + index] = static_cast<uint8_t>(static_cast<int8_t>(std::lround(scaled)));
+                }
+            }
+        }
+    return true;
+}
+
+// Q8_0 4-row x 4-token repack for the 4x8 GEMM.
+static bool build_q8_pack(const uint8_t* raw, size_t rows, uint32_t columns,
+                          std::vector<uint8_t>& output)
+{
+    if (raw == nullptr || rows == 0 || rows % 4 != 0 || columns % 32 != 0)
+        return false;
+    const uint32_t block_count = columns / 32;
+    const size_t tile_count = rows / 4;
+    output.resize(tile_count * block_count * 144);
+    for (size_t tile = 0; tile < tile_count; ++tile)
+        for (uint32_t block = 0; block < block_count; ++block)
+        {
+            uint8_t* destination = output.data() + (tile * block_count + block) * 144;
+            for (uint32_t row = 0; row < 4; ++row)
+            {
+                const uint8_t* source = raw
+                                        + ((tile * 4 + row) * static_cast<size_t>(block_count) + block) * 34;
+                std::memcpy(destination + row * 2, source, 2);
+            }
+            for (uint32_t index = 0; index < 16; ++index)
+            {
+                const uint32_t row = index % 4;
+                const uint32_t chunk = index / 4;
+                const uint8_t* source = raw
+                                        + ((tile * 4 + row) * static_cast<size_t>(block_count) + block) * 34 + 2
+                                        + chunk * 8;
+                std::memcpy(destination + 16 + index * 8, source, 8);
+            }
+        }
+    return true;
+}
+
+// Lazily builds the requested derived layouts once and publishes them on the
+// operator sidecar, so the lifetime follows the model instead of a
+// process-global pointer-keyed cache.
 static std::shared_ptr<const QnKPack> get_qnk_packed_weights(const TensorData& matrix,
                                                              std::shared_ptr<const QnKPack>* sidecar,
                                                              size_t rows,
-                                                             uint32_t columns) noexcept
+                                                             uint32_t columns,
+                                                             uint32_t need) noexcept
 {
     static std::mutex build_locks[64];
     const std::span<const uint8_t> raw = matrix.qnk_values();
+    if (raw.empty())
+        return {};
+    const auto satisfied = [&](const std::shared_ptr<const QnKPack>& pack) noexcept {
+        if (!pack || !pack->valid_shape(matrix.dtype, rows, columns))
+            return false;
+        if ((need & QnKNeedNative) != 0 && !pack->valid())
+            return false;
+        if ((need & QnKNeedQ8) != 0 && pack->q8_compat.empty() && pack->q8_pack.empty())
+            return false;
+        return true;
+    };
+    // Published packs are immutable, so the steady-state read is lock-free.
+    if (sidecar != nullptr)
+    {
+        const std::shared_ptr<const QnKPack> fast = std::atomic_load_explicit(sidecar, std::memory_order_acquire);
+        if (satisfied(fast))
+            return fast;
+    }
     const uintptr_t storage_key = reinterpret_cast<uintptr_t>(raw.data());
     std::lock_guard<std::mutex> lock(build_locks[(storage_key >> 6) & 63u]);
-    std::shared_ptr<const QnKPack> cached = sidecar ? *sidecar : nullptr;
-    if (cached && cached->valid() && cached->dtype == matrix.dtype && cached->rows == rows && cached->columns == columns)
+    const std::shared_ptr<const QnKPack> cached = sidecar ? std::atomic_load_explicit(sidecar, std::memory_order_acquire) : nullptr;
+    const bool shape_ok = cached && cached->valid_shape(matrix.dtype, rows, columns);
+    const bool want_native = (need & QnKNeedNative) != 0 || (shape_ok && cached->valid());
+    const bool want_q8 = (need & QnKNeedQ8) != 0
+                         || (shape_ok && (!cached->q8_compat.empty() || !cached->q8_pack.empty()));
+    if (shape_ok && (!want_native || cached->valid())
+        && (!want_q8 || !cached->q8_compat.empty() || !cached->q8_pack.empty()))
         return cached;
 
-    auto packed = std::make_shared<QnKPack>();
-    if (!qnk_pack_weights(raw.data(), raw.size(), matrix.dtype, rows, columns, *packed))
-        return {};
-    if (sidecar)
-        *sidecar = packed;
-    return packed;
-}
-
-uint32_t qnk_block_size(DType dtype) noexcept
-{
-    if (dtype == DType::NvFp4)
-        return 64;
-    if (dtype == DType::MxFp4)
-        return 32;
-    return dtype == DType::Q8_0 || dtype == DType::IQ4NL || dtype == DType::Q5_1
-                   || dtype == DType::Q4_0 || dtype == DType::Q4_1 || dtype == DType::Q5_0
-               ? 32
-               : (is_qnk_dtype(dtype) ? qnk_block_elements : 0);
-}
-
-size_t qnk_block_bytes(DType dtype) noexcept
-{
-    switch (dtype)
+    try
     {
-    case DType::Q2K: return 84;
-    case DType::Q3K: return 110;
-    case DType::Q4K: return 144;
-    case DType::Q5K: return 176;
-    case DType::Q6K: return 210;
-    case DType::Q8K: return 292;
-    case DType::Q8_0: return 34;
-    case DType::IQ4NL: return 18;
-    case DType::Q5_1: return 24;
-    case DType::Q4_0: return 18;
-    case DType::Q4_1: return 20;
-    case DType::Q5_0: return 22;
-    case DType::IQ4XS: return 136;
-    case DType::MxFp4: return 17;
-    case DType::NvFp4: return 36;
-    default: return 0;
-    }
-}
-
-uint64_t qnk_storage_bytes(DType dtype, size_t rows, uint32_t columns) noexcept
-{
-    if (!qnk_shape_supported(dtype, rows, columns))
-        return 0;
-    const uint64_t row_blocks = static_cast<uint64_t>(columns / qnk_block_size(dtype));
-    const uint64_t bytes_per_block = qnk_block_bytes(dtype);
-    if (row_blocks != 0 && bytes_per_block > std::numeric_limits<uint64_t>::max() / row_blocks)
-        return 0;
-    const uint64_t row_bytes = row_blocks * bytes_per_block;
-    if (rows != 0 && row_bytes > std::numeric_limits<uint64_t>::max() / rows)
-        return 0;
-    return row_bytes * rows;
-}
-
-uint64_t qnk_packed_storage_bytes(DType dtype, size_t rows, uint32_t columns) noexcept
-{
-    if (!qnk_shape_supported(dtype, rows, columns)
-        || rows > std::numeric_limits<size_t>::max() - 7)
-    {
-        return 0;
-    }
-    const uint64_t padded_rows = (rows + 7) / 8 * 8;
-    const uint64_t block_count = columns / qnk_block_size(dtype);
-    const uint64_t block_bytes = qnk_block_bytes(dtype);
-    if (padded_rows > std::numeric_limits<uint64_t>::max() / block_count
-        || padded_rows * block_count > std::numeric_limits<uint64_t>::max() / block_bytes)
-    {
-        return 0;
-    }
-    return padded_rows * block_count * block_bytes;
-}
-
-bool qnk_shape_supported(DType dtype, size_t rows, uint32_t columns) noexcept
-{
-    return is_qnk_dtype(dtype) && rows != 0 && columns != 0 && columns % qnk_block_size(dtype) == 0
-           && qnk_block_bytes(dtype) != 0;
-}
-
-static inline float forward_qnk(DType dtype,
-                                const uint8_t* block,
-                                const float* input,
-                                float* output) noexcept
-{
-    QnKOutput local;
-    local.output = output;
-    local.input = input;
-#if defined(__aarch64__) || defined(_M_ARM64)
-    if (local.input)
-    {
-        local.sum0 = vdupq_n_f32(0.0f);
-        local.sum1 = vdupq_n_f32(0.0f);
-        local.sum2 = vdupq_n_f32(0.0f);
-        local.sum3 = vdupq_n_f32(0.0f);
-    }
-#endif
-    switch (dtype)
-    {
-    case DType::Q2K: dequantize_q2(block, local); break;
-    case DType::Q3K: dequantize_q3(block, local); break;
-    case DType::Q4K: dequantize_q4(block, local); break;
-    case DType::Q5K: dequantize_q5(block, local); break;
-    case DType::Q6K: dequantize_q6(block, local); break;
-    case DType::Q8K: dequantize_q8(block, local); break;
-    case DType::Q8_0: dequantize_q8_0(block, local); break;
-    case DType::IQ4NL: dequantize_iq4_nl(block, local); break;
-    case DType::Q5_1: dequantize_q5_1(block, local); break;
-    case DType::Q4_0:
-    case DType::Q4_1: dequantize_q4(dtype, block, local); break;
-    case DType::Q5_0: dequantize_q5_0(block, local); break;
-    case DType::IQ4XS: dequantize_iq4_xs(block, local); break;
-    case DType::NvFp4: dequantize_nvfp4(block, local); break;
-    default:
-        if (output)
-            std::fill_n(output, qnk_block_elements, 0.0f);
-        return 0.0f;
-    }
-#if defined(__aarch64__) || defined(_M_ARM64)
-    if (local.input)
-    {
-        local.sum0 = vaddq_f32(vaddq_f32(local.sum0, local.sum1),
-                               vaddq_f32(local.sum2, local.sum3));
-        return vaddvq_f32(local.sum0);
-    }
-#endif
-    return 0.0f;
-}
-
-void qnk_dequantize_block(DType dtype, const uint8_t* block, float* output) noexcept
-{
-    if (!block || !output || !is_qnk_dtype(dtype))
-        return;
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
-    if (qnk_block_size(dtype) == 32
-        && (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2
-            || mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512))
-    {
-        msvc_avx2_qnk_deq32(dtype, block, output);
-        return;
-    }
-#endif
-    if (dtype == DType::Q6K)
-    {
-        QnKOutput destination;
-        destination.output = output;
-        destination.input = nullptr;
-        dequantize_q6(block, destination);
-        return;
-    }
-    forward_qnk(dtype, block, nullptr, output);
-}
-
-float qnk_dot_block(DType dtype, const uint8_t* block, const float* input) noexcept
-{
-    if (!block || !input || !is_qnk_dtype(dtype))
-        return 0.0f;
-    if (dtype == DType::NvFp4)
-    {
-        std::array<float, 64> decoded;
-        qnk_dequantize_block(dtype, block, decoded.data());
-        return float_dot(decoded.data(), input, static_cast<uint32_t>(decoded.size()));
-    }
-    if (qnk_block_size(dtype) == 32)
-    {
-        // Consume the native FP16 scale and codes directly. K-series integer
-        // kernels and activation quantization use a different block ABI.
-#if defined(__aarch64__) || defined(_M_ARM64)
-        return forward_qnk(dtype, block, input, nullptr);
-#else
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
-        const MxFp4KernelKind simd_kind = mxfp4_kernel_kind();
-        if (simd_kind == MxFp4KernelKind::X86Avx2 || simd_kind == MxFp4KernelKind::X86Avx512)
+        auto packed = std::make_shared<QnKPack>();
+        if (want_native)
         {
-            // block_count 1 with a zero stride is the single-block case of the
-            // row kernel, so 32-value blocks have one dispatch site.
-            return msvc_avx2_qnk_dot_row(dtype, block, 0, 1, input);
-        }
-#endif
-        const float scale = load_f16(block);
-        float sum = 0.0f;
-        if (dtype == DType::Q5_1)
-        {
-            const float minimum = load_f16(block + 2);
-            const uint32_t high = load_u32(block + 4);
-            for (uint32_t index = 0; index < 32; ++index)
-            {
-                const uint32_t value = ((block[8 + index % 16] >> (index / 16 * 4)) & 15u)
-                                       | (((high >> index) & 1u) << 4);
-                sum += (scale * static_cast<float>(value) + minimum) * input[index];
-            }
-            return sum;
-        }
-        if (dtype == DType::Q4_0 || dtype == DType::Q4_1)
-        {
-            const bool affine = dtype == DType::Q4_1;
-            const float minimum = affine ? load_f16(block + 2) : 0.0f;
-            const uint8_t* values = block + (affine ? 4 : 2);
-            for (uint32_t index = 0; index < 16; ++index)
-            {
-                const float low = scale * static_cast<float>(static_cast<int>(values[index] & 15u) - (affine ? 0 : 8)) + minimum;
-                const float high = scale * static_cast<float>(static_cast<int>(values[index] >> 4) - (affine ? 0 : 8)) + minimum;
-                sum += low * input[index] + high * input[index + 16];
-            }
-            return sum;
-        }
-        if (dtype == DType::Q5_0)
-        {
-            const uint32_t high_bits = load_u32(block + 2);
-            const uint8_t* values = block + 6;
-            for (uint32_t index = 0; index < 16; ++index)
-            {
-                const int low = static_cast<int>((values[index] & 15u) | (((high_bits >> index) & 1u) << 4)) - 16;
-                const int high = static_cast<int>((values[index] >> 4) | (((high_bits >> (index + 16)) & 1u) << 4)) - 16;
-                sum += scale * static_cast<float>(low) * input[index]
-                       + scale * static_cast<float>(high) * input[index + 16];
-            }
-            return sum;
-        }
-        for (uint32_t index = 0; index < 32; ++index)
-        {
-            const int8_t value = dtype == DType::IQ4NL
-                                     ? iq4_nl_values[(block[2 + index % 16] >> (index / 16 * 4)) & 15u]
-                                     : reinterpret_cast<const int8_t*>(block + 2)[index];
-            sum += (scale * static_cast<float>(value)) * input[index];
-        }
-        return sum;
-#endif
-    }
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
-    if (qnk_block_size(dtype) == qnk_block_elements && dtype != DType::IQ4XS)
-    {
-        if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512)
-            return msvc_avx512_qnk_dot_block(dtype, block, input);
-        if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2)
-            return msvc_avx2_qnk_dot_block(dtype, block, input);
-    }
-#endif
-#if defined(__aarch64__) || defined(_M_ARM64)
-    if (block && input && (dtype == DType::Q2K || dtype == DType::Q3K || dtype == DType::Q4K || dtype == DType::Q5K || dtype == DType::Q6K || dtype == DType::Q8K))
-        return forward_qnk(dtype, block, input, nullptr);
-#endif
-    alignas(64) float decoded[qnk_block_elements];
-    qnk_dequantize_block(dtype, block, decoded);
-#if defined(__aarch64__) || defined(_M_ARM64)
-    return float_dot(decoded, input, qnk_block_elements);
-#else
-    float sum = 0.0f;
-    for (uint32_t index = 0; index < qnk_block_elements; ++index)
-        sum += decoded[index] * input[index];
-    return sum;
-#endif
-}
-
-void qnk_q8k_quantize(const float* source, uint8_t* output, uint32_t columns) noexcept
-{
-    if (!source || !output || columns == 0 || columns % qnk_block_elements != 0)
-        return;
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
-    if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512)
-    {
-        msvc_avx512_qnk_q8k_quantize(source, output, columns);
-        return;
-    }
-    if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2)
-    {
-        msvc_avx2_qnk_q8k_quantize(source, output, columns);
-        return;
-    }
-#endif
-    const uint32_t block_count = columns / qnk_block_elements;
-    for (uint32_t block_index = 0; block_index < block_count; ++block_index)
-    {
-        const float* values = source + static_cast<size_t>(block_index) * qnk_block_elements;
-        uint8_t* encoded = output + static_cast<size_t>(block_index) * qnk_block_bytes(DType::Q8K);
-        float maximum = 0.0f;
-        float signed_maximum = 0.0f;
-#if defined(__aarch64__) || defined(_M_ARM64)
-        bool finite = true;
-#endif
-        for (uint32_t index = 0; index < qnk_block_elements; ++index)
-        {
-            const float value = values[index];
-#if defined(__aarch64__) || defined(_M_ARM64)
-            finite = finite && std::isfinite(value);
-#endif
-            const float absolute = std::fabs(value);
-            if (absolute > maximum)
-            {
-                maximum = absolute;
-                signed_maximum = value;
-            }
-        }
-        if (maximum == 0.0f)
-        {
-            std::memset(encoded, 0, qnk_block_bytes(DType::Q8K));
-            continue;
-        }
-        const float inverse_scale = -127.0f / signed_maximum;
-        const float scale = 1.0f / inverse_scale;
-        std::memcpy(encoded, &scale, sizeof(scale));
-        int8_t* quantized = reinterpret_cast<int8_t*>(encoded + 4);
-#if defined(__aarch64__) || defined(_M_ARM64)
-        if (finite && std::isfinite(inverse_scale))
-        {
-            const int32x4_t minimum_value = vdupq_n_s32(-127);
-            const int32x4_t maximum_value = vdupq_n_s32(127);
-            for (uint32_t index = 0; index < qnk_block_elements; index += 16)
-            {
-                const int32x4_t q0 = vcvtq_s32_f32(vrndxq_f32(vmulq_n_f32(vld1q_f32(values + index), inverse_scale)));
-                const int32x4_t q1 = vcvtq_s32_f32(vrndxq_f32(vmulq_n_f32(vld1q_f32(values + index + 4), inverse_scale)));
-                const int32x4_t q2 = vcvtq_s32_f32(vrndxq_f32(vmulq_n_f32(vld1q_f32(values + index + 8), inverse_scale)));
-                const int32x4_t q3 = vcvtq_s32_f32(vrndxq_f32(vmulq_n_f32(vld1q_f32(values + index + 12), inverse_scale)));
-                const int32x4_t c0 = vmaxq_s32(vminq_s32(q0, maximum_value), minimum_value);
-                const int32x4_t c1 = vmaxq_s32(vminq_s32(q1, maximum_value), minimum_value);
-                const int32x4_t c2 = vmaxq_s32(vminq_s32(q2, maximum_value), minimum_value);
-                const int32x4_t c3 = vmaxq_s32(vminq_s32(q3, maximum_value), minimum_value);
-                const int16x8_t c01 = vcombine_s16(vmovn_s32(c0), vmovn_s32(c1));
-                const int16x8_t c23 = vcombine_s16(vmovn_s32(c2), vmovn_s32(c3));
-                const int8x16_t packed = vcombine_s8(vmovn_s16(c01), vmovn_s16(c23));
-                vst1q_s8(quantized + index, packed);
-                const int16_t sum = vaddlvq_s8(packed);
-                std::memcpy(encoded + 260 + index / 16 * sizeof(sum), &sum, sizeof(sum));
-            }
+            if (!qnk_pack_weights(raw.data(), raw.size(), matrix.dtype, rows, columns, *packed))
+                return {};
         }
         else
-#endif
         {
-            for (uint32_t index = 0; index < qnk_block_elements; ++index)
+            packed->dtype = matrix.dtype;
+            packed->rows = rows;
+            packed->columns = columns;
+            packed->block_count = columns / qnk_block_size(matrix.dtype);
+        }
+        if (want_q8)
+        {
+            if (qnk_block_size(matrix.dtype) == 32)
             {
-                const long rounded = std::lrintf(inverse_scale * values[index]);
-                quantized[index] = static_cast<int8_t>(std::clamp<long>(rounded, -127, 127));
+                if (matrix.dtype != DType::Q8_0
+                    || !build_q8_pack(raw.data(), rows, columns, packed->q8_pack))
+                    return {};
             }
-            for (uint32_t sum_index = 0; sum_index < qnk_block_elements / 16; ++sum_index)
+            else if (!build_q8_compat(raw.data(), matrix.dtype, rows, columns, packed->q8_compat))
             {
-                int16_t sum = 0;
-                for (uint32_t lane = 0; lane < 16; ++lane)
-                    sum = static_cast<int16_t>(sum + quantized[sum_index * 16 + lane]);
-                std::memcpy(encoded + 260 + sum_index * sizeof(int16_t), &sum, sizeof(sum));
+                return {};
             }
         }
+        if (sidecar)
+            std::atomic_store_explicit(sidecar, std::shared_ptr<const QnKPack>(packed), std::memory_order_release);
+        return packed;
     }
+    catch (...)
+    {
+        return {};
+    }
+}
+
+// Q8 payload for the int8-activation kernels; the owner keeps it alive.
+struct Q8Payload
+{
+    std::shared_ptr<const QnKPack> pack;
+    const std::vector<uint8_t>* data = nullptr;
+
+    [[nodiscard]] bool valid() const noexcept
+    {
+        return data != nullptr && !data->empty();
+    }
+};
+
+static Q8Payload q8_payload(const TensorData& matrix,
+                            std::shared_ptr<const QnKPack>* sidecar,
+                            size_t rows,
+                            uint32_t columns)
+{
+    Q8Payload payload;
+    payload.pack = get_qnk_packed_weights(matrix, sidecar, rows, columns, QnKNeedQ8);
+    if (!payload.pack)
+        return payload;
+    payload.data = !payload.pack->q8_compat.empty() ? &payload.pack->q8_compat : &payload.pack->q8_pack;
+    return payload;
 }
 
 bool qnk_pack_weights(const uint8_t* raw,
@@ -1241,280 +573,13 @@ bool qnk_pack_weights(const uint8_t* raw,
     return true;
 }
 
-namespace {
-uint16_t float_to_half_bits(float value) noexcept
-{
-    uint32_t bits = 0;
-    std::memcpy(&bits, &value, sizeof(bits));
-    const uint32_t sign = (bits >> 16) & 0x8000u;
-    const int32_t exponent = static_cast<int32_t>((bits >> 23) & 0xffu) - 127 + 15;
-    const uint32_t mantissa = bits & 0x7fffffu;
-    if (exponent >= 31)
-        return static_cast<uint16_t>(sign | 0x7c00u);
-    if (exponent <= 0)
-    {
-        if (exponent < -10)
-            return static_cast<uint16_t>(sign);
-        const uint32_t normalized = (mantissa | 0x800000u) >> static_cast<uint32_t>(1 - exponent);
-        return static_cast<uint16_t>(sign | ((normalized + 0x1000u) >> 13));
-    }
-    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent) << 10) | ((mantissa + 0x1000u) >> 13));
-}
-
-struct Q8FallbackEntry
-{
-    DType dtype = DType::Q4K;
-    size_t rows = 0;
-    uint32_t columns = 0;
-    std::shared_ptr<const std::vector<uint8_t>> storage;
-};
-
-std::mutex q8_fallback_mutex;
-std::unordered_map<const uint8_t*, Q8FallbackEntry> q8_fallback_cache;
-
-std::shared_ptr<const std::vector<uint8_t>> get_q8_fallback(DType dtype,
-                                                            const uint8_t* raw,
-                                                            size_t rows,
-                                                            uint32_t columns)
-{
-    std::lock_guard<std::mutex> lock(q8_fallback_mutex);
-    const auto found = q8_fallback_cache.find(raw);
-    if (found != q8_fallback_cache.end() && found->second.dtype == dtype
-        && found->second.rows == rows && found->second.columns == columns)
-        return found->second.storage;
-    if (q8_fallback_cache.size() > 512)
-        q8_fallback_cache.clear();
-
-    const uint32_t block_size = qnk_block_size(dtype);
-    const uint32_t source_blocks = columns / block_size;
-    const uint32_t target_blocks = columns / 32;
-    const size_t source_bytes = qnk_block_bytes(dtype);
-    auto storage = std::make_shared<std::vector<uint8_t>>(
-        rows * static_cast<size_t>(target_blocks) * 34);
-    alignas(64) float decoded[256];
-    for (size_t row = 0; row < rows; ++row)
-        for (uint32_t block = 0; block < source_blocks; ++block)
-        {
-            const uint8_t* source = raw
-                                    + (row * static_cast<size_t>(source_blocks) + block) * source_bytes;
-            qnk_dequantize_block(dtype, source, decoded);
-            for (uint32_t sub = 0; sub < block_size / 32; ++sub)
-            {
-                const float* values = decoded + sub * 32;
-                float maximum = 0.0f;
-                for (uint32_t index = 0; index < 32; ++index)
-                    maximum = std::max(maximum, std::fabs(values[index]));
-                const float scale = maximum > 0.0f ? maximum / 127.0f : 1.0f;
-                uint8_t* destination = storage->data()
-                                       + (row * static_cast<size_t>(target_blocks)
-                                          + block * (block_size / 32) + sub) * 34;
-                const uint16_t half = float_to_half_bits(scale);
-                std::memcpy(destination, &half, sizeof(half));
-                const float inverse = 1.0f / scale;
-                for (uint32_t index = 0; index < 32; ++index)
-                {
-                    const float scaled = std::max(-127.0f, std::min(127.0f, values[index] * inverse));
-                    destination[2 + index] = static_cast<uint8_t>(static_cast<int8_t>(std::lround(scaled)));
-                }
-            }
-        }
-    q8_fallback_cache[raw] = Q8FallbackEntry{dtype, rows, columns, storage};
-    return storage;
-}
-struct Q8Weight4Entry
-{
-    size_t rows = 0;
-    uint32_t columns = 0;
-    std::shared_ptr<const std::vector<uint8_t>> storage;
-};
-
-std::mutex q8_weight4_mutex;
-std::unordered_map<const uint8_t*, Q8Weight4Entry> q8_weight4_cache;
-size_t q8_weight4_bytes = 0;
-
-struct Q8PackScratch
-{
-    std::vector<int8_t> pack;
-    std::vector<float> scales;
-};
-thread_local Q8PackScratch q8_pack_scratch;
-constexpr size_t q8_weight4_byte_limit = size_t{2} << 30;
-
-std::shared_ptr<const std::vector<uint8_t>> get_q8_weight4(const uint8_t* raw, size_t rows, uint32_t columns)
-{
-    std::lock_guard<std::mutex> lock(q8_weight4_mutex);
-    const auto found = q8_weight4_cache.find(raw);
-    if (found != q8_weight4_cache.end() && found->second.rows == rows
-        && found->second.columns == columns)
-        return found->second.storage;
-    const uint32_t block_count = columns / 32;
-    const size_t tile_count = rows / 4;
-    const size_t pack_bytes = tile_count * block_count * 144;
-    if (q8_weight4_bytes + pack_bytes > q8_weight4_byte_limit)
-        return {};
-    auto storage = std::make_shared<std::vector<uint8_t>>(pack_bytes);
-    for (size_t tile = 0; tile < tile_count; ++tile)
-        for (uint32_t block = 0; block < block_count; ++block)
-        {
-            uint8_t* destination = storage->data() + (tile * block_count + block) * 144;
-            for (uint32_t row = 0; row < 4; ++row)
-            {
-                const uint8_t* source = raw
-                                        + ((tile * 4 + row) * static_cast<size_t>(block_count) + block) * 34;
-                std::memcpy(destination + row * 2, source, 2);
-            }
-            for (uint32_t index = 0; index < 16; ++index)
-            {
-                const uint32_t row = index % 4;
-                const uint32_t chunk = index / 4;
-                const uint8_t* source = raw
-                                        + ((tile * 4 + row) * static_cast<size_t>(block_count) + block) * 34 + 2
-                                        + chunk * 8;
-                std::memcpy(destination + 16 + index * 8, source, 8);
-            }
-        }
-    q8_weight4_cache[raw] = Q8Weight4Entry{rows, columns, storage};
-    q8_weight4_bytes += pack_bytes;
-    return storage;
-}
-
-std::vector<int8_t> build_activation4(const int8_t* codes, size_t tokens, uint32_t columns)
-{
-    const uint32_t block_count = columns / 32;
-    const size_t groups = tokens / 4;
-    std::vector<int8_t> packed(groups * block_count * 128);
-    const int team_size = omp_in_parallel() != 0
-                              ? 1
-                              : static_cast<int>(std::min<size_t>(groups, static_cast<size_t>(cpu_linear_num_threads())));
-#pragma omp parallel for schedule(static) num_threads(team_size) if (team_size > 1)
-    for (int64_t group_index = 0; group_index < static_cast<int64_t>(groups); ++group_index)
-    {
-        const size_t group = static_cast<size_t>(group_index);
-        for (uint32_t block = 0; block < block_count; ++block)
-            for (uint32_t chunk = 0; chunk < 4; ++chunk)
-                for (uint32_t token = 0; token < 4; ++token)
-                    std::memcpy(packed.data() + (group * block_count + block) * 128 + chunk * 32 + token * 8,
-                                codes + (group * 4 + token) * static_cast<size_t>(columns)
-                                    + static_cast<size_t>(block) * 32 + chunk * 8,
-                                8);
-    }
-    return packed;
-}
-
-void run_gemm12_tail(const uint8_t* weight_pack,
-                     size_t rows,
-                     uint32_t columns,
-                     const int8_t* codes,
-                     const float* scales,
-                     size_t tokens,
-                     float* output,
-                     size_t stride)
-{
-    const uint32_t block_count = columns / 32;
-    const std::vector<int8_t> activation_pack = build_activation4(codes, tokens, columns);
-    const size_t main_tokens = tokens - tokens % 12;
-    const size_t tail_tokens = tokens - main_tokens;
-    if (main_tokens != 0)
-        neon_qnk_prefill_q8_0_gemm12(weight_pack, rows, columns,
-                                           reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                           scales, main_tokens, output, stride);
-    if (tail_tokens != 0)
-    {
-        const int8_t* tail_codes = reinterpret_cast<const int8_t*>(activation_pack.data())
-                                   + (main_tokens / 4) * block_count * 128;
-        const float* tail_scales = scales + main_tokens * block_count;
-        float* tail_output = output + main_tokens * stride;
-        if (tail_tokens % 8 == 0)
-            neon_qnk_prefill_q8_0_gemm8(weight_pack, rows, columns,
-                                              reinterpret_cast<const uint8_t*>(tail_codes),
-                                              tail_scales, tail_tokens, tail_output, stride);
-        else
-            neon_qnk_prefill_q8_0_gemm(weight_pack, rows, columns,
-                                             reinterpret_cast<const uint8_t*>(tail_codes),
-                                             tail_scales, tail_tokens, tail_output, stride);
-    }
-}
-
-struct Q8Weight136Entry
-{
-    size_t rows = 0;
-    uint32_t columns = 0;
-    std::shared_ptr<const std::vector<uint8_t>> storage;
-};
-
-std::mutex q8_weight136_mutex;
-std::unordered_map<const uint8_t*, Q8Weight136Entry> q8_weight136_cache;
-
-std::shared_ptr<const std::vector<uint8_t>> get_q8_weight136(const uint8_t* raw, size_t rows, uint32_t columns)
-{
-    std::lock_guard<std::mutex> lock(q8_weight136_mutex);
-    const auto found = q8_weight136_cache.find(raw);
-    if (found != q8_weight136_cache.end() && found->second.rows == rows
-        && found->second.columns == columns)
-        return found->second.storage;
-    const uint32_t block_count = columns / 32;
-    const size_t tile_count = rows / 4;
-    auto storage = std::make_shared<std::vector<uint8_t>>(tile_count * block_count * 136);
-    for (size_t tile = 0; tile < tile_count; ++tile)
-        for (uint32_t block = 0; block < block_count; ++block)
-        {
-            uint8_t* destination = storage->data() + (tile * block_count + block) * 136;
-            for (uint32_t row = 0; row < 4; ++row)
-            {
-                const uint8_t* source = raw
-                                        + ((tile * 4 + row) * static_cast<size_t>(block_count) + block) * 34;
-                std::memcpy(destination + row * 2, source, 2);
-            }
-            for (uint32_t index = 0; index < 16; ++index)
-            {
-                const uint32_t row = index % 4;
-                const uint32_t chunk = index / 4;
-                const uint8_t* source = raw
-                                        + ((tile * 4 + row) * static_cast<size_t>(block_count) + block) * 34 + 2
-                                        + chunk * 8;
-                std::memcpy(destination + 8 + index * 8, source, 8);
-            }
-        }
-    q8_weight136_cache[raw] = Q8Weight136Entry{rows, columns, storage};
-    return storage;
-}
-
-std::vector<int8_t> build_activation136(const int8_t* codes, const float* scales, size_t tokens, uint32_t columns)
-{
-    const uint32_t block_count = columns / 32;
-    const size_t groups = tokens / 4;
-    std::vector<int8_t> packed(groups * block_count * 136);
-    for (size_t group = 0; group < groups; ++group)
-        for (uint32_t block = 0; block < block_count; ++block)
-        {
-            int8_t* destination = packed.data() + (group * block_count + block) * 136;
-            for (uint32_t token = 0; token < 4; ++token)
-            {
-                const __fp16 half = static_cast<__fp16>(scales[(group * 4 + token) * block_count + block]);
-                std::memcpy(destination + token * 2, &half, sizeof(half));
-            }
-            for (uint32_t chunk = 0; chunk < 4; ++chunk)
-                for (uint32_t token = 0; token < 4; ++token)
-                    std::memcpy(destination + 8 + chunk * 32 + token * 8,
-                                codes + (group * 4 + token) * static_cast<size_t>(columns)
-                                    + static_cast<size_t>(block) * 32 + chunk * 8,
-                                8);
-        }
-    return packed;
-}
-
-std::string q8_gemm_mode()
-{
-    return std::string("auto");
-}
-} // namespace
-
-bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
-                        const ActivationBuffer& input,
-                        std::initializer_list<ActivationBuffer*> outputs,
-                        bool use_packed_weights,
-                        std::span<std::shared_ptr<const QnKPack>* const> sidecars,
-                        bool use_q8_activations) noexcept
+static bool qnk_linear_impl(std::initializer_list<const TensorData*> matrices,
+                            const ActivationBuffer& input,
+                            std::initializer_list<ActivationBuffer*> outputs,
+                            bool use_packed_weights,
+                            std::span<std::shared_ptr<const QnKPack>* const> sidecars,
+                            bool use_q8_activations,
+                            QnkQ8Input* q8_input)
 {
     const size_t matrix_count = matrices.size();
     if ((matrix_count != 1 && matrix_count != 2)
@@ -1561,8 +626,8 @@ bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
         }
         std::array<ActivationBuffer, 2> projected;
         const bool success = matrix_count == 1
-                                 ? forward_linear_qnk({weights[0]}, *float_input, {&projected[0]}, use_packed_weights, sidecars, use_q8_activations)
-                                 : forward_linear_qnk({weights[0], weights[1]}, *float_input, {&projected[0], &projected[1]}, use_packed_weights, sidecars, use_q8_activations);
+                                 ? qnk_linear_impl({weights[0]}, *float_input, {&projected[0]}, use_packed_weights, sidecars, use_q8_activations, q8_input)
+                                 : qnk_linear_impl({weights[0], weights[1]}, *float_input, {&projected[0], &projected[1]}, use_packed_weights, sidecars, use_q8_activations, q8_input);
         if (!success)
             return false;
         for (size_t index = 0; index < matrix_count; ++index)
@@ -1587,34 +652,37 @@ bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
         }
         return true;
     }
-#if defined(__aarch64__) || defined(_M_ARM64)
-    const auto prepare_q8_prefill = [&](uint32_t columns,
-                                        std::vector<int8_t>& codes,
-                                        std::vector<float>& scales,
-                                        std::vector<int32_t>& sums) {
-        const uint32_t q8_block_count = columns / 32;
-        codes.resize(input.rows() * static_cast<std::size_t>(columns));
-        scales.resize(input.rows() * static_cast<std::size_t>(q8_block_count));
-        sums.resize(input.rows() * static_cast<std::size_t>(q8_block_count));
-        const int team_size = omp_in_parallel() != 0
-                                  ? 1
-                                  : static_cast<int>(std::min<size_t>(
-                                        input.rows(), static_cast<size_t>(cpu_linear_num_threads())));
-#pragma omp parallel for schedule(static) num_threads(team_size) if (team_size > 1)
-        for (size_t token = 0; token < input.rows(); ++token)
-            neon_qnk_q8_quant(input.row(token),
-                              codes.data() + token * static_cast<std::size_t>(columns),
-                              scales.data() + token * static_cast<std::size_t>(q8_block_count),
-                              sums.data() + token * static_cast<std::size_t>(q8_block_count),
-                              columns);
+    // Thread-local activation quantization reused across projections on this
+    // thread; qnk_quantize_input keeps the buffer capacity between calls.
+    static thread_local QnkQ8Input q8_scratch;
+    // Shared quantization for this input, reusing the caller's buffer when it
+    // matches and otherwise the thread-local scratch.
+    const auto q8_get = [&](uint32_t columns) -> const QnkQ8Input& {
+        if (q8_input != nullptr && q8_input->columns == columns
+            && qnk_q8_input_matches(*q8_input, input))
+            return *q8_input;
+        qnk_quantize_input(input, q8_scratch);
+        return q8_scratch;
     };
+#if defined(__aarch64__) || defined(_M_ARM64)
+    struct Q8PackScratch
+    {
+        std::vector<int8_t> pack;
+        std::vector<float> scales;
+    };
+    static thread_local Q8PackScratch q8_pack_scratch;
 #endif
+
+    // View of the quantized activation row used by both prefill and decode.
+    const auto q8_row = [&](uint32_t columns) {
+        const QnkQ8Input& act = q8_get(columns);
+        if (act.rows != input.rows() || act.columns != columns)
+            return QnkQ8Row{};
+        return QnkQ8Row{act.codes.data(), act.scales.data(), act.sums.data()};
+    };
 
     if (matrix_count == 1)
     {
-        if (!weights[0] || !results[0] || results[0] == &input
-            || input.dtype() != DType::Float32 || results[0]->dtype() != DType::Float32)
-            return false;
         const TensorData& matrix = *weights[0];
         if (!is_qnk_dtype(matrix.dtype) || matrix.shape.size() != 2)
             return false;
@@ -1633,25 +701,24 @@ bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
                               || matrix.dtype == DType::Q8_0 || matrix.dtype == DType::IQ4NL;
 #if defined(__aarch64__) || defined(_M_ARM64)
         if (use_q8_activations && input.rows() > 1 && is_qnk_dtype(matrix.dtype)
-            && qnk_block_size(matrix.dtype) != 32)
+            && qnk_block_size(matrix.dtype) != 32 && neon_qnk_q8_supported())
         {
-            const std::shared_ptr<const std::vector<uint8_t>> fallback =
-                get_q8_fallback(matrix.dtype, raw.data(), rows, columns);
-            if (fallback)
+            const Q8Payload fallback = q8_payload(matrix, sidecars.empty() ? nullptr : sidecars[0], rows, columns);
+            if (fallback.valid())
             {
-                std::vector<int8_t> codes;
-                std::vector<float> scales;
-                std::vector<int32_t> sums;
-                prepare_q8_prefill(columns, codes, scales, sums);
-                if (rows % 8 == 0)
-                    neon_qnk_prefill_q8_0_rows8(fallback->data(), rows, columns,
-                                                codes.data(), scales.data(), input.rows(),
-                                                results[0]->row(0), results[0]->columns());
-                else
-                    neon_qnk_prefill_q8_0(fallback->data(), rows, columns,
-                                          codes.data(), scales.data(), input.rows(),
-                                          results[0]->row(0), results[0]->columns());
-                return true;
+                const QnkQ8Row view = q8_row(columns);
+                if (view.codes != nullptr)
+                {
+                    if (rows % 8 == 0)
+                        neon_qnk_prefill_q8_0_rows8(fallback.data->data(), rows, columns,
+                                                    view.codes, view.scales, input.rows(),
+                                                    results[0]->row(0), results[0]->columns());
+                    else
+                        neon_qnk_prefill_q8_0(fallback.data->data(), rows, columns,
+                                              view.codes, view.scales, input.rows(),
+                                              results[0]->row(0), results[0]->columns());
+                    return true;
+                }
             }
         }
         if (use_q8_activations && input.rows() > 1 && q8_dtype
@@ -1660,139 +727,71 @@ bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
             if (matrix.dtype == DType::Q8_0 && rows % 4 == 0 && input.rows() % 4 == 0
                 && neon_qnk_i8mm_supported())
             {
-                const std::string mode = q8_gemm_mode();
-                const bool use_pack = mode == "auto" || mode == "gemm" || mode == "gemm8"
-                                      || mode == "gemm16" || mode == "gemm32";
-                if (use_pack)
+                const Q8Payload weight_pack = q8_payload(matrix, sidecars.empty() ? nullptr : sidecars[0], rows, columns);
+                if (weight_pack.valid())
                 {
-                    const std::shared_ptr<const std::vector<uint8_t>> weight_pack =
-                        get_q8_weight4(raw.data(), rows, columns);
-                    if (weight_pack)
-                    {
-                        Q8PackScratch& scratch = q8_pack_scratch;
-                        scratch.pack.resize(input.rows() * static_cast<std::size_t>(columns));
-                        scratch.scales.resize(input.rows() * static_cast<std::size_t>(columns / 32));
-                        neon_qnk_q8_quant_pack4(input.row(0), input.rows(), columns,
-                                                scratch.pack.data(), scratch.scales.data());
-                        const std::vector<int8_t>& activation_pack = scratch.pack;
-                        const std::vector<float>& activation_scales = scratch.scales;
-                        if ((mode == "auto" || mode == "gemm8") && input.rows() % 8 == 0)
-                            neon_qnk_prefill_q8_0_gemm8(weight_pack->data(), rows, columns,
-                                                              reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                              activation_scales.data(), input.rows(),
-                                                              results[0]->row(0), results[0]->columns());
-                        else
-                            neon_qnk_prefill_q8_0_gemm(weight_pack->data(), rows, columns,
-                                                             reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                             activation_scales.data(), input.rows(),
-                                                             results[0]->row(0), results[0]->columns());
-                        return true;
-                    }
+                    Q8PackScratch& scratch = q8_pack_scratch;
+                    scratch.pack.resize(input.rows() * static_cast<std::size_t>(columns));
+                    scratch.scales.resize(input.rows() * static_cast<std::size_t>(columns / 32));
+                    neon_qnk_q8_quant_pack4(input.row(0), input.rows(), columns,
+                                            scratch.pack.data(), scratch.scales.data());
+                    const std::vector<int8_t>& activation_pack = scratch.pack;
+                    const std::vector<float>& activation_scales = scratch.scales;
+                    if (input.rows() % 8 == 0)
+                        neon_qnk_prefill_q8_0_gemm8(weight_pack.data->data(), rows, columns,
+                                                    reinterpret_cast<const uint8_t*>(activation_pack.data()),
+                                                    activation_scales.data(), input.rows(),
+                                                    results[0]->row(0), results[0]->columns());
+                    else
+                        neon_qnk_prefill_q8_0_gemm4(weight_pack.data->data(), rows, columns,
+                                                    reinterpret_cast<const uint8_t*>(activation_pack.data()),
+                                                    activation_scales.data(), input.rows(),
+                                                    results[0]->row(0), results[0]->columns());
+                    return true;
                 }
             }
-            std::vector<int8_t> codes;
-            std::vector<float> scales;
-            std::vector<int32_t> sums;
-            prepare_q8_prefill(columns, codes, scales, sums);
-            if (matrix.dtype == DType::Q8_0)
+            const QnkQ8Row view = q8_row(columns);
+            if (view.codes != nullptr)
             {
-                const std::string gemm_mode = q8_gemm_mode();
-                if ((gemm_mode == "auto" || gemm_mode == "gemm" || gemm_mode == "gemm8"
-                     || gemm_mode == "gemm12" || gemm_mode == "gemm16" || gemm_mode == "gemm32"
-                     || gemm_mode == "exact")
-                    && rows % 4 == 0 && input.rows() % 4 == 0 && neon_qnk_i8mm_supported()
-                    && (gemm_mode != "auto" || raw.size() <= (size_t{32} << 20)))
+                if (matrix.dtype == DType::Q8_0)
                 {
-                    const std::shared_ptr<const std::vector<uint8_t>> weight_pack =
-                        get_q8_weight4(raw.data(), rows, columns);
-                    if (weight_pack)
-                    {
-                    const std::vector<int8_t> activation_pack =
-                        build_activation4(codes.data(), input.rows(), columns);
-                    if (gemm_mode == "exact")
-                    {
-                        const std::shared_ptr<const std::vector<uint8_t>> exact_weight =
-                            get_q8_weight136(raw.data(), rows, columns);
-                        const std::vector<int8_t> exact_activation =
-                            build_activation136(codes.data(), scales.data(), input.rows(), columns);
-                        neon_qnk_prefill_q8_0_gemm136(exact_weight->data(), rows, columns,
-                                                            reinterpret_cast<const uint8_t*>(exact_activation.data()),
-                                                            scales.data(), input.rows(),
-                                                            results[0]->row(0), results[0]->columns());
-                    }
-                    else if (gemm_mode == "gemm12")
-                        run_gemm12_tail(weight_pack->data(), rows, columns,
-                                        codes.data(), scales.data(), input.rows(),
-                                        results[0]->row(0), results[0]->columns());
-                    else if (gemm_mode == "gemm32" && input.rows() % 32 == 0)
-                    neon_qnk_prefill_q8_0_gemm32(weight_pack->data(), rows, columns,
-                                                       reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                       scales.data(), input.rows(),
-                                                       results[0]->row(0), results[0]->columns());
-                else if ((gemm_mode == "auto" || gemm_mode == "gemm16") && input.rows() % 16 == 0)
-                        neon_qnk_prefill_q8_0_gemm16(weight_pack->data(), rows, columns,
-                                                           reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                           scales.data(), input.rows(),
-                                                           results[0]->row(0), results[0]->columns());
-                    else if ((gemm_mode == "auto" || gemm_mode == "gemm8") && input.rows() % 8 == 0)
-                        neon_qnk_prefill_q8_0_gemm8(weight_pack->data(), rows, columns,
-                                                          reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                          scales.data(), input.rows(),
-                                                          results[0]->row(0), results[0]->columns());
-                    else
-                        neon_qnk_prefill_q8_0_gemm(weight_pack->data(), rows, columns,
-                                                         reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                         scales.data(), input.rows(),
-                                                         results[0]->row(0), results[0]->columns());
-                    }
-                    else if (rows % 8 == 0)
+                    if (rows % 8 == 0)
                         neon_qnk_prefill_q8_0_rows8(raw.data(), rows, columns,
-                                                    codes.data(), scales.data(), input.rows(),
+                                                    view.codes, view.scales, input.rows(),
                                                     results[0]->row(0), results[0]->columns());
                     else
                         neon_qnk_prefill_q8_0(raw.data(), rows, columns,
-                                              codes.data(), scales.data(), input.rows(),
+                                              view.codes, view.scales, input.rows(),
                                               results[0]->row(0), results[0]->columns());
                 }
                 else if (rows % 8 == 0)
-                    neon_qnk_prefill_q8_0_rows8(raw.data(), rows, columns,
-                                                codes.data(), scales.data(), input.rows(),
-                                                results[0]->row(0), results[0]->columns());
+                    neon_qnk_prefill_q8_rows8(matrix.dtype, raw.data(), rows, columns,
+                                              view.codes, view.scales, view.sums, input.rows(),
+                                              results[0]->row(0), results[0]->columns());
                 else
-                    neon_qnk_prefill_q8_0(raw.data(), rows, columns,
-                                          codes.data(), scales.data(), input.rows(),
-                                          results[0]->row(0), results[0]->columns());
+                    neon_qnk_prefill_q8(matrix.dtype, raw.data(), rows, columns,
+                                        view.codes, view.scales, view.sums, input.rows(),
+                                        results[0]->row(0), results[0]->columns());
+                return true;
             }
-            else if (rows % 8 == 0)
-                neon_qnk_prefill_q8_rows8(matrix.dtype, raw.data(), rows, columns,
-                                          codes.data(), scales.data(), sums.data(), input.rows(),
-                                          results[0]->row(0), results[0]->columns());
-            else
-                neon_qnk_prefill_q8(matrix.dtype, raw.data(), rows, columns,
-                                    codes.data(), scales.data(), sums.data(), input.rows(),
-                                    results[0]->row(0), results[0]->columns());
-            return true;
         }
 #endif
 #if defined(__aarch64__) || defined(_M_ARM64)
         if (use_q8_activations && input.rows() == 1 && is_qnk_dtype(matrix.dtype)
-            && qnk_block_size(matrix.dtype) != 32)
+            && qnk_block_size(matrix.dtype) != 32 && neon_qnk_q8_supported())
         {
-            const std::shared_ptr<const std::vector<uint8_t>> fallback =
-                get_q8_fallback(matrix.dtype, raw.data(), rows, columns);
-            if (fallback)
+            const Q8Payload fallback = q8_payload(matrix, sidecars.empty() ? nullptr : sidecars[0], rows, columns);
+            if (fallback.valid())
             {
-                QnkQ8Row q8;
-                const uint32_t q8_block_count = columns / 32;
-                q8.codes.resize(columns);
-                q8.scales.resize(q8_block_count);
-                q8.sums.resize(q8_block_count);
-                neon_qnk_q8_quant(input.row(0), q8.codes.data(), q8.scales.data(), q8.sums.data(), columns);
-                qnk_gemm<false>(fallback->data(), nullptr, DType::Q8_0, rows, columns,
-                                input.row(0), columns, 1,
-                                results[0]->row(0), results[0]->columns(),
-                                nullptr, nullptr, nullptr, &q8);
-                return true;
+                const QnkQ8Row q8 = q8_row(columns);
+                if (q8.codes != nullptr)
+                {
+                    qnk_gemm<false>(fallback.data->data(), nullptr, DType::Q8_0, rows, columns,
+                                    input.row(0), columns, 1,
+                                    results[0]->row(0), results[0]->columns(),
+                                    nullptr, nullptr, nullptr, &q8);
+                    return true;
+                }
             }
         }
 #endif
@@ -1811,15 +810,8 @@ bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
                          || mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512);
         if (q8_enabled)
         {
-            const uint32_t q8_block_count = columns / 32;
-            q8.codes.resize(columns);
-            q8.scales.resize(q8_block_count);
-            q8.sums.resize(q8_block_count);
-            msvc_avx2_qnk_q8_quant(input.row(0),
-                                   q8.codes.data(),
-                                   q8.scales.data(),
-                                   q8.sums.data(),
-                                   columns);
+            q8 = q8_row(columns);
+            q8_enabled = q8.codes != nullptr;
         }
 #elif defined(__aarch64__) || defined(_M_ARM64)
         q8_enabled = use_q8_activations && input.rows() == 1
@@ -1827,15 +819,8 @@ bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
                      && neon_qnk_q8_supported();
         if (q8_enabled)
         {
-            const uint32_t q8_block_count = columns / 32;
-            q8.codes.resize(columns);
-            q8.scales.resize(q8_block_count);
-            q8.sums.resize(q8_block_count);
-            neon_qnk_q8_quant(input.row(0),
-                              q8.codes.data(),
-                              q8.scales.data(),
-                              q8.sums.data(),
-                              columns);
+            q8 = q8_row(columns);
+            q8_enabled = q8.codes != nullptr;
         }
 #endif
         if (!use_packed_weights)
@@ -1846,7 +831,8 @@ bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
             return true;
         }
         const std::shared_ptr<const QnKPack> packed = get_qnk_packed_weights(matrix,
-                                                                             sidecars.empty() ? nullptr : sidecars[0], rows, columns);
+                                                                             sidecars.empty() ? nullptr : sidecars[0], rows, columns,
+                                                                             QnKNeedNative);
         if (!packed)
             return false;
 
@@ -1872,11 +858,6 @@ bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
         return true;
     }
 
-    if (!weights[0] || !weights[1] || !results[0] || !results[1]
-        || input.dtype() != DType::Float32 || results[0]->dtype() != DType::Float32
-        || results[1]->dtype() != DType::Float32 || results[0] == &input || results[1] == &input
-        || results[0] == results[1])
-        return false;
     const TensorData& matrix0 = *weights[0];
     const TensorData& matrix1 = *weights[1];
     if (!is_qnk_dtype(matrix0.dtype) || matrix0.dtype != matrix1.dtype
@@ -1908,10 +889,10 @@ bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
     std::shared_ptr<const QnKPack> packed1;
     if (use_packed_weights)
     {
-        packed0 = get_qnk_packed_weights(matrix0, sidecars.empty() ? nullptr : sidecars[0], rows0, columns);
+        packed0 = get_qnk_packed_weights(matrix0, sidecars.empty() ? nullptr : sidecars[0], rows0, columns, QnKNeedNative);
         if (!packed0)
             return false;
-        packed1 = get_qnk_packed_weights(matrix1, sidecars.empty() ? nullptr : sidecars[1], rows1, columns);
+        packed1 = get_qnk_packed_weights(matrix1, sidecars.empty() ? nullptr : sidecars[1], rows1, columns, QnKNeedNative);
         if (!packed1)
             return false;
     }
@@ -1923,37 +904,35 @@ bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
                           && qnk_block_size(matrix0.dtype) == 32;
 #if defined(__aarch64__) || defined(_M_ARM64)
     if (use_q8_activations && input.rows() > 1 && is_qnk_dtype(matrix0.dtype)
-        && qnk_block_size(matrix0.dtype) != 32)
+        && qnk_block_size(matrix0.dtype) != 32 && neon_qnk_q8_supported())
     {
-        const std::shared_ptr<const std::vector<uint8_t>> fallback0 =
-            get_q8_fallback(matrix0.dtype, raw0.data(), rows0, columns);
-        const std::shared_ptr<const std::vector<uint8_t>> fallback1 =
-            get_q8_fallback(matrix1.dtype, raw1.data(), rows1, columns);
-        if (fallback0 && fallback1)
+        const Q8Payload fallback0 = q8_payload(matrix0, sidecars.empty() ? nullptr : sidecars[0], rows0, columns);
+        const Q8Payload fallback1 = q8_payload(matrix1, sidecars.empty() ? nullptr : sidecars[1], rows1, columns);
+        if (fallback0.valid() && fallback1.valid())
         {
-            std::vector<int8_t> codes;
-            std::vector<float> scales;
-            std::vector<int32_t> sums;
-            prepare_q8_prefill(columns, codes, scales, sums);
-            if (rows0 % 8 == 0 && rows1 % 8 == 0)
+            const QnkQ8Row view = q8_row(columns);
+            if (view.codes != nullptr)
             {
-                neon_qnk_prefill_q8_0_rows8(fallback0->data(), rows0, columns,
-                                            codes.data(), scales.data(), input.rows(),
-                                            results[0]->row(0), results[0]->columns());
-                neon_qnk_prefill_q8_0_rows8(fallback1->data(), rows1, columns,
-                                            codes.data(), scales.data(), input.rows(),
-                                            results[1]->row(0), results[1]->columns());
+                if (rows0 % 8 == 0 && rows1 % 8 == 0)
+                {
+                    neon_qnk_prefill_q8_0_rows8(fallback0.data->data(), rows0, columns,
+                                                view.codes, view.scales, input.rows(),
+                                                results[0]->row(0), results[0]->columns());
+                    neon_qnk_prefill_q8_0_rows8(fallback1.data->data(), rows1, columns,
+                                                view.codes, view.scales, input.rows(),
+                                                results[1]->row(0), results[1]->columns());
+                }
+                else
+                {
+                    neon_qnk_prefill_q8_0(fallback0.data->data(), rows0, columns,
+                                          view.codes, view.scales, input.rows(),
+                                          results[0]->row(0), results[0]->columns());
+                    neon_qnk_prefill_q8_0(fallback1.data->data(), rows1, columns,
+                                          view.codes, view.scales, input.rows(),
+                                          results[1]->row(0), results[1]->columns());
+                }
+                return true;
             }
-            else
-            {
-                neon_qnk_prefill_q8_0(fallback0->data(), rows0, columns,
-                                      codes.data(), scales.data(), input.rows(),
-                                      results[0]->row(0), results[0]->columns());
-                neon_qnk_prefill_q8_0(fallback1->data(), rows1, columns,
-                                      codes.data(), scales.data(), input.rows(),
-                                      results[1]->row(0), results[1]->columns());
-            }
-            return true;
         }
     }
     if (use_q8_activations && input.rows() > 1 && q8_dtype
@@ -1962,229 +941,119 @@ bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
         if (matrix0.dtype == DType::Q8_0 && rows0 % 4 == 0 && rows1 % 4 == 0
             && input.rows() % 4 == 0 && neon_qnk_i8mm_supported())
         {
-            const std::string mode = q8_gemm_mode();
-            const bool use_pack = mode == "auto" || mode == "gemm" || mode == "gemm8"
-                                  || mode == "gemm16" || mode == "gemm32";
-            if (use_pack)
+            const Q8Payload weight_pack0 = q8_payload(matrix0, sidecars.empty() ? nullptr : sidecars[0], rows0, columns);
+            const Q8Payload weight_pack1 = q8_payload(matrix1, sidecars.empty() ? nullptr : sidecars[1], rows1, columns);
+            if (weight_pack0.valid() && weight_pack1.valid())
             {
-                const std::shared_ptr<const std::vector<uint8_t>> weight_pack0 =
-                    get_q8_weight4(raw0.data(), rows0, columns);
-                const std::shared_ptr<const std::vector<uint8_t>> weight_pack1 =
-                    get_q8_weight4(raw1.data(), rows1, columns);
-                if (weight_pack0 && weight_pack1)
+                Q8PackScratch& scratch = q8_pack_scratch;
+                scratch.pack.resize(input.rows() * static_cast<std::size_t>(columns));
+                scratch.scales.resize(input.rows() * static_cast<std::size_t>(columns / 32));
+                neon_qnk_q8_quant_pack4(input.row(0), input.rows(), columns,
+                                        scratch.pack.data(), scratch.scales.data());
+                const std::vector<int8_t>& activation_pack = scratch.pack;
+                const std::vector<float>& activation_scales = scratch.scales;
+                if (input.rows() % 16 == 0)
                 {
-                    Q8PackScratch& scratch = q8_pack_scratch;
-                    scratch.pack.resize(input.rows() * static_cast<std::size_t>(columns));
-                    scratch.scales.resize(input.rows() * static_cast<std::size_t>(columns / 32));
-                    neon_qnk_q8_quant_pack4(input.row(0), input.rows(), columns,
-                                            scratch.pack.data(), scratch.scales.data());
-                    const std::vector<int8_t>& activation_pack = scratch.pack;
-                    const std::vector<float>& activation_scales = scratch.scales;
-                    if ((mode == "auto" || mode == "gemm16") && input.rows() % 16 == 0)
-                    {
-                        neon_qnk_prefill_q8_0_gemm16(weight_pack0->data(), rows0, columns,
-                                                           reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                           activation_scales.data(), input.rows(),
-                                                           results[0]->row(0), results[0]->columns());
-                        neon_qnk_prefill_q8_0_gemm16(weight_pack1->data(), rows1, columns,
-                                                           reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                           activation_scales.data(), input.rows(),
-                                                           results[1]->row(0), results[1]->columns());
-                    }
-                    else if ((mode == "auto" || mode == "gemm8") && input.rows() % 8 == 0)
-                    {
-                        neon_qnk_prefill_q8_0_gemm8(weight_pack0->data(), rows0, columns,
-                                                          reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                          activation_scales.data(), input.rows(),
-                                                          results[0]->row(0), results[0]->columns());
-                        neon_qnk_prefill_q8_0_gemm8(weight_pack1->data(), rows1, columns,
-                                                          reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                          activation_scales.data(), input.rows(),
-                                                          results[1]->row(0), results[1]->columns());
-                    }
-                    else
-                    {
-                        neon_qnk_prefill_q8_0_gemm(weight_pack0->data(), rows0, columns,
-                                                         reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                         activation_scales.data(), input.rows(),
-                                                         results[0]->row(0), results[0]->columns());
-                        neon_qnk_prefill_q8_0_gemm(weight_pack1->data(), rows1, columns,
-                                                         reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                         activation_scales.data(), input.rows(),
-                                                         results[1]->row(0), results[1]->columns());
-                    }
-                    return true;
+                    neon_qnk_prefill_q8_0_gemm16(weight_pack0.data->data(), rows0, columns,
+                                                 reinterpret_cast<const uint8_t*>(activation_pack.data()),
+                                                 activation_scales.data(), input.rows(),
+                                                 results[0]->row(0), results[0]->columns());
+                    neon_qnk_prefill_q8_0_gemm16(weight_pack1.data->data(), rows1, columns,
+                                                 reinterpret_cast<const uint8_t*>(activation_pack.data()),
+                                                 activation_scales.data(), input.rows(),
+                                                 results[1]->row(0), results[1]->columns());
                 }
-            }
-        }
-        std::vector<int8_t> codes;
-        std::vector<float> scales;
-        std::vector<int32_t> sums;
-        prepare_q8_prefill(columns, codes, scales, sums);
-        if (matrix0.dtype == DType::Q8_0)
-        {
-            const std::string gemm_mode = q8_gemm_mode();
-            if ((gemm_mode == "auto" || gemm_mode == "gemm" || gemm_mode == "gemm8"
-                 || gemm_mode == "gemm12" || gemm_mode == "gemm16" || gemm_mode == "gemm32"
-                 || gemm_mode == "exact")
-                && rows0 % 4 == 0 && rows1 % 4 == 0
-                && input.rows() % 4 == 0 && neon_qnk_i8mm_supported()
-                && (gemm_mode != "auto" || (raw0.size() <= (size_t{32} << 20)
-                                            && raw1.size() <= (size_t{32} << 20))))
-            {
-                const std::shared_ptr<const std::vector<uint8_t>> weight_pack0 =
-                    get_q8_weight4(raw0.data(), rows0, columns);
-                const std::shared_ptr<const std::vector<uint8_t>> weight_pack1 =
-                    get_q8_weight4(raw1.data(), rows1, columns);
-                if (weight_pack0 && weight_pack1)
+                else if (input.rows() % 8 == 0)
                 {
-                const std::vector<int8_t> activation_pack =
-                    build_activation4(codes.data(), input.rows(), columns);
-                if (gemm_mode == "exact")
-                {
-                    const std::shared_ptr<const std::vector<uint8_t>> exact_weight0 =
-                        get_q8_weight136(raw0.data(), rows0, columns);
-                    const std::shared_ptr<const std::vector<uint8_t>> exact_weight1 =
-                        get_q8_weight136(raw1.data(), rows1, columns);
-                    const std::vector<int8_t> exact_activation =
-                        build_activation136(codes.data(), scales.data(), input.rows(), columns);
-                    neon_qnk_prefill_q8_0_gemm136(exact_weight0->data(), rows0, columns,
-                                                        reinterpret_cast<const uint8_t*>(exact_activation.data()),
-                                                        scales.data(), input.rows(),
-                                                        results[0]->row(0), results[0]->columns());
-                    neon_qnk_prefill_q8_0_gemm136(exact_weight1->data(), rows1, columns,
-                                                        reinterpret_cast<const uint8_t*>(exact_activation.data()),
-                                                        scales.data(), input.rows(),
-                                                        results[1]->row(0), results[1]->columns());
-                }
-                else if (gemm_mode == "gemm12")
-                {
-                    run_gemm12_tail(weight_pack0->data(), rows0, columns,
-                                    codes.data(), scales.data(), input.rows(),
-                                    results[0]->row(0), results[0]->columns());
-                    run_gemm12_tail(weight_pack1->data(), rows1, columns,
-                                    codes.data(), scales.data(), input.rows(),
-                                    results[1]->row(0), results[1]->columns());
-                }
-                else if (gemm_mode == "gemm32" && input.rows() % 32 == 0)
-                {
-                    neon_qnk_prefill_q8_0_gemm32(weight_pack0->data(), rows0, columns,
-                                                       reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                       scales.data(), input.rows(),
-                                                       results[0]->row(0), results[0]->columns());
-                    neon_qnk_prefill_q8_0_gemm32(weight_pack1->data(), rows1, columns,
-                                                       reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                       scales.data(), input.rows(),
-                                                       results[1]->row(0), results[1]->columns());
-                }
-                else if ((gemm_mode == "auto" || gemm_mode == "gemm16") && input.rows() % 16 == 0)
-                {
-                    neon_qnk_prefill_q8_0_gemm16(weight_pack0->data(), rows0, columns,
-                                                       reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                       scales.data(), input.rows(),
-                                                       results[0]->row(0), results[0]->columns());
-                    neon_qnk_prefill_q8_0_gemm16(weight_pack1->data(), rows1, columns,
-                                                       reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                       scales.data(), input.rows(),
-                                                       results[1]->row(0), results[1]->columns());
-                }
-                else if ((gemm_mode == "auto" || gemm_mode == "gemm8") && input.rows() % 8 == 0)
-                {
-                    neon_qnk_prefill_q8_0_gemm8(weight_pack0->data(), rows0, columns,
-                                                      reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                      scales.data(), input.rows(),
-                                                      results[0]->row(0), results[0]->columns());
-                    neon_qnk_prefill_q8_0_gemm8(weight_pack1->data(), rows1, columns,
-                                                      reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                      scales.data(), input.rows(),
-                                                      results[1]->row(0), results[1]->columns());
-                }
-                else
-                {
-                    neon_qnk_prefill_q8_0_gemm(weight_pack0->data(), rows0, columns,
-                                                     reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                     scales.data(), input.rows(),
-                                                     results[0]->row(0), results[0]->columns());
-                    neon_qnk_prefill_q8_0_gemm(weight_pack1->data(), rows1, columns,
-                                                     reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                     scales.data(), input.rows(),
-                                                     results[1]->row(0), results[1]->columns());
-                }
-                }
-                else
-                {
-                    neon_qnk_prefill_q8_0_rows8(raw0.data(), rows0, columns,
-                                                codes.data(), scales.data(), input.rows(),
+                    neon_qnk_prefill_q8_0_gemm8(weight_pack0.data->data(), rows0, columns,
+                                                reinterpret_cast<const uint8_t*>(activation_pack.data()),
+                                                activation_scales.data(), input.rows(),
                                                 results[0]->row(0), results[0]->columns());
-                    neon_qnk_prefill_q8_0_rows8(raw1.data(), rows1, columns,
-                                                codes.data(), scales.data(), input.rows(),
+                    neon_qnk_prefill_q8_0_gemm8(weight_pack1.data->data(), rows1, columns,
+                                                reinterpret_cast<const uint8_t*>(activation_pack.data()),
+                                                activation_scales.data(), input.rows(),
                                                 results[1]->row(0), results[1]->columns());
                 }
-            }
-            else if (rows0 % 8 == 0 && rows1 % 8 == 0)
-            {
-                neon_qnk_prefill_q8_0_rows8(raw0.data(), rows0, columns,
-                                            codes.data(), scales.data(), input.rows(),
-                                            results[0]->row(0), results[0]->columns());
-                neon_qnk_prefill_q8_0_rows8(raw1.data(), rows1, columns,
-                                            codes.data(), scales.data(), input.rows(),
-                                            results[1]->row(0), results[1]->columns());
-            }
-            else
-            {
-                neon_qnk_prefill_q8_0(raw0.data(), rows0, columns,
-                                      codes.data(), scales.data(), input.rows(),
-                                      results[0]->row(0), results[0]->columns());
-                neon_qnk_prefill_q8_0(raw1.data(), rows1, columns,
-                                      codes.data(), scales.data(), input.rows(),
-                                      results[1]->row(0), results[1]->columns());
+                else
+                {
+                    neon_qnk_prefill_q8_0_gemm4(weight_pack0.data->data(), rows0, columns,
+                                                reinterpret_cast<const uint8_t*>(activation_pack.data()),
+                                                activation_scales.data(), input.rows(),
+                                                results[0]->row(0), results[0]->columns());
+                    neon_qnk_prefill_q8_0_gemm4(weight_pack1.data->data(), rows1, columns,
+                                                reinterpret_cast<const uint8_t*>(activation_pack.data()),
+                                                activation_scales.data(), input.rows(),
+                                                results[1]->row(0), results[1]->columns());
+                }
+                return true;
             }
         }
-        else
+        const QnkQ8Row view = q8_row(columns);
+        if (view.codes != nullptr)
         {
-            if (rows0 % 8 == 0 && rows1 % 8 == 0)
+            if (matrix0.dtype == DType::Q8_0)
             {
-                neon_qnk_prefill_q8_rows8(matrix0.dtype, raw0.data(), rows0, columns,
-                                          codes.data(), scales.data(), sums.data(), input.rows(),
+                if (rows0 % 8 == 0 && rows1 % 8 == 0)
+                {
+                    neon_qnk_prefill_q8_0_rows8(raw0.data(), rows0, columns,
+                                                view.codes, view.scales, input.rows(),
+                                                results[0]->row(0), results[0]->columns());
+                    neon_qnk_prefill_q8_0_rows8(raw1.data(), rows1, columns,
+                                                view.codes, view.scales, input.rows(),
+                                                results[1]->row(0), results[1]->columns());
+                }
+                else
+                {
+                    neon_qnk_prefill_q8_0(raw0.data(), rows0, columns,
+                                          view.codes, view.scales, input.rows(),
                                           results[0]->row(0), results[0]->columns());
-                neon_qnk_prefill_q8_rows8(matrix1.dtype, raw1.data(), rows1, columns,
-                                          codes.data(), scales.data(), sums.data(), input.rows(),
+                    neon_qnk_prefill_q8_0(raw1.data(), rows1, columns,
+                                          view.codes, view.scales, input.rows(),
                                           results[1]->row(0), results[1]->columns());
+                }
             }
             else
             {
-                neon_qnk_prefill_q8(matrix0.dtype, raw0.data(), rows0, columns,
-                                    codes.data(), scales.data(), sums.data(), input.rows(),
-                                    results[0]->row(0), results[0]->columns());
-                neon_qnk_prefill_q8(matrix1.dtype, raw1.data(), rows1, columns,
-                                    codes.data(), scales.data(), sums.data(), input.rows(),
-                                    results[1]->row(0), results[1]->columns());
+                if (rows0 % 8 == 0 && rows1 % 8 == 0)
+                {
+                    neon_qnk_prefill_q8_rows8(matrix0.dtype, raw0.data(), rows0, columns,
+                                              view.codes, view.scales, view.sums, input.rows(),
+                                              results[0]->row(0), results[0]->columns());
+                    neon_qnk_prefill_q8_rows8(matrix1.dtype, raw1.data(), rows1, columns,
+                                              view.codes, view.scales, view.sums, input.rows(),
+                                              results[1]->row(0), results[1]->columns());
+                }
+                else
+                {
+                    neon_qnk_prefill_q8(matrix0.dtype, raw0.data(), rows0, columns,
+                                        view.codes, view.scales, view.sums, input.rows(),
+                                        results[0]->row(0), results[0]->columns());
+                    neon_qnk_prefill_q8(matrix1.dtype, raw1.data(), rows1, columns,
+                                        view.codes, view.scales, view.sums, input.rows(),
+                                        results[1]->row(0), results[1]->columns());
+                }
             }
+            return true;
         }
-        return true;
     }
 #endif
 #if defined(__aarch64__) || defined(_M_ARM64)
     if (use_q8_activations && input.rows() == 1 && is_qnk_dtype(matrix0.dtype)
-        && qnk_block_size(matrix0.dtype) != 32)
+        && qnk_block_size(matrix0.dtype) != 32 && neon_qnk_q8_supported())
     {
-        const std::shared_ptr<const std::vector<uint8_t>> fallback0 =
-            get_q8_fallback(matrix0.dtype, raw0.data(), rows0, columns);
-        const std::shared_ptr<const std::vector<uint8_t>> fallback1 =
-            get_q8_fallback(matrix1.dtype, raw1.data(), rows1, columns);
-        if (fallback0 && fallback1)
+        const Q8Payload fallback0 = q8_payload(matrix0, sidecars.empty() ? nullptr : sidecars[0], rows0, columns);
+        const Q8Payload fallback1 = q8_payload(matrix1, sidecars.empty() ? nullptr : sidecars[1], rows1, columns);
+        if (fallback0.valid() && fallback1.valid())
         {
-            QnkQ8Row q8;
-            const uint32_t q8_block_count = columns / 32;
-            q8.codes.resize(columns);
-            q8.scales.resize(q8_block_count);
-            q8.sums.resize(q8_block_count);
-            neon_qnk_q8_quant(input.row(0), q8.codes.data(), q8.scales.data(), q8.sums.data(), columns);
-            qnk_gemm<true>(fallback0->data(), nullptr, DType::Q8_0, rows0, columns,
-                           input.row(0), columns, 1,
-                           results[0]->row(0), results[0]->columns(),
-                           &matrix1, nullptr, results[1], &q8);
-            return true;
+            const QnkQ8Row q8 = q8_row(columns);
+            if (q8.codes != nullptr)
+            {
+                qnk_gemm<true>(fallback0.data->data(), nullptr, DType::Q8_0, rows0, columns,
+                               input.row(0), columns, 1,
+                               results[0]->row(0), results[0]->columns(),
+                               &matrix1, nullptr, results[1], &q8, fallback1.data->data());
+                return true;
+            }
         }
     }
 #endif
@@ -2196,30 +1065,16 @@ bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
                      || mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512);
     if (q8_enabled)
     {
-        const uint32_t q8_block_count = columns / 32;
-        q8.codes.resize(columns);
-        q8.scales.resize(q8_block_count);
-        q8.sums.resize(q8_block_count);
-        msvc_avx2_qnk_q8_quant(input.row(0),
-                               q8.codes.data(),
-                               q8.scales.data(),
-                               q8.sums.data(),
-                               columns);
+        q8 = q8_row(columns);
+        q8_enabled = q8.codes != nullptr;
     }
 #elif defined(__aarch64__) || defined(_M_ARM64)
     q8_enabled = use_q8_activations && input.rows() == 1 && q8_dtype
                  && neon_qnk_q8_supported();
     if (q8_enabled)
     {
-        const uint32_t q8_block_count = columns / 32;
-        q8.codes.resize(columns);
-        q8.scales.resize(q8_block_count);
-        q8.sums.resize(q8_block_count);
-        neon_qnk_q8_quant(input.row(0),
-                          q8.codes.data(),
-                          q8.scales.data(),
-                          q8.sums.data(),
-                          columns);
+        q8 = q8_row(columns);
+        q8_enabled = q8.codes != nullptr;
     }
 #else
     static_cast<void>(q8_dtype);
@@ -2228,6 +1083,73 @@ bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
                    input.row(0), columns, input.rows(), results[0]->row(0), results[0]->columns(),
                    &matrix1, packed1.get(), results[1], q8_enabled ? &q8 : nullptr);
     return true;
+}
+
+bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
+                        const ActivationBuffer& input,
+                        std::initializer_list<ActivationBuffer*> outputs,
+                        bool use_packed_weights,
+                        std::span<std::shared_ptr<const QnKPack>* const> sidecars,
+                        bool use_q8_activations,
+                        QnkQ8Input* q8_input)
+{
+    return qnk_linear_impl(matrices, input, outputs, use_packed_weights, sidecars, use_q8_activations, q8_input);
+}
+
+void qnk_quantize_input(const ActivationBuffer& input, QnkQ8Input& quantized) noexcept
+{
+    quantized.source = nullptr;
+    quantized.rows = 0;
+    quantized.columns = 0;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    const bool supported = neon_qnk_q8_supported();
+#elif defined(NCNN_MOE_MSVC_X86_SIMD)
+    const bool supported = mxfp4_kernel_kind() == Mxfp4KernelKind::X86Avx2
+                           || mxfp4_kernel_kind() == Mxfp4KernelKind::X86Avx512;
+#else
+    const bool supported = false;
+#endif
+    if (!supported || input.dtype() != DType::Float32
+        || input.rows() == 0 || input.columns() == 0 || input.columns() % 32 != 0)
+        return;
+    try
+    {
+        const uint32_t block_count = input.columns() / 32;
+        quantized.codes.resize(input.rows() * input.columns());
+        quantized.scales.resize(input.rows() * block_count);
+        quantized.sums.resize(input.rows() * block_count);
+        int8_t* codes = quantized.codes.data();
+        float* scales = quantized.scales.data();
+        int32_t* sums = quantized.sums.data();
+#if defined(_OPENMP)
+        const int team_size = omp_in_parallel() != 0
+                                  ? 1
+                                  : static_cast<int>(std::min<size_t>(input.rows(), static_cast<size_t>(cpu_linear_num_threads())));
+#else
+        const int team_size = 1;
+#endif
+#pragma omp parallel for schedule(static) num_threads(team_size) if (team_size > 1)
+        for (size_t token = 0; token < input.rows(); ++token)
+        {
+            int8_t* token_codes = codes + token * static_cast<std::size_t>(input.columns());
+            float* token_scales = scales + token * static_cast<std::size_t>(block_count);
+            int32_t* token_sums = sums + token * static_cast<std::size_t>(block_count);
+#if defined(__aarch64__) || defined(_M_ARM64)
+            neon_qnk_q8_quant(input.row(token), token_codes, token_scales, token_sums, input.columns());
+#else
+            msvc_avx2_qnk_q8_quant(input.row(token), token_codes, token_scales, token_sums, input.columns());
+#endif
+        }
+        quantized.source = input.row(0);
+        quantized.rows = input.rows();
+        quantized.columns = input.columns();
+    }
+    catch (...)
+    {
+        quantized.source = nullptr;
+        quantized.rows = 0;
+        quantized.columns = 0;
+    }
 }
 
 } // namespace moe

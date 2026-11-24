@@ -11,8 +11,10 @@
 #include <mat.h>
 #endif
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <span>
 #include <vector>
@@ -30,6 +32,18 @@ class Bfloat16Linear_vulkan;
 class QnkLinear_vulkan;
 class Float8Linear_vulkan;
 class VulkanContext;
+
+// KV ranges a one-row split decode actually scans. The split kernel rounds each
+// range up to 16 keys, so a wide hint can leave trailing ranges empty; those
+// never write their partial row, and merging uninitialized partials would
+// corrupt the result. `splits` counts non-empty ranges only.
+struct AttnSplitRange
+{
+    uint64_t splits = 0;
+    uint64_t tokens = 0;
+};
+
+[[nodiscard]] AttnSplitRange split_range(uint64_t destination_count, bool available) noexcept;
 
 class AttentionWork_vulkan
 {
@@ -101,9 +115,36 @@ struct AttentionConfig_vulkan
     uint32_t rope_active = 0;
     DType activation_dtype = DType::Float32;
     DType kv_cache_dtype = DType::Float32;
+    // Device storage; Float16 when the device cannot store BF16.
+    DType kv_dtype = DType::Float32;
+    // Sliding-window caches wrap; contiguous caches keep one K/V copy.
+    bool kv_double = true;
+    // Long-KV policy: FP16 storage and full-window preallocation.
+    bool kv_fp16 = false;
+    bool kv_full = false;
+    uint32_t kv_tokens = 0;
     uint32_t flags = 0;
     uint64_t optimization_flags = OptimizationDefaultFlags;
 };
+
+// Cache rows reserved for a context. Sliding-window caches use a power-of-two
+// ring; contiguous caches only add a small growth margin.
+[[nodiscard]] inline uint64_t kv_capacity(bool sliding, uint64_t tokens) noexcept
+{
+    if (tokens == 0)
+        return 1;
+    if (sliding)
+    {
+        uint64_t capacity = 16;
+        while (capacity < tokens && capacity <= static_cast<uint64_t>(std::numeric_limits<int>::max()) / 2)
+            capacity *= 2;
+        return capacity < tokens ? tokens : capacity;
+    }
+    // Contiguous caches never wrap; add a small margin for generated tokens.
+    const uint64_t margin = std::max<uint64_t>(1024, tokens / 64);
+    return tokens > std::numeric_limits<uint64_t>::max() - margin ? std::numeric_limits<uint64_t>::max()
+                                                                  : tokens + margin;
+}
 
 enum class AttentionBatchResult_vulkan
 {
@@ -128,7 +169,10 @@ public:
     // direct_ring may be true only when the prepared recorder proves support.
     [[nodiscard]] static std::vector<uint64_t> scratch_elements(const AttentionConfig_vulkan& config, uint32_t rows,
                                                                 uint32_t context_tokens, uint32_t sequence_count,
-                                                                uint64_t kv_element_size, bool direct_ring = false);
+                                                                uint64_t kv_element_size, bool direct_ring = false,
+                                                                bool flash = false);
+    // True when the prefill flash pipeline was created for this operator.
+    [[nodiscard]] bool flash_ok() const noexcept;
     ~Attention_vulkan();
 
     [[nodiscard]] static std::shared_ptr<Attention_vulkan> create(const TensorData& norm_weight, const TensorData* sinks,
@@ -158,7 +202,11 @@ public:
                                                                          const AttentionConfig_vulkan& config,
                                                                          std::shared_ptr<QnkLinear_vulkan> fused_native_qkv = {},
                                                                          const TensorData* norm_bias = nullptr,
-                                                                         const TensorData* attn_post_norm = nullptr);
+                                                                         const TensorData* attn_post_norm = nullptr,
+                                                                         // One-row decode may keep the block-quantized payload and
+                                                                         // stream it instead of the BF16 expansion.
+                                                                         const std::array<CompiledOperator, 5>* projections_q8 = nullptr,
+                                                                         std::shared_ptr<QnkLinear_vulkan> fused_qkv_q8 = {});
     // One upload, one submission, and one download per Attention block.
     [[nodiscard]] bool forward(uint64_t position_offset, LayerCache& cache, const ActivationBuffer& input, ActivationBuffer& output) const;
     // Materializes an otherwise valid device KV ring into the CPU cache.  This
@@ -239,7 +287,9 @@ private:
                                                                        const AttentionConfig_vulkan& config,
                                                                        std::shared_ptr<QnkLinear_vulkan> fused_native_qkv = {},
                                                                        const TensorData* norm_bias = nullptr,
-                                                                       const TensorData* attn_post_norm = nullptr);
+                                                                       const TensorData* attn_post_norm = nullptr,
+                                                                       const std::array<CompiledOperator, 5>* projections_q8 = nullptr,
+                                                                       std::shared_ptr<QnkLinear_vulkan> fused_qkv_q8 = {});
     std::unique_ptr<Implementation> d;
 };
 

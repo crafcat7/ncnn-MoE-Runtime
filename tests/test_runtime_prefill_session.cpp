@@ -166,7 +166,8 @@ void test_prefill_decode_and_reset()
     check(reused_layer.router_logits.bytes().data() == router_data);
     check(!reused_layer.experts_executed);
     const std::array<int32_t, 1> layered_decode = {1};
-    check(static_cast<bool>(forward_model(layered_model, layered_decode, reused_statistics, reused_state, direct_prompt.size())));
+    check(static_cast<bool>(forward_model(layered_model, layered_decode, reused_statistics, reused_state, direct_prompt.size(),
+                                          LogitsOutput::All)));
     check(reused_layer.normalized.bytes().data() == normalized_data);
     check(reused_layer.router_logits.bytes().data() == router_data);
     auto layered_repeat_status = forward_model(layered_model, direct_prompt, reused_statistics, reused_state, 0, LogitsOutput::All);
@@ -1202,33 +1203,26 @@ void test_session_execution_failure_requires_reset()
         {
             auto session = runtime.create_session(model.value(), options).value();
             auto control = runtime.create_session(model.value(), options).value();
-            bool caught = false;
             {
                 ScopedLmHeadFailure failure(*model.value(), exception);
-                try
+                // Internal exceptions are converted to Error at the Session boundary.
+                const char* expected = exception
+                                           ? "host storage was released"
+                                           : "LM head node has an invalid weight binding";
+                if (prefill)
                 {
-                    if (prefill)
-                    {
-                        const std::array<int32_t, 2> input = {0, 1};
-                        auto result = session->prefill(input);
-                        check(!result);
-                        check(result.error().message == "LM head node has an invalid weight binding");
-                    }
-                    else
-                    {
-                        auto result = session->decode(0);
-                        check(!result);
-                        check(result.error().message == "LM head node has an invalid weight binding");
-                    }
+                    const std::array<int32_t, 2> input = {0, 1};
+                    auto result = session->prefill(input);
+                    check(!result);
+                    check(result.error().message.find(expected) != std::string::npos);
                 }
-                catch (const std::runtime_error& error)
+                else
                 {
-                    check(exception);
-                    check(std::string(error.what()).find("host storage was released") != std::string::npos);
-                    caught = true;
+                    auto result = session->decode(0);
+                    check(!result);
+                    check(result.error().message.find(expected) != std::string::npos);
                 }
             }
-            check(caught == exception);
             check_session_requires_reset(session);
             check(static_cast<bool>(session->reset()));
             auto actual = session->decode(1);
@@ -1836,10 +1830,10 @@ void test_speculative_generation()
                 ActivationBuffer gpu_shared_output;
                 ExpertWorkspace cpu_shared_workspace;
                 ExpertWorkspace gpu_shared_workspace;
-                forward_shared_expert(cpu_int4_dspark, cpu_int4_dspark.speculative.net.layer_plans.front().moe,
-                                      shared_input, cpu_shared_output, cpu_shared_workspace);
+                check(static_cast<bool>(forward_shared_expert(cpu_int4_dspark, cpu_int4_dspark.speculative.net.layer_plans.front().moe,
+                                                              shared_input, cpu_shared_output, cpu_shared_workspace)));
                 const VulkanStatistics shared_before = get_vulkan_statistics(dspark_vulkan_runtime);
-                forward_shared_expert(gpu_int4_dspark, gpu_shared_plan, shared_input, gpu_shared_output, gpu_shared_workspace);
+                check(static_cast<bool>(forward_shared_expert(gpu_int4_dspark, gpu_shared_plan, shared_input, gpu_shared_output, gpu_shared_workspace)));
                 const VulkanStatistics shared_after = get_vulkan_statistics(dspark_vulkan_runtime);
                 check(shared_after.compute_submissions > shared_before.compute_submissions);
                 check(shared_after.int4_dispatches - shared_before.int4_dispatches == 3);
@@ -2056,8 +2050,6 @@ void test_speculative_generation()
             auto session = runtime.create_session(model.value()).value();
             const auto saved_bindings = compiled.speculative.layer_nodes;
             bool callback_reached = false;
-            bool caught = false;
-            try
             {
                 auto result = session->generate(input, options, [&](const StreamToken& token) {
                     if (token.index == 1)
@@ -2080,17 +2072,14 @@ void test_speculative_generation()
                     return true;
                 });
                 check(!result);
-                check(result.error().message == (failure == 0 ? "speculative execution graph has an incomplete layer binding" : "generation callback modified the Session"));
-            }
-            catch (const std::runtime_error& error)
-            {
-                check(failure == 1);
-                check(std::string(error.what()) == "speculative callback failed");
-                caught = true;
+                const char* expected = failure == 0
+                                           ? "speculative execution graph has an incomplete layer binding"
+                                       : failure == 1 ? "speculative callback failed"
+                                                      : "generation callback modified the Session";
+                check(result.error().message == expected);
             }
             compiled.speculative.layer_nodes = saved_bindings;
             check(callback_reached);
-            check(caught == (failure == 1));
             if (failure == 0)
             {
                 check_session_requires_reset(session, 1);
@@ -2138,6 +2127,7 @@ void test_chunked_prefill_matches_single_batch()
     check(static_cast<bool>(model));
 
     SessionOptions single_batch_options;
+    // Zero means "do not chunk": the whole prompt runs as one batch.
     single_batch_options.prefill_chunk_size = 0;
     auto single_batch_session = runtime.create_session(model.value(), single_batch_options);
     check(static_cast<bool>(single_batch_session));

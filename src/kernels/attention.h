@@ -65,8 +65,24 @@ struct AttentionScratch
     std::vector<float> flash_partial_sum;
     std::vector<float> flash_partial_output;
     std::vector<float> workspace;
+    // FP16 flash: KV window converted once per forward, FP16 QK/PV dots.
+    std::vector<uint16_t> f16_key;
+    std::vector<uint16_t> f16_val;
+    std::vector<uint16_t> f16_work;
     std::vector<float> rope_cosine;
     std::vector<float> rope_sine;
+    // Reused by every layer of a forward: cos/sin depend only on position.
+    std::vector<float> rope_cosine_cache;
+    std::vector<float> rope_sine_cache;
+    uint64_t rope_cache_position = ~uint64_t(0);
+    uint32_t rope_cache_rows = 0;
+    uint32_t rope_cache_half_dim = 0;
+    uint32_t rope_cache_active = 0;
+    uint32_t rope_cache_context = 0;
+    float rope_cache_theta = 0.0f;
+    float rope_cache_factor = 0.0f;
+    float rope_cache_ntk_alpha = 0.0f;
+    float rope_cache_ntk_beta = 0.0f;
     std::vector<LatentAttentionRowContext> latent_row_contexts;
     std::vector<std::pair<const LayerCache*, uint32_t>> latent_projected_compressed_counts;
     std::vector<uint64_t> latent_positions;

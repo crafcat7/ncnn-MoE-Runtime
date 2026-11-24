@@ -28,6 +28,8 @@
 namespace ncnn {
 namespace moe {
 
+class WeightStore;
+
 struct SessionStatistics;
 
 struct ExpertWorkspace

@@ -589,14 +589,6 @@ static Option parse_options(int argc, char** argv, int first_argument)
             result.expert_memory_mode = parse_expert_memory_mode(require_value(argc, argv, index, "--expert-memory"));
         else if (argument == "--cpu-packed-weights")
             result.cpu_packed_weight_mode = parse_cpu_packed_weight_mode(require_value(argc, argv, index, "--cpu-packed-weights"));
-        else if (argument == "--cpu-qnk-q8")
-        {
-            // Opt-in int8 activation kernels for block-quantized CPU projections.
-            if (parse_cpu_packed_weight_mode(require_value(argc, argv, index, "--cpu-qnk-q8")) == CpuPackedWeightMode::Enabled)
-                result.optimization_flags |= OptimizationCpuQnkQ8;
-            else
-                result.optimization_flags &= ~OptimizationCpuQnkQ8;
-        }
         else if (argument == "--vulkan-device")
             result.vulkan_device_index = require_uint32(require_value(argc, argv, index, "--vulkan-device"), "--vulkan-device");
         else if (argument == "--vulkan-devices")
@@ -627,6 +619,18 @@ static Option parse_options(int argc, char** argv, int first_argument)
             result.optimization_flags &= ~OptimizationVulkanExpertDirectStaging;
         else if (argument == "--disable-vulkan-shared-expert-overlap")
             result.optimization_flags &= ~OptimizationVulkanSharedExpertOverlap;
+        else if (argument == "--disable-vulkan-qnk")
+            result.optimization_flags &= ~OptimizationVulkanQnK;
+        else if (argument == "--cpu-f16-attention")
+        {
+            const std::string_view mode = require_value(argc, argv, index, "--cpu-f16-attention");
+            if (mode == "on")
+                result.optimization_flags |= OptimizationCpuFlashAttentionF16;
+            else if (mode == "off")
+                result.optimization_flags &= ~OptimizationCpuFlashAttentionF16;
+            else
+                throw std::invalid_argument("CPU f16 attention mode must be on or off");
+        }
         else
             throw std::invalid_argument("unknown worker option: " + argument);
     }
@@ -754,6 +758,9 @@ private:
         const EffectiveOption& effective = model_compiled(*model).opt;
         const ModelMemoryPlan& memory_plan = model_compiled(*model).memory_plan;
         const char* cpu_packed_weights = has_flag(effective.optimization_flags, OptimizationCpuPackedWeights) ? "on" : "off";
+        const char* cpu_f16_attention = has_flag(effective.optimization_flags, OptimizationCpuFlashAttentionF16)
+                                            ? "on"
+                                            : "off";
         JsonObject model_json;
         model_json.add_string("model_type", model->descriptor().model_type);
         model_json.add_uint("vocabulary_size", model->descriptor().vocabulary_size);
@@ -786,6 +793,7 @@ private:
         resources.add_string("expert_io_mode", expert_io_mode_name(effective.expert_io_mode));
         resources.add_string("requested_cpu_packed_weights", cpu_packed_weights);
         resources.add_string("selected_cpu_packed_weights", cpu_packed_weights);
+        resources.add_string("cpu_f16_attention", cpu_f16_attention);
         resources.add_uint("host_memory_budget_bytes", memory_plan.host_memory_budget);
         resources.add_uint("expert_cache_bytes", memory_plan.expert_cache_size);
         resources.add_uint("expert_gpu_cache_bytes", effective.expert_gpu_cache_size);
@@ -1552,9 +1560,12 @@ public:
 static void print_usage(const char* executable)
 {
     std::cerr << "usage: " << executable << " <model-directory> [runtime options]\n"
-              << "  runtime: --backend auto|cpu|hybrid, --host-memory-mb N,\n"
+              << "  runtime: --backend auto|cpu|hybrid,\n"
+              << "           --host-memory-mb N,\n"
               << "           --expert-cache-mb N, --expert-gpu-cache-mb N, --expert-io-workers N,\n"
               << "           --expert-memory auto|eager|on-demand, --cpu-packed-weights on|off,\n"
+              << "           --cpu-f16-attention on|off,\n"
+              << "           --disable-vulkan-qnk,\n"
               << "           --vulkan-device N, --vulkan-devices N[,N...]\n"
               << "  io/cache: --mmap-experts, --buffered-expert-io,\n"
               << "            --disable-gpu-expert-execution,\n"

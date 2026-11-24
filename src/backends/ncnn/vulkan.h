@@ -79,7 +79,6 @@ struct VulkanStatistics
     uint64_t attention_device_rope_fusions = 0;
     uint64_t attention_qkv_ring_fusions = 0;
     uint64_t attention_decode_sdpa_fusions = 0;
-    uint64_t attention_cache_materializations = 0;
     uint64_t attention_cpu_fallbacks = 0;
     uint64_t shared_expert_swiglu_fusions = 0;
     uint64_t gated_delta_fusions = 0;
@@ -88,7 +87,6 @@ struct VulkanStatistics
     uint64_t kv_ring_appends = 0;
     uint64_t kv_ring_resizes = 0;
     uint64_t kv_ring_wrapped_views = 0;
-    uint64_t bfloat16_cooperative_matrix_dispatches = 0;
 };
 
 [[nodiscard]] uint32_t get_gpu_count() noexcept;

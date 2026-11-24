@@ -13,8 +13,9 @@ namespace moe {
 class GpuSubmissionBudget
 {
 public:
-    explicit GpuSubmissionBudget(double total_work) noexcept
-        : target(std::clamp(std::isfinite(total_work) ? total_work / 40.0 : max_work, 1.0, max_work))
+    explicit GpuSubmissionBudget(double total_work, double divisor) noexcept
+        : target(std::clamp(std::isfinite(total_work) && divisor > 0.0 ? total_work / divisor : max_work,
+                            1.0, max_work))
     {
     }
 

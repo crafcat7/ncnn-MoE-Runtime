@@ -92,9 +92,20 @@ struct SpeculativeModelPlan
     }
 };
 
+// Prompt rows reserved by load-time GPU planning (device arenas, resident
+// command chains, Expert banks, per-session KV) before a Session exists. The
+// public SessionOptions default is zero, which resolves to this value (or 128
+// for CPU Gated DeltaNet prefill) inside Session.
+inline constexpr uint32_t default_prefill_rows = 512;
+// KV switches: FP16 storage above 64k, full-window preallocation above 128k.
+inline constexpr uint32_t kv_fp16_tokens = 64 * 1024;
+inline constexpr uint32_t kv_full_tokens = 128 * 1024;
+
 struct CompiledModel
 {
     MoeModelDescriptor descriptor;
+    // Maximum attention window across layers.
+    uint32_t max_context = 0;
     Net net;
     ModelMemoryPlan memory_plan;
     std::shared_ptr<GraphResources> graph_resources;

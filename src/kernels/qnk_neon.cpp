@@ -8,6 +8,7 @@
 
 #include "qnk.h"
 #include "ops.h"
+#include "vector.h"
 
 #if defined(__aarch64__) || defined(_M_ARM64)
 
@@ -32,18 +33,14 @@
 namespace ncnn {
 namespace moe {
 
-namespace {
-
 constexpr int8_t kIq4NlTable[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
-inline float load_f16(const uint8_t* data) noexcept
+static inline float load_f16(const uint8_t* data) noexcept
 {
     uint16_t bits = 0;
     std::memcpy(&bits, data, sizeof(bits));
-    __fp16 half = 0.0f;
-    std::memcpy(&half, &bits, sizeof(half));
-    return static_cast<float>(half);
+    return f16_to_f32(bits);
 }
 
 inline int8x16_t low_nibbles(uint8x16_t packed) noexcept
@@ -64,7 +61,7 @@ inline uint8x16_t q5_high_bits(const uint8_t* high, uint32_t half) noexcept
         1, 2, 4, 8, 16, 32, 64, static_cast<uint8_t>(0x80)};
     const uint8x16_t masks = vld1q_u8(lane_mask);
     const uint8x16_t bytes = vcombine_u8(vdup_n_u8(high[half * 2]),
-                                          vdup_n_u8(high[half * 2 + 1]));
+                                         vdup_n_u8(high[half * 2 + 1]));
     return vandq_u8(vceqq_u8(vandq_u8(bytes, masks), masks), vdupq_n_u8(0x10));
 }
 
@@ -76,8 +73,8 @@ inline uint8x16_t q5_high_bits(const uint8_t* high, uint32_t half) noexcept
 
 #if defined(__clang__)
 NCNN_MOE_ARM_DOTPROD __attribute__((always_inline)) inline int32x4_t dot32_vec(int8x16_t first,
-                                              int8x16_t second,
-                                              const int8_t* input) noexcept
+                                                                               int8x16_t second,
+                                                                               const int8_t* input) noexcept
 {
     int32x4_t accumulator = vdupq_n_s32(0);
     accumulator = vdotq_s32(accumulator, first, vld1q_s8(input));
@@ -86,14 +83,12 @@ NCNN_MOE_ARM_DOTPROD __attribute__((always_inline)) inline int32x4_t dot32_vec(i
 }
 
 NCNN_MOE_ARM_DOTPROD __attribute__((always_inline)) inline int32_t dot32(int8x16_t first,
-                                          int8x16_t second,
-                                          const int8_t* input) noexcept
+                                                                         int8x16_t second,
+                                                                         const int8_t* input) noexcept
 {
     return vaddvq_s32(dot32_vec(first, second, input));
 }
 #endif
-
-} // namespace
 
 bool neon_qnk_q8_supported() noexcept
 {
@@ -108,7 +103,6 @@ bool neon_qnk_q8_supported() noexcept
     return false;
 #endif
 }
-
 
 void neon_qnk_q8_quant_pack4_group(const float* source,
                                    std::size_t group,
@@ -154,18 +148,22 @@ void neon_qnk_q8_quant_pack4_group(const float* source,
 }
 
 void neon_qnk_q8_quant_pack4(const float* source,
-                              std::size_t tokens,
-                              uint32_t columns,
-                              int8_t* pack,
-                              float* scales) noexcept
+                             std::size_t tokens,
+                             uint32_t columns,
+                             int8_t* pack,
+                             float* scales) noexcept
 {
     if (!source || !pack || !scales || tokens == 0 || tokens % 4 != 0
         || columns == 0 || columns % 32 != 0)
         return;
     const std::size_t groups = tokens / 4;
+#if defined(_OPENMP)
     const int team_size = omp_in_parallel() != 0
                               ? 1
                               : static_cast<int>(std::min<std::size_t>(groups, static_cast<std::size_t>(cpu_linear_num_threads())));
+#else
+    const int team_size = 1;
+#endif
 #pragma omp parallel for schedule(static) num_threads(team_size) if (team_size > 1)
     for (int64_t group = 0; group < static_cast<int64_t>(groups); ++group)
         neon_qnk_q8_quant_pack4_group(source, static_cast<std::size_t>(group), columns, pack, scales);
@@ -217,10 +215,10 @@ void neon_qnk_q8_quant(const float* source,
 
 #if defined(__clang__)
 NCNN_MOE_ARM_DOTPROD static float q8_0_row(const uint8_t* weights,
-                                            std::size_t block_stride,
-                                            uint32_t block_count,
-                                            const int8_t* input,
-                                            const float* input_scales) noexcept
+                                           std::size_t block_stride,
+                                           uint32_t block_count,
+                                           const int8_t* input,
+                                           const float* input_scales) noexcept
 {
     float32x4_t accumulators[4] = {vdupq_n_f32(0.0f), vdupq_n_f32(0.0f),
                                    vdupq_n_f32(0.0f), vdupq_n_f32(0.0f)};
@@ -271,12 +269,12 @@ NCNN_MOE_ARM_DOTPROD static float q8_0_row(const uint8_t* weights,
 }
 
 NCNN_MOE_ARM_DOTPROD float neon_qnk_q8_row(DType dtype,
-                                            const uint8_t* weights,
-                                            std::size_t block_stride,
-                                            uint32_t block_count,
-                                            const int8_t* input,
-                                            const float* input_scales,
-                                            const int32_t* input_sums) noexcept
+                                           const uint8_t* weights,
+                                           std::size_t block_stride,
+                                           uint32_t block_count,
+                                           const int8_t* input,
+                                           const float* input_scales,
+                                           const int32_t* input_sums) noexcept
 {
     if (!weights || !input || !input_scales || !input_sums || block_count == 0)
         return 0.0f;
@@ -347,13 +345,13 @@ NCNN_MOE_ARM_DOTPROD float neon_qnk_q8_row(DType dtype,
     return result;
 }
 NCNN_MOE_ARM_DOTPROD void neon_qnk_prefill_q8_0_rows8(const uint8_t* __restrict weights,
-                                                        std::size_t rows,
-                                                        uint32_t columns,
-                                                        const int8_t* __restrict activation_codes,
-                                                        const float* __restrict activation_scales,
-                                                        std::size_t token_count,
-                                                        float* __restrict output,
-                                                        std::size_t output_stride) noexcept
+                                                      std::size_t rows,
+                                                      uint32_t columns,
+                                                      const int8_t* __restrict activation_codes,
+                                                      const float* __restrict activation_scales,
+                                                      std::size_t token_count,
+                                                      float* __restrict output,
+                                                      std::size_t output_stride) noexcept
 {
     if (!weights || !activation_codes || !activation_scales || !output
         || rows == 0 || token_count == 0 || columns == 0 || columns % 32 != 0
@@ -362,8 +360,7 @@ NCNN_MOE_ARM_DOTPROD void neon_qnk_prefill_q8_0_rows8(const uint8_t* __restrict 
     const uint32_t block_count = columns / 32;
     const std::size_t row_tiles = rows / 8;
     const uint64_t operation_count = static_cast<uint64_t>(rows) * columns * token_count;
-    const int team_size = static_cast<int>(std::min<std::size_t>(
-        row_tiles, static_cast<std::size_t>(cpu_linear_team_size(operation_count, DType::Q8_0))));
+    const int team_size = static_cast<int>(std::min<std::size_t>(row_tiles, static_cast<std::size_t>(cpu_linear_team_size(operation_count, DType::Q8_0))));
 #pragma omp parallel for schedule(dynamic, 1) num_threads(team_size) if (team_size > 1)
     for (int64_t tile_index = 0; tile_index < static_cast<int64_t>(row_tiles); ++tile_index)
     {
@@ -383,8 +380,7 @@ NCNN_MOE_ARM_DOTPROD void neon_qnk_prefill_q8_0_rows8(const uint8_t* __restrict 
             }
             for (std::size_t first_token = 0; first_token < token_count; first_token += 4)
             {
-                const uint32_t token_count_tile = static_cast<uint32_t>(
-                    std::min<std::size_t>(4, token_count - first_token));
+                const uint32_t token_count_tile = static_cast<uint32_t>(std::min<std::size_t>(4, token_count - first_token));
                 if (token_count_tile == 4)
                 {
                     for (uint32_t pair = 0; pair < 2; ++pair)
@@ -473,13 +469,13 @@ NCNN_MOE_ARM_DOTPROD void neon_qnk_prefill_q8_0_rows8(const uint8_t* __restrict 
 }
 
 NCNN_MOE_ARM_DOTPROD void neon_qnk_prefill_q8_0(const uint8_t* weights,
-                                                    std::size_t rows,
-                                                    uint32_t columns,
-                                                    const int8_t* activation_codes,
-                                                    const float* activation_scales,
-                                                    std::size_t token_count,
-                                                    float* output,
-                                                    std::size_t output_stride) noexcept
+                                                std::size_t rows,
+                                                uint32_t columns,
+                                                const int8_t* activation_codes,
+                                                const float* activation_scales,
+                                                std::size_t token_count,
+                                                float* output,
+                                                std::size_t output_stride) noexcept
 {
     if (!weights || !activation_codes || !activation_scales || !output
         || rows == 0 || token_count == 0 || columns == 0 || columns % 32 != 0)
@@ -487,8 +483,7 @@ NCNN_MOE_ARM_DOTPROD void neon_qnk_prefill_q8_0(const uint8_t* weights,
     const uint32_t block_count = columns / 32;
     const std::size_t row_tiles = (rows + 3) / 4;
     const uint64_t operation_count = static_cast<uint64_t>(rows) * columns * token_count;
-    const int team_size = static_cast<int>(std::min<std::size_t>(
-        row_tiles, static_cast<std::size_t>(cpu_linear_team_size(operation_count, DType::Q8_0))));
+    const int team_size = static_cast<int>(std::min<std::size_t>(row_tiles, static_cast<std::size_t>(cpu_linear_team_size(operation_count, DType::Q8_0))));
 #pragma omp parallel for schedule(static) num_threads(team_size) if (team_size > 1)
     for (int64_t tile_index = 0; tile_index < static_cast<int64_t>(row_tiles); ++tile_index)
     {
@@ -509,8 +504,7 @@ NCNN_MOE_ARM_DOTPROD void neon_qnk_prefill_q8_0(const uint8_t* weights,
             }
             for (std::size_t first_token = 0; first_token < token_count; first_token += 4)
             {
-                const uint32_t token_count_tile = static_cast<uint32_t>(
-                    std::min<std::size_t>(4, token_count - first_token));
+                const uint32_t token_count_tile = static_cast<uint32_t>(std::min<std::size_t>(4, token_count - first_token));
                 int8x16_t activation_low[4];
                 int8x16_t activation_high[4];
                 float activation_scale[4];
@@ -582,15 +576,15 @@ NCNN_MOE_ARM_DOTPROD void neon_qnk_prefill_q8_0(const uint8_t* weights,
     }
 }
 NCNN_MOE_ARM_DOTPROD void neon_qnk_prefill_q8_rows8(DType dtype,
-                                                     const uint8_t* weights,
-                                                     std::size_t rows,
-                                                     uint32_t columns,
-                                                     const int8_t* activation_codes,
-                                                     const float* activation_scales,
-                                                     const int32_t* activation_sums,
-                                                     std::size_t token_count,
-                                                     float* output,
-                                                     std::size_t output_stride) noexcept
+                                                    const uint8_t* weights,
+                                                    std::size_t rows,
+                                                    uint32_t columns,
+                                                    const int8_t* activation_codes,
+                                                    const float* activation_scales,
+                                                    const int32_t* activation_sums,
+                                                    std::size_t token_count,
+                                                    float* output,
+                                                    std::size_t output_stride) noexcept
 {
     if (!weights || !activation_codes || !activation_scales || !activation_sums || !output
         || rows == 0 || rows % 8 != 0 || token_count == 0 || columns == 0 || columns % 32 != 0)
@@ -600,8 +594,7 @@ NCNN_MOE_ARM_DOTPROD void neon_qnk_prefill_q8_rows8(DType dtype,
     const std::size_t block_bytes = qnk_block_bytes(dtype);
     const std::size_t row_tiles = rows / 8;
     const uint64_t operation_count = static_cast<uint64_t>(rows) * columns * token_count;
-    const int team_size = static_cast<int>(std::min<std::size_t>(
-        row_tiles, static_cast<std::size_t>(cpu_linear_team_size(operation_count, dtype))));
+    const int team_size = static_cast<int>(std::min<std::size_t>(row_tiles, static_cast<std::size_t>(cpu_linear_team_size(operation_count, dtype))));
 #pragma omp parallel for schedule(dynamic, 1) num_threads(team_size) if (team_size > 1)
     for (int64_t tile_index = 0; tile_index < static_cast<int64_t>(row_tiles); ++tile_index)
     {
@@ -638,9 +631,9 @@ NCNN_MOE_ARM_DOTPROD void neon_qnk_prefill_q8_rows8(DType dtype,
                     const uint8_t* high = encoded + (affine ? 4 : 2);
                     const uint8x16_t packed = vld1q_u8(encoded + (affine ? 8 : 6));
                     weight_low[row] = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(packed, vdupq_n_u8(0x0f)),
-                                                                    q5_high_bits(high, 0)));
+                                                                   q5_high_bits(high, 0)));
                     weight_high[row] = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(packed, 4),
-                                                                     q5_high_bits(high, 1)));
+                                                                    q5_high_bits(high, 1)));
                     weight_scale[row] = load_f16(encoded);
                     weight_additive[row] = affine ? load_f16(encoded + 2) : 0.0f;
                     weight_bias[row] = affine ? 0.0f : 16.0f;
@@ -667,8 +660,7 @@ NCNN_MOE_ARM_DOTPROD void neon_qnk_prefill_q8_rows8(DType dtype,
             }
             for (std::size_t first_token = 0; first_token < token_count; first_token += 4)
             {
-                const uint32_t token_count_tile = static_cast<uint32_t>(
-                    std::min<std::size_t>(4, token_count - first_token));
+                const uint32_t token_count_tile = static_cast<uint32_t>(std::min<std::size_t>(4, token_count - first_token));
                 if (token_count_tile == 4)
                 {
                     for (uint32_t pair = 0; pair < 2; ++pair)
@@ -713,9 +705,9 @@ NCNN_MOE_ARM_DOTPROD void neon_qnk_prefill_q8_rows8(DType dtype,
                             float32x4_t value1 = vmulq_f32(vcvtq_f32_s32(sums1),
                                                            vmulq_n_f32(scales, activation1_scale));
                             value0 = vaddq_f32(value0, vmulq_n_f32(correction,
-                                                                  activation0_scale * activation0_sum));
+                                                                   activation0_scale * activation0_sum));
                             value1 = vaddq_f32(value1, vmulq_n_f32(correction,
-                                                                  activation1_scale * activation1_sum));
+                                                                   activation1_scale * activation1_sum));
                             float* destination0 = output + (first_token + token0) * output_stride + first_row + group * 4;
                             float* destination1 = output + (first_token + token1) * output_stride + first_row + group * 4;
                             if (block == 0)
@@ -769,15 +761,15 @@ NCNN_MOE_ARM_DOTPROD void neon_qnk_prefill_q8_rows8(DType dtype,
 }
 
 NCNN_MOE_ARM_DOTPROD void neon_qnk_prefill_q8(DType dtype,
-                                                    const uint8_t* weights,
-                                                    std::size_t rows,
-                                                    uint32_t columns,
-                                                    const int8_t* activation_codes,
-                                                    const float* activation_scales,
-                                                    const int32_t* activation_sums,
-                                                    std::size_t token_count,
-                                                    float* output,
-                                                    std::size_t output_stride) noexcept
+                                              const uint8_t* weights,
+                                              std::size_t rows,
+                                              uint32_t columns,
+                                              const int8_t* activation_codes,
+                                              const float* activation_scales,
+                                              const int32_t* activation_sums,
+                                              std::size_t token_count,
+                                              float* output,
+                                              std::size_t output_stride) noexcept
 {
     if (!weights || !activation_codes || !activation_scales || !activation_sums || !output
         || rows == 0 || token_count == 0 || columns == 0 || columns % 32 != 0)
@@ -787,8 +779,7 @@ NCNN_MOE_ARM_DOTPROD void neon_qnk_prefill_q8(DType dtype,
     const std::size_t block_bytes = qnk_block_bytes(dtype);
     const std::size_t row_tiles = (rows + 3) / 4;
     const uint64_t operation_count = static_cast<uint64_t>(rows) * columns * token_count;
-    const int team_size = static_cast<int>(std::min<std::size_t>(
-        row_tiles, static_cast<std::size_t>(cpu_linear_team_size(operation_count, dtype))));
+    const int team_size = static_cast<int>(std::min<std::size_t>(row_tiles, static_cast<std::size_t>(cpu_linear_team_size(operation_count, dtype))));
 #pragma omp parallel for schedule(static) num_threads(team_size) if (team_size > 1)
     for (int64_t tile_index = 0; tile_index < static_cast<int64_t>(row_tiles); ++tile_index)
     {
@@ -826,9 +817,9 @@ NCNN_MOE_ARM_DOTPROD void neon_qnk_prefill_q8(DType dtype,
                     const uint8_t* high = encoded + (affine ? 4 : 2);
                     const uint8x16_t packed = vld1q_u8(encoded + (affine ? 8 : 6));
                     weight_low[row] = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(packed, vdupq_n_u8(0x0f)),
-                                                                    q5_high_bits(high, 0)));
+                                                                   q5_high_bits(high, 0)));
                     weight_high[row] = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(packed, 4),
-                                                                     q5_high_bits(high, 1)));
+                                                                    q5_high_bits(high, 1)));
                     weight_scale[row] = load_f16(encoded);
                     weight_additive[row] = affine ? load_f16(encoded + 2) : 0.0f;
                     weight_bias[row] = affine ? 0.0f : 16.0f;
@@ -855,8 +846,7 @@ NCNN_MOE_ARM_DOTPROD void neon_qnk_prefill_q8(DType dtype,
             }
             for (std::size_t first_token = 0; first_token < token_count; first_token += 4)
             {
-                const uint32_t token_count_tile = static_cast<uint32_t>(
-                    std::min<std::size_t>(4, token_count - first_token));
+                const uint32_t token_count_tile = static_cast<uint32_t>(std::min<std::size_t>(4, token_count - first_token));
                 int8x16_t activation_low[4];
                 int8x16_t activation_high[4];
                 float activation_scale[4];
@@ -887,7 +877,7 @@ NCNN_MOE_ARM_DOTPROD void neon_qnk_prefill_q8(DType dtype,
                         const int32x4_t sums = vpaddq_s32(vpaddq_s32(dot[0], dot[1]),
                                                           vpaddq_s32(dot[2], dot[3]));
                         float32x4_t value = vmulq_f32(vcvtq_f32_s32(sums),
-                                                       vmulq_n_f32(scales, activation_scale[token]));
+                                                      vmulq_n_f32(scales, activation_scale[token]));
                         value = vaddq_f32(value,
                                           vmulq_n_f32(correction,
                                                       activation_scale[token]
@@ -941,6 +931,17 @@ void neon_qnk_prefill_q8_0(const uint8_t*,
                            std::size_t,
                            float*,
                            std::size_t) noexcept
+{
+}
+
+void neon_qnk_prefill_q8_0_rows8(const uint8_t*,
+                                 std::size_t,
+                                 uint32_t,
+                                 const int8_t*,
+                                 const float*,
+                                 std::size_t,
+                                 float*,
+                                 std::size_t) noexcept
 {
 }
 

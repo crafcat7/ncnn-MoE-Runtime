@@ -241,19 +241,11 @@ static Result<void> fwd_shared(const CompiledModel& model,
     if (shared_done(state)) return {};
     assert(state.normalized.rows() == rows);
     assert(state.normalized.columns() == model.descriptor.hidden_size);
-    try
-    {
-        forward_shared_expert(model, moe, state.normalized, state.shared_expert_output,
-                              state.shared_expert_workspace, state.normalized_device,
-                              retain_device_output ? &state.shared_expert_device_output : nullptr,
-                              state.require_device_execution,
-                              backend == ExecutionBackend::Vulkan && model.opt.hybrid_mode == HybridMode::HybridExperts);
-    }
-    catch (const std::exception& error)
-    {
-        return Error{ErrorCode::InternalError, error.what()};
-    }
-    return {};
+    return forward_shared_expert(model, moe, state.normalized, state.shared_expert_output,
+                                 state.shared_expert_workspace, state.normalized_device,
+                                 retain_device_output ? &state.shared_expert_device_output : nullptr,
+                                 state.require_device_execution,
+                                 backend == ExecutionBackend::Vulkan && model.opt.hybrid_mode == HybridMode::HybridExperts);
 }
 
 [[nodiscard]] static Result<void> fwd_shared_group(const CompiledModel& model,
@@ -386,16 +378,11 @@ static void run_shared_overlap(void* raw)
                              work.backend);
 }
 
-static Result<void> fwd_dense(const CompiledModel& model,
-                              const CompiledLayerPlan& layer,
-                              ActivationBuffer& hidden,
-                              LayerState& scratch,
-                              ExecutionBackend backend);
-
 [[nodiscard]] static Result<void> fwd_dense_layer(const CompiledModel& model,
+                                                  const WeightStore& weights,
                                                   const CompiledLayerPlan& layer,
                                                   ActivationBuffer& hidden,
-                                                  LayerState& layer_state,
+                                                  LayerState& scratch,
                                                   GpuSegmentWorkspace_vulkan& gpu,
                                                   LatentLayerWorkspace_vulkan& latent,
                                                   ExecutionBackend backend)
@@ -408,38 +395,24 @@ static Result<void> fwd_dense(const CompiledModel& model,
     }
     if (latent.active() && !LatentLayer_vulkan::materialize_hidden(latent, hidden))
         return Error{ErrorCode::InternalError, "cannot materialize dense FFN input"};
-    return fwd_dense(model, layer, hidden, layer_state, backend);
-}
-
-static Result<void> fwd_dense(const CompiledModel& model,
-                              const CompiledLayerPlan& layer,
-                              ActivationBuffer& hidden,
-                              LayerState& scratch,
-                              ExecutionBackend backend)
-{
     if (layer.dense_pre_ffn_norm_bias != invalid_tensor_handle)
     {
-        forward_layer_norm(hidden, model.weights.at(layer.dense_pre_ffn_norm_weight),
-                           model.weights.at(layer.dense_pre_ffn_norm_bias), model.descriptor.norm_epsilon, scratch.normalized);
+        forward_layer_norm(hidden, weights.at(layer.dense_pre_ffn_norm_weight),
+                           weights.at(layer.dense_pre_ffn_norm_bias), model.descriptor.norm_epsilon, scratch.normalized);
     }
     else
     {
-        forward_rms_norm(hidden, model.weights.at(layer.dense_pre_ffn_norm_weight),
+        forward_rms_norm(hidden, weights.at(layer.dense_pre_ffn_norm_weight),
                          model.descriptor.norm_epsilon, scratch.normalized, model.descriptor.norm_weight_offset);
     }
-    try
-    {
-        forward_dense_ffn(model, layer.dense_ffn, scratch.normalized, scratch.shared_expert_output,
-                          scratch.shared_expert_workspace, backend);
-    }
-    catch (const std::exception& error)
-    {
-        return Error{ErrorCode::InternalError, error.what()};
-    }
+    auto dense = forward_dense_ffn(model, layer.dense_ffn, scratch.normalized, scratch.shared_expert_output,
+                                   scratch.shared_expert_workspace, backend);
+    if (!dense)
+        return dense;
     if (layer.moe.parallel_ffn)
     {
         forward_rms_norm(scratch.shared_expert_output,
-                         model.weights.at(layer.moe.dense_post_norm),
+                         weights.at(layer.moe.dense_post_norm),
                          model.descriptor.norm_epsilon,
                          scratch.normalized,
                          0.0f);
@@ -550,6 +523,7 @@ static ExpertDispatchOptions route_opt(const CompiledModel& model,
 }
 
 static void norm_fwd(const CompiledModel& model,
+                     const WeightStore& weights,
                      TensorHandle weight,
                      const ActivationBuffer& input,
                      ActivationBuffer& output)
@@ -557,20 +531,21 @@ static void norm_fwd(const CompiledModel& model,
     if (model.descriptor.final_norm == NormType::LayerNorm)
     {
         forward_layer_norm(input,
-                           model.weights.at(weight),
-                           model.weights.at(model.final_norm_bias),
+                           weights.at(weight),
+                           weights.at(model.final_norm_bias),
                            model.descriptor.norm_epsilon,
                            output);
         return;
     }
     forward_rms_norm(input,
-                     model.weights.at(weight),
+                     weights.at(weight),
                      model.descriptor.norm_epsilon,
                      output,
                      model.descriptor.norm_weight_offset);
 }
 
 [[nodiscard]] static Result<void> hyper_head(const CompiledModel& model,
+                                             const WeightStore& weights,
                                              const ActivationBuffer& input,
                                              HyperConnectionScratch& scratch,
                                              ActivationBuffer& output)
@@ -578,9 +553,9 @@ static void norm_fwd(const CompiledModel& model,
     if (model.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
     {
         return hc_head(input,
-                       model.weights.at(model.hyper_head_function),
-                       model.weights.at(model.hyper_head_scale),
-                       model.weights.at(model.hyper_head_base),
+                       weights.at(model.hyper_head_function),
+                       weights.at(model.hyper_head_scale),
+                       weights.at(model.hyper_head_base),
                        model.descriptor.hyper_connection_multiplier,
                        model.descriptor.norm_epsilon,
                        model.descriptor.hyper_connection_epsilon,
@@ -591,53 +566,13 @@ static void norm_fwd(const CompiledModel& model,
     if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
     {
         return gr_head(input,
-                       model.weights,
+                       weights,
                        model.operators,
                        model.gated_residual_head,
                        model.descriptor,
                        output,
                        scratch,
                        model.opt.optimization_flags);
-    }
-    return {};
-}
-
-[[nodiscard]] static Result<void> lm_head_linear(const CompiledModel& model,
-                                                 const Layer& node,
-                                                 TensorHandle weight,
-                                                 const ActivationBuffer& input,
-                                                 ActivationBuffer& logits)
-{
-    const TensorData& matrix = model.weights.at(weight);
-    const CompiledOperator* op = model.operators.find_weight(weight);
-    if (model.lm_head_bias != invalid_tensor_handle)
-    {
-        forward_linear(matrix,
-                       model.weights.at(model.lm_head_bias),
-                       input,
-                       logits,
-                       model.opt.optimization_flags,
-                       op,
-                       node.backend);
-    }
-    else
-    {
-        forward_linear(matrix,
-                       input,
-                       logits,
-                       model.opt.optimization_flags,
-                       op,
-                       node.backend);
-    }
-    if (model.descriptor.logit_softcap > 0.0f)
-    {
-        const float cap = model.descriptor.logit_softcap;
-        for (size_t row = 0; row < logits.rows(); ++row)
-        {
-            float* values = logits.row(row);
-            for (uint32_t column = 0; column < logits.columns(); ++column)
-                values[column] = cap * std::tanh(values[column] / cap);
-        }
     }
     return {};
 }
@@ -713,14 +648,16 @@ static void norm_fwd(const CompiledModel& model,
 }
 
 [[nodiscard]] static Result<void> fwd_lm_head(const CompiledModel& model,
+                                              const WeightStore& weights,
                                               const Layer& node,
+                                              ExecutionBackend backend,
                                               const CompiledOperator& lm_head_operator,
                                               const ActivationBuffer& input,
                                               ActivationBuffer& norm_output,
                                               ActivationBuffer& logits,
                                               bool norm_deferred)
 {
-    if (norm_deferred && node.backend == ExecutionBackend::Vulkan
+    if (norm_deferred && backend == ExecutionBackend::Vulkan
         && lm_head_operator.bfloat16)
     {
         if (!lm_head_operator.bfloat16->forward_rms_norm_chain(input, logits))
@@ -731,13 +668,44 @@ static void norm_fwd(const CompiledModel& model,
     if (norm_deferred)
     {
         forward_rms_norm(input,
-                         model.weights.at(node.weights[1]),
+                         weights.at(node.weights[1]),
                          model.descriptor.norm_epsilon,
                          norm_output,
                          model.descriptor.norm_weight_offset);
         project_input = &norm_output;
     }
-    return lm_head_linear(model, node, node.weights[0], *project_input, logits);
+    const TensorData& matrix = weights.at(node.weights[0]);
+    const CompiledOperator* op = model.operators.find_weight(node.weights[0]);
+    if (model.lm_head_bias != invalid_tensor_handle)
+    {
+        forward_linear(matrix,
+                       weights.at(model.lm_head_bias),
+                       *project_input,
+                       logits,
+                       model.opt.optimization_flags,
+                       op,
+                       backend);
+    }
+    else
+    {
+        forward_linear(matrix,
+                       *project_input,
+                       logits,
+                       model.opt.optimization_flags,
+                       op,
+                       backend);
+    }
+    if (model.descriptor.logit_softcap > 0.0f)
+    {
+        const float cap = model.descriptor.logit_softcap;
+        for (size_t row = 0; row < logits.rows(); ++row)
+        {
+            float* values = logits.row(row);
+            for (uint32_t column = 0; column < logits.columns(); ++column)
+                values[column] = cap * std::tanh(values[column] / cap);
+        }
+    }
+    return {};
 }
 
 Result<void> forward_model(const CompiledModel& model,
@@ -749,6 +717,9 @@ Result<void> forward_model(const CompiledModel& model,
 {
     const CpuOpenMpThreadLimitScope openmp_scope;
     const ScopedExpertBackendForeground backend_fg(model.expert_backend);
+    const WeightStore& weights = model.weights;
+    const std::vector<Layer>& layers = model.net.layers;
+    const bool gpu_chain = model.gated_residual_chain;
     if (attn_state_unknown(state))
     {
         return Error{
@@ -766,11 +737,11 @@ Result<void> forward_model(const CompiledModel& model,
 
     if (input_ids.size() > std::numeric_limits<uint64_t>::max() - position_offset)
         return Error{ErrorCode::InvalidArgument, "execution position overflows"};
-    auto output_size = ensure_graph(model, input_ids.size(), position_offset + input_ids.size());
-    if (!output_size)
-        return output_size.error();
+    auto planned = ensure_graph(model, input_ids.size(), position_offset + input_ids.size());
+    if (!planned)
+        return planned.error();
     reset_state(model, state);
-    state.gpu_segment.reserve_host_output(output_size.value());
+    state.gpu_segment.reserve_host_output(planned.value());
 
     const bool use_speculative_context = model.speculative.enabled()
                                          && state.use_speculative_context;
@@ -811,7 +782,7 @@ Result<void> forward_model(const CompiledModel& model,
     const ScopedGatedResidualWorkspace gated_residual_scope(state.gated_residual_layer);
     const ScopedGpuSegmentWorkspace gpu_workspace_scope(state.gpu_segment);
     bool resident_head_finished = false;
-    if (model.gated_residual_chain && (use_speculative_context || has_flag(model.opt.flags, OptionRouterPrediction)))
+    if (gpu_chain && (use_speculative_context || has_flag(model.opt.flags, OptionRouterPrediction)))
         return Error{ErrorCode::InvalidArgument, "continuous gated residual Vulkan execution does not support speculative cache transactions or router prediction"};
     bool router_fused = false;
     bool head_deferred = false;
@@ -828,7 +799,7 @@ Result<void> forward_model(const CompiledModel& model,
     const auto fwd_embedding = [&](const Layer* node) -> Result<void> {
         if (node->weights.size() != 1)
             return Error{ErrorCode::InternalError, "token embedding node has an invalid weight binding"};
-        forward_embedding(model.weights.at(node->weights[0]),
+        forward_embedding(weights.at(node->weights[0]),
                           input_ids,
                           hidden);
         scale_rows(hidden, model.descriptor.embed_scale);
@@ -917,7 +888,7 @@ Result<void> forward_model(const CompiledModel& model,
             if (!GpuSegment_vulkan::materialize_hidden(state.gpu_segment, hidden, error))
                 return Error{ErrorCode::InternalError, "resident Vulkan head boundary failed: " + error};
         }
-        if (model.gated_residual_chain)
+        if (gpu_chain)
         {
             if (!GatedResidualLayer_vulkan::finish(model, logits_output != LogitsOutput::None,
                                                    logits_output == LogitsOutput::Last, state.logits, state.gated_residual_layer))
@@ -959,7 +930,7 @@ Result<void> forward_model(const CompiledModel& model,
         }
         if (model.descriptor.hyper_connection_kind != HyperConnectionKind::None)
         {
-            auto head = hyper_head(model, hidden, state.hyper_connection_scratch,
+            auto head = hyper_head(model, weights, hidden, state.hyper_connection_scratch,
                                    state.expert_scratch.staged_output);
             if (!head)
                 return head.error();
@@ -967,7 +938,7 @@ Result<void> forward_model(const CompiledModel& model,
         }
         if (model.descriptor.final_norm != NormType::None)
         {
-            norm_fwd(model, node->weights[0], hidden,
+            norm_fwd(model, weights, node->weights[0], hidden,
                      state.expert_scratch.staged_output);
             hidden.swap(state.expert_scratch.staged_output);
         }
@@ -984,7 +955,7 @@ Result<void> forward_model(const CompiledModel& model,
     };
     const auto fwd_head = [&](const Layer* node) -> Result<void> {
         if (resident_head_finished) return {};
-        if (model.gated_residual_chain) return {};
+        if (gpu_chain) return {};
         const size_t weight_count = model.descriptor.final_norm == NormType::None ? 1 : 2;
         if (node->weights.size() != weight_count)
             return Error{ErrorCode::InternalError, "LM head node has an invalid weight binding"};
@@ -1015,8 +986,8 @@ Result<void> forward_model(const CompiledModel& model,
                 lm_head_input = &last_hidden;
             }
         }
-        auto headed = fwd_lm_head(model, *node, lm_head_operator, *lm_head_input,
-                                  state.final_norm, state.logits, norm_deferred);
+        auto headed = fwd_lm_head(model, weights, *node, node->backend, lm_head_operator,
+                                  *lm_head_input, state.final_norm, state.logits, norm_deferred);
         if (!headed)
             return headed.error();
         norm_deferred = false;
@@ -1024,14 +995,17 @@ Result<void> forward_model(const CompiledModel& model,
         return {};
     };
     const auto fwd_ffn = [&](const Layer* node, const CompiledLayerPlan& layer, LayerState& layer_state) -> Result<void> {
-        return fwd_dense_layer(model, layer, hidden, layer_state, state.gpu_segment,
+        return fwd_dense_layer(model, weights, layer, hidden, layer_state, state.gpu_segment,
                                layer_workspace, node->backend);
     };
     const auto fwd_attn = [&](const Layer* node, const CompiledLayerPlan& layer, LayerState& layer_state, const MoeBlockPlan& moe) -> Result<void> {
-        const auto segment = node->plan_index < model.gpu_segments.size() ? model.gpu_segments[node->plan_index] : nullptr;
+        const ExecutionBackend backend = node->backend;
+        const auto segment = node->backend == ExecutionBackend::Vulkan && node->plan_index < model.gpu_segments.size()
+                                 ? model.gpu_segments[node->plan_index]
+                                 : nullptr;
         if (segment)
         {
-            if (node->backend != ExecutionBackend::Vulkan)
+            if (backend != ExecutionBackend::Vulkan)
                 return Error{ErrorCode::InternalError, "resident graph segment has a non-Vulkan Attention node"};
             std::string error;
             auto published = publish_segment(pending_continuation, continuation_target, node->id,
@@ -1065,7 +1039,7 @@ Result<void> forward_model(const CompiledModel& model,
             if (!GpuSegment_vulkan::materialize_hidden(state.gpu_segment, hidden, error))
                 return Error{ErrorCode::InternalError, "resident Vulkan graph boundary failed: " + error};
         }
-        if (model.gated_residual_chain)
+        if (gpu_chain)
         {
             const auto& fused = model.operators.at_weight(layer.attention.output_weight).gated_residual_layer;
             auto options = route_opt(model, moe, input_ids, state.expert_scratch.explicit_expert_ids);
@@ -1084,7 +1058,7 @@ Result<void> forward_model(const CompiledModel& model,
             return Error{ErrorCode::InternalError, "cannot materialize latent state for the next attention input"};
         if (layer.ple.enabled())
         {
-            auto ple = forward_ple(model.weights,
+            auto ple = forward_ple(weights,
                                    model.operators,
                                    layer.ple,
                                    model.descriptor,
@@ -1098,7 +1072,7 @@ Result<void> forward_model(const CompiledModel& model,
         if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
         {
             auto mixed = gr_pre(hidden,
-                                model.weights,
+                                weights,
                                 model.operators,
                                 layer.attention_gated_residual,
                                 model.descriptor,
@@ -1111,10 +1085,10 @@ Result<void> forward_model(const CompiledModel& model,
         }
         if (layer.attention.kind == AttentionKind::GatedDeltaNet)
         {
-            auto gated_delta = forward_gated_delta(model.weights,
+            auto gated_delta = forward_gated_delta(weights,
                                                    model.operators,
                                                    layer.attention,
-                                                   node->backend,
+                                                   backend,
                                                    state.layers[layer.layer_id],
                                                    state.gated_delta_scratch,
                                                    *attn_input,
@@ -1139,7 +1113,7 @@ Result<void> forward_model(const CompiledModel& model,
         else if (layer.attention.kind == AttentionKind::MultiHeadLatent)
         {
             const auto& fused = model.operators.at_weight(layer.attention.query_a_weight).latent_layer;
-            if (use_layer_fusion && node->backend == ExecutionBackend::Vulkan && fused)
+            if (use_layer_fusion && backend == ExecutionBackend::Vulkan && fused)
             {
                 auto& positions = state.attention_positions;
                 auto& caches = state.attention_caches;
@@ -1166,9 +1140,9 @@ Result<void> forward_model(const CompiledModel& model,
             if (model.descriptor.hyper_connection_kind == HyperConnectionKind::Sinkhorn)
             {
                 auto mixed = hc_pre(hidden,
-                                    model.weights.at(layer.hyper_connection.attention_function),
-                                    model.weights.at(layer.hyper_connection.attention_scale),
-                                    model.weights.at(layer.hyper_connection.attention_base),
+                                    weights.at(layer.hyper_connection.attention_function),
+                                    weights.at(layer.hyper_connection.attention_scale),
+                                    weights.at(layer.hyper_connection.attention_base),
                                     model.descriptor.hyper_connection_multiplier,
                                     model.descriptor.hyper_connection_iterations,
                                     model.descriptor.norm_epsilon,
@@ -1181,10 +1155,10 @@ Result<void> forward_model(const CompiledModel& model,
                 attention_input = &hyper_mix.reduced;
             }
             ActivationBuffer& attention_output = state.attention_scratch.output;
-            auto output = forward_latent_attention(model.weights,
+            auto output = forward_latent_attention(weights,
                                                    model.operators,
                                                    layer.attention,
-                                                   node->backend,
+                                                   backend,
                                                    position_offset,
                                                    state.layers[layer.layer_id],
                                                    state.attention_scratch,
@@ -1209,10 +1183,10 @@ Result<void> forward_model(const CompiledModel& model,
         }
         else
         {
-            auto attention = forward_attention(model.weights,
+            auto attention = forward_attention(weights,
                                                model.operators,
                                                layer.attention,
-                                               node->backend,
+                                               backend,
                                                position_offset,
                                                state.layers[layer.layer_id],
                                                state.attention_scratch,
@@ -1254,7 +1228,7 @@ Result<void> forward_model(const CompiledModel& model,
         if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
         {
             auto mixed = gr_pre(hidden,
-                                model.weights,
+                                weights,
                                 model.operators,
                                 layer.ffn_gated_residual,
                                 model.descriptor,
@@ -1410,7 +1384,7 @@ Result<void> forward_model(const CompiledModel& model,
         if (moe.has_shared_expert && layer_state.shared_expert_output.rows() == 0
             && !layer_state.shared_expert_device_output)
             return Error{ErrorCode::InternalError, "Combine executed before Shared Expert group"};
-        if (model.gated_residual_chain)
+        if (gpu_chain)
         {
             auto& inputs = state.expert_scratch.combine_inputs;
             inputs.clear();
@@ -1530,8 +1504,8 @@ Result<void> forward_model(const CompiledModel& model,
     };
     for (const LayerId node_id : model.net.order)
     {
-        assert(node_id < model.net.layers.size());
-        const Layer* node = &model.net.layers[node_id];
+        assert(node_id < layers.size());
+        const Layer* node = &layers[node_id];
         if (resident_chain_finished) continue;
         if (resident_prefix_layers != 0 && node->plan_index < resident_prefix_layers)
             continue;
@@ -1962,7 +1936,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                     ErrorCode::InternalError,
                     "cannot merge staged hyper head rows"};
             }
-            auto head = hyper_head(model, merged_hyper, workspace.hyper_connection,
+            auto head = hyper_head(model, model.weights, merged_hyper, workspace.hyper_connection,
                                    scratch.staged_output);
             if (!head)
                 return head.error();
@@ -1976,7 +1950,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             {
                 return Error{ErrorCode::InternalError, "cannot merge staged hidden rows"};
             }
-            norm_fwd(model, node->weights[0], merged, scratch.staged_output);
+            norm_fwd(model, model.weights, node->weights[0], merged, scratch.staged_output);
             if (!split_hidden_rows(scratch.staged_output))
                 return Error{ErrorCode::InternalError, "cannot split staged final norm rows"};
         }
@@ -2038,7 +2012,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
             std::copy_n(hidden.row(0), hidden.columns(), merged.row(output_row++));
         }
         const CompiledOperator& lm_head_operator = model.operators.at_weight(node->weights[0]);
-        auto headed = fwd_lm_head(model, *node, lm_head_operator, merged,
+        auto headed = fwd_lm_head(model, model.weights, *node, node->backend, lm_head_operator, merged,
                                   workspace.staged_router_logits, scratch.staged_output,
                                   norm_deferred);
         if (!headed)
@@ -2707,7 +2681,7 @@ Result<void> forward_decode_batch(const CompiledModel& model,
                 stepped = Error{ErrorCode::InternalError, "cannot merge staged dense FFN rows"};
                 break;
             }
-            stepped = fwd_dense_layer(model, layer, merged, workspace.staged_state,
+            stepped = fwd_dense_layer(model, model.weights, layer, merged, workspace.staged_state,
                                       workspace.gpu_segment, layer_workspace, node->backend);
             if (stepped && !split_hidden_rows(merged))
                 stepped = Error{ErrorCode::InternalError, "cannot split staged dense FFN rows"};

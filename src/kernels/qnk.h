@@ -24,10 +24,17 @@ inline constexpr uint32_t qnk_block_elements = 256;
 [[nodiscard]] uint64_t qnk_packed_storage_bytes(DType dtype, size_t rows, uint32_t columns) noexcept;
 [[nodiscard]] bool qnk_shape_supported(DType dtype, size_t rows, uint32_t columns) noexcept;
 
-// Packed layout: [8-row tile][block][row][raw block].
+// Derived CPU layouts for one block-quantized matrix. Built lazily, immutable
+// afterwards, and owned by the operator's sidecar so the lifetime follows the
+// model instead of a process-global cache.
+//   storage:    native layout, [8-row tile][block][row][raw block]
+//   q8_compat:  K-quant expanded to Q8_0 blocks (34 B per 32 values)
+//   q8_pack:    Q8_0 repacked for the 4x8 GEMM (144 B per 4 rows x 32 values)
 struct QnKPack
 {
     std::vector<uint8_t> storage;
+    std::vector<uint8_t> q8_compat;
+    std::vector<uint8_t> q8_pack;
     DType dtype = DType::Q4K;
     size_t rows = 0;
     uint32_t columns = 0;
@@ -36,6 +43,8 @@ struct QnKPack
     void clear() noexcept
     {
         storage.clear();
+        q8_compat.clear();
+        q8_pack.clear();
         rows = 0;
         columns = 0;
         block_count = 0;
@@ -45,6 +54,12 @@ struct QnKPack
     {
         return is_qnk_dtype(dtype) && rows != 0 && columns != 0 && block_count != 0
                && !storage.empty();
+    }
+
+    [[nodiscard]] bool valid_shape(DType expected, size_t expected_rows, uint32_t expected_columns) const noexcept
+    {
+        return dtype == expected && rows == expected_rows && columns == expected_columns
+               && block_count != 0;
     }
 };
 
@@ -70,84 +85,79 @@ void qnk_q8k_quantize(const float* source,
                       uint8_t* output,
                       uint32_t columns) noexcept;
 
+// Q8_0 activation quantization shared by projections that consume the same
+// input buffer (Q/K/V, gate/up). Consumers verify source address and shape;
+// rebuild it after the input contents change in place.
+struct QnkQ8Input
+{
+    const float* source = nullptr;
+    size_t rows = 0;
+    uint32_t columns = 0;
+    std::vector<int8_t> codes;
+    std::vector<float> scales;
+    std::vector<int32_t> sums;
+};
+
+// No-op (leaving codes empty) when the int8 activation kernels are unavailable
+// or the input is not float32 with 32-value columns.
+void qnk_quantize_input(const ActivationBuffer& input, QnkQ8Input& quantized) noexcept;
+
+[[nodiscard]] inline bool qnk_q8_input_matches(const QnkQ8Input& quantized,
+                                               const ActivationBuffer& input) noexcept
+{
+    return quantized.rows != 0 && quantized.rows == input.rows()
+           && quantized.columns == input.columns()
+           && quantized.source == input.row(0)
+           && !quantized.codes.empty();
+}
+
+// True when every matrix uses a native 32-value block format; K-quants keep
+// float activations and are never requantized by the dispatcher.
+[[nodiscard]] bool qnk_q8_act(const DType* dtypes, size_t count) noexcept;
+
 #if defined(__aarch64__) || defined(_M_ARM64)
 // ARM64 counterpart of the x86 int8-activation path for 32-value blocks.
 [[nodiscard]] bool neon_qnk_q8_supported() noexcept;
 [[nodiscard]] bool neon_qnk_i8mm_supported() noexcept;
 
-void neon_qnk_prefill_q8_0_gemm12(const uint8_t* weight_pack,
-                                        size_t rows,
-                                        uint32_t columns,
-                                        const uint8_t* activation_pack,
-                                        const float* activation_scales,
-                                        size_t token_count,
-                                        float* output,
-                                        size_t output_stride) noexcept;
-
-void neon_qnk_prefill_q8_0_gemm32(const uint8_t* weight_pack,
-                                        size_t rows,
-                                        uint32_t columns,
-                                        const uint8_t* activation_pack,
-                                        const float* activation_scales,
-                                        size_t token_count,
-                                        float* output,
-                                        size_t output_stride) noexcept;
-
-void neon_qnk_prefill_q8_0_fused16(const float* input,
-                                   size_t tokens,
-                                   uint32_t columns,
-                                   const uint8_t* weight_pack,
-                                   size_t rows,
-                                   float* output,
-                                   size_t output_stride) noexcept;
-
 void neon_qnk_prefill_q8_0_gemm16(const uint8_t* weight_pack,
-                                        size_t rows,
-                                        uint32_t columns,
-                                        const uint8_t* activation_pack,
-                                        const float* activation_scales,
-                                        size_t token_count,
-                                        float* output,
-                                        size_t output_stride) noexcept;
+                                  size_t rows,
+                                  uint32_t columns,
+                                  const uint8_t* activation_pack,
+                                  const float* activation_scales,
+                                  size_t token_count,
+                                  float* output,
+                                  size_t output_stride) noexcept;
 
 void neon_qnk_prefill_q8_0_gemm8(const uint8_t* weight_pack,
-                                       size_t rows,
-                                       uint32_t columns,
-                                       const uint8_t* activation_pack,
-                                       const float* activation_scales,
-                                       size_t token_count,
-                                       float* output,
-                                       size_t output_stride) noexcept;
+                                 size_t rows,
+                                 uint32_t columns,
+                                 const uint8_t* activation_pack,
+                                 const float* activation_scales,
+                                 size_t token_count,
+                                 float* output,
+                                 size_t output_stride) noexcept;
 
-void neon_qnk_prefill_q8_0_gemm136(const uint8_t* weight_pack,
-                                         size_t rows,
-                                         uint32_t columns,
-                                         const uint8_t* activation_pack,
-                                         const float* activation_scales,
-                                         size_t token_count,
-                                         float* output,
-                                         size_t output_stride) noexcept;
-
-void neon_qnk_prefill_q8_0_gemm(const uint8_t* weight_pack,
-                                      size_t rows,
-                                      uint32_t columns,
-                                      const uint8_t* activation_pack,
-                                      const float* activation_scales,
-                                      size_t token_count,
-                                      float* output,
-                                      size_t output_stride) noexcept;
+void neon_qnk_prefill_q8_0_gemm4(const uint8_t* weight_pack,
+                                 size_t rows,
+                                 uint32_t columns,
+                                 const uint8_t* activation_pack,
+                                 const float* activation_scales,
+                                 size_t token_count,
+                                 float* output,
+                                 size_t output_stride) noexcept;
 
 void neon_qnk_q8_quant_pack4_group(const float* source,
-                                    size_t group,
-                                    uint32_t columns,
-                                    int8_t* pack,
-                                    float* scales) noexcept;
+                                   size_t group,
+                                   uint32_t columns,
+                                   int8_t* pack,
+                                   float* scales) noexcept;
 
 void neon_qnk_q8_quant_pack4(const float* source,
-                              size_t tokens,
-                              uint32_t columns,
-                              int8_t* pack,
-                              float* scales) noexcept;
+                             size_t tokens,
+                             uint32_t columns,
+                             int8_t* pack,
+                             float* scales) noexcept;
 
 void neon_qnk_q8_quant(const float* source,
                        int8_t* values,
@@ -215,16 +225,16 @@ void neon_qnk_prefill_q8(DType dtype,
                                     uint32_t columns,
                                     QnKPack& output) noexcept;
 
-// use_q8_activations selects the int8 activation kernels for 32-value block
-// weights. It trades activation precision for a quarter of the activation
-// bytes and stays opt-in, because the exact-float parity contracts assume the
-// float32 dot path.
+// use_q8_activations selects the int8 activation kernels. It trades activation
+// precision for a quarter of the activation bytes; the dispatcher enables it
+// for native 32-value formats, and exact-float callers pass false.
 [[nodiscard]] bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
                                       const ActivationBuffer& input,
                                       std::initializer_list<ActivationBuffer*> outputs,
                                       bool use_packed_weights,
                                       std::span<std::shared_ptr<const QnKPack>* const> sidecars = {},
-                                      bool use_q8_activations = false) noexcept;
+                                      bool use_q8_activations = false,
+                                      QnkQ8Input* q8_input = nullptr);
 
 } // namespace moe
 } // namespace ncnn

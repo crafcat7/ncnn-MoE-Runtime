@@ -30,17 +30,32 @@ inline constexpr uint64_t vulkan_weight_block_size = 64 * 1024;
 [[nodiscard]] inline uint64_t vulkan_kv_size(DType dtype, uint32_t device_index) noexcept
 {
 #if NCNN_MOE_WITH_VULKAN
-    if (dtype == DType::BFloat16)
+    if (dtype == DType::BFloat16 || dtype == DType::Float16)
     {
         const int count = ncnn::get_gpu_count();
         if (count <= 0 || device_index >= static_cast<uint32_t>(count)) return UINT64_MAX;
-        if (ncnn::get_gpu_info(static_cast<int>(device_index)).support_bf16_storage()) return sizeof(uint16_t);
+        const ncnn::GpuInfo& info = ncnn::get_gpu_info(static_cast<int>(device_index));
+        if (dtype == DType::BFloat16 ? info.support_bf16_storage() : info.support_fp16_storage())
+            return sizeof(uint16_t);
     }
 #else
     (void)dtype;
     (void)device_index;
 #endif
     return sizeof(float);
+}
+
+// Device storage for a logical KV dtype. Devices without BF16 storage use
+// FP16 instead of widening the cache to FP32.
+[[nodiscard]] inline DType kv_device_dtype(DType dtype, uint32_t device_index, bool fp16) noexcept
+{
+    if (dtype == DType::BFloat16 && vulkan_kv_size(dtype, device_index) != sizeof(uint16_t))
+    {
+        if (fp16 && vulkan_kv_size(DType::Float16, device_index) == sizeof(uint16_t))
+            return DType::Float16;
+        return DType::Float32;
+    }
+    return dtype;
 }
 
 #if NCNN_MOE_WITH_VULKAN
@@ -122,7 +137,6 @@ struct VulkanRuntimeState
     AtomicCounter attention_device_rope_fusions;
     AtomicCounter attention_qkv_ring_fusions;
     AtomicCounter attention_decode_sdpa_fusions;
-    AtomicCounter attention_cache_materializations;
     AtomicCounter attention_cpu_fallbacks;
     AtomicCounter shared_expert_swiglu_fusions;
     AtomicCounter gated_delta_fusions;
@@ -131,7 +145,6 @@ struct VulkanRuntimeState
     AtomicCounter kv_ring_appends;
     AtomicCounter kv_ring_resizes;
     AtomicCounter kv_ring_wrapped_views;
-    AtomicCounter bfloat16_cooperative_matrix_dispatches;
     AtomicCounter dispatches;
     AtomicCounter int4_dispatches;
     AtomicCounter attention_blocks;

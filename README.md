@@ -163,6 +163,23 @@ Python CLI tests:
 python -m unittest discover -s tests_py -v
 ```
 
+## Optimization toggles
+
+Flash prefill, split decode and Q8 decode projections are always enabled;
+`--disable-vulkan-qnk` clears `OptimizationVulkanQnK` so the generic BF16
+projection path can be measured against it. Resident-chain submission is split
+adaptively from the device type and KV context: 64 below 2048 tokens on
+integrated memory, up to 1024 at long context, and 40 otherwise.
+
+`SessionOptions::prefill_chunk_size` defaults to 512 rows; zero prefills the
+whole prompt in one batch. Load-time GPU planning uses a fixed 512-row planning
+default for resident command chains, Expert banks and per-session KV
+reservations.
+
+Hybrid Vulkan expands dense Qn_K projections to BF16 at load so the prefill tile
+GEMM can consume them; the token embedding stays block-quantized. Expect roughly
+2 bytes/parameter for the converted projections on the host.
+
 ## Features
 
 - Compile once: `Net` owns `Layer[]`, `Blob[]`, compiled plans, and the final
@@ -173,11 +190,23 @@ python -m unittest discover -s tests_py -v
   cache, GPU cache, victim cache, resident Expert banks, and on-demand streaming.
 - Shared Expert overlap and device-resident routed aggregation where supported.
 - Native Vulkan paths for standard Attention, latent Attention, GatedDeltaNet,
-  dense projections, and supported Experts.
+  dense projections, and supported Experts. Multi-row attention uses a flash
+  kernel (64-row query tiles, fp16 K/V tiles in shared memory, inline causal and
+  sliding-window masks); one-row decode splits its KV scan across workgroups and
+  streams the retained block-quantized attention projections while multi-row
+  prefill keeps the BF16 tile GEMM. The resident chain splits decode work into
+  smaller command buffers on unified-memory devices so recording overlaps GPU
+  execution.
 - CPU SIMD dispatch for AVX2, AVX-512, BF16, VNNI, Arm NEON, and SVE/SVE2, with
   workload-aware OpenMP scheduling.
 - Direct quantized execution for FP8, MXFP4, Qn_K, INT4/INT8, and GGUF-native
-  Q4/Q5/Q8/IQ formats without expanding every weight to BF16.
+  Q4/Q5/Q8/IQ formats without expanding every weight to BF16. Projections read
+  int8 activations by default for the native 32-value block formats
+  (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/IQ4_NL); K-quants always stay on float32
+  activations.
+- CPU flash attention runs long-prompt QK/PV dots with FP16 accumulation and
+  saturating KV conversion by default; `--cpu-f16-attention off` restores exact
+  FP32 dots.
 - Host-memory budgeting, mmap/direct/buffered Expert I/O, graph arena planning
   from Blob lifetimes, and separate KV/recurrent Session state.
 - `BatchScheduler` for multi-Session decode and DSpark/MTP speculative decoding

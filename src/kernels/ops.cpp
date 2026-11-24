@@ -772,7 +772,8 @@ bool forward_linear(std::initializer_list<const TensorData*> matrices,
                     std::initializer_list<ActivationBuffer*> outputs,
                     uint64_t optimization_flags,
                     std::initializer_list<const CompiledOperator*> ops,
-                    ActivationBuffer* quantized_input_scratch)
+                    ActivationBuffer* quantized_input_scratch,
+                    QnkQ8Input* q8_input)
 {
     const size_t matrix_count = matrices.size();
     if ((matrix_count != 2 && matrix_count != 4)
@@ -832,12 +833,16 @@ bool forward_linear(std::initializer_list<const TensorData*> matrices,
                 sidecars[i] = owners[i] ? &owners[i]->qnk_packed : nullptr;
         }
         const auto sidecar_span = std::span<std::shared_ptr<const QnKPack>* const>(sidecars.data(), matrix_count);
+        std::array<DType, 2> activation_dtypes{};
+        for (size_t index = 0; index < matrix_count; ++index)
+            activation_dtypes[index] = weights[index]->dtype;
         return forward_linear_qnk(matrices,
                                   input,
                                   outputs,
                                   has_flag(optimization_flags, OptimizationCpuPackedWeights),
                                   sidecar_span,
-                                  has_flag(optimization_flags, OptimizationCpuQnkQ8));
+                                  qnk_q8_act(activation_dtypes.data(), matrix_count),
+                                  q8_input);
     }
     if (is_qnk_dtype(dtype))
         return false;
@@ -1088,17 +1093,20 @@ get_mxfp4_q8_packed_weights(const TensorData& matrix,
                             uint32_t block_count,
                             size_t row_count)
 {
+    // Published packs are immutable, so the steady-state read is lock-free.
+    if (sidecar != nullptr)
+    {
+        const std::shared_ptr<const Mxfp4Q8PackedMatrix> fast = std::atomic_load_explicit(sidecar, std::memory_order_acquire);
+        if (fast && fast->valid() && fast->rows == row_count && fast->block_count == block_count)
+            return fast;
+    }
     // Protect the first immutable sidecar build.
     static std::mutex build_locks[64];
     const uintptr_t storage_key = reinterpret_cast<uintptr_t>(matrix.mxfp4_blocks.data());
     std::lock_guard<std::mutex> build_lock(build_locks[(storage_key >> 6) & 63u]);
-    std::shared_ptr<const Mxfp4Q8PackedMatrix> cached = sidecar ? *sidecar : nullptr;
-    if (cached && cached->valid()
-        && cached->rows == row_count
-        && cached->block_count == block_count)
-    {
+    std::shared_ptr<const Mxfp4Q8PackedMatrix> cached = sidecar ? std::atomic_load_explicit(sidecar, std::memory_order_acquire) : nullptr;
+    if (cached && cached->valid() && cached->rows == row_count && cached->block_count == block_count)
         return cached;
-    }
 
     auto packed = std::make_shared<Mxfp4Q8PackedMatrix>();
     if (!mxfp4_q8_pack_weights(matrix.mxfp4_blocks.data(),
@@ -1110,7 +1118,7 @@ get_mxfp4_q8_packed_weights(const TensorData& matrix,
         return {};
     }
     if (sidecar)
-        *sidecar = packed;
+        std::atomic_store_explicit(sidecar, std::shared_ptr<const Mxfp4Q8PackedMatrix>(packed), std::memory_order_release);
     return packed;
 }
 
@@ -1140,7 +1148,7 @@ static bool forward_linear_vulkan(const CompiledOperator* op,
     return true;
 }
 
-void forward_linear(const TensorData& matrix, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, const CompiledOperator* op, ExecutionBackend backend, ActivationBuffer* quantized_input_scratch)
+void forward_linear(const TensorData& matrix, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, const CompiledOperator* op, ExecutionBackend backend, ActivationBuffer* quantized_input_scratch, QnkQ8Input* q8_input)
 {
     assert(!quantized_input_scratch
            || (quantized_input_scratch != &input
@@ -1201,7 +1209,8 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
                                {&output},
                                has_flag(optimization_flags, OptimizationCpuPackedWeights),
                                sidecar_span,
-                               has_flag(optimization_flags, OptimizationCpuQnkQ8)))
+                               qnk_q8_act(&matrix.dtype, 1),
+                               q8_input))
             return;
         throw std::runtime_error("invalid native GGML linear weight or activation shape");
     }
@@ -2768,7 +2777,7 @@ bool forward_experts_mxfp4(std::span<const Mxfp4Task> tasks, Mxfp4Scratch* scrat
     return true;
 }
 
-void forward_linear(const TensorData& matrix, const TensorData& bias, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, const CompiledOperator* op, ExecutionBackend backend, ActivationBuffer* quantized_input_scratch)
+void forward_linear(const TensorData& matrix, const TensorData& bias, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, const CompiledOperator* op, ExecutionBackend backend, ActivationBuffer* quantized_input_scratch, QnkQ8Input* q8_input)
 {
     assert(matrix.shape.size() == 2);
     const uint32_t output_columns = matrix.shape[0];

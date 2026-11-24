@@ -25,22 +25,22 @@ struct TensorData;
 enum class ExecutionBackend;
 
 // Input and output must be distinct; existing output capacity is reused.
-void forward_dense_ffn(const CompiledModel& model,
-                       const ExpertPlan& ffn,
-                       const ActivationBuffer& input,
-                       ActivationBuffer& output,
-                       ExpertWorkspace& workspace,
-                       ExecutionBackend backend);
+[[nodiscard]] Result<void> forward_dense_ffn(const CompiledModel& model,
+                                             const ExpertPlan& ffn,
+                                             const ActivationBuffer& input,
+                                             ActivationBuffer& output,
+                                             ExpertWorkspace& workspace,
+                                             ExecutionBackend backend);
 
-void forward_shared_expert(const CompiledModel& model,
-                           const MoeBlockPlan& moe,
-                           const ActivationBuffer& input,
-                           ActivationBuffer& output,
-                           ExpertWorkspace& workspace,
-                           const std::shared_ptr<const DeviceTensor_vulkan>& device_input = {},
-                           std::shared_ptr<const DeviceTensor_vulkan>* device_output = nullptr,
-                           bool require_device_execution = false,
-                           bool require_gpu_execution = false);
+[[nodiscard]] Result<void> forward_shared_expert(const CompiledModel& model,
+                                                 const MoeBlockPlan& moe,
+                                                 const ActivationBuffer& input,
+                                                 ActivationBuffer& output,
+                                                 ExpertWorkspace& workspace,
+                                                 const std::shared_ptr<const DeviceTensor_vulkan>& device_input = {},
+                                                 std::shared_ptr<const DeviceTensor_vulkan>* device_output = nullptr,
+                                                 bool require_device_execution = false,
+                                                 bool require_gpu_execution = false);
 
 bool support_vulkan_expert(const ExpertPlan& expert,
                            const TensorData& gate_up,

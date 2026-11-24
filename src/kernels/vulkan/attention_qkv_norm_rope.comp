@@ -63,6 +63,7 @@ layout(push_constant) uniform parameter
     uint round_kv;
     uint lane_stride;
     uint value_norm;
+    uint double_write;
 }
 p;
 
@@ -209,7 +210,7 @@ void main()
             const float stored_second = p.round_kv != 0u ? round_bf16(rotated_second) : rotated_second;
             buffer_st1(key_data, destination_base + pair, stored_first);
             buffer_st1(key_data, destination_base + rope_half + pair, stored_second);
-            if (p.direct_ring != 0)
+            if (p.direct_ring != 0 && p.double_write != 0)
             {
                 const uint duplicate = destination_base
                                        + p.ring_capacity * p.head_dimension;
@@ -226,7 +227,7 @@ void main()
                                          * inverse_rms * key_scale;
                 const float stored_key = p.round_kv != 0u ? round_bf16(normalized) : normalized;
                 buffer_st1(key_data, destination_base + dimension, stored_key);
-                if (p.direct_ring != 0)
+                if (p.direct_ring != 0 && p.double_write != 0)
                 {
                     buffer_st1(key_data,
                                destination_base
@@ -242,7 +243,7 @@ void main()
             const float normalized_value = value * value_inverse_rms;
             const float stored_value = p.round_kv != 0u ? round_bf16(normalized_value) : normalized_value;
             buffer_st1(value_data, value_destination_base + dimension, stored_value);
-            if (p.direct_ring != 0)
+            if (p.direct_ring != 0 && p.double_write != 0)
             {
                 buffer_st1(value_data,
                            value_destination_base

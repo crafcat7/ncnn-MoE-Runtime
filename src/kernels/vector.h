@@ -39,7 +39,41 @@ void bfloat16_gemm_4x8(const uint16_t* weights,
                        uint32_t token_count,
                        float* output,
                        size_t output_stride) noexcept;
+// FP16 flash math: FP16 QK/PV products and accumulation; conversions saturate.
+[[nodiscard]] float f16_to_f32(uint16_t value) noexcept;
+[[nodiscard]] uint16_t float_to_f16(float value) noexcept;
+void f32_to_f16(uint16_t* output, const float* input, size_t count) noexcept;
+void bf16_to_f16(uint16_t* output, const uint16_t* input, size_t count) noexcept;
+void f16_gemm_4x8(const uint16_t* weights,
+                  size_t weight_stride,
+                  const uint16_t* input,
+                  size_t input_stride,
+                  uint32_t input_columns,
+                  uint32_t output_count,
+                  uint32_t token_count,
+                  float* output,
+                  size_t output_stride) noexcept;
+void f16_pv(float* output,
+            const uint16_t* values,
+            size_t value_stride,
+            const uint16_t* weights,
+            uint32_t count,
+            uint32_t columns) noexcept;
+// Two query rows share one FP16 V tile; output is row-major, 2 x columns.
+void f16_pv4(float* output,
+             const uint16_t* values,
+             size_t value_stride,
+             const float* weights0,
+             const float* weights1,
+             const float* weights2,
+             const float* weights3,
+             uint32_t count,
+             uint32_t columns) noexcept;
+// Scale in place and return the maximum; used by the flash mask.
+float f32_scale_max(float* values, float scale, uint32_t count) noexcept;
 void float_exp_inplace(float* values, uint32_t count) noexcept;
+// Exp((scores - maximum)) in one pass and return the sum.
+float f32_softmax(float* values, uint32_t count, float maximum) noexcept;
 [[nodiscard]] bool float_exp_simd_available() noexcept;
 void float_silu_inplace(float* values, uint32_t count) noexcept;
 float int8_float_dot(const int8_t* left, const float* right, uint32_t count) noexcept;

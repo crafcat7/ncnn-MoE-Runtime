@@ -203,6 +203,7 @@ struct SessionMetrics
 struct SessionOptions
 {
     uint64_t sampling_seed = 0;
+    // Prompt rows per prefill chunk; zero prefills the whole prompt in one batch.
     uint32_t prefill_chunk_size = 512;
     bool use_speculative_context = true;
 };
@@ -217,6 +218,8 @@ public:
     [[nodiscard]] Result<PrefillResult> prefill(std::span<const int32_t> input_ids);
     [[nodiscard]] Result<DecodeResult> decode(int32_t input_id);
     [[nodiscard]] Result<SampledToken> sample(std::span<const float> logits, const SamplingOptions& opt = {});
+    // Callback and text-decoder exceptions are reported as
+    // Error{InternalError} with the original message; they do not escape.
     [[nodiscard]] Result<GenerationResult> generate(std::span<const int32_t> input_ids, const GenerationOptions& opt = {}, TokenStreamCallback on_token = {}, TokenTextDecoder decode_text = {});
     [[nodiscard]] Result<void> reset();
 

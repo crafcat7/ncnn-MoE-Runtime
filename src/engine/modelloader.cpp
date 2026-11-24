@@ -217,7 +217,7 @@ Result<void> ModelLoader::resolve_gpu_devices()
 {
     const bool support_vulkan = has_flag(info.flags, RuntimeVulkanCpu);
     if (opt.hybrid_mode == HybridMode::HybridExperts && !support_vulkan)
-        return Error{ErrorCode::UnsupportedModel, "HybridExperts requires a Vulkan device and Vulkan-enabled ncnn"};
+        return Error{ErrorCode::UnsupportedModel, "Hybrid Vulkan modes require a Vulkan device and Vulkan-enabled ncnn"};
 
     if (!opt.vulkan_device_indices.empty())
     {
@@ -390,49 +390,63 @@ Result<void> ModelLoader::plan_memory()
         return mapped.error();
     native_weights = std::move(mapped).value();
     normalize_expert_storage(descriptor, *native_weights);
-    if (opt.hybrid_mode == HybridMode::HybridExperts
-        && has_flag(info.flags, RuntimeVulkan))
+    // Hybrid Vulkan expands dense Qn_K projections to BF16 for the prefill tile
+    // GEMM and retains the block payload for the one-row decode projections.
+    // The token embedding stays block-quantized: its lookup runs on the host and
+    // would only pay twice the bytes. A tied lm_head shares that mapping and is
+    // converted through its own entry, so it still reaches the BF16 GEMM.
+    if (opt.hybrid_mode == HybridMode::HybridExperts && has_flag(info.flags, RuntimeVulkan))
     {
-        size_t converted = 0;
         for (auto& item : *native_weights)
         {
             TensorData& tensor = item.second;
             if (!is_qnk_dtype(tensor.dtype) || tensor.shape.size() != 2)
                 continue;
-            if (item.first.find(".experts.") != std::string::npos)
+            if (item.first.find(".experts.") != std::string::npos
+                || item.first.find("token_embedding.") != std::string::npos)
+                continue;
+            // A stored input-column permutation is applied by the QnK shader;
+            // Bfloat16Linear_vulkan has no gather, so converting would silently
+            // drop the permutation. Keep such tensors block-quantized.
+            if (!tensor.input_column_indices.empty())
                 continue;
             const uint32_t rows = tensor.shape[0];
             const uint32_t columns = tensor.shape[1];
             const uint32_t block_elements = qnk_block_size(tensor.dtype);
-            const uint32_t block_count = columns / block_elements;
             const size_t block_bytes = qnk_block_bytes(tensor.dtype);
+            if (rows == 0 || columns == 0 || block_elements == 0 || block_bytes == 0
+                || columns % block_elements != 0)
+                continue;
+            const uint32_t block_count = columns / block_elements;
             const std::span<const uint8_t> raw = tensor.qnk_values();
-            if (block_elements == 0 || block_bytes == 0
-                || columns % block_elements != 0
-                || raw.size() < static_cast<size_t>(rows) * block_count * block_bytes)
+            if (raw.size() < static_cast<size_t>(rows) * block_count * block_bytes)
                 continue;
             std::vector<uint16_t> converted_values(static_cast<size_t>(rows) * columns);
-            std::array<float, qnk_block_elements> decoded{};
-            for (uint32_t row = 0; row < rows; ++row)
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+            for (int64_t row_index = 0; row_index < static_cast<int64_t>(rows); ++row_index)
+            {
+                const size_t row = static_cast<size_t>(row_index);
+                std::array<float, qnk_block_elements> decoded{};
                 for (uint32_t block = 0; block < block_count; ++block)
                 {
                     const uint8_t* encoded = raw.data()
-                                             + (static_cast<size_t>(row) * block_count + block) * block_bytes;
+                                             + (row * block_count + block) * block_bytes;
                     qnk_dequantize_block(tensor.dtype, encoded, decoded.data());
-                    for (uint32_t index = 0; index < block_elements; ++index)
-                        converted_values[static_cast<size_t>(row) * columns
-                                         + static_cast<size_t>(block) * block_elements + index] =
-                            ncnn::moe::float_to_bfloat16(decoded[index]);
+                    float_to_bfloat16_array(converted_values.data()
+                                                + row * columns
+                                                + static_cast<size_t>(block) * block_elements,
+                                            decoded.data(),
+                                            block_elements);
                 }
+            }
+            // Keep the block-quantized payload for the decode-only QnK
+            // projections; the BF16 copy serves the multi-row prefill GEMM.
+            tensor.qnk_dtype = tensor.dtype;
             tensor.dtype = DType::BFloat16;
             tensor.bfloat16_data = std::move(converted_values);
-            tensor.quantized_data.clear();
-            tensor.mapped_data.reset();
-            tensor.mapped_size = 0;
-            ++converted;
         }
-        if (converted != 0)
-            std::fprintf(stderr, "[nmr] converted %zu QnK tensors to BF16 for Vulkan\n", converted);
     }
     native_quantized_experts = std::any_of(native_weights->begin(), native_weights->end(), [](const auto& item) {
         return item.first.find(".experts.") != std::string::npos
@@ -645,11 +659,11 @@ Result<void> ModelLoader::compile_model()
     if (use_file_backed_experts)
         compiler_opt.flags |= BackendFileBackedExperts;
 
-    auto ret = ncnn::moe::compile_model_validated(std::move(descriptor),
-                                                  std::move(weights).value(),
-                                                  model,
-                                                  opt.hybrid_mode,
-                                                  compiler_opt);
+    auto ret = compile_model_validated(std::move(descriptor),
+                                       std::move(weights).value(),
+                                       model,
+                                       opt.hybrid_mode,
+                                       compiler_opt);
     if (!ret)
         return ret.error();
 
@@ -1141,7 +1155,7 @@ Result<void> ModelLoader::load(const std::filesystem::path& model_path)
     if (!ret)
         return ret.error();
 
-    ret = prepare_model_expert_banks(model, SessionOptions{}.prefill_chunk_size, opt.expert_gpu_cache_size);
+    ret = prepare_model_expert_banks(model, default_prefill_rows, opt.expert_gpu_cache_size);
     if (!ret)
         return ret.error();
 

@@ -29,6 +29,8 @@
 #endif
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <array>
 #include <functional>
 #include <limits>
@@ -364,7 +366,7 @@ static bool attn_native(const CompiledModel& compiled,
     return true;
 }
 
-static uint64_t release_tensor_host_storage(TensorData& tensor)
+static uint64_t release_storage(TensorData& tensor)
 {
     uint64_t released_size = 0;
     if (tensor.dtype == DType::Float32)
@@ -374,8 +376,10 @@ static uint64_t release_tensor_host_storage(TensorData& tensor)
     }
     else if (tensor.dtype == DType::BFloat16)
     {
-        released_size = tensor.bfloat16_data.size() * sizeof(uint16_t);
+        released_size = tensor.bfloat16_data.size() * sizeof(uint16_t)
+                        + tensor.quantized_data.size();
         std::vector<uint16_t>().swap(tensor.bfloat16_data);
+        std::vector<uint8_t>().swap(tensor.quantized_data);
     }
     else if (tensor.dtype == DType::Float8E4M3)
     {
@@ -397,12 +401,12 @@ static uint64_t release_tensor_host_storage(TensorData& tensor)
     return released_size;
 }
 
-static void release_vulkan_dense_handle(CompiledModel& compiled, TensorHandle handle)
+static void release_dense(CompiledModel& compiled, TensorHandle handle)
 {
     if (handle == invalid_tensor_handle)
         return;
     compiled.released_dense_host_size = saturating_add_u64(compiled.released_dense_host_size,
-                                                           release_tensor_host_storage(compiled.weights.at_mutable(handle)));
+                                                           release_storage(compiled.weights.at_mutable(handle)));
 }
 
 void release_host_copies(CompiledModel& compiled)
@@ -443,7 +447,7 @@ void release_host_copies(CompiledModel& compiled)
         if (uses_vulkan_dense_operator(compiled.operators.at_weight(handle))
             && std::find(shared_fallback_handles.begin(), shared_fallback_handles.end(), handle) == shared_fallback_handles.end())
             compiled.released_dense_host_size = saturating_add_u64(compiled.released_dense_host_size,
-                                                                   release_tensor_host_storage(tensor));
+                                                                   release_storage(tensor));
     }
 
     const auto release_fused_layer_handles = [&compiled](CompiledLayerPlan& layer) {
@@ -452,64 +456,64 @@ void release_host_copies(CompiledModel& compiled)
                                || attention.fused_qkv_gate_bfloat16_operator != invalid_compiled_operator_handle;
         if (qkv_fused)
         {
-            release_vulkan_dense_handle(compiled, attention.query_weight);
-            release_vulkan_dense_handle(compiled, attention.key_weight);
-            release_vulkan_dense_handle(compiled, attention.value_weight);
+            release_dense(compiled, attention.query_weight);
+            release_dense(compiled, attention.key_weight);
+            release_dense(compiled, attention.value_weight);
         }
         if (attention.fused_qkv_gate_bfloat16_operator != invalid_compiled_operator_handle)
-            release_vulkan_dense_handle(compiled, attention.output_gate_weight);
+            release_dense(compiled, attention.output_gate_weight);
 
         if (attention.fused_delta_input_operator != invalid_compiled_operator_handle
             && attention.gated_delta_vulkan_operator != invalid_compiled_operator_handle
             && compiled.operators.at(attention.gated_delta_vulkan_operator).gated_delta
             && uses_vulkan_dense_operator(compiled.operators.at(attention.fused_delta_input_operator)))
         {
-            release_vulkan_dense_handle(compiled, attention.delta_qkv_weight);
-            release_vulkan_dense_handle(compiled, attention.delta_z_weight);
-            release_vulkan_dense_handle(compiled, attention.delta_beta_weight);
-            release_vulkan_dense_handle(compiled, attention.delta_alpha_weight);
+            release_dense(compiled, attention.delta_qkv_weight);
+            release_dense(compiled, attention.delta_z_weight);
+            release_dense(compiled, attention.delta_beta_weight);
+            release_dense(compiled, attention.delta_alpha_weight);
         }
 
         if (attention.vulkan_attention_operator != invalid_compiled_operator_handle)
         {
-            release_vulkan_dense_handle(compiled, attention.pre_attention_norm_weight);
-            release_vulkan_dense_handle(compiled, attention.sinks);
+            release_dense(compiled, attention.pre_attention_norm_weight);
+            release_dense(compiled, attention.sinks);
             if (has_flag(attention.flags, AttentionBlockPostNorm))
-                release_vulkan_dense_handle(compiled, attention.attn_post_norm);
+                release_dense(compiled, attention.attn_post_norm);
             if (has_flag(attention.flags, AttentionBlockQueryKeyNorm))
             {
-                release_vulkan_dense_handle(compiled, attention.query_norm_weight);
-                release_vulkan_dense_handle(compiled, attention.key_norm_weight);
+                release_dense(compiled, attention.query_norm_weight);
+                release_dense(compiled, attention.key_norm_weight);
             }
         }
 
         if (layer.moe.fused_shared_input_bfloat16_operator != invalid_compiled_operator_handle)
         {
-            release_vulkan_dense_handle(compiled, layer.moe.shared_expert.gate_weight);
-            release_vulkan_dense_handle(compiled, layer.moe.shared_expert.up_weight);
-            release_vulkan_dense_handle(compiled, layer.moe.shared_expert_gate_weight);
+            release_dense(compiled, layer.moe.shared_expert.gate_weight);
+            release_dense(compiled, layer.moe.shared_expert.up_weight);
+            release_dense(compiled, layer.moe.shared_expert_gate_weight);
         }
         const ExpertPlan& shared = layer.moe.shared_expert;
         const auto& shared_chain = compiled.operators.at(shared.vulkan_operator).qnk_expert;
         if (layer.moe.has_shared_expert && shared_chain && shared_chain->has_router_gate())
-            release_vulkan_dense_handle(compiled, layer.moe.shared_expert_gate_weight);
+            release_dense(compiled, layer.moe.shared_expert_gate_weight);
         if (layer.moe.has_shared_expert && shared.vulkan_operator != invalid_compiled_operator_handle
             && compiled.operators.at(shared.vulkan_operator).qnk_expert
             && compiled.weights.at(shared.gate_weight).dtype == DType::Q8_0
             && compiled.weights.at(shared.up_weight).dtype == DType::Q8_0
             && compiled.weights.at(shared.down_weight).dtype == DType::Q8_0)
         {
-            release_vulkan_dense_handle(compiled, shared.gate_weight);
-            release_vulkan_dense_handle(compiled, shared.up_weight);
-            release_vulkan_dense_handle(compiled, shared.down_weight);
+            release_dense(compiled, shared.gate_weight);
+            release_dense(compiled, shared.up_weight);
+            release_dense(compiled, shared.down_weight);
         }
         const ExpertPlan& dense = layer.dense_ffn;
         if (dense.down_weight != invalid_tensor_handle && !dense.use_gpu_cache
             && support_vulkan_dense_ffn(compiled.operators, dense))
         {
-            release_vulkan_dense_handle(compiled, dense.gate_weight);
-            release_vulkan_dense_handle(compiled, dense.up_weight);
-            release_vulkan_dense_handle(compiled, dense.down_weight);
+            release_dense(compiled, dense.gate_weight);
+            release_dense(compiled, dense.up_weight);
+            release_dense(compiled, dense.down_weight);
         }
     };
 
@@ -517,6 +521,19 @@ void release_host_copies(CompiledModel& compiled)
         release_fused_layer_handles(layer);
     for (CompiledLayerPlan& layer : compiled.speculative.net.layer_plans)
         release_fused_layer_handles(layer);
+
+    // The vocabulary matrix is the largest dense tensor; release it once the
+    // device head owns the weights. A tied embedding keeps the shared mapping
+    if (compiled.lm_head_weight != invalid_tensor_handle
+        && compiled.lm_head_weight != compiled.token_embedding
+        && std::any_of(compiled.net.layers.begin(), compiled.net.layers.end(), [](const Layer& node) {
+               return node.kind == LayerKind::LmHead && node.backend == ExecutionBackend::Vulkan;
+           }))
+    {
+        const CompiledOperator& head = compiled.operators.at_weight(compiled.lm_head_weight);
+        if (head.qnk || head.bfloat16 || head.float8 || head.linear)
+            release_dense(compiled, compiled.lm_head_weight);
+    }
 
     const MappedOwners retained_owners = mapped_owners();
     for (const auto& [owner, bytes] : previous_owners)
@@ -1097,6 +1114,10 @@ static AttentionConfig_vulkan attn_vk_config(const CompiledModel& compiled,
     config.rope_active = plan.rope_active;
     config.activation_dtype = compiled.descriptor.activation_dtype;
     config.kv_cache_dtype = plan.kv_cache_dtype;
+    config.kv_double = plan.sliding_window != 0;
+    config.kv_fp16 = compiled.max_context > kv_fp16_tokens;
+    config.kv_full = compiled.max_context > kv_full_tokens;
+    config.kv_tokens = compiled.max_context;
     config.optimization_flags = compiled.opt.optimization_flags;
     if (has_flag(plan.flags, AttentionBlockSink))
         config.flags |= AttentionSink;
@@ -1153,6 +1174,10 @@ static Result<void> prepare_native_attention(CompiledModel& compiled,
         plan.fused_qkv_operator = fused_handle;
     }
 #endif
+    const auto make_qnk = [&](const TensorData& matrix, const TensorData* bias) {
+        return QnkLinear_vulkan::create(matrix, bias, layer_plan.vulkan_device_index,
+                                        compiled.vulkan_runtime, compiled.opt.optimization_flags);
+    };
     std::array<CompiledOperator, 5> projections;
     for (size_t index = 0; index < projections.size(); ++index)
     {
@@ -1185,10 +1210,7 @@ static Result<void> prepare_native_attention(CompiledModel& compiled,
         }
         else
         {
-            projection.qnk = QnkLinear_vulkan::create(compiled.weights.at(handle), bias,
-                                                      layer_plan.vulkan_device_index,
-                                                      compiled.vulkan_runtime,
-                                                      compiled.opt.optimization_flags);
+            projection.qnk = make_qnk(compiled.weights.at(handle), bias);
         }
         if (!projection.qnk && !projection.float8)
             return Error{ErrorCode::InternalError,
@@ -1199,6 +1221,64 @@ static Result<void> prepare_native_attention(CompiledModel& compiled,
         projection_operator = projection;
         projections[index] = std::move(projection);
     }
+
+    // Decode override: rebuild the projections from the retained block-
+    // quantized payload. One-row decode then streams half the bytes while the
+    // BF16 set above keeps serving multi-row prefill.
+    std::array<CompiledOperator, 5> projections_q8;
+    std::shared_ptr<QnkLinear_vulkan> fused_qkv_q8;
+    std::vector<TensorData> shadows;
+    bool ready = false;
+#if NCNN_MOE_WITH_VULKAN
+    if (has_flag(compiled.opt.optimization_flags, OptimizationVulkanQnK))
+    {
+        shadows.reserve(5);
+        bool complete = true;
+        for (size_t index = 0; index < std::size(weights) && complete; ++index)
+        {
+            const TensorHandle handle = weights[index];
+            if (handle == invalid_tensor_handle)
+            {
+                complete = index == 4;
+                continue;
+            }
+            complete = is_qnk_dtype(compiled.weights.at(handle).qnk_dtype);
+            if (complete)
+                shadows.push_back(qnk_view(compiled.weights.at(handle)));
+        }
+        if (complete)
+        {
+            const std::array<const TensorData*, 3> qkv = {&shadows[0], &shadows[1], &shadows[2]};
+            const std::array<const TensorData*, 3> qkv_bias = {
+                biases[0] == invalid_tensor_handle ? nullptr : &compiled.weights.at(biases[0]),
+                biases[1] == invalid_tensor_handle ? nullptr : &compiled.weights.at(biases[1]),
+                biases[2] == invalid_tensor_handle ? nullptr : &compiled.weights.at(biases[2])};
+            if (QnkLinear_vulkan::can_fuse(qkv))
+                fused_qkv_q8 = QnkLinear_vulkan::create_fused(qkv, qkv_bias, layer_plan.vulkan_device_index,
+                                                              compiled.vulkan_runtime,
+                                                              compiled.opt.optimization_flags);
+            if (!fused_qkv_q8)
+            {
+                // A biased or non-fusable QKV layout keeps one Q8 operator per
+                // matrix; record_native_qkv already handles the unfused shape.
+                for (size_t index = 0; index < 3; ++index)
+                    projections_q8[index].qnk = make_qnk(shadows[index], qkv_bias[index]);
+            }
+            projections_q8[3].qnk = make_qnk(shadows[3], biases[3] == invalid_tensor_handle ? nullptr : &compiled.weights.at(biases[3]));
+            if (weights[4] != invalid_tensor_handle)
+                projections_q8[4].qnk = make_qnk(shadows[4], nullptr);
+            const bool qkv_ready = fused_qkv_q8
+                                   || (projections_q8[0].qnk && projections_q8[1].qnk && projections_q8[2].qnk);
+            ready = qkv_ready && projections_q8[3].qnk != nullptr
+                    && (weights[4] == invalid_tensor_handle || projections_q8[4].qnk != nullptr);
+            if (!ready)
+            {
+                projections_q8 = {};
+                fused_qkv_q8.reset();
+            }
+        }
+    }
+#endif
 
     const TensorData* query_norm = has_flag(plan.flags, AttentionBlockQueryKeyNorm)
                                        ? &compiled.weights.at(plan.query_norm_weight)
@@ -1221,7 +1301,9 @@ static Result<void> prepare_native_attention(CompiledModel& compiled,
                                                               sinks,
                                                               projections,
                                                               attn_vk_config(compiled, plan), fused_qkv, norm_bias,
-                                                              post_attention_norm);
+                                                              post_attention_norm,
+                                                              ready ? &projections_q8 : nullptr,
+                                                              std::move(fused_qkv_q8));
     if (!attention_operator)
         return Error{ErrorCode::InternalError,
                      "failed to create native Vulkan Standard Attention at layer "
@@ -1531,25 +1613,23 @@ static uint64_t attn_init_size(const CompiledModel& compiled,
 {
     const uint64_t key_columns = saturating_multiply_u64(attention.kv_head_count,
                                                          attention.head_dimension);
-    uint64_t required_tokens = std::max<uint64_t>(1, context_tokens == 0 ? SessionOptions{}.prefill_chunk_size : context_tokens);
+    uint64_t required_tokens = std::max<uint64_t>(1, context_tokens == 0 ? default_prefill_rows : context_tokens);
     if (has_flag(attention.flags, AttentionBlockSink))
         required_tokens = saturating_add_u64(required_tokens, 1);
-    uint64_t capacity = 16;
-    while (capacity < required_tokens
-           && capacity <= static_cast<uint64_t>(std::numeric_limits<int>::max()) / 2)
-    {
-        capacity *= 2;
-    }
-    if (capacity < required_tokens)
-        capacity = required_tokens;
-    const uint64_t element_size = vulkan_kv_size(attention.kv_cache_dtype, device_index);
+    uint64_t capacity = kv_capacity(attention.sliding_window != 0, required_tokens);
+    if (attention.sliding_window == 0 && compiled.max_context > kv_full_tokens)
+        capacity = std::max(capacity, kv_capacity(false, compiled.max_context));
+    if (capacity == UINT64_MAX)
+        return UINT64_MAX;
+    const DType kv_dtype = kv_device_dtype(attention.kv_cache_dtype, device_index,
+                                           compiled.max_context > kv_fp16_tokens);
+    const uint64_t element_size = vulkan_kv_size(kv_dtype, device_index);
     if (element_size == UINT64_MAX) return UINT64_MAX;
-    // The Vulkan KV ring stores two copies of each key/value row so wrapped
-    // cache views stay contiguous. Count every concurrent Session's initial
-    // prefill capacity; later growth remains checked at allocation time.
+    // Sliding-window caches keep a second contiguous copy of each row; plain
+    // contexts keep one K and one V row.
     const uint64_t ring = saturating_multiply_u64(saturating_multiply_u64(capacity,
                                                                           key_columns),
-                                                  element_size * 4);
+                                                  element_size * (attention.sliding_window != 0 ? 4 : 2));
     return saturating_multiply_u64(ring,
                                    std::max(1u, compiled.opt.num_concurrent_sessions));
 }
@@ -1590,6 +1670,14 @@ uint64_t attn_vk_size(const CompiledModel& compiled,
                 if (projection == 0)
                     return 0;
                 input = saturating_add_u64(input, projection);
+                // One-row decode keeps a second, block-quantized copy of every
+                // attention projection resident.
+                if (is_qnk_dtype(matrix.qnk_dtype))
+                {
+                    const TensorData shadow = qnk_view(matrix);
+                    input = saturating_add_u64(input,
+                                               QnkLinear_vulkan::projection_storage_bytes(shadow, alignment));
+                }
             }
             const uint64_t hidden_bytes = static_cast<uint64_t>(compiled.descriptor.hidden_size) * sizeof(float);
             constants = const_buf_size({hidden_bytes,
@@ -1698,7 +1786,7 @@ static uint64_t attention_session_state_size(const CompiledModel& compiled,
         if (has_flag(attention.flags, AttentionBlockQsa))
         {
             uint64_t capacity = 16;
-            const uint64_t tokens = context_tokens == 0 ? SessionOptions{}.prefill_chunk_size : context_tokens;
+            const uint64_t tokens = context_tokens == 0 ? default_prefill_rows : context_tokens;
             while (capacity < tokens) capacity = saturating_multiply_u64(capacity, 2);
             const uint64_t key = saturating_multiply_u64(attention.kv_head_count, attention.head_dimension);
             const uint64_t kv = saturating_multiply_u64(saturating_multiply_u64(capacity, key),
@@ -1707,6 +1795,11 @@ static uint64_t attention_session_state_size(const CompiledModel& compiled,
             const uint64_t index = saturating_multiply_u64(saturating_multiply_u64(capacity + blocks, attention.index_head_dimension), sizeof(float));
             return saturating_add_u64(kv, index);
         }
+        // Above 128k contiguous K/V is allocated from the graph compute arena
+        // on first prefill; reserving it again as session state double-counts
+        // the cache and pushes the window past the device budget.
+        if (attention.sliding_window == 0 && compiled.max_context > kv_full_tokens)
+            return 0;
         const uint64_t state = attn_init_size(compiled, attention, device_index,
                                               context_tokens);
         return state == UINT64_MAX ? UINT64_MAX : state / sessions;
@@ -1717,7 +1810,7 @@ static uint64_t attention_session_state_size(const CompiledModel& compiled,
     {
         // Expanded-value MLA grows a linear latent cache; plan for the
         // requested context (or the default prefill chunk) plus growth copy.
-        const uint64_t tokens = context_tokens == 0 ? SessionOptions{}.prefill_chunk_size : context_tokens;
+        const uint64_t tokens = context_tokens == 0 ? default_prefill_rows : context_tokens;
         uint64_t capacity = 128;
         while (capacity < tokens)
             capacity = saturating_multiply_u64(capacity, 2);
@@ -1731,7 +1824,7 @@ static uint64_t attention_session_state_size(const CompiledModel& compiled,
     if (attention.compression_ratio != 0)
     {
         const uint64_t ratio = attention.compression_ratio;
-        const uint64_t tokens = context_tokens == 0 ? SessionOptions{}.prefill_chunk_size : context_tokens;
+        const uint64_t tokens = context_tokens == 0 ? default_prefill_rows : context_tokens;
         const uint64_t required_chunks = (tokens + ratio - 1) / ratio;
         uint64_t chunks = 32;
         while (chunks < required_chunks) chunks = saturating_multiply_u64(chunks, 2);
@@ -1796,7 +1889,7 @@ static GpuResourceRequest gated_residual_resources(const CompiledModel& compiled
     const uint64_t copies = descriptor.hyper_connection_multiplier;
     const uint64_t expanded = saturating_multiply_u64(hidden, copies);
     const uint64_t rank = descriptor.hyper_connection_low_rank;
-    const uint64_t rows = std::max<uint64_t>(1, SessionOptions{}.prefill_chunk_size);
+    const uint64_t rows = std::max<uint64_t>(1, default_prefill_rows);
     uint64_t capacity = 1;
     while (capacity < rows)
         capacity = saturating_multiply_u64(capacity, 2);
@@ -2070,7 +2163,7 @@ static uint64_t expert_wave_workspace_size(const CompiledModel& model, uint32_t 
                                        expert.down_bias == invalid_tensor_handle ? nullptr : &model.weights.at(expert.down_bias),
                                        expert.activation, expert.activation_limit)
                     == 0) return;
-                const uint64_t tokens = SessionOptions{}.prefill_chunk_size;
+                const uint64_t tokens = default_prefill_rows;
                 const uint64_t routes = saturating_multiply_u64(tokens, std::max(1u, top_k));
                 // An eight-Expert wave can contain all routes from the chunk.
                 // Gathered input/output and gate/up projections coexist; route
@@ -2268,7 +2361,7 @@ static Result<GpuResourceRequest> attention_resource_request(const CompiledModel
         && attn_needs_native(model, attention, device)
         && !has_flag(model.opt.optimization_flags, OptimizationVulkanQnK)) return request;
     request.session_state_size = session_state_size;
-    const uint64_t rows = std::max(1u, SessionOptions{}.prefill_chunk_size);
+    const uint64_t rows = std::max(1u, default_prefill_rows);
     const uint64_t query = saturating_multiply_u64(attention.head_count, attention.head_dimension);
     const uint64_t value = saturating_multiply_u64(attention.head_count, attention.value_head_dimension);
     // Uploaded input, normalized input, Q/K/V projections, attended values
@@ -2398,7 +2491,7 @@ static GpuResourceRequest ffn_resource_request(const CompiledModel& model, const
     }
     if (shared && layer.moe.shared_expert_gate_weight != invalid_tensor_handle)
         size = saturating_add_u64(size, projection_storage(model, layer.moe.shared_expert_gate_weight, alignment, device));
-    const uint64_t rows = SessionOptions{}.prefill_chunk_size;
+    const uint64_t rows = default_prefill_rows;
     const uint64_t columns = saturating_add_u64(saturating_multiply_u64(model.descriptor.hidden_size, 2),
                                                 saturating_multiply_u64(model.weights.at(ffn.up_weight).shape[0], 3));
     return {size, 0, saturating_multiply_u64(saturating_multiply_u64(rows, columns), sizeof(float))};
@@ -2586,7 +2679,7 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
             for (const auto& layer : compiled.net.layer_plans)
                 request.persistent_size = saturating_add_u64(request.persistent_size,
                                                              saturating_add_u64(constant_storage(compiled, {layer.dense_pre_ffn_norm_weight, layer.dense_pre_ffn_norm_bias}, alignment), alignment * 8));
-            request.workspace_size = saturating_multiply_u64(SessionOptions{}.prefill_chunk_size,
+            request.workspace_size = saturating_multiply_u64(default_prefill_rows,
                                                              saturating_multiply_u64(compiled.descriptor.hidden_size, 4 * sizeof(float)));
             if (resources.can_admit(device, request))
             {
@@ -2602,7 +2695,7 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
                 if (!resources.allocation_fits(device, request))
                     return Error{ErrorCode::InvalidArgument, "resident dense graph exceeds the live device budget"};
                 resources.commit(device, request);
-                compiled.resident_submission_rows = SessionOptions{}.prefill_chunk_size;
+                compiled.resident_submission_rows = compiled.max_context > kv_full_tokens ? 0 : default_prefill_rows;
             }
         }
         // A mixed graph may contain a dense FFN beside routed layers. The
@@ -2621,7 +2714,7 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
             GpuResourceRequest request;
             request.persistent_size = constant_storage(compiled, {layer.dense_pre_ffn_norm_weight, layer.dense_pre_ffn_norm_bias}, dense_alignment);
             request.persistent_size = saturating_add_u64(request.persistent_size, saturating_multiply_u64(dense_alignment, 8));
-            request.workspace_size = saturating_multiply_u64(SessionOptions{}.prefill_chunk_size,
+            request.workspace_size = saturating_multiply_u64(default_prefill_rows,
                                                              saturating_multiply_u64(compiled.descriptor.hidden_size, 4 * sizeof(float)));
             std::shared_ptr<GpuSegment_vulkan> segment;
             auto prepared = prepare_resource_group(compiled, resources, dense_device, request, &layer, "dense segment at layer " + std::to_string(layer.layer_id), [&]() -> Result<void> {
@@ -2651,7 +2744,7 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
             request.persistent_size = saturating_add_u64(request.persistent_size, saturating_multiply_u64(segment_alignment, 8));
             const uint64_t columns = saturating_add_u64(saturating_multiply_u64(compiled.descriptor.hidden_size, 4),
                                                         saturating_add_u64(layer.moe.experts.size(), Router_vulkan::selected_columns(layer.moe.top_k)));
-            request.workspace_size = saturating_multiply_u64(saturating_multiply_u64(SessionOptions{}.prefill_chunk_size, columns), sizeof(float));
+            request.workspace_size = saturating_multiply_u64(saturating_multiply_u64(default_prefill_rows, columns), sizeof(float));
             if (!resources.can_admit(segment_device, request))
                 return Error{ErrorCode::InvalidArgument, "Vulkan resource plan cannot allocate resident graph segment at layer " + std::to_string(layer.layer_id)};
             auto segment = GpuSegment_vulkan::create(compiled, layer);
@@ -2831,11 +2924,14 @@ static Result<void> append_graph_node_scratch(const CompiledModel& model, const 
                 }
             }
 #endif
-            const uint64_t kv_size = vulkan_kv_size(attention.kv_cache_dtype, device);
+            const DType kv_dtype = kv_device_dtype(attention.kv_cache_dtype, device,
+                                                   model.max_context > kv_fp16_tokens);
+            const uint64_t kv_size = vulkan_kv_size(kv_dtype, device);
             if (kv_size == UINT64_MAX)
                 return Error{ErrorCode::InvalidArgument, "Vulkan Attention KV device is invalid"};
+            const bool flash = op && op->flash_ok();
             elements = Attention_vulkan::scratch_elements(attn_vk_config(model, attention),
-                                                          rows, context_tokens, sequence_count, kv_size, direct_ring);
+                                                          rows, context_tokens, sequence_count, kv_size, direct_ring, flash);
             for (TensorHandle weight : {attention.query_weight, attention.key_weight, attention.value_weight,
                                         attention.output_gate_weight, attention.output_weight})
             {
@@ -3378,17 +3474,19 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
                                                           result.context_tokens);
             if (layer.attention.kind == AttentionKind::Standard)
             {
-                // Doubling a ring retains its previous half-capacity buffer
-                // until publication after the fence. This is allocation
-                // overlap, rather than spare heap headroom.
-                const uint64_t previous = result.context_tokens > 16
-                                              ? attention_session_state_size(compiled, layer.attention, layer.vulkan_device_index,
-                                                                             std::max(1u, result.context_tokens / 2))
-                                              : 0;
-                if (resident_chain && graph == &compiled.net)
-                    resident_growth[node.plan_index] = previous;
-                else
-                    growth[layer.vulkan_device_index] = std::max(growth[layer.vulkan_device_index], previous);
+                // Contiguous caches carry a growth margin in the capacity and
+                // do not reserve a copy; sliding rings keep their previous half.
+                if (layer.attention.sliding_window != 0)
+                {
+                    const uint64_t previous = result.context_tokens > 16
+                                                  ? attention_session_state_size(compiled, layer.attention, layer.vulkan_device_index,
+                                                                                 std::max(1u, result.context_tokens / 2))
+                                                  : 0;
+                    if (resident_chain && graph == &compiled.net)
+                        resident_growth[node.plan_index] = previous;
+                    else
+                        growth[layer.vulkan_device_index] = std::max(growth[layer.vulkan_device_index], previous);
+                }
             }
             else if (layer.attention.kind == AttentionKind::GatedDeltaNet)
             {

@@ -1762,7 +1762,8 @@ void test_qwen4_exp_compile_and_execute()
     SessionState state;
     SessionStatistics statistics;
     const std::array<int32_t, 4> prompt = {1, 2, 9, 3};
-    auto prefilled_status = forward_model(compiled, prompt, statistics, state, 0);
+    auto prefilled_status = forward_model(compiled, prompt, statistics, state, 0,
+                                          LogitsOutput::All);
     if (!prefilled_status)
     {
         throw std::runtime_error("Qwen4 Exp test execution failed: "

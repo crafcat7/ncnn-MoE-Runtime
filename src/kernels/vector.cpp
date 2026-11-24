@@ -5,6 +5,7 @@
 #include "engine/cpu.h"
 #include "ncnn/moe/runtime.h"
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <limits>
@@ -609,6 +610,35 @@ static void scalar_bfloat16_rms_norm(float* output,
     }
 }
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+static void neon_float_rope_inplace(float* values,
+                                    const float* cosine,
+                                    const float* sine,
+                                    uint32_t dimension) noexcept
+{
+    const uint32_t half_dimension = dimension / 2;
+    uint32_t index = 0;
+    for (; index + 4 <= half_dimension; index += 4)
+    {
+        const float32x4_t first = vld1q_f32(values + index);
+        const float32x4_t second = vld1q_f32(values + half_dimension + index);
+        const float32x4_t cosine_values = vld1q_f32(cosine + index);
+        const float32x4_t sine_values = vld1q_f32(sine + index);
+        vst1q_f32(values + index,
+                  vsubq_f32(vmulq_f32(first, cosine_values), vmulq_f32(second, sine_values)));
+        vst1q_f32(values + half_dimension + index,
+                  vaddq_f32(vmulq_f32(second, cosine_values), vmulq_f32(first, sine_values)));
+    }
+    for (; index < half_dimension; ++index)
+    {
+        const float first = values[index];
+        const float second = values[half_dimension + index];
+        values[index] = first * cosine[index] - second * sine[index];
+        values[half_dimension + index] = second * cosine[index] + first * sine[index];
+    }
+}
+#endif
+
 static void scalar_float_rope_inplace(float* values,
                                       const float* cosine,
                                       const float* sine,
@@ -894,7 +924,9 @@ static Bfloat16RmsNormFunction select_bfloat16_rms_norm() noexcept
 
 static FloatRopeFunction select_float_rope() noexcept
 {
-#if defined(NCNN_MOE_VECTOR_X86_SIMD)
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return neon_float_rope_inplace;
+#elif defined(NCNN_MOE_VECTOR_X86_SIMD)
     const uint64_t isa = cpu_isa_flags();
     if ((isa & CpuIsaX86Avx512) != 0)
         return avx512_float_rope_inplace;
@@ -1121,6 +1153,434 @@ void bfloat16_gemm_4x8(const uint16_t* weights,
 #endif
     scalar_bfloat16_gemm_4x8(weights, weight_stride, input, input_stride, input_columns,
                              output_count, token_count, output, output_stride);
+}
+
+// Portable half conversion for scalar tails and non-ARM builds.
+float f16_to_f32(uint16_t value) noexcept
+{
+    const uint32_t sign = static_cast<uint32_t>(value & 0x8000u) << 16;
+    uint32_t exponent = (value >> 10) & 0x1Fu;
+    uint32_t mantissa = value & 0x3FFu;
+    uint32_t bits = 0;
+    if (exponent == 0)
+    {
+        if (mantissa == 0)
+        {
+            bits = sign;
+        }
+        else
+        {
+            exponent = 127 - 15 + 1;
+            while ((mantissa & 0x400u) == 0)
+            {
+                mantissa <<= 1;
+                --exponent;
+            }
+            mantissa &= 0x3FFu;
+            bits = sign | (exponent << 23) | (mantissa << 13);
+        }
+    }
+    else if (exponent == 0x1Fu)
+    {
+        bits = sign | 0x7F800000u | (mantissa << 13);
+    }
+    else
+    {
+        bits = sign | ((exponent + 127 - 15) << 23) | (mantissa << 13);
+    }
+    return std::bit_cast<float>(bits);
+}
+
+uint16_t float_to_f16(float value) noexcept
+{
+    // Saturate so KV outliers cannot produce inf/NaN.
+    if (value > 65504.0f)
+        value = 65504.0f;
+    else if (value < -65504.0f)
+        value = -65504.0f;
+    const uint32_t bits = std::bit_cast<uint32_t>(value);
+    const uint32_t sign = (bits >> 16) & 0x8000u;
+    const uint32_t raw_exponent = (bits >> 23) & 0xFFu;
+    uint32_t mantissa = bits & 0x7FFFFFu;
+    int32_t exponent = static_cast<int32_t>(raw_exponent) - 127 + 15;
+    if (raw_exponent == 0xFFu)
+        return static_cast<uint16_t>(sign | (mantissa != 0 ? 0x7E00u : 0x7C00u));
+    if (exponent >= 0x1F)
+        return static_cast<uint16_t>(sign | 0x7C00u);
+    if (exponent <= 0)
+    {
+        if (exponent < -10)
+            return static_cast<uint16_t>(sign);
+        mantissa |= 0x800000u;
+        const int32_t shift = 14 - exponent;
+        uint32_t rounded = mantissa >> shift;
+        const uint32_t remainder = mantissa & ((UINT32_C(1) << shift) - 1u);
+        const uint32_t halfway = UINT32_C(1) << (shift - 1);
+        if (remainder > halfway || (remainder == halfway && (rounded & 1u) != 0))
+            ++rounded;
+        return static_cast<uint16_t>(sign | rounded);
+    }
+    uint32_t rounded = mantissa >> 13;
+    const uint32_t remainder = mantissa & 0x1FFFu;
+    if (remainder > 0x1000u || (remainder == 0x1000u && (rounded & 1u) != 0))
+    {
+        ++rounded;
+        if (rounded == 0x400u)
+        {
+            rounded = 0;
+            ++exponent;
+            if (exponent >= 0x1F)
+                return static_cast<uint16_t>(sign | 0x7C00u);
+        }
+    }
+    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent) << 10) | rounded);
+}
+
+void f32_to_f16(uint16_t* output, const float* input, size_t count) noexcept
+{
+    size_t index = 0;
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    const float32x4_t f16_maximum = vdupq_n_f32(65504.0f);
+    const float32x4_t f16_minimum = vdupq_n_f32(-65504.0f);
+    for (; index + 4 <= count; index += 4)
+    {
+        // vcvt_f16_f32 yields inf past 65504; saturate like the scalar tail so
+        // KV outliers cannot poison the F16 attention tiles.
+        const float32x4_t values = vmaxq_f32(vminq_f32(vld1q_f32(input + index), f16_maximum), f16_minimum);
+        vst1_f16(reinterpret_cast<__fp16*>(output + index), vcvt_f16_f32(values));
+    }
+#endif
+    for (; index < count; ++index)
+        output[index] = float_to_f16(input[index]);
+}
+
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+static float f16_sum(float16x8_t values) noexcept
+{
+    const float32x4_t low = vcvt_f32_f16(vget_low_f16(values));
+    const float32x4_t high = vcvt_f32_f16(vget_high_f16(values));
+    return vaddvq_f32(vaddq_f32(low, high));
+}
+#endif
+
+void bf16_to_f16(uint16_t* output, const uint16_t* input, size_t count) noexcept
+{
+    size_t index = 0;
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    const float32x4_t f16_maximum = vdupq_n_f32(65504.0f);
+    const float32x4_t f16_minimum = vdupq_n_f32(-65504.0f);
+    for (; index + 4 <= count; index += 4)
+    {
+        const uint32x4_t bits = vshlq_n_u32(vmovl_u16(vld1_u16(input + index)), 16);
+        const float32x4_t values = vmaxq_f32(vminq_f32(vreinterpretq_f32_u32(bits), f16_maximum), f16_minimum);
+        vst1_f16(reinterpret_cast<__fp16*>(output + index), vcvt_f16_f32(values));
+    }
+#endif
+    for (; index < count; ++index)
+        output[index] = float_to_f16(bfloat16_to_float(input[index]));
+}
+
+void f16_gemm_4x8(const uint16_t* weights,
+                  size_t weight_stride,
+                  const uint16_t* input,
+                  size_t input_stride,
+                  uint32_t input_columns,
+                  uint32_t output_count,
+                  uint32_t token_count,
+                  float* output,
+                  size_t output_stride) noexcept
+{
+    for (uint32_t row_base = 0; row_base < token_count; row_base += 4)
+    {
+        const uint32_t rows = std::min(4u, token_count - row_base);
+        for (uint32_t column_base = 0; column_base < output_count; column_base += 4)
+        {
+            const uint32_t columns = std::min(4u, output_count - column_base);
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+            float16x8_t accumulators[4][4];
+            for (uint32_t row = 0; row < rows; ++row)
+                for (uint32_t column = 0; column < columns; ++column)
+                    accumulators[row][column] = vdupq_n_f16(0.0f);
+            uint32_t offset = 0;
+            for (; offset + 8 <= input_columns; offset += 8)
+            {
+                float16x8_t queries[4];
+                for (uint32_t row = 0; row < rows; ++row)
+                    queries[row] = vld1q_f16(reinterpret_cast<const __fp16*>(input + (row_base + row) * input_stride + offset));
+                for (uint32_t column = 0; column < columns; ++column)
+                {
+                    const float16x8_t key = vld1q_f16(reinterpret_cast<const __fp16*>(weights + (column_base + column) * weight_stride + offset));
+                    for (uint32_t row = 0; row < rows; ++row)
+                        accumulators[row][column] = vfmaq_f16(accumulators[row][column], queries[row], key);
+                }
+            }
+            for (uint32_t row = 0; row < rows; ++row)
+            {
+                for (uint32_t column = 0; column < columns; ++column)
+                {
+                    float sum = f16_sum(accumulators[row][column]);
+                    for (uint32_t tail = offset; tail < input_columns; ++tail)
+                    {
+                        sum += f16_to_f32(input[(row_base + row) * input_stride + tail])
+                               * f16_to_f32(weights[(column_base + column) * weight_stride + tail]);
+                    }
+                    output[(row_base + row) * output_stride + column_base + column] = sum;
+                }
+            }
+#else
+            for (uint32_t row = 0; row < rows; ++row)
+            {
+                for (uint32_t column = 0; column < columns; ++column)
+                {
+                    float sum = 0.0f;
+                    for (uint32_t offset = 0; offset < input_columns; ++offset)
+                    {
+                        sum += f16_to_f32(input[(row_base + row) * input_stride + offset])
+                               * f16_to_f32(weights[(column_base + column) * weight_stride + offset]);
+                    }
+                    output[(row_base + row) * output_stride + column_base + column] = sum;
+                }
+            }
+#endif
+        }
+    }
+}
+
+void f16_pv(float* output,
+            const uint16_t* values,
+            size_t value_stride,
+            const uint16_t* weights,
+            uint32_t count,
+            uint32_t columns) noexcept
+{
+    uint32_t column = 0;
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    // One broadcast feeds four 8-lane chunks (32 values).
+    for (; column + 32 <= columns; column += 32)
+    {
+        float16x8_t accumulator0 = vdupq_n_f16(0.0f);
+        float16x8_t accumulator1 = vdupq_n_f16(0.0f);
+        float16x8_t accumulator2 = vdupq_n_f16(0.0f);
+        float16x8_t accumulator3 = vdupq_n_f16(0.0f);
+        for (uint32_t index = 0; index < count; ++index)
+        {
+            const float16x8_t weight = vdupq_n_f16(*reinterpret_cast<const __fp16*>(weights + index));
+            const uint16_t* row = values + static_cast<size_t>(index) * value_stride + column;
+            accumulator0 = vfmaq_f16(accumulator0, weight, vld1q_f16(reinterpret_cast<const __fp16*>(row)));
+            accumulator1 = vfmaq_f16(accumulator1, weight, vld1q_f16(reinterpret_cast<const __fp16*>(row + 8)));
+            accumulator2 = vfmaq_f16(accumulator2, weight, vld1q_f16(reinterpret_cast<const __fp16*>(row + 16)));
+            accumulator3 = vfmaq_f16(accumulator3, weight, vld1q_f16(reinterpret_cast<const __fp16*>(row + 24)));
+        }
+        vst1q_f32(output + column, vcvt_f32_f16(vget_low_f16(accumulator0)));
+        vst1q_f32(output + column + 4, vcvt_f32_f16(vget_high_f16(accumulator0)));
+        vst1q_f32(output + column + 8, vcvt_f32_f16(vget_low_f16(accumulator1)));
+        vst1q_f32(output + column + 12, vcvt_f32_f16(vget_high_f16(accumulator1)));
+        vst1q_f32(output + column + 16, vcvt_f32_f16(vget_low_f16(accumulator2)));
+        vst1q_f32(output + column + 20, vcvt_f32_f16(vget_high_f16(accumulator2)));
+        vst1q_f32(output + column + 24, vcvt_f32_f16(vget_low_f16(accumulator3)));
+        vst1q_f32(output + column + 28, vcvt_f32_f16(vget_high_f16(accumulator3)));
+    }
+    for (; column + 8 <= columns; column += 8)
+    {
+        float16x8_t accumulator = vdupq_n_f16(0.0f);
+        for (uint32_t index = 0; index < count; ++index)
+        {
+            const float16x8_t weight = vdupq_n_f16(*reinterpret_cast<const __fp16*>(weights + index));
+            accumulator = vfmaq_f16(accumulator,
+                                    weight,
+                                    vld1q_f16(reinterpret_cast<const __fp16*>(values + static_cast<size_t>(index) * value_stride + column)));
+        }
+        vst1q_f32(output + column, vcvt_f32_f16(vget_low_f16(accumulator)));
+        vst1q_f32(output + column + 4, vcvt_f32_f16(vget_high_f16(accumulator)));
+    }
+#endif
+    for (; column < columns; ++column)
+    {
+        float sum = 0.0f;
+        for (uint32_t index = 0; index < count; ++index)
+        {
+            sum += f16_to_f32(values[static_cast<size_t>(index) * value_stride + column])
+                   * f16_to_f32(weights[index]);
+        }
+        output[column] = sum;
+    }
+}
+
+void f16_pv4(float* output,
+             const uint16_t* values,
+             size_t value_stride,
+             const float* weights0,
+             const float* weights1,
+             const float* weights2,
+             const float* weights3,
+             uint32_t count,
+             uint32_t columns) noexcept
+{
+    uint32_t column = 0;
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    for (; column + 32 <= columns; column += 32)
+    {
+        float16x8_t accumulator00 = vdupq_n_f16(0.0f);
+        float16x8_t accumulator01 = vdupq_n_f16(0.0f);
+        float16x8_t accumulator02 = vdupq_n_f16(0.0f);
+        float16x8_t accumulator03 = vdupq_n_f16(0.0f);
+        float16x8_t accumulator10 = vdupq_n_f16(0.0f);
+        float16x8_t accumulator11 = vdupq_n_f16(0.0f);
+        float16x8_t accumulator12 = vdupq_n_f16(0.0f);
+        float16x8_t accumulator13 = vdupq_n_f16(0.0f);
+        float16x8_t accumulator20 = vdupq_n_f16(0.0f);
+        float16x8_t accumulator21 = vdupq_n_f16(0.0f);
+        float16x8_t accumulator22 = vdupq_n_f16(0.0f);
+        float16x8_t accumulator23 = vdupq_n_f16(0.0f);
+        float16x8_t accumulator30 = vdupq_n_f16(0.0f);
+        float16x8_t accumulator31 = vdupq_n_f16(0.0f);
+        float16x8_t accumulator32 = vdupq_n_f16(0.0f);
+        float16x8_t accumulator33 = vdupq_n_f16(0.0f);
+        for (uint32_t index = 0; index < count; ++index)
+        {
+            const float16x8_t weight0 = vdupq_n_f16(static_cast<__fp16>(weights0[index]));
+            const float16x8_t weight1 = vdupq_n_f16(static_cast<__fp16>(weights1[index]));
+            const float16x8_t weight2 = vdupq_n_f16(static_cast<__fp16>(weights2[index]));
+            const float16x8_t weight3 = vdupq_n_f16(static_cast<__fp16>(weights3[index]));
+            const uint16_t* row = values + static_cast<size_t>(index) * value_stride + column;
+            const float16x8_t value0 = vld1q_f16(reinterpret_cast<const __fp16*>(row));
+            const float16x8_t value1 = vld1q_f16(reinterpret_cast<const __fp16*>(row + 8));
+            const float16x8_t value2 = vld1q_f16(reinterpret_cast<const __fp16*>(row + 16));
+            const float16x8_t value3 = vld1q_f16(reinterpret_cast<const __fp16*>(row + 24));
+            accumulator00 = vfmaq_f16(accumulator00, weight0, value0);
+            accumulator01 = vfmaq_f16(accumulator01, weight0, value1);
+            accumulator02 = vfmaq_f16(accumulator02, weight0, value2);
+            accumulator03 = vfmaq_f16(accumulator03, weight0, value3);
+            accumulator10 = vfmaq_f16(accumulator10, weight1, value0);
+            accumulator11 = vfmaq_f16(accumulator11, weight1, value1);
+            accumulator12 = vfmaq_f16(accumulator12, weight1, value2);
+            accumulator13 = vfmaq_f16(accumulator13, weight1, value3);
+            accumulator20 = vfmaq_f16(accumulator20, weight2, value0);
+            accumulator21 = vfmaq_f16(accumulator21, weight2, value1);
+            accumulator22 = vfmaq_f16(accumulator22, weight2, value2);
+            accumulator23 = vfmaq_f16(accumulator23, weight2, value3);
+            accumulator30 = vfmaq_f16(accumulator30, weight3, value0);
+            accumulator31 = vfmaq_f16(accumulator31, weight3, value1);
+            accumulator32 = vfmaq_f16(accumulator32, weight3, value2);
+            accumulator33 = vfmaq_f16(accumulator33, weight3, value3);
+        }
+        for (uint32_t row = 0; row < 4; ++row)
+        {
+            float* row_output = output + static_cast<size_t>(row) * columns + column;
+            const float16x8_t a0 = row == 0 ? accumulator00 : row == 1 ? accumulator10
+                                                          : row == 2   ? accumulator20
+                                                                       : accumulator30;
+            const float16x8_t a1 = row == 0 ? accumulator01 : row == 1 ? accumulator11
+                                                          : row == 2   ? accumulator21
+                                                                       : accumulator31;
+            const float16x8_t a2 = row == 0 ? accumulator02 : row == 1 ? accumulator12
+                                                          : row == 2   ? accumulator22
+                                                                       : accumulator32;
+            const float16x8_t a3 = row == 0 ? accumulator03 : row == 1 ? accumulator13
+                                                          : row == 2   ? accumulator23
+                                                                       : accumulator33;
+            vst1q_f32(row_output, vcvt_f32_f16(vget_low_f16(a0)));
+            vst1q_f32(row_output + 4, vcvt_f32_f16(vget_high_f16(a0)));
+            vst1q_f32(row_output + 8, vcvt_f32_f16(vget_low_f16(a1)));
+            vst1q_f32(row_output + 12, vcvt_f32_f16(vget_high_f16(a1)));
+            vst1q_f32(row_output + 16, vcvt_f32_f16(vget_low_f16(a2)));
+            vst1q_f32(row_output + 20, vcvt_f32_f16(vget_high_f16(a2)));
+            vst1q_f32(row_output + 24, vcvt_f32_f16(vget_low_f16(a3)));
+            vst1q_f32(row_output + 28, vcvt_f32_f16(vget_high_f16(a3)));
+        }
+    }
+    for (; column + 8 <= columns; column += 8)
+    {
+        float16x8_t accumulator0 = vdupq_n_f16(0.0f);
+        float16x8_t accumulator1 = vdupq_n_f16(0.0f);
+        float16x8_t accumulator2 = vdupq_n_f16(0.0f);
+        float16x8_t accumulator3 = vdupq_n_f16(0.0f);
+        for (uint32_t index = 0; index < count; ++index)
+        {
+            const float16x8_t value = vld1q_f16(reinterpret_cast<const __fp16*>(values + static_cast<size_t>(index) * value_stride + column));
+            accumulator0 = vfmaq_f16(accumulator0, vdupq_n_f16(static_cast<__fp16>(weights0[index])), value);
+            accumulator1 = vfmaq_f16(accumulator1, vdupq_n_f16(static_cast<__fp16>(weights1[index])), value);
+            accumulator2 = vfmaq_f16(accumulator2, vdupq_n_f16(static_cast<__fp16>(weights2[index])), value);
+            accumulator3 = vfmaq_f16(accumulator3, vdupq_n_f16(static_cast<__fp16>(weights3[index])), value);
+        }
+        vst1q_f32(output + column, vcvt_f32_f16(vget_low_f16(accumulator0)));
+        vst1q_f32(output + column + 4, vcvt_f32_f16(vget_high_f16(accumulator0)));
+        vst1q_f32(output + columns + column, vcvt_f32_f16(vget_low_f16(accumulator1)));
+        vst1q_f32(output + columns + column + 4, vcvt_f32_f16(vget_high_f16(accumulator1)));
+        vst1q_f32(output + 2 * columns + column, vcvt_f32_f16(vget_low_f16(accumulator2)));
+        vst1q_f32(output + 2 * columns + column + 4, vcvt_f32_f16(vget_high_f16(accumulator2)));
+        vst1q_f32(output + 3 * columns + column, vcvt_f32_f16(vget_low_f16(accumulator3)));
+        vst1q_f32(output + 3 * columns + column + 4, vcvt_f32_f16(vget_high_f16(accumulator3)));
+    }
+#endif
+    for (; column < columns; ++column)
+    {
+        float sum0 = 0.0f;
+        float sum1 = 0.0f;
+        float sum2 = 0.0f;
+        float sum3 = 0.0f;
+        for (uint32_t index = 0; index < count; ++index)
+        {
+            const float value = f16_to_f32(values[static_cast<size_t>(index) * value_stride + column]);
+            sum0 += weights0[index] * value;
+            sum1 += weights1[index] * value;
+            sum2 += weights2[index] * value;
+            sum3 += weights3[index] * value;
+        }
+        output[column] = sum0;
+        output[columns + column] = sum1;
+        output[2 * columns + column] = sum2;
+        output[3 * columns + column] = sum3;
+    }
+}
+
+float f32_scale_max(float* values, float scale, uint32_t count) noexcept
+{
+    uint32_t index = 0;
+    float maximum = -std::numeric_limits<float>::infinity();
+#if defined(__aarch64__) || defined(_M_ARM64)
+    const float32x4_t scale_values = vdupq_n_f32(scale);
+    float32x4_t maximum_values = vdupq_n_f32(maximum);
+    for (; index + 4 <= count; index += 4)
+    {
+        const float32x4_t scaled = vmulq_f32(vld1q_f32(values + index), scale_values);
+        vst1q_f32(values + index, scaled);
+        maximum_values = vmaxq_f32(maximum_values, scaled);
+    }
+    maximum = vmaxvq_f32(maximum_values);
+#endif
+    for (; index < count; ++index)
+    {
+        const float scaled = values[index] * scale;
+        values[index] = scaled;
+        maximum = std::max(maximum, scaled);
+    }
+    return maximum;
+}
+
+float f32_softmax(float* values, uint32_t count, float maximum) noexcept
+{
+    float sum = 0.0f;
+    uint32_t index = 0;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    const float32x4_t maximum_values = vdupq_n_f32(maximum);
+    float32x4_t sum_values = vdupq_n_f32(0.0f);
+    for (; index + 4 <= count; index += 4)
+    {
+        const float32x4_t differences = vsubq_f32(vld1q_f32(values + index), maximum_values);
+        const float32x4_t exponentials = neon_expf(differences);
+        vst1q_f32(values + index, exponentials);
+        sum_values = vaddq_f32(sum_values, exponentials);
+    }
+    sum = vaddvq_f32(sum_values);
+#endif
+    for (; index < count; ++index)
+    {
+        const float exponential = float_approximate_exp(values[index] - maximum);
+        values[index] = exponential;
+        sum += exponential;
+    }
+    return sum;
 }
 
 void float_exp_inplace(float* values, uint32_t count) noexcept

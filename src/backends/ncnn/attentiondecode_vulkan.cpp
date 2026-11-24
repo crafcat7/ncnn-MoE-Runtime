@@ -145,35 +145,6 @@ static bool valid_matrix_plan(const AttentionDecodePlan& plan)
                   <= static_cast<uint64_t>(std::numeric_limits<int>::max());
 }
 
-static bool valid_buffer(const ncnn::VkMat& tensor, uint64_t required_bytes, const VkPhysicalDeviceLimits& limits)
-{
-    if (!tensor.data || tensor.elemsize == 0 || tensor.offset > tensor.data->capacity
-        || tensor.buffer_offset() < tensor.data->offset)
-        return false;
-#if NCNN_BATCH
-    if (tensor.n != 1 || tensor.nstep > std::numeric_limits<size_t>::max() / tensor.elemsize)
-        return false;
-#endif
-    const size_t descriptor_bytes = tensor.buffer_capacity();
-    return descriptor_bytes >= required_bytes && descriptor_bytes <= limits.maxStorageBufferRange
-           && descriptor_bytes <= tensor.data->capacity - tensor.offset
-           && tensor.buffer_offset() % std::max<VkDeviceSize>(1, limits.minStorageBufferOffsetAlignment) == 0;
-}
-
-static bool valid_tensor(const ncnn::VkMat& tensor, uint32_t columns, uint32_t rows, uint32_t heads,
-                         size_t element_size, const VkPhysicalDeviceLimits& limits, bool permit_sink_row = false)
-{
-    const bool valid_rows = tensor.h == rows
-                            || (permit_sink_row && static_cast<uint64_t>(tensor.h) == static_cast<uint64_t>(rows) + 1);
-    const uint64_t row_elements = static_cast<uint64_t>(columns) * static_cast<uint32_t>(tensor.h);
-    return !tensor.empty() && tensor.dims == 3 && tensor.w == columns && valid_rows && tensor.c == heads
-           && tensor.elempack == 1 && tensor.elemsize == element_size
-           && tensor.cstep >= row_elements
-           && tensor.cstep <= std::numeric_limits<uint32_t>::max() / heads
-           && (tensor.cstep * element_size) % 16 == 0 && tensor.buffer_offset() % 16 == 0
-           && valid_buffer(tensor, ((heads - 1) * tensor.cstep + row_elements) * element_size, limits);
-}
-
 AttentionDecodeCapabilities query_attention_decode_capabilities(const ncnn::GpuInfo& info)
 {
     AttentionDecodeCapabilities capabilities;
@@ -269,23 +240,6 @@ bool AttentionDecodeVulkan::record(const AttentionDecodePlan& plan,
 {
     const auto& shape = plan.shape;
     if (!context || !matrix_pipeline || !reduce_pipeline || !allocator)
-        return false;
-    const auto& limits = context->device()->info.physicalDeviceProperties().limits;
-    const size_t kv_element_size = shape.kv_storage_bfloat16 ? sizeof(uint16_t) : sizeof(float);
-    if (!valid_matrix_plan(plan) || !same_pipeline_shape(plan, pipeline_plan)
-        || !valid_tensor(query, shape.head_dimension, 1, shape.query_heads, sizeof(float), limits)
-        || !valid_tensor(key, shape.head_dimension, shape.kv_tokens, shape.kv_heads, kv_element_size, limits, attention_sink)
-        || !valid_tensor(value, shape.head_dimension, shape.kv_tokens, shape.kv_heads, kv_element_size, limits, attention_sink)
-        || sinks.empty() || sinks.dims != 1 || sinks.w != shape.query_heads || sinks.elempack != 1 || sinks.elemsize != sizeof(float)
-        || !valid_buffer(sinks, static_cast<uint64_t>(shape.query_heads) * sizeof(float), limits)
-        || plan.scratch_bytes > limits.maxStorageBufferRange
-        || static_cast<uint64_t>(shape.query_heads) * shape.head_dimension * sizeof(float) > limits.maxStorageBufferRange
-        || plan.split_count > context->device()->info.max_workgroup_count_x()
-        || plan.query_groups > context->device()->info.max_workgroup_count_y()
-        || shape.kv_heads > context->device()->info.max_workgroup_count_z()
-        || shape.query_heads > context->device()->info.max_workgroup_count_x()
-        || shape.query_heads > static_cast<uint32_t>(std::numeric_limits<int>::max()) / 128
-        || plan.split_count > static_cast<uint32_t>(std::numeric_limits<int>::max()) / plan.workgroup_size)
         return false;
 
     ncnn::VkMat partial;

@@ -558,7 +558,7 @@ class WorkerClient:
         session_id: str,
         *,
         seed: int = 0,
-        prefill_chunk_size: int = 512,
+        prefill_chunk_size: int = 0,
         enable_speculative_context: bool = True,
     ) -> dict[str, Any]:
         return self.request(
@@ -924,6 +924,11 @@ def runtime_args_from_settings(settings: dict[str, Any]) -> list[str]:
                 "CPU packed weights in runtime settings must be off or on"
             )
         args.extend(["--cpu-packed-weights", cpu_packed_weights])
+    cpu_f16_attention = settings.get("cpu_f16_attention")
+    if cpu_f16_attention is not None:
+        if cpu_f16_attention not in ("off", "on"):
+            raise ValueError("CPU F16 attention in runtime settings must be off or on")
+        args.extend(["--cpu-f16-attention", cpu_f16_attention])
     for key, option in (
         ("host_memory_mb", "--host-memory-mb"),
         ("expert_cache_mb", "--expert-cache-mb"),
@@ -1184,8 +1189,6 @@ def _format_runtime_metrics(metrics: Any) -> str:
             f"{_format_metric_count(gpu.get('attention_device_rope_fusions'), available=gpu_available)}"
             "/"
             f"{_format_metric_count(gpu.get('attention_qkv_ring_fusions'), available=gpu_available)}"
-            " / kv-materialize "
-            f"{_format_metric_count(gpu.get('attention_cache_materializations'), available=gpu_available)}"
             " / attention-cpu-fallback "
             f"{_format_metric_count(gpu.get('attention_cpu_fallbacks'), available=gpu_available)}",
             "  Device blocks: Qwen "
@@ -1244,11 +1247,11 @@ def _add_worker_options(parser: argparse.ArgumentParser) -> None:
         help="Enable the optional CPU Expert weight repack (default: off)",
     )
     parser.add_argument(
-        "--cpu-qnk-q8",
+        "--cpu-f16-attention",
         choices=("off", "on"),
         help=(
-            "Quantize CPU activations to int8 for block-quantized projections, "
-            "cutting activation traffic fourfold at some accuracy cost (default: off)"
+            "Run CPU long-prompt flash-attention QK/PV dots in FP16 with FP16 "
+            "accumulation. On by default; pass off for exact FP32 dots."
         ),
     )
     parser.add_argument("--host-memory-mb", type=int)
@@ -1315,8 +1318,8 @@ def _add_generation_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--prefill-chunk-size",
         type=int,
-        default=512,
-        help="Prefill tokens per chunk; 0 processes all remaining input as one batch (unchunked)",
+        default=0,
+        help="Prefill tokens per chunk; 0 prefills the whole prompt in one batch",
     )
     stream_group = parser.add_mutually_exclusive_group()
     stream_group.add_argument("--stream", dest="stream", action="store_true", help="Stream generated text (default)")
@@ -1373,8 +1376,8 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     tune.add_argument(
         "--prefill-chunk-size",
         type=int,
-        default=512,
-        help="Prefill tokens per chunk; 0 processes all remaining input as one batch (unchunked)",
+        default=0,
+        help="Prefill tokens per chunk; 0 prefills the whole prompt in one batch",
     )
     tune.add_argument("--seed", type=int, default=0)
     _add_metrics_options(tune)
@@ -1475,6 +1478,7 @@ def cli_runtime_settings(arguments: argparse.Namespace) -> dict[str, Any]:
         "backend",
         "expert_memory",
         "cpu_packed_weights",
+        "cpu_f16_attention",
         "host_memory_mb",
         "expert_cache_mb",
         "expert_gpu_cache_mb",
@@ -1513,14 +1517,6 @@ def context_budget(adapter: ModelAdapter, arguments: argparse.Namespace, ready: 
     return max(1, model_limit - reserve)
 
 
-def runtime_cpu_qnk_q8_args(args: list[str], arguments: argparse.Namespace) -> list[str]:
-    """Forward the opt-in int8 activation switch the shared runtime mapper does not know."""
-    value = getattr(arguments, "cpu_qnk_q8", None)
-    if value is None:
-        return args
-    return [*args, "--cpu-qnk-q8", str(value)]
-
-
 def open_worker(
     arguments: argparse.Namespace,
     model: Path,
@@ -1542,7 +1538,7 @@ def open_worker(
     client = WorkerClient(
         worker,
         model,
-        runtime_cpu_qnk_q8_args(runtime_args_from_settings(initial), arguments),
+        runtime_args_from_settings(initial),
         verbose=getattr(arguments, "verbose", False),
     )
     if select_adapter and adapter is None:
@@ -1575,7 +1571,7 @@ def open_worker(
         client = WorkerClient(
             worker,
             model,
-            runtime_cpu_qnk_q8_args(runtime_args_from_settings(merged), arguments),
+            runtime_args_from_settings(merged),
             verbose=getattr(arguments, "verbose", False),
         )
     return client, merged, profile_record, adapter

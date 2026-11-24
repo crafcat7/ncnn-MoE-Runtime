@@ -2,6 +2,7 @@
 #define NCNN_MOE_TYPES_H
 
 #include <algorithm>
+#include <cassert>
 #include <cstring>
 #include <cstddef>
 #include <cstdint>
@@ -378,6 +379,10 @@ struct TensorData
     std::shared_ptr<const uint8_t> mapped_data;
     uint64_t mapped_size = 0;
     std::shared_ptr<const MxFp4FileStorage> mxfp4_file_storage;
+    // Block-quantized payload retained when a dense tensor is expanded to BF16
+    // for the Vulkan prefill path. Decode-only projections stream it through a
+    // QnK operator instead, which halves the one-row weight bytes.
+    DType qnk_dtype = DType::Float32;
 
     [[nodiscard]] uint64_t element_count() const noexcept;
     [[nodiscard]] std::span<const float> float32_values() const noexcept;
@@ -414,7 +419,11 @@ inline std::span<const uint16_t> TensorData::bfloat16_values() const noexcept
 {
     if (!bfloat16_data.empty())
         return bfloat16_data;
-    if (dtype != DType::BFloat16 || !mapped_data || mapped_size % sizeof(uint16_t) != 0 || reinterpret_cast<uintptr_t>(mapped_data.get()) % alignof(uint16_t) != 0)
+    // A retained QnK payload backs the decode shadow, not the BF16 view.
+    // Callers must use qnk_view()/the QnK operators instead of treating the
+    // block payload as bfloat16; the empty span below is a last-resort guard.
+    assert(!is_qnk_dtype(qnk_dtype) && "retained QnK payload has no bfloat16 view");
+    if (dtype != DType::BFloat16 || is_qnk_dtype(qnk_dtype) || !mapped_data || mapped_size % sizeof(uint16_t) != 0 || reinterpret_cast<uintptr_t>(mapped_data.get()) % alignof(uint16_t) != 0)
     {
         return {};
     }

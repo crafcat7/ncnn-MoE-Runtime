@@ -163,5 +163,28 @@ class Gemma4StopTokenTest(unittest.TestCase):
         self.assertEqual(adapter.decode_completion_text("plain answer").answer, "plain answer")
 
 
+class RuntimeSettingsTest(unittest.TestCase):
+    def test_cpu_toggle_settings(self) -> None:
+        arguments = argparse.Namespace(cpu_f16_attention="on")
+        captured = ncnn_moe.cli_runtime_settings(arguments)
+        self.assertEqual(captured["cpu_f16_attention"], "on")
+        merged = ncnn_moe.merge_runtime_settings(
+            cli={
+                "backend": "hybrid",
+                "cpu_f16_attention": "off",
+            },
+            session=None,
+            profile=None,
+            user=None,
+        )
+        args = ncnn_moe.runtime_args_from_settings(merged)
+        self.assertIn("--hybrid", args)
+        self.assertEqual(args[args.index("--cpu-f16-attention") + 1], "off")
+
+    def test_rejects_unknown_cpu_toggle_values(self) -> None:
+        with self.assertRaises(ValueError):
+            ncnn_moe.runtime_args_from_settings({"cpu_f16_attention": "maybe"})
+
+
 if __name__ == "__main__":
     unittest.main()

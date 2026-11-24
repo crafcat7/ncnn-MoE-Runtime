@@ -590,8 +590,12 @@ public:
         target.reset();
     }
 
+    // record_dense_ffn=false leaves the dense FFN to the resident graph driver,
+    // which records it after its own submission boundary; recording it here as
+    // well executed every dense FFN twice.
     bool record_layer(const ncnn::VkMat* combined, ncnn::VkCompute& command,
-                      const ncnn::VkMat* recorded_hidden = nullptr, bool download_routes = true)
+                      const ncnn::VkMat* recorded_hidden = nullptr, bool download_routes = true,
+                      bool record_dense_ffn = true)
     {
         const auto* d = target.get();
         auto fail = [&](const char* reason) { error = reason; return false; };
@@ -703,6 +707,8 @@ public:
             if (!norm_recorded)
                 return fail("cannot record Vulkan FFN norm");
         }
+        if (d->dense && !record_dense_ffn)
+            return true;
         if (d->dense)
         {
             ncnn::VkMat ffn_output;
@@ -1136,7 +1142,6 @@ bool GpuSegmentContinuation_vulkan::publish(ExpertDispatchPlan& routes, GpuSegme
     counters.dispatches += d->ffn_statistics.dispatches + 3;
     counters.int4_dispatches += d->ffn_statistics.int4_dispatches;
     counters.shared_expert_swiglu_fusions += d->ffn_statistics.shared_expert_swiglu_fusions;
-    counters.bfloat16_cooperative_matrix_dispatches += d->ffn_statistics.bfloat16_cooperative_matrix_dispatches;
     counters.compute_submissions += d->standalone;
     ++counters.resident_graph_submissions;
     counters.batch_uploads += d->uploaded;
@@ -1177,7 +1182,6 @@ bool GpuSegmentContinuation_vulkan::publish_head(ActivationBuffer& logits, GpuSe
     counters.rms_norm_linear_fusions += d->fused_head;
     counters.int4_dispatches += d->ffn_statistics.int4_dispatches + (d->produce_logits && target.lm_head.qnk && target.lm_head.qnk->dtype() == DType::Int4 ? 1 : 0);
     counters.shared_expert_swiglu_fusions += d->ffn_statistics.shared_expert_swiglu_fusions;
-    counters.bfloat16_cooperative_matrix_dispatches += d->ffn_statistics.bfloat16_cooperative_matrix_dispatches;
     counters.compute_submissions += d->standalone;
     ++counters.resident_graph_submissions;
     counters.batch_downloads += d->produce_logits;
@@ -1287,7 +1291,21 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
         estimate.ffn = std::max(1.0, rows * (selected * coefficients.routed_expert_per_selection_row + coefficients.fixed_ffn_per_row));
         total_work += estimate.attention_router + estimate.ffn;
     }
-    GpuSubmissionBudget budget(total_work);
+    // A finer split lets the GPU start earlier on unified-memory devices,
+    // where host recording overlaps execution. Longer KV contexts make each
+    // recorded chunk heavier, so keep the command size roughly constant
+    // instead of using the short-context divisor.
+    const uint64_t context_tokens = caches.empty() ? 0 : caches.front()->token_count;
+    const double divisor = context->device()->info.type() == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+                               ? (context_tokens < 2048
+                                      ? 64.0
+                                  : context_tokens < 8192
+                                      ? std::clamp(static_cast<double>(context_tokens) / 64.0,
+                                                   256.0, 512.0)
+                                      : std::clamp(static_cast<double>(context_tokens) / 64.0,
+                                                   512.0, 1024.0))
+                               : 40.0;
+    GpuSubmissionBudget budget(total_work, divisor);
     bool successful = false, submitted = false, chunk_attempted = false;
     const auto cleanup = [&](void*) {
         if (!successful)
@@ -1355,7 +1373,7 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
             current.caches.assign(caches.begin() + layer * rows, caches.begin() + (layer + 1) * rows);
             if (!current.target->dense) current.options = options[layer];
             current.initial_hidden = &initial_hidden;
-            if (!current.record_layer(nullptr, *recording, hidden.empty() ? nullptr : &hidden, false))
+            if (!current.record_layer(nullptr, *recording, hidden.empty() ? nullptr : &hidden, false, false))
                 return fail(current.error);
             budget.record(layer_work[layer].attention_router);
             // Submit completed record-only stages before a large successor.
@@ -1453,7 +1471,6 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
                                                ? 1
                                                : 0);
             counters.shared_expert_swiglu_fusions += stats.shared_expert_swiglu_fusions;
-            counters.bfloat16_cooperative_matrix_dispatches += stats.bfloat16_cooperative_matrix_dispatches;
             counters.rms_norm_linear_fusions += pending->fused_head;
         }
         auto& counters = context->runtime_state();
@@ -1623,7 +1640,6 @@ bool GpuSegment_vulkan::materialize_hidden(GpuSegmentWorkspace_vulkan& workspace
     counters.dispatches += statistics.dispatches;
     counters.int4_dispatches += statistics.int4_dispatches;
     counters.shared_expert_swiglu_fusions += statistics.shared_expert_swiglu_fusions;
-    counters.bfloat16_cooperative_matrix_dispatches += statistics.bfloat16_cooperative_matrix_dispatches;
     ++counters.compute_submissions;
     ++counters.resident_graph_submissions;
     ++counters.batch_downloads;

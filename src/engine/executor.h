@@ -59,7 +59,7 @@ void record_vulkan_delta(SessionStatistics& stats,
                                          SessionStatistics& statistics,
                                          SessionState& state,
                                          uint64_t position_offset,
-                                         LogitsOutput logits_output = LogitsOutput::All);
+                                         LogitsOutput logits_output);
 
 [[nodiscard]] Result<void> forward_decode_batch(const CompiledModel& model,
                                                 std::span<const DecodeBatchEntry> entries,

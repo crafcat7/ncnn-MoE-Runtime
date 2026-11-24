@@ -22,7 +22,6 @@ struct FfnRecordStatistics_vulkan
     uint64_t dispatches = 0;
     uint64_t int4_dispatches = 0;
     uint64_t shared_expert_swiglu_fusions = 0;
-    uint64_t bfloat16_cooperative_matrix_dispatches = 0;
 };
 
 // A view of already prepared Shared Expert products. The adapter owns the

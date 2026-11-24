@@ -1525,18 +1525,17 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const Activat
                                static_cast<uint32_t>(input.rows()),
                                command);
 
-    std::vector<bool> cooperative_dispatches(extra_operators.size(), false);
     std::vector<ncnn::VkMat> projection_bindings;
     std::vector<ncnn::vk_constant_type> projection_constants;
     for (size_t index = 0; index < extra_operators.size(); ++index)
     {
         const auto& extra = *extra_operators[index]->d;
-        cooperative_dispatches[index] = extra.record_projection(original_input_gpu,
-                                                                extra_gpu[index],
-                                                                static_cast<uint32_t>(input.rows()),
-                                                                command,
-                                                                projection_bindings,
-                                                                projection_constants);
+        (void)extra.record_projection(original_input_gpu,
+                                      extra_gpu[index],
+                                      static_cast<uint32_t>(input.rows()),
+                                      command,
+                                      projection_bindings,
+                                      projection_constants);
     }
 
     if ((!retained_output && !direct_host_output
@@ -1600,11 +1599,6 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const Activat
     ++runtime_state.compute_submissions;
     ++runtime_state.batch_uploads;
     runtime_state.batch_downloads += (retained_output ? 1 : 2) + extra_operators.size();
-    for (bool used_cooperative_matrix : cooperative_dispatches)
-    {
-        if (used_cooperative_matrix)
-            ++runtime_state.bfloat16_cooperative_matrix_dispatches;
-    }
     return true;
 #else
     (void)input;
@@ -1860,7 +1854,6 @@ bool Float8Linear_vulkan::forward_swiglu_chain_device(const DeviceTensor_vulkan&
     state.dispatches += statistics.dispatches;
     state.int4_dispatches += statistics.int4_dispatches;
     state.shared_expert_swiglu_fusions += statistics.shared_expert_swiglu_fusions;
-    state.bfloat16_cooperative_matrix_dispatches += statistics.bfloat16_cooperative_matrix_dispatches;
     ++state.compute_submissions;
     successful = true;
     return true;

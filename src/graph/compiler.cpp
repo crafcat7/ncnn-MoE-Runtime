@@ -269,7 +269,9 @@ static Result<TensorHandle> require_tensor(const WeightStore& weights, const std
     {
         if (tensor.bfloat16_values().size() != tensor.element_count())
             return Error{ErrorCode::InvalidModel, "invalid bfloat16 data length for tensor: " + name};
-        if (!tensor.bfloat16_data.empty() && tensor.mapped_data)
+        // A Hybrid model keeps the block-quantized payload behind the BF16
+        // expansion so one-row CPU decode can read it without a second upload.
+        if (!tensor.bfloat16_data.empty() && tensor.mapped_data && !is_qnk_dtype(tensor.qnk_dtype))
             return Error{ErrorCode::InvalidModel, "bfloat16 tensor has duplicate storage: " + name};
         if (!tensor.float32_data.empty()
             || !tensor.int8_data.empty()
@@ -2076,6 +2078,8 @@ Result<void> compile_model_validated(MoeModelDescriptor descriptor, WeightMappin
     }
 
     compiled.descriptor = std::move(descriptor);
+    for (const LayerDescriptor& layer : compiled.descriptor.layers)
+        compiled.max_context = std::max(compiled.max_context, layer.attention.max_context_length);
     compiled.opt.optimization_flags = opt.optimization_flags;
     compiled.opt.num_concurrent_sessions = std::max(1u, opt.num_concurrent_sessions);
     compiled.vulkan_runtime = opt.vulkan_runtime;

@@ -101,3 +101,9 @@ repair-report.md
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Local benchmark workspace (models, reference runtimes, results, scripts)
+/bench/
+
+# Local runtime scratch
+/tmp/

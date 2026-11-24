@@ -1327,6 +1327,15 @@ void test_attention_output_aliases()
                                                                       reference_cache, reference_scratch, input, expected,
                                                                       g_test_optimization_flags & ~OptimizationCpuFlashAttention & ~OptimizationCpuSplitKvAttention)));
                         }
+                        // The exact comparison below covers the FP32 flash path;
+                        // the FP16 variant is checked separately.
+                        const uint64_t exact_flags = g_test_optimization_flags
+                                                     & ~OptimizationCpuFlashAttentionF16;
+                        const bool check_f16 = dtype == DType::BFloat16 && window == 0 && rows == 8
+                                               && first == 0 && threads == 8;
+                        LayerCache f16_cache;
+                        if (check_f16)
+                            f16_cache = cache;
                         const float poison = std::numeric_limits<float>::quiet_NaN();
                         std::fill(scratch.workspace.begin(), scratch.workspace.end(), poison);
                         std::fill(scratch.flash_partial_max.begin(), scratch.flash_partial_max.end(), poison);
@@ -1334,7 +1343,7 @@ void test_attention_output_aliases()
                         std::fill(scratch.flash_partial_output.begin(), scratch.flash_partial_output.end(), poison);
                         ActivationBuffer actual;
                         check(static_cast<bool>(forward_attention(weights, operators, plan, ExecutionBackend::Cpu, 11 + context,
-                                                                  cache, scratch, input, actual, g_test_optimization_flags)));
+                                                                  cache, scratch, input, actual, exact_flags)));
                         if (dtype == DType::BFloat16 && rows > 1
                             && has_flag(g_test_optimization_flags, OptimizationCpuBf16DirectAttention)
                             && has_flag(g_test_optimization_flags, OptimizationCpuFlashAttention))
@@ -1342,6 +1351,18 @@ void test_attention_output_aliases()
                             check(scratch.key_cache.empty());
                             check(scratch.value_cache.size()
                                   == static_cast<size_t>(context + rows) * cache.columns);
+                        }
+                        if (check_f16)
+                        {
+                            AttentionScratch f16_scratch;
+                            ActivationBuffer f16_output;
+                            check(static_cast<bool>(forward_attention(weights, operators, plan, ExecutionBackend::Cpu,
+                                                                      11 + context, f16_cache, f16_scratch, input,
+                                                                      f16_output,
+                                                                      exact_flags
+                                                                          | OptimizationCpuFlashAttentionF16)));
+                            for (size_t index = 0; index < actual.values().size(); ++index)
+                                check_near(f16_output.values()[index], actual.values()[index], 5e-3f);
                         }
                         if (first == 0)
                             contiguous = actual;

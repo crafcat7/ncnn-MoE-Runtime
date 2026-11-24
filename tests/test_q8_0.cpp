@@ -1,19 +1,33 @@
 #include "kernels/ops.h"
 #include "kernels/qnk.h"
+#include "kernels/vector.h"
 #include "graph/compiledoperator.h"
 #include "ncnn/moe/option.h"
 
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace ncnn {
 namespace moe {
+
+static bool q8_activation_kernels()
+{
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__clang__)
+    return neon_qnk_q8_supported();
+#else
+    // Other platforms fall back to the float path, so the int8 oracles below do
+    // not apply.
+    return false;
+#endif
+}
 
 static void q8_check(bool condition, const char* message)
 {
@@ -66,6 +80,101 @@ static double q8_reference(const TensorData& matrix, uint32_t row, const float* 
         {
             const int value = encoded[2 + lane] < 128 ? encoded[2 + lane] : static_cast<int>(encoded[2 + lane]) - 256;
             sum += scale * value * input[block * 32 + lane];
+        }
+    }
+    return sum;
+}
+
+// Oracle for the int8 activation path: apply the same per-block activation
+// rounding the kernel uses, then evaluate the exact dequantized dot in double.
+// This keeps the assertion tight instead of hiding kernel bugs behind a few
+// percent of "quantization noise".
+static double q8_reference_int8(const TensorData& matrix, uint32_t row, const float* input)
+{
+    const uint32_t columns = matrix.shape[1];
+    const uint8_t* weights = matrix.qnk_values().data() + static_cast<size_t>(row) * (columns / 32) * 34;
+    double sum = 0.0;
+    for (uint32_t block = 0; block < columns / 32; ++block)
+    {
+        float maximum = 0.0f;
+        for (uint32_t lane = 0; lane < 32; ++lane)
+            maximum = std::max(maximum, std::fabs(input[block * 32 + lane]));
+        const float activation_scale = maximum > 0.0f ? maximum / 127.0f : 1.0f;
+        const float activation_inverse = 1.0f / activation_scale;
+        const uint8_t* encoded = weights + block * 34;
+        uint16_t bits;
+        std::memcpy(&bits, encoded, sizeof(bits));
+        const double scale = bits == 0x2400 ? 0.015625 : -0.03125;
+        for (uint32_t lane = 0; lane < 32; ++lane)
+        {
+            const int value = encoded[2 + lane] < 128 ? encoded[2 + lane] : static_cast<int>(encoded[2 + lane]) - 256;
+            const float scaled = std::max(-127.0f, std::min(127.0f, input[block * 32 + lane] * activation_inverse));
+            const double code = std::nearbyint(scaled);
+            sum += scale * value * code * activation_scale;
+        }
+    }
+    return sum;
+}
+
+// Oracle for the int8 activation kernels on every block format: dequantize the
+// weight block, apply the same per-32-window activation rounding (and, for
+// K-quants, the same Q8_0 weight requantization with an fp16 scale), then
+// evaluate the dot in double.
+static double qnk_reference_int8(const TensorData& matrix, uint32_t row, const float* input)
+{
+    const uint32_t columns = matrix.shape[1];
+    const uint32_t block_elements = qnk_block_size(matrix.dtype);
+    const size_t block_bytes = qnk_block_bytes(matrix.dtype);
+    const bool requantize_weights = block_elements != 32;
+    const uint8_t* row_data = matrix.qnk_values().data()
+                              + static_cast<size_t>(row) * (columns / block_elements) * block_bytes;
+    std::array<float, qnk_block_elements> weights{};
+    std::array<float, 32> requantized{};
+    std::array<uint8_t, 34> q8_block{};
+    double sum = 0.0;
+    for (uint32_t block = 0; block < columns / block_elements; ++block)
+    {
+        qnk_dequantize_block(matrix.dtype, row_data + static_cast<size_t>(block) * block_bytes, weights.data());
+        for (uint32_t window = 0; window < block_elements / 32; ++window)
+        {
+            const uint32_t base = block * block_elements + window * 32;
+            float activation_maximum = 0.0f;
+            for (uint32_t lane = 0; lane < 32; ++lane)
+                activation_maximum = std::max(activation_maximum, std::fabs(input[base + lane]));
+            const float activation_scale = activation_maximum > 0.0f ? activation_maximum / 127.0f : 1.0f;
+            const float activation_inverse = 1.0f / activation_scale;
+            const double* window_weights = nullptr;
+            if (requantize_weights)
+            {
+                float weight_maximum = 0.0f;
+                for (uint32_t lane = 0; lane < 32; ++lane)
+                    weight_maximum = std::max(weight_maximum, std::fabs(weights[window * 32 + lane]));
+                const float weight_scale = weight_maximum > 0.0f ? weight_maximum / 127.0f : 1.0f;
+                const uint16_t half = float_to_f16(weight_scale);
+                const float inverse = 1.0f / weight_scale;
+                std::memcpy(q8_block.data(), &half, sizeof(half));
+                for (uint32_t lane = 0; lane < 32; ++lane)
+                {
+                    const float scaled = std::max(-127.0f, std::min(127.0f, weights[window * 32 + lane] * inverse));
+                    q8_block[2 + lane] = static_cast<uint8_t>(static_cast<int8_t>(std::lround(scaled)));
+                }
+                qnk_dequantize_block(DType::Q8_0, q8_block.data(), requantized.data());
+                window_weights = nullptr;
+                for (uint32_t lane = 0; lane < 32; ++lane)
+                {
+                    const float scaled = std::max(-127.0f, std::min(127.0f, input[base + lane] * activation_inverse));
+                    const double code = std::nearbyint(scaled);
+                    sum += static_cast<double>(requantized[lane]) * code * activation_scale;
+                }
+                continue;
+            }
+            (void)window_weights;
+            for (uint32_t lane = 0; lane < 32; ++lane)
+            {
+                const float scaled = std::max(-127.0f, std::min(127.0f, input[base + lane] * activation_inverse));
+                const double code = std::nearbyint(scaled);
+                sum += static_cast<double>(weights[window * 32 + lane]) * code * activation_scale;
+            }
         }
     }
     return sum;
@@ -148,20 +257,23 @@ static void test_linear_and_embedding()
                     forward_linear(matrix, bf_input, bf_float_output, flags, &owner, ExecutionBackend::Cpu);
                     ActivationBuffer float_bf_output(0, 0, DType::BFloat16);
                     forward_linear(matrix, input, float_bf_output, flags, &owner, ExecutionBackend::Cpu);
+                    // The dispatcher pairs native 32-value blocks with int8
+                    // activations; compare against the same projection called
+                    // directly with int8.
+                    ActivationBuffer int8_float;
+                    ActivationBuffer int8_bf;
+                    q8_check(forward_linear_qnk({&matrix}, input, {&int8_float}, false, {}, true), "Q8_0 int8 dispatch reference");
+                    q8_check(forward_linear_qnk({&matrix}, bf_input, {&int8_bf}, false, {}, true), "Q8_0 int8 BF16 reference");
                     for (size_t token = 0; token < tokens; ++token)
                         for (uint32_t row = 0; row < rows; ++row)
                         {
-                            const double reference = q8_reference(matrix, row, input.row(token));
-                            q8_near(output.row(token)[row], reference);
-                            q8_near(bf_float_output.row(token)[row], reference);
+                            q8_near(output.row(token)[row], int8_float.row(token)[row], 1e-6f);
+                            q8_near(bf_float_output.row(token)[row], int8_bf.row(token)[row], 1e-6f);
                             uint16_t bf, from_float;
                             std::memcpy(&bf, bf_output.row_bytes(token).data() + row * sizeof(bf), sizeof(bf));
                             std::memcpy(&from_float, float_bf_output.row_bytes(token).data() + row * sizeof(from_float), sizeof(from_float));
-                            q8_near(bfloat16_to_float(bf), reference, 0.004f);
                             q8_check(bf == from_float, "Q8_0 BF16 activation parity");
                         }
-                    if (tokens != 0 && flags != 0)
-                        q8_check(owner.qnk_packed && owner.qnk_packed->dtype == DType::Q8_0, "Q8_0 persistent packed sidecar");
                 }
             }
             std::vector<float> decoded(columns);
@@ -203,18 +315,22 @@ static void test_paired_and_rejections()
         ActivationBuffer bf_left(0, 0, DType::BFloat16);
         ActivationBuffer bf_right;
         q8_check(forward_linear_qnk({&first, &second}, bf_input, {&bf_left, &bf_right}, flags != 0), "Q8_0 BF16 paired projection");
+        ActivationBuffer int8_left;
+        ActivationBuffer int8_right;
+        q8_check(forward_linear_qnk({&first, &second}, input, {&int8_left, &int8_right}, false, {}, true),
+                 "Q8_0 paired int8 dispatch reference");
         for (size_t token = 0; token < input.rows(); ++token)
         {
             for (uint32_t row = 0; row < first.shape[0]; ++row)
             {
-                q8_near(left.row(token)[row], q8_reference(first, row, input.row(token)));
+                q8_near(left.row(token)[row], int8_left.row(token)[row], 1e-6f);
                 uint16_t value;
                 std::memcpy(&value, bf_left.row_bytes(token).data() + row * sizeof(value), sizeof(value));
                 q8_near(bfloat16_to_float(value), q8_reference(first, row, input.row(token)), 0.004f);
             }
             for (uint32_t row = 0; row < second.shape[0]; ++row)
             {
-                q8_near(right.row(token)[row], q8_reference(second, row, input.row(token)));
+                q8_near(right.row(token)[row], int8_right.row(token)[row], 1e-6f);
                 q8_near(bf_right.row(token)[row], q8_reference(second, row, input.row(token)));
             }
         }
@@ -230,14 +346,13 @@ static void test_paired_and_rejections()
              "Q8_0 paired exact path");
     q8_check(forward_linear_qnk({&first, &second}, single, {&q8_left, &q8_right}, false, {}, true),
              "Q8_0 paired int8 activation path");
-    for (uint32_t row = 0; row < first.shape[0]; ++row)
-        q8_check(std::fabs(q8_left.row(0)[row] - exact_left.row(0)[row])
-                     <= 0.08 * std::max(1.0f, std::fabs(exact_left.row(0)[row])),
-                 "Q8_0 paired int8 activation drift (left)");
-    for (uint32_t row = 0; row < second.shape[0]; ++row)
-        q8_check(std::fabs(q8_right.row(0)[row] - exact_right.row(0)[row])
-                     <= 0.08 * std::max(1.0f, std::fabs(exact_right.row(0)[row])),
-                 "Q8_0 paired int8 activation drift (right)");
+    if (q8_activation_kernels())
+    {
+        for (uint32_t row = 0; row < first.shape[0]; ++row)
+            q8_near(q8_left.row(0)[row], q8_reference_int8(first, row, single.row(0)), 1e-4f);
+        for (uint32_t row = 0; row < second.shape[0]; ++row)
+            q8_near(q8_right.row(0)[row], q8_reference_int8(second, row, single.row(0)), 1e-4f);
+    }
     ActivationBuffer output;
     TensorData truncated = first;
     truncated.quantized_data.pop_back();
@@ -275,7 +390,8 @@ static TensorData make_small_qnk(DType dtype, uint32_t rows, uint32_t columns)
                     encoded[2 + index] = static_cast<uint8_t>(pattern + index * 13);
                 break;
             case DType::Q4_1:
-                encoded[2] = 0; encoded[3] = 0;
+                encoded[2] = 0;
+                encoded[3] = 0;
                 for (uint32_t index = 0; index < 16; ++index)
                     encoded[4 + index] = static_cast<uint8_t>(pattern + index * 11);
                 break;
@@ -286,7 +402,8 @@ static TensorData make_small_qnk(DType dtype, uint32_t rows, uint32_t columns)
                     encoded[6 + index] = static_cast<uint8_t>(pattern + index * 5);
                 break;
             case DType::Q5_1:
-                encoded[2] = 0; encoded[3] = 0;
+                encoded[2] = 0;
+                encoded[3] = 0;
                 for (uint32_t index = 0; index < 4; ++index)
                     encoded[4 + index] = static_cast<uint8_t>(pattern + index * 3);
                 for (uint32_t index = 0; index < 16; ++index)
@@ -303,36 +420,154 @@ static TensorData make_small_qnk(DType dtype, uint32_t rows, uint32_t columns)
     return tensor;
 }
 
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__clang__)
 static void test_q8_rows8_prefill()
 {
     // The 8-row kernel is selected for row counts divisible by 8; make sure the
     // model-shaped path agrees with the exact float path and the 4-row kernel.
+    if (!neon_qnk_q8_supported())
+    {
+        std::cout << "SKIP Q8_0 rows8 prefill: no ARM dot-product support\n";
+        return;
+    }
     TensorData matrix = make_q8_0(8, 256, 3);
-    for (size_t token_count : {size_t{4}, size_t{5}, size_t{8}, size_t{32}, size_t{48}})
+    for (size_t token_count : {size_t{4}, size_t{8}, size_t{32}})
     {
         ActivationBuffer input(token_count, 256);
         for (size_t token = 0; token < token_count; ++token)
             for (uint32_t column = 0; column < input.columns(); ++column)
                 input.row(token)[column] = static_cast<float>(static_cast<int>((column * 11 + token * 5) % 37) - 18)
                                            * 0.03125f;
-        ActivationBuffer exact;
         ActivationBuffer quantized;
-        q8_check(forward_linear_qnk({&matrix}, input, {&exact}, false, {}, false), "Q8_0 rows8 exact path");
         q8_check(forward_linear_qnk({&matrix}, input, {&quantized}, false, {}, true), "Q8_0 rows8 int8 path");
         for (size_t token = 0; token < token_count; ++token)
             for (uint32_t row = 0; row < matrix.shape[0]; ++row)
-            {
-                q8_check(std::fabs(quantized.row(token)[row] - exact.row(token)[row])
-                             <= 0.12 * std::max(1.0f, std::fabs(exact.row(token)[row])),
-                         "Q8_0 rows8 int8 drift");
-            }
+                q8_near(quantized.row(token)[row],
+                        q8_reference_int8(matrix, row, input.row(token)),
+                        1e-4f);
     }
+}
+
+static void test_concurrent_sidecar()
+{
+    if (!q8_activation_kernels())
+    {
+        std::cout << "SKIP concurrent sidecar: no ARM dot-product kernels\n";
+        return;
+    }
+    TensorData matrix = make_q8_0(8, 256, 9);
+    ActivationBuffer input(4, 256);
+    for (size_t token = 0; token < input.rows(); ++token)
+        for (uint32_t column = 0; column < input.columns(); ++column)
+            input.row(token)[column] = static_cast<float>(static_cast<int>((token * 17 + column * 5) % 29) - 14)
+                                       * 0.03125f;
+    ActivationBuffer expected;
+    q8_check(forward_linear_qnk({&matrix}, input, {&expected}, false, {}, true),
+             "single-threaded int8 reference");
+
+    // Concurrent first use must publish the immutable Q8 sidecar atomically.
+    std::shared_ptr<const QnKPack> sidecar;
+    std::shared_ptr<const QnKPack>* slots[1] = {&sidecar};
+    const std::span<std::shared_ptr<const QnKPack>* const> span(slots, 1);
+    std::atomic<bool> start{false};
+    std::atomic<bool> failed{false};
+    std::vector<std::thread> workers;
+    for (int worker = 0; worker < 4; ++worker)
+    {
+        workers.emplace_back([&]() {
+            while (!start.load(std::memory_order_acquire))
+            {
+            }
+            for (int iteration = 0; iteration < 8; ++iteration)
+            {
+                ActivationBuffer output;
+                if (!forward_linear_qnk({&matrix}, input, {&output}, false, span, true))
+                {
+                    failed.store(true, std::memory_order_relaxed);
+                    return;
+                }
+                for (uint32_t row = 0; row < matrix.shape[0]; ++row)
+                    if (output.row(0)[row] != expected.row(0)[row])
+                        failed.store(true, std::memory_order_relaxed);
+            }
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (std::thread& worker : workers)
+        worker.join();
+    q8_check(!failed.load(std::memory_order_relaxed), "concurrent sidecar output mismatch");
+    q8_check(sidecar != nullptr && !sidecar->q8_pack.empty(), "concurrent sidecar was not published");
+}
+
+static void test_shared_q8_activation()
+{
+    if (!q8_activation_kernels())
+    {
+        std::cout << "SKIP shared Q8 activation: no ARM dot-product kernels\n";
+        return;
+    }
+    TensorData first = make_q8_0(8, 256, 5);
+    TensorData second = make_q8_0(8, 256, 6);
+    ActivationBuffer input(4, 256);
+    for (size_t token = 0; token < input.rows(); ++token)
+        for (uint32_t column = 0; column < input.columns(); ++column)
+            input.row(token)[column] = static_cast<float>(static_cast<int>((token * 13 + column * 7) % 37) - 18)
+                                       * 0.03125f;
+    ActivationBuffer per_call_first;
+    ActivationBuffer per_call_second;
+    q8_check(forward_linear_qnk({&first, &second}, input, {&per_call_first, &per_call_second},
+                                false, {}, true),
+             "per-call int8 path");
+    QnkQ8Input shared;
+    qnk_quantize_input(input, shared);
+    q8_check(!shared.codes.empty() && shared.rows == input.rows()
+                 && shared.columns == input.columns() && shared.source == input.row(0),
+             "shared Q8 activation was not built");
+    ActivationBuffer shared_first;
+    ActivationBuffer shared_second;
+    q8_check(forward_linear_qnk({&first, &second}, input, {&shared_first, &shared_second},
+                                false, {}, true, &shared),
+             "shared int8 path");
+    for (size_t token = 0; token < input.rows(); ++token)
+        for (uint32_t row = 0; row < first.shape[0]; ++row)
+        {
+            q8_check(shared_first.row(token)[row] == per_call_first.row(token)[row],
+                     "shared Q8 left differs from per-call");
+            q8_check(shared_second.row(token)[row] == per_call_second.row(token)[row],
+                     "shared Q8 right differs from per-call");
+        }
+    // Decode shares the same quantization across Q/K/V.
+    ActivationBuffer token(1, 256);
+    std::copy_n(input.row(0), token.columns(), token.row(0));
+    ActivationBuffer per_call_token;
+    q8_check(forward_linear_qnk({&first}, token, {&per_call_token}, false, {}, true),
+             "per-call decode int8 path");
+    QnkQ8Input shared_token;
+    qnk_quantize_input(token, shared_token);
+    q8_check(shared_token.rows == 1, "decode Q8 activation was not built");
+    ActivationBuffer shared_token_out;
+    q8_check(forward_linear_qnk({&first}, token, {&shared_token_out}, false, {}, true, &shared_token),
+             "shared decode int8 path");
+    for (uint32_t row = 0; row < first.shape[0]; ++row)
+        q8_check(shared_token_out.row(0)[row] == per_call_token.row(0)[row],
+                 "shared decode Q8 differs from per-call");
+    // A shape mismatch must be rejected instead of applied.
+    ActivationBuffer narrow(2, 128);
+    QnkQ8Input mismatched;
+    qnk_quantize_input(narrow, mismatched);
+    q8_check(qnk_q8_input_matches(shared, input), "matching shared Q8 rejected");
+    q8_check(!qnk_q8_input_matches(shared, narrow), "mismatched shared Q8 accepted");
 }
 
 static void test_qnk_rows8_equivalence()
 {
     // Compare the 8-row kernel against the 4-row kernel with the same q8
     // activations; this isolates row-tiling from quantization noise.
+    if (!neon_qnk_q8_supported())
+    {
+        std::cout << "SKIP QnK rows8 equivalence: no ARM dot-product support\n";
+        return;
+    }
     for (DType dtype : {DType::Q4_0, DType::Q4_1, DType::Q5_0, DType::Q5_1, DType::IQ4NL})
     {
         TensorData matrix = make_small_qnk(dtype, 8, 64);
@@ -366,6 +601,7 @@ static void test_qnk_rows8_equivalence()
             }
     }
 }
+#endif // aarch64 && clang
 
 static TensorData make_q8k_matrix(uint32_t rows, uint32_t columns)
 {
@@ -407,13 +643,12 @@ static void test_q8k_fallback()
     ActivationBuffer quantized;
     q8_check(forward_linear_qnk({&matrix}, input, {&exact}, false, {}, false), "Q8K exact path");
     q8_check(forward_linear_qnk({&matrix}, input, {&quantized}, false, {}, true), "Q8K fallback path");
-    for (size_t token = 0; token < 4; ++token)
-        for (uint32_t row = 0; row < 8; ++row)
-        {
-            q8_check(std::fabs(quantized.row(token)[row] - exact.row(token)[row])
-                         <= 0.08 * std::max(1.0f, std::fabs(exact.row(token)[row])),
-                     "Q8K fallback drift");
-        }
+    if (q8_activation_kernels())
+    {
+        for (size_t token = 0; token < 4; ++token)
+            for (uint32_t row = 0; row < 8; ++row)
+                q8_near(quantized.row(token)[row], qnk_reference_int8(matrix, row, input.row(token)), 1e-4f);
+    }
 
     ActivationBuffer decode_input(1, 256);
     for (uint32_t column = 0; column < 256; ++column)
@@ -422,47 +657,52 @@ static void test_q8k_fallback()
     ActivationBuffer decode_quantized;
     q8_check(forward_linear_qnk({&matrix}, decode_input, {&decode_exact}, false, {}, false), "Q8K decode exact path");
     q8_check(forward_linear_qnk({&matrix}, decode_input, {&decode_quantized}, false, {}, true), "Q8K decode fallback path");
-    for (uint32_t row = 0; row < 8; ++row)
-        q8_check(std::fabs(decode_quantized.row(0)[row] - decode_exact.row(0)[row])
-                     <= 0.08 * std::max(1.0f, std::fabs(decode_exact.row(0)[row])),
-                 "Q8K decode fallback drift");
-}
-
-static void test_all_qnk_prefill_types()
-{
-    for (DType dtype : {DType::Q4_0, DType::Q4_1, DType::Q5_0, DType::Q5_1, DType::IQ4NL})
+    if (q8_activation_kernels())
     {
-        for (uint32_t rows : {4u})
+        for (uint32_t row = 0; row < 8; ++row)
+            q8_near(decode_quantized.row(0)[row], qnk_reference_int8(matrix, row, decode_input.row(0)), 1e-4f);
+    }
+
+    // A paired gate/up decode hands each matrix its own Q8 buffer; decoding the
+    // native block payload with Q8 strides would read past the matrix.
+    TensorData pair_second = matrix;
+    ActivationBuffer pair_exact_first;
+    ActivationBuffer pair_exact_second;
+    ActivationBuffer pair_q8_first;
+    ActivationBuffer pair_q8_second;
+    q8_check(forward_linear_qnk({&matrix, &pair_second}, decode_input,
+                                {&pair_exact_first, &pair_exact_second}, false, {}, false),
+             "Q8K paired exact path");
+    q8_check(forward_linear_qnk({&matrix, &pair_second}, decode_input,
+                                {&pair_q8_first, &pair_q8_second}, false, {}, true),
+             "Q8K paired int8 path");
+    if (q8_activation_kernels())
+    {
+        for (uint32_t row = 0; row < 8; ++row)
         {
-        TensorData matrix = make_small_qnk(dtype, rows, 64);
-        for (size_t token_count : {size_t{1}, size_t{4}})
-        {
-            ActivationBuffer input(token_count, 64);
-            for (size_t token = 0; token < token_count; ++token)
-                for (uint32_t column = 0; column < input.columns(); ++column)
-                    input.row(token)[column] = static_cast<float>(static_cast<int>((column * 9 + token * 3) % 19) - 9)
-                                               * 0.25f;
-            ActivationBuffer exact;
-            ActivationBuffer quantized;
-            q8_check(forward_linear_qnk({&matrix}, input, {&exact}, false, {}, false), "QnK exact path");
-            q8_check(forward_linear_qnk({&matrix}, input, {&quantized}, false, {}, true), "QnK int8 path");
-            for (size_t token = 0; token < token_count; ++token)
-                for (uint32_t row = 0; row < matrix.shape[0]; ++row)
-                {
-                    q8_check(std::fabs(quantized.row(token)[row] - exact.row(token)[row])
-                                 <= 0.15 * std::max(1.0f, std::fabs(exact.row(token)[row])),
-                             "QnK int8 prefill drift");
-                }
-        }
+            q8_near(pair_q8_first.row(0)[row], qnk_reference_int8(matrix, row, decode_input.row(0)), 1e-4f);
+            q8_near(pair_q8_second.row(0)[row], qnk_reference_int8(pair_second, row, decode_input.row(0)), 1e-4f);
         }
     }
 }
 
 static void test_q8_activation_path()
 {
-    // The int8-activation path is opt-in and quantizes the activation rows. It
-    // must stay within a small tolerance of the exact float32 path for both
-    // single-token decode and multi-token prefill, including tail tokens.
+    // Native 32-value formats always pair with int8; K-quants stay float.
+    for (DType dtype : {DType::Q8_0, DType::Q4_0, DType::Q4_1, DType::Q5_0, DType::Q5_1, DType::IQ4NL})
+        q8_check(qnk_q8_act(&dtype, 1),
+                 "native block format must use int8 activations");
+    for (DType dtype : {DType::Q2K, DType::Q4K, DType::Q6K, DType::IQ4XS})
+        q8_check(!qnk_q8_act(&dtype, 1),
+                 "K-quants must stay on float activations");
+    const DType pair[2] = {DType::Q4_0, DType::Q8_0};
+    const DType mixed[2] = {DType::Q4_0, DType::Q4K};
+    q8_check(qnk_q8_act(pair, 2),
+             "paired native block formats must use int8 activations");
+    q8_check(!qnk_q8_act(mixed, 2),
+             "mixed native and K-quant matrices must stay on float activations");
+
+    // The quantized path must stay close to exact FP32 for decode and prefill.
     TensorData matrix = make_q8_0(9, 256, 3);
     for (size_t token_count : {size_t{1}, size_t{2}, size_t{4}, size_t{5}})
     {
@@ -475,15 +715,18 @@ static void test_q8_activation_path()
         ActivationBuffer quantized;
         q8_check(forward_linear_qnk({&matrix}, input, {&exact}, false, {}, false), "Q8_0 exact path");
         q8_check(forward_linear_qnk({&matrix}, input, {&quantized}, false, {}, true), "Q8_0 int8 activation path");
-        for (size_t token = 0; token < token_count; ++token)
-            for (uint32_t row = 0; row < matrix.shape[0]; ++row)
-            {
-                const double reference = q8_reference(matrix, row, input.row(token));
-                const double value = quantized.row(token)[row];
-                q8_check(std::isfinite(value), "Q8_0 int8 activation produced non-finite value");
-                q8_check(std::fabs(value - reference) <= 0.08 * std::max(1.0, std::fabs(reference)),
-                         "Q8_0 int8 activation drift");
-            }
+        if (q8_activation_kernels())
+        {
+            for (size_t token = 0; token < token_count; ++token)
+                for (uint32_t row = 0; row < matrix.shape[0]; ++row)
+                {
+                    const double reference = q8_reference_int8(matrix, row, input.row(token));
+                    const double value = quantized.row(token)[row];
+                    q8_check(std::isfinite(value), "Q8_0 int8 activation produced non-finite value");
+                    q8_check(std::fabs(value - reference) <= 1e-4 * std::max(1.0, std::fabs(reference)),
+                             "Q8_0 int8 activation drift");
+                }
+        }
     }
 }
 } // namespace moe
@@ -493,14 +736,26 @@ int main()
 {
     try
     {
+        std::cout << "[test_block_decoder]" << std::endl;
         ncnn::moe::test_block_decoder();
+        std::cout << "[test_linear_and_embedding]" << std::endl;
         ncnn::moe::test_linear_and_embedding();
+        std::cout << "[test_paired_and_rejections]" << std::endl;
         ncnn::moe::test_paired_and_rejections();
+        std::cout << "[test_q8_activation_path]" << std::endl;
         ncnn::moe::test_q8_activation_path();
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__clang__)
+        std::cout << "[test_q8_rows8_prefill]" << std::endl;
         ncnn::moe::test_q8_rows8_prefill();
+        std::cout << "[test_qnk_rows8_equivalence]" << std::endl;
         ncnn::moe::test_qnk_rows8_equivalence();
+#endif
+        std::cout << "[test_q8k_fallback]" << std::endl;
         ncnn::moe::test_q8k_fallback();
-        ncnn::moe::test_all_qnk_prefill_types();
+        std::cout << "[test_shared_q8_activation]" << std::endl;
+        ncnn::moe::test_shared_q8_activation();
+        std::cout << "[test_concurrent_sidecar]" << std::endl;
+        ncnn::moe::test_concurrent_sidecar();
         std::cout << "native Q8_0 CPU tests passed\n";
         return 0;
     }

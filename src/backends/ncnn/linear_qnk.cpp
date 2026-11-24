@@ -238,6 +238,27 @@ static uint64_t qnk_mxfp4_native_size(const TensorData& matrix) noexcept
     return block_count * 17;
 }
 
+TensorData qnk_view(const TensorData& matrix)
+{
+    TensorData view;
+    view.dtype = matrix.qnk_dtype;
+    view.shape = matrix.shape;
+    view.qnk_interleave_rows = matrix.qnk_interleave_rows;
+    view.input_column_indices = matrix.input_column_indices;
+    if (!matrix.quantized_data.empty())
+    {
+        view.mapped_data = std::shared_ptr<const uint8_t>(matrix.quantized_data.data(),
+                                                          [](const uint8_t*) {});
+        view.mapped_size = matrix.quantized_data.size();
+    }
+    else
+    {
+        view.mapped_data = matrix.mapped_data;
+        view.mapped_size = matrix.mapped_size;
+    }
+    return view;
+}
+
 uint64_t QnkLinear_vulkan::storage_bytes(const TensorData& matrix, uint64_t alignment) noexcept
 {
     const bool mxfp4 = matrix.dtype == DType::MxFp4;
@@ -755,7 +776,7 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
             return {};
         if (matrix.dtype == DType::BFloat16)
         {
-            create_tile_gemm(implementation.vulkan_context, implementation.option, implementation.tile_gemm);
+            (void)create_tile_gemm(implementation.vulkan_context, implementation.option, implementation.tile_gemm);
             // Plain BF16 rows are the only layout ncnn's Gemm can pack as-is.
             if (implementation.block_count == 0 && implementation.input_group_count == 1
                 && implementation.block_size == static_cast<uint64_t>(implementation.input_columns) * sizeof(uint16_t))

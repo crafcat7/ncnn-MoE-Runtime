@@ -1025,7 +1025,7 @@ static Result<uint64_t> gr_release_size(const MoeModelDescriptor& descriptor,
         }
         if (!release)
             continue;
-        // Match release_tensor_host_storage, not logical tensor dimensions:
+        // Match release_storage, not logical tensor dimensions:
         // auxiliary metadata and native non-Q8 blocks are never reclaimed.
         const uint64_t count = tensor.dtype == DType::Float32    ? tensor.float32_data.size()
                                : tensor.dtype == DType::BFloat16 ? tensor.bfloat16_data.size()

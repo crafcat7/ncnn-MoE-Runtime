@@ -43,6 +43,7 @@ layout(push_constant) uniform parameter
     uint position_offset;
     float rope_concentration;
     uint round_kv;
+    uint double_write;
 }
 p;
 
@@ -116,7 +117,7 @@ void main()
         const float stored_second = p.round_kv != 0u ? round_bf16(rotated_second) : rotated_second;
         buffer_st1(key_data, destination, stored_first);
         buffer_st1(key_data, destination + half_dimension, stored_second);
-        if (p.direct_ring != 0)
+        if (p.direct_ring != 0 && p.double_write != 0)
         {
             const uint duplicate = destination + p.ring_capacity * p.head_dimension;
             buffer_st1(key_data, duplicate, stored_first);
@@ -138,7 +139,7 @@ void main()
     const float value = fused_qkv_data[source];
     const float stored_value = p.round_kv != 0u ? round_bf16(value) : value;
     buffer_st1(value_data, destination, stored_value);
-    if (p.direct_ring != 0)
+    if (p.direct_ring != 0 && p.double_write != 0)
     {
         buffer_st1(value_data,
                    destination + p.ring_capacity * p.head_dimension,

@@ -40,6 +40,7 @@ layout(push_constant) uniform parameter
     uint source_start;
     uint copy_only;
     uint destination_fp32;
+    uint double_write;
 }
 p;
 
@@ -87,9 +88,12 @@ void main()
         value_float_data[destination_index] = value;
         return;
     }
-    const uint duplicate_index = destination_index + p.capacity * p.width;
     buffer_st1(destination_key_data, destination_index, key);
-    buffer_st1(destination_key_data, duplicate_index, key);
     buffer_st1(destination_value_data, destination_index, value);
-    buffer_st1(destination_value_data, duplicate_index, value);
+    if (p.double_write != 0)
+    {
+        const uint duplicate_index = destination_index + p.capacity * p.width;
+        buffer_st1(destination_key_data, duplicate_index, key);
+        buffer_st1(destination_value_data, duplicate_index, value);
+    }
 }

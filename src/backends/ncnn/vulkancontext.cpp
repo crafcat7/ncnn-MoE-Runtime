@@ -753,14 +753,12 @@ VulkanStatistics get_vulkan_statistics(const VulkanRuntimePtr& vulkan_runtime) n
     result.attention_device_rope_fusions = state.attention_device_rope_fusions.load();
     result.attention_qkv_ring_fusions = state.attention_qkv_ring_fusions.load();
     result.attention_decode_sdpa_fusions = state.attention_decode_sdpa_fusions.load();
-    result.attention_cache_materializations = state.attention_cache_materializations.load();
     result.attention_cpu_fallbacks = state.attention_cpu_fallbacks.load();
     result.shared_expert_swiglu_fusions = state.shared_expert_swiglu_fusions.load();
     result.gated_delta_fusions = state.gated_delta_fusions.load();
     result.gated_delta_submissions = state.gated_delta_submissions.load();
     result.rms_norm_linear_fusions = state.rms_norm_linear_fusions.load();
     result.kv_ring_appends = state.kv_ring_appends.load();
-    result.bfloat16_cooperative_matrix_dispatches = state.bfloat16_cooperative_matrix_dispatches.load();
     result.kv_ring_resizes = state.kv_ring_resizes.load();
     result.kv_ring_wrapped_views = state.kv_ring_wrapped_views.load();
     return result;

@@ -1,0 +1,169 @@
+#version 450
+
+// Split decode with subgroup reductions.
+//
+// Same split/merge contract as attention_decode_split.comp, but the QK dot,
+// block maximum and block sum reduce through 32-lane subgroup shuffles instead
+// of shared-memory barriers. One block covers 32 KV rows.
+
+#if ncnn_subgroup_basic && ncnn_subgroup_shuffle
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#endif
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer query_blob
+{
+    float query_data[];
+};
+layout(binding = 1) readonly buffer key_blob
+{
+    sfp key_data[];
+};
+layout(binding = 2) readonly buffer value_blob
+{
+    sfp value_data[];
+};
+layout(binding = 3) readonly buffer sink_blob
+{
+    float sink_data[];
+};
+layout(binding = 4) writeonly buffer partial_blob
+{
+    float partial_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint head_dimension;
+    uint destination_count;
+    uint head_count;
+    uint key_value_head_count;
+    uint query_cstep;
+    uint key_cstep;
+    uint value_cstep;
+    uint use_attention_sink;
+    float scale;
+    uint split_count;
+    uint split_tokens;
+}
+p;
+
+shared float cached_query[256];
+shared float scores[32];
+shared float weights[32];
+
+void main()
+{
+#if ncnn_subgroup_basic && ncnn_subgroup_shuffle
+    const uint lane = gl_LocalInvocationID.x;
+    const uint head = gl_WorkGroupID.z;
+    const uint split = gl_WorkGroupID.y;
+    if (head >= p.head_count || split >= p.split_count || p.split_tokens == 0)
+        return;
+    const uint split_begin = min(p.destination_count, split * p.split_tokens);
+    const uint split_end = min(p.destination_count, split_begin + p.split_tokens);
+    if (split_begin >= split_end)
+        return;
+
+    const uint heads_per_group = p.head_count / p.key_value_head_count;
+    const uint key_value_head = head / heads_per_group;
+    const uint query_base = head * p.query_cstep;
+    const uint key_base = key_value_head * p.key_cstep;
+    const uint value_base = key_value_head * p.value_cstep;
+    const uint token_lane = lane >> 3;
+    const uint dimension_lane = lane & 7u;
+
+    if (lane < p.head_dimension)
+        cached_query[lane] = query_data[query_base + lane];
+    barrier();
+
+    float maximum = -3.402823466e+38;
+    float denominator = 0.0;
+    float numerator = 0.0;
+
+    for (uint block = split_begin; block < split_end; block += 32)
+    {
+        const uint token = block + token_lane;
+        const bool valid_token = token < split_end;
+        const bool sink_token = p.use_attention_sink != 0 && token + 1 == p.destination_count;
+        float partial = 0.0;
+        if (valid_token && !sink_token)
+        {
+            for (uint dimension = dimension_lane; dimension < p.head_dimension; dimension += 8)
+                partial += cached_query[dimension]
+                           * buffer_ld1(key_data, key_base + token * p.head_dimension + dimension);
+        }
+        partial += subgroupShuffleXor(partial, 4u);
+        partial += subgroupShuffleXor(partial, 2u);
+        partial += subgroupShuffleXor(partial, 1u);
+        if (dimension_lane == 0)
+            scores[token_lane] = !valid_token ? -3.402823466e+38
+                                 : sink_token ? sink_data[head]
+                                              : partial * p.scale;
+        barrier();
+
+        const uint score_lane = gl_SubgroupInvocationID;
+        float block_maximum = scores[score_lane];
+        block_maximum = max(block_maximum, subgroupShuffleXor(block_maximum, 16u));
+        block_maximum = max(block_maximum, subgroupShuffleXor(block_maximum, 8u));
+        block_maximum = max(block_maximum, subgroupShuffleXor(block_maximum, 4u));
+        block_maximum = max(block_maximum, subgroupShuffleXor(block_maximum, 2u));
+        block_maximum = max(block_maximum, subgroupShuffleXor(block_maximum, 1u));
+        const float next_maximum = max(maximum, block_maximum);
+        const float previous_scale = denominator == 0.0 ? 0.0 : exp(maximum - next_maximum);
+        if (gl_SubgroupID == 0u)
+        {
+            const uint index = block + score_lane;
+            weights[score_lane] = index < split_end ? exp(scores[score_lane] - next_maximum) : 0.0;
+        }
+        barrier();
+        float block_sum = weights[score_lane];
+        block_sum += subgroupShuffleXor(block_sum, 16u);
+        block_sum += subgroupShuffleXor(block_sum, 8u);
+        block_sum += subgroupShuffleXor(block_sum, 4u);
+        block_sum += subgroupShuffleXor(block_sum, 2u);
+        block_sum += subgroupShuffleXor(block_sum, 1u);
+        denominator = denominator * previous_scale + block_sum;
+        maximum = next_maximum;
+
+        if (lane < p.head_dimension)
+        {
+            const uint value_count = min(32u, split_end - block);
+            const uint complete_values = value_count & ~3u;
+            float block_numerator = 0.0;
+            uint index = 0u;
+            for (; index < complete_values; index += 4u)
+            {
+                const float value0 = buffer_ld1(value_data, value_base + (block + index) * p.head_dimension + lane);
+                const float value1 = buffer_ld1(value_data, value_base + (block + index + 1u) * p.head_dimension + lane);
+                const float value2 = buffer_ld1(value_data, value_base + (block + index + 2u) * p.head_dimension + lane);
+                const float value3 = buffer_ld1(value_data, value_base + (block + index + 3u) * p.head_dimension + lane);
+                block_numerator += weights[index] * value0;
+                block_numerator += weights[index + 1u] * value1;
+                block_numerator += weights[index + 2u] * value2;
+                block_numerator += weights[index + 3u] * value3;
+            }
+            for (; index < value_count; ++index)
+            {
+                const uint value_token = block + index;
+                if (p.use_attention_sink == 0 || value_token + 1 != p.destination_count)
+                    block_numerator += weights[index]
+                                       * buffer_ld1(value_data, value_base + value_token * p.head_dimension + lane);
+            }
+            numerator = numerator * previous_scale + block_numerator;
+        }
+        barrier();
+    }
+
+    const uint row = (head * p.split_count + split) * (p.head_dimension + 2u);
+    if (lane < p.head_dimension)
+        partial_data[row + lane] = numerator;
+    if (lane == 0)
+    {
+        partial_data[row + p.head_dimension] = maximum;
+        partial_data[row + p.head_dimension + 1u] = denominator;
+    }
+#endif
+}

@@ -26,6 +26,7 @@ p;
 
 shared float merged_maximum;
 shared float merged_denominator;
+shared float split_scale[16];
 
 void main()
 {
@@ -34,33 +35,36 @@ void main()
     if (head >= p.head_count || p.split_count == 0)
         return;
 
-    float maximum = -3.402823466e+38;
-    for (uint split = 0; split < p.split_count; ++split)
-        maximum = max(maximum, partial_data[(head * p.split_count + split) * (p.head_dimension + 2u) + p.head_dimension]);
     if (lane == 0)
-        merged_maximum = maximum;
-    barrier();
-    maximum = merged_maximum;
-
-    float numerator = 0.0;
-    float denominator = 0.0;
-    for (uint split = 0; split < p.split_count; ++split)
     {
-        const uint row = (head * p.split_count + split) * (p.head_dimension + 2u);
-        const float split_maximum = partial_data[row + p.head_dimension];
-        if (split_maximum <= -3.402823466e+38)
-            continue;
-        const float split_scale = exp(split_maximum - maximum);
-        if (lane < p.head_dimension)
-            numerator += partial_data[row + lane] * split_scale;
-        if (lane == 0)
-            denominator += partial_data[row + p.head_dimension + 1u] * split_scale;
-    }
-    if (lane == 0)
+        float maximum = -3.402823466e+38;
+        for (uint split = 0; split < p.split_count; ++split)
+            maximum = max(maximum, partial_data[(head * p.split_count + split) * (p.head_dimension + 2u) + p.head_dimension]);
+        merged_maximum = maximum;
+        float denominator = 0.0;
+        for (uint split = 0; split < p.split_count; ++split)
+        {
+            const uint row = (head * p.split_count + split) * (p.head_dimension + 2u);
+            const float split_maximum = partial_data[row + p.head_dimension];
+            float scale = 0.0;
+            if (split_maximum > -3.402823466e+38)
+            {
+                scale = exp(split_maximum - maximum);
+                denominator += partial_data[row + p.head_dimension + 1u] * scale;
+            }
+            split_scale[split] = scale;
+        }
         merged_denominator = denominator;
+    }
     barrier();
+    float numerator = 0.0;
     if (lane < p.head_dimension)
     {
+        for (uint split = 0; split < p.split_count; ++split)
+        {
+            const uint row = (head * p.split_count + split) * (p.head_dimension + 2u);
+            numerator += partial_data[row + lane] * split_scale[split];
+        }
         const float sum = merged_denominator;
         output_data[head * p.head_dimension + lane] = sum == 0.0 ? 0.0 : numerator / sum;
     }
