@@ -368,15 +368,44 @@ void forward_embedding_row(const TensorData& embedding, uint32_t row_index, floa
     }
 }
 
-void forward_embedding(const TensorData& embedding, std::span<const int32_t> input_ids, ActivationBuffer& output)
+void forward_embedding(const TensorData& embedding, std::span<const int32_t> input_ids, ActivationBuffer& output, float scale)
 {
     assert(embedding.shape.size() == 2);
     output.reset(input_ids.size(), embedding.shape[1], false);
-    for (size_t token_index = 0; token_index < input_ids.size(); ++token_index)
+    const size_t rows = input_ids.size();
+    const uint64_t row_count = embedding.shape[0];
+    if (rows == 0)
+        return;
+    for (size_t token_index = 0; token_index < rows; ++token_index)
     {
-        if (input_ids[token_index] < 0)
+        const int32_t token = input_ids[token_index];
+        if (token < 0 || static_cast<uint64_t>(token) >= row_count)
             throw std::runtime_error("embedding token ID is out of range");
-        forward_embedding_row(embedding, static_cast<uint32_t>(input_ids[token_index]), output.row(token_index));
+    }
+    // Resolve the storage layout and dtype once outside the parallel region:
+    // a malformed table must fail cleanly instead of terminating inside OpenMP.
+    forward_embedding_row(embedding, static_cast<uint32_t>(input_ids[0]), output.row(0));
+    if (scale != 1.0f)
+        for (uint32_t column = 0; column < embedding.shape[1]; ++column)
+            output.row(0)[column] *= scale;
+    const uint32_t columns = embedding.shape[1];
+    // Only the plain float/bf16 tables are guaranteed not to raise from a row
+    // decode; quantized tables keep the serial loop so a corrupt row reports a
+    // normal error instead of terminating inside the parallel region.
+    const bool parallel_safe = embedding.dtype == DType::Float32 || embedding.dtype == DType::BFloat16;
+    const int threads = (parallel_safe && rows > 1)
+                            ? static_cast<int>(std::min<size_t>(rows, static_cast<size_t>(cpu_linear_num_threads())))
+                            : 1;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) num_threads(threads) if (threads > 1)
+#endif
+    for (int64_t token_index = 1; token_index < static_cast<int64_t>(rows); ++token_index)
+    {
+        float* row = output.row(static_cast<size_t>(token_index));
+        forward_embedding_row(embedding, static_cast<uint32_t>(input_ids[static_cast<size_t>(token_index)]), row);
+        if (scale != 1.0f)
+            for (uint32_t column = 0; column < columns; ++column)
+                row[column] *= scale;
     }
 }
 

@@ -1,5 +1,11 @@
 #version 450
 
+// Single-row dense projection (matvec). One workgroup owns one or two output
+// rows; every lane consumes four input values and four weights per step.
+// Activations and BF16 weights are read as aligned 16-byte / 8-byte vectors so
+// a step costs one input load and one weight load per lane instead of four
+// scalar input loads plus two weight loads.
+
 #if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
@@ -11,9 +17,9 @@ layout(constant_id = 1) const uint input_pack = 4;
 layout(constant_id = 2) const uint output_pack = 4;
 
 layout(binding = 0) readonly buffer input_blob
-{ float input_data[]; };
+{ uvec4 input_vectors[]; };
 layout(binding = 1) readonly buffer weight_blob
-{ uint weights[]; };
+{ uvec2 weight_pairs[]; };
 layout(binding = 2) readonly buffer bias_blob
 { float bias_data[]; };
 layout(binding = 3) writeonly buffer output_blob
@@ -27,36 +33,44 @@ layout(push_constant) uniform parameter
 }
 p;
 
+uint weight_word(uint index)
+{
+    const uvec2 pair = weight_pairs[index >> 1u];
+    return (index & 1u) == 0u ? pair.x : pair.y;
+}
+
 float matrix_weight(uint output_column, uint input_column)
 {
     if (weight_format == 1u)
     {
         const uint index = output_column * p.input_columns + input_column;
-        return uintBitsToFloat(((weights[index >> 1u] >> ((index & 1u) * 16u)) & 65535u) << 16u);
+        return uintBitsToFloat(((weight_word(index >> 1u) >> ((index & 1u) * 16u)) & 65535u) << 16u);
     }
     const uint tile = (output_column / output_pack) * (p.input_columns / input_pack)
                       + input_column / input_pack;
     const uint index = tile * input_pack * output_pack
                        + (output_column % output_pack) * input_pack
                        + input_column % input_pack;
-    return uintBitsToFloat(weights[index]);
+    return uintBitsToFloat(weight_word(index));
 }
 
 vec4 matrix_values(uint output_column, uint input_column)
 {
-    if (weight_format == 1u && input_column + 3u < p.input_columns)
+    if (weight_format == 1u && (p.input_columns & 3u) == 0u && input_column + 3u < p.input_columns)
     {
+        // Four consecutive BF16 weights are one aligned uvec2; the row start is
+        // a multiple of four columns for every supported projection shape.
         const uint index = output_column * p.input_columns + input_column;
-        const uint first = weights[index >> 1u];
-        const uint second = weights[(index + 2u) >> 1u];
-        return vec4(uintBitsToFloat((first & 65535u) << 16u), uintBitsToFloat(first & 0xffff0000u),
-                    uintBitsToFloat((second & 65535u) << 16u), uintBitsToFloat(second & 0xffff0000u));
+        const uvec2 pair = weight_pairs[index >> 2u];
+        return vec4(uintBitsToFloat((pair.x & 65535u) << 16u), uintBitsToFloat(pair.x & 0xffff0000u),
+                    uintBitsToFloat((pair.y & 65535u) << 16u), uintBitsToFloat(pair.y & 0xffff0000u));
     }
     if (weight_format == 0u && input_pack == 4u)
     {
         const uint tile = (output_column / output_pack) * (p.input_columns / 4u) + input_column / 4u;
         const uint index = tile * 4u * output_pack + (output_column % output_pack) * 4u;
-        return uintBitsToFloat(uvec4(weights[index], weights[index + 1u], weights[index + 2u], weights[index + 3u]));
+        return uintBitsToFloat(uvec4(weight_word(index), weight_word(index + 1u),
+                                     weight_word(index + 2u), weight_word(index + 3u)));
     }
     vec4 result = vec4(0.0);
     for (uint index = 0u; index < 4u; ++index)
@@ -77,11 +91,19 @@ void main()
     float sum1 = 0.0;
     for (uint column = lane * 4u; column < p.input_columns; column += 512u)
     {
-        vec4 input_values = vec4(0.0);
-        input_values.x = input_data[column];
-        if (column + 1u < p.input_columns) input_values.y = input_data[column + 1u];
-        if (column + 2u < p.input_columns) input_values.z = input_data[column + 2u];
-        if (column + 3u < p.input_columns) input_values.w = input_data[column + 3u];
+        vec4 input_values;
+        if (column + 3u < p.input_columns)
+        {
+            input_values = uintBitsToFloat(input_vectors[column >> 2u]);
+        }
+        else
+        {
+            const uvec4 tail = input_vectors[column >> 2u];
+            input_values = vec4(0.0);
+            input_values.x = uintBitsToFloat(tail.x);
+            if (column + 1u < p.input_columns) input_values.y = uintBitsToFloat(tail.y);
+            if (column + 2u < p.input_columns) input_values.z = uintBitsToFloat(tail.z);
+        }
         if (output_column < p.output_columns)
             sum0 += dot(matrix_values(output_column, column), input_values);
         if (second_output)

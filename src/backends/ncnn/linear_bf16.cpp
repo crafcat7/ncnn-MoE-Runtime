@@ -53,12 +53,14 @@
 #if NCNN_MOE_WITH_VULKAN
 #include "kernels/vulkan/projection_matvec.comp.hex.h"
 #include "kernels/vulkan/bfloat16_cooperative_projection.comp.hex.h"
+#include "kernels/vulkan/bfloat16_gemm_cm2.comp.hex.h"
 #include "kernels/vulkan/bfloat16_projection.comp.hex.h"
 #include "kernels/vulkan/bfloat16_rms_norm_projection.comp.hex.h"
 #include "kernels/vulkan/bfloat16_row_rms.comp.hex.h"
 #include "kernels/vulkan/bfloat16_swiglu_down.comp.hex.h"
 #include "kernels/vulkan/bfloat16_tile_64x64.comp.hex.h"
 #include "kernels/vulkan/bfloat16_tile_32x64.comp.hex.h"
+#include "kernels/vulkan/fp32_to_bf16.comp.hex.h"
 #endif
 #include "linear_impl.h"
 #include "linear_internal.h"
@@ -340,6 +342,249 @@ static bool create_bfloat16_swiglu_down_pipeline(const std::shared_ptr<VulkanCon
     context->cache_pipeline(bfloat16_swiglu_down_shader,
                             shader_variant,
                             destination);
+    return true;
+}
+
+static bool supports_gemm_cm2_shape(const ncnn::GpuInfo& info, uint32_t wg,
+                                    uint32_t bm, uint32_t bn, uint32_t bk) noexcept
+{
+    if (!info.support_VK_KHR_cooperative_matrix() || !info.support_bf16_storage()
+        || !info.support_VK_KHR_shader_bfloat16() || !info.support_bf16_cooperative_matrix()
+        || !info.support_VK_NV_cooperative_matrix2())
+        return false;
+    const auto& features = info.queryCooperativeMatrix2FeaturesNV();
+    const auto& properties = info.queryCooperativeMatrix2PropertiesNV();
+    if (!features.cooperativeMatrixWorkgroupScope
+        || !features.cooperativeMatrixFlexibleDimensions
+        || !features.cooperativeMatrixConversions
+        || !features.cooperativeMatrixPerElementOperations
+        || !features.cooperativeMatrixTensorAddressing
+        || properties.cooperativeMatrixWorkgroupScopeMaxWorkgroupSize < wg
+        || properties.cooperativeMatrixWorkgroupScopeReservedSharedMemory > info.max_shared_memory_size()
+        || properties.cooperativeMatrixFlexibleDimensionsMaxDimension < std::max({bm, bn, bk})
+        || info.max_workgroup_invocations() < wg
+        || info.max_workgroup_size_x() < wg
+        || (info.support_subgroup_ops() & VK_SUBGROUP_FEATURE_BASIC_BIT) == 0)
+        return false;
+    for (const auto& property : info.queryCooperativeMatrixFlexibleDimensionsSubPropertiesNV())
+    {
+        if (property.scope == VK_SCOPE_WORKGROUP_KHR
+            && property.workgroupInvocations == wg
+            && property.AType == VK_COMPONENT_TYPE_BFLOAT16_KHR
+            && property.BType == VK_COMPONENT_TYPE_BFLOAT16_KHR
+            && property.CType == VK_COMPONENT_TYPE_FLOAT32_KHR
+            && property.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR
+            && property.MGranularity != 0 && property.NGranularity != 0 && property.KGranularity != 0
+            && bm % property.MGranularity == 0 && bn % property.NGranularity == 0
+            && bk % property.KGranularity == 0)
+            return true;
+    }
+    return false;
+}
+
+bool create_cm2_gemm(const std::shared_ptr<VulkanContext>& context,
+                     const ncnn::Option& option,
+                     Cm2Gemm (&pipes)[4],
+                     bool bf16_out)
+{
+    if (!context)
+        return false;
+    ncnn::VulkanDevice* device = context->device();
+    if (device->info.subgroup_size() != 32)
+        return false;
+
+    ncnn::Option cast_opt = option;
+    cast_opt.use_fp16_packed = false;
+    cast_opt.use_fp16_storage = false;
+    cast_opt.use_fp16_arithmetic = false;
+    cast_opt.use_bf16_packed = false;
+    cast_opt.use_bf16_storage = false;
+    std::shared_ptr<ncnn::Pipeline> cast_pipeline;
+    if (!create_cached_pipeline(context, fp32_to_bf16_shader,
+                                static_cast<int>(sizeof(fp32_to_bf16_shader) - 1),
+                                cast_opt, 0, 0, 256, cast_pipeline))
+        return false;
+
+    struct geometry
+    {
+        uint32_t bm;
+        uint32_t bn;
+        uint32_t bk;
+        uint32_t wg;
+    };
+    const geometry geometries[4] = {
+        {128, 128, 64, 256},
+        {64, 128, 64, 128},
+        {64, 64, 64, 128},
+        {32, 64, 64, 128},
+    };
+
+    ncnn::Option compile_option = cast_opt;
+    compile_option.use_bf16_storage = true;
+    static const std::string bf16_out_shader = prefix_shader(bfloat16_gemm_cm2_shader,
+                                                             static_cast<int>(sizeof(bfloat16_gemm_cm2_shader) - 1),
+                                                             "#define NCNN_GEMM_CM2_BF16_OUT\n");
+    const char* shader_source = bf16_out ? bf16_out_shader.c_str() : bfloat16_gemm_cm2_shader;
+    const int shader_length = bf16_out ? static_cast<int>(bf16_out_shader.size())
+                                       : static_cast<int>(sizeof(bfloat16_gemm_cm2_shader) - 1);
+    const uint64_t source_variant = bf16_out ? UINT64_C(0x1000000000000000) : UINT64_C(0);
+
+    bool any = false;
+    for (size_t index = 0; index < 4; ++index)
+    {
+        geometry item = geometries[index];
+        if (!supports_gemm_cm2_shape(device->info, item.wg, item.bm, item.bn, item.bk))
+        {
+            if (supports_gemm_cm2_shape(device->info, item.wg, item.bm, item.bn, 32u))
+                item.bk = 32u;
+            else
+                continue;
+        }
+        const uint64_t variant = static_cast<uint64_t>(item.bm)
+                                 | (static_cast<uint64_t>(item.bn) << 16)
+                                 | (static_cast<uint64_t>(item.bk) << 32)
+                                 | (static_cast<uint64_t>(item.wg) << 48)
+                                 | source_variant;
+        std::vector<ncnn::vk_specialization_type> specs(3);
+        specs[0].u32 = item.bm;
+        specs[1].u32 = item.bn;
+        specs[2].u32 = item.bk;
+        if (!create_cached_pipeline(context, shader_source, shader_length, compile_option,
+                                    0, variant, static_cast<int>(item.wg), pipes[index].pipeline, specs, 32))
+            continue;
+        pipes[index].cast_pipeline = cast_pipeline;
+        pipes[index].bm = item.bm;
+        pipes[index].bn = item.bn;
+        pipes[index].bk = item.bk;
+        pipes[index].wg = item.wg;
+        any = true;
+    }
+    return any;
+}
+
+bool record_cm2_gemm(const Cm2Gemm (&pipes)[4],
+                     const ncnn::VkMat& in,
+                     const ncnn::VkMat& w,
+                     const ncnn::VkMat& bias,
+                     bool has_bias,
+                     ncnn::VkMat& out,
+                     const TileShape& shape,
+                     VulkanContext* context,
+                     ncnn::VkCompute& command,
+                     std::vector<ncnn::VkMat>& bindings,
+                     std::vector<ncnn::vk_constant_type>& constants,
+                     const ncnn::VkMat* res,
+                     bool* res_fused,
+                     bool out_bf16)
+{
+    const uint32_t stride = shape.stride != 0 ? shape.stride : shape.n;
+    const bool input_bf16 = in.elemsize == sizeof(uint16_t);
+    const bool input_f32 = in.elemsize == sizeof(float);
+    if (shape.rows < 8 || shape.k == 0 || shape.n == 0
+        || (shape.k & 1u) != 0 || shape.groups != 1
+        || stride < static_cast<uint64_t>(shape.offset) + shape.n
+        || in.empty() || in.dims != 2 || in.elempack != 1 || (!input_bf16 && !input_f32)
+        || in.w != static_cast<int>(shape.k) || in.h != static_cast<int>(shape.rows)
+        || in.cstep != static_cast<size_t>(in.w) * in.h
+        || out.empty() || out.dims != 2 || out.elempack != 1
+        || out.elemsize != (out_bf16 ? sizeof(uint16_t) : sizeof(float))
+        || out.w != static_cast<int>(stride) || out.h != static_cast<int>(shape.rows)
+        || w.empty() || bias.empty()
+        || w.buffer_capacity() < static_cast<uint64_t>(shape.k) * shape.n * sizeof(uint16_t)
+        || bias.buffer_capacity() < static_cast<uint64_t>(shape.n) * sizeof(float)
+        || out.buffer_capacity() < static_cast<uint64_t>(stride) * shape.rows * out.elemsize)
+        return false;
+
+    const Cm2Gemm* selected = nullptr;
+    if (shape.rows < 48 && pipes[3].pipeline)
+    {
+        selected = &pipes[3];
+    }
+    else
+    {
+        if (shape.rows >= 128 && pipes[0].pipeline)
+        {
+            const uint64_t bm0 = (shape.rows + pipes[0].bm - 1) / pipes[0].bm;
+            const uint64_t bn0 = (shape.n + pipes[0].bn - 1) / pipes[0].bn;
+            if (bm0 * bn0 >= 210)
+                selected = &pipes[0];
+        }
+        if (!selected && pipes[1].pipeline)
+        {
+            const uint64_t bm1 = (shape.rows + pipes[1].bm - 1) / pipes[1].bm;
+            const uint64_t bn1 = (shape.n + pipes[1].bn - 1) / pipes[1].bn;
+            if (bm1 * bn1 >= 140)
+                selected = &pipes[1];
+        }
+        if (!selected && pipes[2].pipeline)
+            selected = &pipes[2];
+        if (!selected && pipes[1].pipeline)
+            selected = &pipes[1];
+        if (!selected && pipes[0].pipeline)
+            selected = &pipes[0];
+        if (!selected && pipes[3].pipeline)
+            selected = &pipes[3];
+    }
+    if (!selected || !selected->pipeline)
+        return false;
+
+    const uint64_t blocks_m = (shape.rows + selected->bm - 1) / selected->bm;
+    const uint64_t blocks_n = (shape.n + selected->bn - 1) / selected->bn;
+    if (blocks_m * selected->wg > static_cast<uint64_t>(std::numeric_limits<int>::max())
+        || blocks_n > 65535u)
+        return false;
+
+    ncnn::VkMat mat_a_bf16 = in;
+    if (input_f32)
+    {
+        if (!selected->cast_pipeline || !context)
+            return false;
+        const uint64_t pair_count = (static_cast<uint64_t>(shape.rows) * shape.k) >> 1;
+        if (pair_count == 0 || pair_count > static_cast<uint64_t>(std::numeric_limits<int>::max()))
+            return false;
+        ncnn::VkMat converted = context->cm2_scratch(static_cast<int>(shape.k), static_cast<int>(shape.rows), sizeof(uint16_t));
+        if (converted.empty())
+            return false;
+        bindings.resize(2);
+        bindings[0] = in;
+        bindings[1] = converted;
+        constants.resize(1);
+        constants[0].u32 = static_cast<uint32_t>(pair_count);
+        ncnn::VkMat cast_dispatcher;
+        cast_dispatcher.w = static_cast<int>(pair_count);
+        cast_dispatcher.h = 1;
+        cast_dispatcher.c = 1;
+        command.record_pipeline_readonly(selected->cast_pipeline.get(), bindings, {1, 0}, constants, cast_dispatcher);
+        mat_a_bf16 = std::move(converted);
+    }
+
+    const bool has_res = !out_bf16 && res != nullptr && !res->empty()
+                         && res->dims == 2 && res->elempack == 1
+                         && res->elemsize == sizeof(float)
+                         && res->w == static_cast<int>(stride)
+                         && res->h == static_cast<int>(shape.rows);
+    bindings.resize(5);
+    bindings[0] = mat_a_bf16;
+    bindings[1] = w;
+    bindings[2] = bias;
+    bindings[3] = out;
+    bindings[4] = has_res ? *res : bias;
+    constants.resize(6);
+    constants[0].u32 = shape.rows;
+    constants[1].u32 = shape.n;
+    constants[2].u32 = shape.k;
+    constants[3].u32 = stride;
+    constants[4].u32 = shape.offset;
+    constants[5].u32 = (has_bias ? 1u : 0u) | (has_res ? 2u : 0u);
+    ncnn::VkMat dispatcher;
+    dispatcher.w = static_cast<int>(blocks_m * selected->wg);
+    dispatcher.h = static_cast<int>(blocks_n);
+    dispatcher.c = 1;
+    command.record_pipeline_readonly(selected->pipeline.get(), bindings,
+                                     {1, 0, 0, 0, has_res ? static_cast<unsigned char>(1) : static_cast<unsigned char>(0)},
+                                     constants, dispatcher);
+    if (res_fused && has_res)
+        *res_fused = true;
     return true;
 }
 
@@ -1054,7 +1299,17 @@ Bfloat16Linear_vulkan::create_with_allocator(const TensorData& matrix,
         for (uint32_t index = 0; index < output_columns; ++index)
             bias_values[index] = bfloat16_to_float(values[index]);
     }
+    implementation.has_nonzero_bias = false;
+    for (uint32_t index = 0; index < output_columns; ++index)
+    {
+        if (bias_values[index] != 0.0f)
+        {
+            implementation.has_nonzero_bias = true;
+            break;
+        }
+    }
 
+    bool cm2_ready = false;
     {
         const std::lock_guard<std::mutex> lock(implementation.vulkan_context->command_mutex());
         if (!create_bfloat16_projection_pipeline(implementation.vulkan_context,
@@ -1063,6 +1318,8 @@ Bfloat16Linear_vulkan::create_with_allocator(const TensorData& matrix,
         {
             return {};
         }
+        implementation.cm2_ok = create_cm2_gemm(implementation.vulkan_context, implementation.option, implementation.gemm_cm2);
+        cm2_ready = implementation.cm2_ok;
         (void)create_tile_gemm(implementation.vulkan_context, implementation.option, implementation.tile_gemm);
         if (!implementation.row_rms_scale_pipeline)
         {
@@ -1141,6 +1398,7 @@ Bfloat16Linear_vulkan::create_with_allocator(const TensorData& matrix,
     implementation.weight_staging_allocator.reset();
     if (!uploaded)
         return {};
+    if (!cm2_ready)
     {
         // Pipeline creation and the weight upload both submit through the shared
         // context; the QNK path takes this same lock.
@@ -1265,6 +1523,13 @@ bool Bfloat16Linear_vulkan::Implementation::record_projection(const ncnn::VkMat&
         record_matvec(single_row_pipeline.get(), true, input_columns, output_columns, true,
                       input, packed, bias, output, command);
         return false;
+    }
+    if (cm2_ok && activation_variant(option) == 0
+        && record_cm2_gemm(gemm_cm2, input, packed, bias, has_nonzero_bias, output,
+                           {token_count, input_columns, output_columns, output_columns, 0, 1},
+                           vulkan_context.get(), command, bindings, constants))
+    {
+        return true;
     }
     bindings.resize(4);
     bindings[0] = input;
@@ -1391,6 +1656,17 @@ void Bfloat16Linear_vulkan::record_scalar_projection(const ncnn::VkMat& input,
                       implementation.bias, output, cmd);
         return;
     }
+    if (implementation.cm2_ok && activation_variant(implementation.option) == 0)
+    {
+        std::vector<ncnn::VkMat> cm2_bindings;
+        std::vector<ncnn::vk_constant_type> cm2_constants;
+        if (record_cm2_gemm(implementation.gemm_cm2, input, implementation.packed,
+                            implementation.bias, implementation.has_nonzero_bias, output,
+                            {static_cast<uint32_t>(input.h), implementation.input_columns,
+                             implementation.output_columns, implementation.output_columns, 0, 1},
+                            implementation.vulkan_context.get(), cmd, cm2_bindings, cm2_constants))
+            return;
+    }
     if (implementation.coop_gemm && record_coop(input, output, cmd))
         return;
     const std::vector<ncnn::VkMat> bindings = {
@@ -1422,12 +1698,39 @@ void Bfloat16Linear_vulkan::record_scalar_projection(const ncnn::VkMat& input,
 #endif
 }
 
+bool Bfloat16Linear_vulkan::use_cm2() const noexcept
+{
+    const Implementation& impl = *d;
+    return impl.cm2_ok && activation_variant(impl.option) == 0;
+}
+
 void Bfloat16Linear_vulkan::record_norm_projection(const ncnn::VkMat& input,
                                                    ncnn::VkMat& output,
                                                    ncnn::VkCompute& cmd,
                                                    ncnn::VkMat* row_scale_workspace) const
 {
     const Implementation& implementation = *d;
+    if (row_scale_workspace && input.h >= 8 && implementation.cm2_ok
+        && activation_variant(implementation.option) == 0 && implementation.input_rms_norm)
+    {
+        ncnn::VkMat normalized;
+        const bool norm_ok = implementation.input_rms_norm->record(input, normalized, cmd, nullptr, nullptr, true)
+                             || record_input_normalization(input, normalized, cmd);
+        if (norm_ok && !normalized.empty())
+        {
+            *row_scale_workspace = normalized;
+            std::vector<ncnn::VkMat> cm2_bindings;
+            std::vector<ncnn::vk_constant_type> cm2_constants;
+            if (record_cm2_gemm(implementation.gemm_cm2, normalized, implementation.packed,
+                                implementation.bias, implementation.has_nonzero_bias, output,
+                                {static_cast<uint32_t>(input.h), implementation.input_columns,
+                                 implementation.output_columns, implementation.output_columns, 0, 1},
+                                implementation.vulkan_context.get(), cmd, cm2_bindings, cm2_constants))
+            {
+                return;
+            }
+        }
+    }
     if (implementation.coop_gemm && record_coop(input, output, cmd, true))
         return;
     record_rms_norm_projection(input, output, cmd, row_scale_workspace);
@@ -1529,6 +1832,17 @@ int Bfloat16Linear_vulkan::forward(const ncnn::VkMat& input,
     }
     // Prefill takes the cooperative-matrix Gemm when the weights and shape fit;
     // this is the same reuse record_scalar_projection already applies.
+    if (implementation.cm2_ok && activation_variant(implementation.option) == 0)
+    {
+        std::vector<ncnn::VkMat> cm2_bindings;
+        std::vector<ncnn::vk_constant_type> cm2_constants;
+        if (record_cm2_gemm(implementation.gemm_cm2, input, implementation.packed,
+                            implementation.bias, implementation.has_nonzero_bias, output,
+                            {static_cast<uint32_t>(input.h), implementation.input_columns,
+                             implementation.output_columns, implementation.output_columns, 0, 1},
+                            implementation.vulkan_context.get(), cmd, cm2_bindings, cm2_constants))
+            return 0;
+    }
     if (implementation.coop_gemm && record_coop(input, output, cmd))
         return 0;
     if (implementation.record_tile(input, output, static_cast<uint32_t>(input.h),
@@ -1648,12 +1962,12 @@ bool Bfloat16Linear_vulkan::forward(const ActivationBuffer& input,
 
     std::vector<ncnn::VkMat> bindings;
     std::vector<ncnn::vk_constant_type> constants;
-    const bool used_cooperative_matrix = implementation.record_projection(input_gpu,
-                                                                          output_gpu,
-                                                                          static_cast<uint32_t>(input.rows()),
-                                                                          command,
-                                                                          bindings,
-                                                                          constants);
+    (void)implementation.record_projection(input_gpu,
+                                           output_gpu,
+                                           static_cast<uint32_t>(input.rows()),
+                                           command,
+                                           bindings,
+                                           constants);
     if ((!direct_host_output
          && !record_staging_download(output_gpu,
                                      input.rows(),
@@ -1673,9 +1987,6 @@ bool Bfloat16Linear_vulkan::forward(const ActivationBuffer& input,
     ++runtime_state.compute_submissions;
     ++runtime_state.batch_uploads;
     ++runtime_state.batch_downloads;
-    if (used_cooperative_matrix)
-    {
-    }
     return true;
 #else
     (void)input;
@@ -1823,9 +2134,9 @@ bool Bfloat16Linear_vulkan::forward_parallel(const ActivationBuffer& input,
     ++runtime_state.compute_submissions;
     ++runtime_state.batch_uploads;
     runtime_state.batch_downloads += 2;
-    if (first_used_cooperative_matrix)
-        if (parallel_used_cooperative_matrix)
-            return true;
+    (void)first_used_cooperative_matrix;
+    (void)parallel_used_cooperative_matrix;
+    return true;
 #else
     (void)input;
     (void)parallel_operator;
@@ -1937,12 +2248,12 @@ bool Bfloat16Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
 
     std::vector<ncnn::VkMat> bindings(4);
     std::vector<ncnn::vk_constant_type> constants(5);
-    const bool used_cooperative_matrix = first.record_projection(input_gpu,
-                                                                 fused_gpu,
-                                                                 static_cast<uint32_t>(input.rows()),
-                                                                 command,
-                                                                 bindings,
-                                                                 constants);
+    (void)first.record_projection(input_gpu,
+                                  fused_gpu,
+                                  static_cast<uint32_t>(input.rows()),
+                                  command,
+                                  bindings,
+                                  constants);
 
     bindings = {
         fused_gpu,
@@ -1986,9 +2297,6 @@ bool Bfloat16Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
     ++runtime_state.compute_submissions;
     ++runtime_state.batch_uploads;
     ++runtime_state.batch_downloads;
-    if (used_cooperative_matrix)
-    {
-    }
     return true;
 #else
     (void)input;
@@ -2019,6 +2327,9 @@ std::vector<uint64_t> Bfloat16Linear_vulkan::swiglu_scratch_elements(uint32_t in
     if (!swiglu_shape(intermediate_columns, router_gate, rows, fused_columns))
         return intermediate_columns == 0 || rows == 0 ? std::vector<uint64_t>{}
                                                       : std::vector<uint64_t>{UINT64_MAX};
+    if (rows >= 16)
+        return {saturating_multiply_u64(fused_columns, rows),
+                saturating_multiply_u64(intermediate_columns, rows)};
     return {saturating_multiply_u64(fused_columns, rows)};
 }
 
@@ -2029,10 +2340,63 @@ bool Bfloat16Linear_vulkan::record_swiglu_chain(const ncnn::VkMat& input,
                                                 float activation_limit, bool apply_router_gate,
                                                 ncnn::VkMat& output, ncnn::VkCompute& command,
                                                 std::vector<ncnn::VkMat>& workspace,
-                                                FfnRecordStatistics_vulkan& statistics) const
+                                                FfnRecordStatistics_vulkan& statistics,
+                                                const ncnn::VkMat* res,
+                                                bool* res_fused) const
 {
+    if (res_fused)
+        *res_fused = false;
     const auto& first = *d;
     const auto& down = *down_operator.d;
+    const bool use_cm2_prefill = input.h >= 16
+                                 && down.cm2_ok
+                                 && activation_variant(first.option) == 0
+                                 && (!apply_router_gate || !down.has_nonzero_bias)
+                                 && (first.swiglu_pipe
+                                     || create_qnk_swiglu_pipe(first.vulkan_context,
+                                                               first.option,
+                                                               first.swiglu_pipe,
+                                                               true));
+    if (use_cm2_prefill)
+    {
+        workspace.reserve(workspace.size() + 3);
+        ncnn::VkMat fused, activated, result;
+        fused.create(static_cast<int>(first.output_columns), input.h, sizeof(float), first.vulkan_context->blob_allocator());
+        activated.create(static_cast<int>(intermediate_columns), input.h, sizeof(uint16_t), 1,
+                         first.vulkan_context->blob_allocator());
+        result.create(static_cast<int>(down.output_columns), input.h, sizeof(float), first.vulkan_context->blob_allocator());
+        if (fused.empty() || activated.empty() || result.empty()) return false;
+        workspace.push_back(fused);
+        workspace.push_back(activated);
+        workspace.push_back(result);
+        std::vector<ncnn::VkMat> bindings;
+        std::vector<ncnn::vk_constant_type> constants;
+        (void)first.record_projection(input, fused, static_cast<uint32_t>(input.h), command, bindings, constants);
+
+        bindings.resize(3);
+        bindings[0] = fused;
+        bindings[1] = activated;
+        bindings[2] = fused;
+        constants.resize(5);
+        constants[0].u32 = intermediate_columns;
+        constants[1].u32 = static_cast<uint32_t>(input.h);
+        constants[2].u32 = activation == ExpertActivation::GeluTanh ? 3u : 1u;
+        constants[3].f = activation == ExpertActivation::DeepSeekSwiGlu ? activation_limit : 0.0f;
+        constants[4].u32 = apply_router_gate ? 3u : 1u;
+        ncnn::VkMat swiglu_dispatcher;
+        swiglu_dispatcher.w = static_cast<int>(intermediate_columns >> 1);
+        swiglu_dispatcher.h = input.h;
+        swiglu_dispatcher.c = 1;
+        command.record_pipeline_readonly(first.swiglu_pipe.get(), bindings, {1, 0, 1}, constants, swiglu_dispatcher);
+
+        if (!record_cm2_gemm(down.gemm_cm2, activated, down.packed, down.bias, down.has_nonzero_bias,
+                             result, {static_cast<uint32_t>(input.h), down.input_columns, down.output_columns, down.output_columns, 0, 1},
+                             first.vulkan_context.get(), command, bindings, constants, res, res_fused))
+            return false;
+        output = result;
+        statistics.dispatches += 3;
+        return true;
+    }
     if (!first.swiglu_down_pipeline
         && !create_bfloat16_swiglu_down_pipeline(first.vulkan_context, first.option, first.swiglu_down_pipeline))
         return false;
@@ -2482,15 +2846,13 @@ bool Bfloat16Expert_vulkan::forward_batch(std::span<const Bfloat16Expert_vulkan*
         if (fused_gpu.empty())
             return false;
 
-        const bool used_cooperative_matrix = gate.record_projection(input_view,
-                                                                    fused_gpu,
-                                                                    static_cast<uint32_t>(rows),
-                                                                    command,
-                                                                    bindings,
-                                                                    constants);
-        if (used_cooperative_matrix)
-
-            bindings[0] = fused_gpu;
+        (void)gate.record_projection(input_view,
+                                     fused_gpu,
+                                     static_cast<uint32_t>(rows),
+                                     command,
+                                     bindings,
+                                     constants);
+        bindings[0] = fused_gpu;
         bindings[1] = down.packed;
         bindings[2] = down.bias;
         bindings[3] = output_view;

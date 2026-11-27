@@ -36,11 +36,14 @@ public:
                                                                   const ExpertPlan& ffn);
     [[nodiscard]] const std::shared_ptr<VulkanContext>& context() const noexcept;
 #if NCNN_MOE_WITH_VULKAN
+    [[nodiscard]] bool use_cm2() const noexcept;
     // Caller holds the context lock and retains input/output/workspace and
     // this adapter until completion or command reset. Never submits or waits.
     [[nodiscard]] bool record(const ncnn::VkMat& normalized, ncnn::VkMat& output,
                               ncnn::VkCompute& command, std::vector<ncnn::VkMat>& workspace,
-                              FfnRecordStatistics_vulkan& statistics) const;
+                              FfnRecordStatistics_vulkan& statistics,
+                              const ncnn::VkMat* res = nullptr,
+                              bool* res_fused = nullptr) const;
 #endif
 private:
     class Implementation;

@@ -1,0 +1,111 @@
+#version 450
+
+// Vectorized dense decode projection for BF16 rows: one warp per output row,
+// four rows per 128-thread workgroup, four columns per lane. The QnK projection
+// shader decodes BF16 one 16-bit word at a time; this kernel reads one aligned
+// 8-byte weight pair and one 16-byte activation vector per lane and converts
+// four values at once. The body consumes four pairs per step so a warp streams
+// 1 KiB of weights from independent loads.
+
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer input_blob
+{
+    vec4 input_vectors[];
+};
+layout(binding = 1) readonly buffer weight_blob
+{
+    uvec2 weight_pairs[];
+};
+layout(binding = 2) readonly buffer bias_blob
+{
+    float bias_data[];
+};
+layout(binding = 3) writeonly buffer output_blob
+{
+    float output_data[];
+};
+layout(binding = 4) readonly buffer residual_blob
+{
+    float residual_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint input_columns;
+    uint output_columns;
+    uint block_count;
+    uint token_count;
+    uint block_bytes;
+    uint group_size;
+    uint group_count;
+    uint scales_offset;
+    uint zeros_offset;
+    uint groups_offset;
+    uint columns_offset;
+    uint output_stride;
+    uint output_column_offset;
+    uint input_group_count;
+    uint add_residual;
+}
+p;
+
+const uint rows_per_workgroup = 4u;
+
+vec4 bf16x4(uvec2 pair)
+{
+    return vec4(uintBitsToFloat((pair.x & 65535u) << 16u),
+                uintBitsToFloat(pair.x & 0xffff0000u),
+                uintBitsToFloat((pair.y & 65535u) << 16u),
+                uintBitsToFloat(pair.y & 0xffff0000u));
+}
+
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x & 31u;
+    const uint output_column = gl_WorkGroupID.x * rows_per_workgroup + (gl_LocalInvocationID.x >> 5u);
+    if (output_column >= p.output_columns)
+        return;
+
+    const uint row_pairs = output_column * (p.input_columns >> 2u);
+    float sum = 0.0;
+    // Four pairs per lane per step, then two, then one for the tail.
+    uint base = 0u;
+    for (; base + 512u <= p.input_columns; base += 512u)
+    {
+        const uint lane_pair = (base >> 2u) + lane * 4u;
+        sum += dot(bf16x4(weight_pairs[row_pairs + lane_pair]), input_vectors[lane_pair]);
+        sum += dot(bf16x4(weight_pairs[row_pairs + lane_pair + 1u]), input_vectors[lane_pair + 1u]);
+        sum += dot(bf16x4(weight_pairs[row_pairs + lane_pair + 2u]), input_vectors[lane_pair + 2u]);
+        sum += dot(bf16x4(weight_pairs[row_pairs + lane_pair + 3u]), input_vectors[lane_pair + 3u]);
+    }
+    for (; base + 256u <= p.input_columns; base += 256u)
+    {
+        const uint lane_pair = (base >> 2u) + lane * 2u;
+        sum += dot(bf16x4(weight_pairs[row_pairs + lane_pair]), input_vectors[lane_pair]);
+        sum += dot(bf16x4(weight_pairs[row_pairs + lane_pair + 1u]), input_vectors[lane_pair + 1u]);
+    }
+    for (; base < p.input_columns; base += 128u)
+    {
+        const uint lane_pair = (base >> 2u) + lane;
+        sum += dot(bf16x4(weight_pairs[row_pairs + lane_pair]), input_vectors[lane_pair]);
+    }
+
+    float total = 0.0;
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    total = subgroupAdd(sum);
+#endif
+    if (lane == 0u)
+    {
+        const uint out_idx = p.output_column_offset + output_column;
+        float result = total + bias_data[output_column];
+        if (p.add_residual != 0u)
+            result += residual_data[out_idx];
+        output_data[out_idx] = result;
+    }
+}

@@ -71,6 +71,43 @@ struct TileGemm
     uint32_t wg = 0; // workgroup size
 };
 
+// Native NV cooperative_matrix2 BF16 GEMM geometries (BF16 in, packed BF16 weights, FP32 out).
+struct Cm2Gemm
+{
+    std::shared_ptr<ncnn::Pipeline> pipeline;
+    std::shared_ptr<ncnn::Pipeline> cast_pipeline;
+    uint32_t bm = 0;
+    uint32_t bn = 0;
+    uint32_t bk = 0;
+    uint32_t wg = 0;
+};
+
+[[nodiscard]] bool create_cm2_gemm(const std::shared_ptr<VulkanContext>& context,
+                                   const ncnn::Option& option,
+                                   Cm2Gemm (&pipes)[4],
+                                   bool bf16_out = false);
+
+[[nodiscard]] bool record_cm2_gemm(const Cm2Gemm (&pipes)[4],
+                                   const ncnn::VkMat& in,
+                                   const ncnn::VkMat& w,
+                                   const ncnn::VkMat& bias,
+                                   bool has_bias,
+                                   ncnn::VkMat& out,
+                                   const struct TileShape& shape,
+                                   VulkanContext* context,
+                                   ncnn::VkCompute& cmd,
+                                   std::vector<ncnn::VkMat>& bindings,
+                                   std::vector<ncnn::vk_constant_type>& constants,
+                                   const ncnn::VkMat* res = nullptr,
+                                   bool* res_fused = nullptr,
+                                   bool out_bf16 = false);
+
+[[nodiscard]] bool create_qnk_swiglu_pipe(const std::shared_ptr<VulkanContext>& context,
+                                          const ncnn::Option& option,
+                                          std::shared_ptr<ncnn::Pipeline>& destination,
+                                          bool bf16_out = false,
+                                          bool bf16_in = false);
+
 // Builds ncnn's cooperative-matrix Gemm for plain BF16 rows: it packs the weights
 // itself and runs FP16 storage with FP32 accumulate, which is the default prefill
 // path. An optional per-output bias is folded into the Gemm operand so the

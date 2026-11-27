@@ -16,10 +16,10 @@ layout(constant_id = 1) const uint KV_TILE = 32;
 layout(constant_id = 2) const uint HEAD_DIM = 64;
 layout(constant_id = 3) const uint KV_BFLOAT16_STORAGE = 1;
 
-// Hardware matrix tiles and online reduction blocks are independent. Keep
-// softmax/value updates at 16 tokens while using the supported 32-column
-// cooperative tile; the remaining columns are masked to contribute zero.
-const uint LOGICAL_KV_TILE = 16;
+// The softmax and value updates run on the full cooperative tile. Earlier
+// variants cut the logical tile to half the tensor width, which doubled the
+// number of iterations and the per-element work for no accuracy gain.
+const uint LOGICAL_KV_TILE = KV_TILE;
 
 layout(binding = 0) readonly buffer query_blob
 { float query_data[]; };

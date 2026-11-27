@@ -229,6 +229,11 @@ bool AttentionDecodeVulkan::record(const AttentionDecodePlan& plan,
     return true;
 }
 
+uint32_t query_attention_device_parallelism(const ncnn::GpuInfo& info)
+{
+    return query_device_parallelism(info);
+}
+
 } // namespace moe
 } // namespace ncnn
 #endif

@@ -286,17 +286,11 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
             // the selected prefix is truncated below.
             model.gpu_expert_bank_plans = plans;
             // Layers per resident command buffer = resident_submission_rows / rows.
-            // Merging layers removes one fence wait per layer but grows the graph
-            // memory plan; past the plan's limit the submission falls off a cliff,
-            // so the default keeps a margin and the knob tunes it per model.
-            //
-            // The plan below models (prefill_rows * layers) tokens recorded one
-            // layer per submission, while execution records prefill_rows tokens with
-            // `layers` layers per submission. Every per-layer scratch buffer scales
-            // with rows, so the candidate bounds the execution peak (and exceeds it
-            // for context-dependent buffers); row-independent per-layer scratch
-            // would break that bound.
-            uint32_t layers = 8;
+            // Plan against base_rows directly: append_graph_region_memory already
+            // derives each chunk's layer grouping from resident_submission_rows,
+            // so passing resident_submission_rows as prefill_rows would reserve
+            // a fictitious (base_rows * layers)-row LM-head and scratch arena.
+            uint32_t layers = static_cast<uint32_t>(std::min<size_t>(32u, std::max<size_t>(1u, plans.size())));
             const uint32_t base_rows = std::max(1u, prefill_rows);
             for (;;)
             {
@@ -305,7 +299,7 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
                                                      : base_rows;
                 // The plan grows with the grouping, so verify it still fits this
                 // device and step back instead of degrading silently.
-                const auto planned = plan_model_graph_memory(model, model.resident_submission_rows,
+                const auto planned = plan_model_graph_memory(model, base_rows,
                                                              std::max(1u, model.opt.num_concurrent_sessions));
                 if (planned)
                 {
@@ -331,7 +325,7 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
                     break;
                 layers /= 2;
             }
-            auto graph = plan_model_graph_memory(model, model.resident_submission_rows, std::max(1u, model.opt.num_concurrent_sessions));
+            auto graph = plan_model_graph_memory(model, base_rows, std::max(1u, model.opt.num_concurrent_sessions));
             if (!graph) return graph.error();
             auto candidate = model.memory_plan.gpu_devices;
             auto resource = std::find_if(candidate.begin(), candidate.end(), [&](const auto& item) { return item.initial.device_index == device; });
@@ -411,7 +405,7 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
                 // no partially prepared bank is changed to streaming/CPU.
                 model.memory_plan.gpu_devices = std::move(candidate);
                 model.gpu_expert_bank_plans = plans;
-                auto prepared = prepare_graph(model, model.resident_submission_rows, std::move(graph).value());
+                auto prepared = prepare_graph(model, base_rows, std::move(graph).value());
                 if (!prepared) return prepared.error();
                 const auto live = bank_live_resources(model, device);
                 if (live.heap_usage > live.heap_budget || bank_total > live.heap_budget - live.heap_usage)

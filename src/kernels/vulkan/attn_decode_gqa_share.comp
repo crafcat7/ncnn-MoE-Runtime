@@ -1,0 +1,435 @@
+#version 450
+
+// Fused GQA split decode: one warp owns one KV head and one slice of the cache,
+// and evaluates every query head of that KV group against the same K/V rows.
+//
+// Two lane mappings share one K/V stream:
+//   * QK reads eight head-dimension values per lane (one aligned 16-byte pair),
+//     with HEAD_DIM/8 lanes cooperating on one token, then reduces with three
+//     subgroup shuffles. Four tokens are in flight per warp for the 64-wide
+//     heads this path selects.
+//   * PV keeps one lane per output dimension and broadcasts the per-token
+//     softmax weight, so the numerator update needs no cross-lane reduction.
+// This removes the per-query-head cache re-read of the older kernels (the cache
+// is streamed once per KV head) while keeping the score reduction to one shuffle
+// series per token instead of one per query head and token.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic && ncnn_subgroup_shuffle
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#endif
+
+// Head dimension and query heads per KV head are template parameters.
+#ifndef HEAD_DIM
+#define HEAD_DIM 64
+#endif
+#ifndef RATIO
+#define RATIO 4
+#endif
+#ifndef Q_DIMS
+#define Q_DIMS 8
+#endif
+#define LANES_PER_TOKEN (HEAD_DIM / Q_DIMS)
+#define TOKENS          (32 / LANES_PER_TOKEN)
+// One lane owns HEAD_DIM/32 output dimensions for the PV product.
+#define OUT_DIMS (HEAD_DIM / 32)
+// One warp owns the whole query group so the cache is streamed exactly once
+// per KV head; extra splits provide the parallelism instead of extra warps.
+#define HEAD_CHUNK     RATIO
+#define WARPS_PER_TASK ((RATIO + HEAD_CHUNK - 1) / HEAD_CHUNK)
+
+layout(binding = 0) readonly buffer query_blob
+{
+    vec4 query_data[];
+};
+layout(binding = 1) readonly buffer key_blob
+{
+    uvec2 key_pairs[];
+};
+layout(binding = 2) readonly buffer value_blob
+{
+    uvec2 value_pairs[];
+};
+layout(binding = 3) readonly buffer sink_blob
+{
+    float sink_data[];
+};
+layout(binding = 4) writeonly buffer partial_blob
+{
+    float partial_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint head_dimension;
+    uint destination_count;
+    uint head_count;
+    uint key_value_head_count;
+    uint query_cstep;
+    uint key_cstep;
+    uint value_cstep;
+    uint use_attention_sink;
+    float scale;
+    uint split_count;
+    uint split_tokens;
+}
+p;
+
+const float LOG2E = 1.4426950408889634;
+const float LN2 = 0.6931471805599453;
+
+vec2 unpack2(uint word)
+{
+#if NCNN_bf16_storage
+    return vec2(uintBitsToFloat((word & 65535u) << 16u),
+                uintBitsToFloat(word & 0xffff0000u));
+#else
+    return unpackHalf2x16(word);
+#endif
+}
+
+vec4 unpack4(uvec2 pair)
+{
+#if NCNN_bf16_storage
+    return vec4(uintBitsToFloat((pair.x & 65535u) << 16u),
+                uintBitsToFloat(pair.x & 0xffff0000u),
+                uintBitsToFloat((pair.y & 65535u) << 16u),
+                uintBitsToFloat(pair.y & 0xffff0000u));
+#else
+    return vec4(unpackHalf2x16(pair.x), unpackHalf2x16(pair.y));
+#endif
+}
+
+void main()
+{
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic && ncnn_subgroup_shuffle
+    const uint lane = gl_SubgroupInvocationID;
+    const uint task = gl_WorkGroupID.x * 4u + gl_SubgroupID;
+    if (task >= p.key_value_head_count * p.split_count)
+        return;
+    const uint warp_in_task = task % WARPS_PER_TASK;
+    const uint base_task = task / WARPS_PER_TASK;
+    const uint kv = base_task % p.key_value_head_count;
+    const uint split = base_task / p.key_value_head_count;
+    if (split >= p.split_count || p.split_tokens == 0)
+        return;
+    // The pipeline variant is selected for this exact grouping; reject a shape
+    // mismatch instead of writing partials the merge pass would misread.
+    if (p.head_count != p.key_value_head_count * RATIO || p.head_dimension != HEAD_DIM)
+        return;
+    const uint head_start = warp_in_task * HEAD_CHUNK;
+
+    const uint split_begin = min(p.destination_count, split * p.split_tokens);
+    const uint split_end = min(p.destination_count, split_begin + p.split_tokens);
+    if (split_begin >= split_end)
+        return;
+
+    const uint token_lane = lane / LANES_PER_TOKEN;
+    const uint q_offset = (lane % LANES_PER_TOKEN) * Q_DIMS;
+    const uint out_offset = lane * OUT_DIMS;
+    const uint head_base = kv * RATIO;
+    // Vector indexes count four 16-bit values (one uvec2) or four floats.
+    const uint query_vec_stride = p.query_cstep >> 2u;
+    const uint query_vec_base = (head_base * p.query_cstep >> 2u) + (q_offset >> 2u);
+    const uint key_vec_base = (kv * p.key_cstep >> 2u) + (q_offset >> 2u);
+    const uint value_vec_base = (kv * p.value_cstep >> 2u);
+    const uint token_vec_stride = p.head_dimension >> 2u;
+    const uint last_token = split_end - 1u;
+    // The sink row is fixed for the whole scan; keep the test out of the fast loop.
+    const uint sink_token = p.use_attention_sink != 0 ? p.destination_count - 1u : 0xffffffffu;
+    const uint safe_end = min(split_end, sink_token);
+    const uint fast_end = safe_end >= split_begin + TOKENS
+                              ? split_begin + ((safe_end - split_begin) / TOKENS) * TOKENS
+                              : split_begin;
+    const float q_scale = p.scale * LOG2E;
+    const uint lane_half = lane >> 1u;
+    const uint lane_odd = lane & 1u;
+
+    float query[HEAD_CHUNK][Q_DIMS];
+    for (uint h = 0; h < HEAD_CHUNK; ++h)
+    {
+        const uint head = head_start + h;
+        if (head >= RATIO)
+            break;
+        const uint base = query_vec_base + head * query_vec_stride;
+#if Q_DIMS == 16
+        const vec4 q0 = query_data[base] * q_scale;
+        const vec4 q1 = query_data[base + 1u] * q_scale;
+        const vec4 q2 = query_data[base + 2u] * q_scale;
+        const vec4 q3 = query_data[base + 3u] * q_scale;
+        query[h][0] = q0.x;
+        query[h][1] = q0.y;
+        query[h][2] = q0.z;
+        query[h][3] = q0.w;
+        query[h][4] = q1.x;
+        query[h][5] = q1.y;
+        query[h][6] = q1.z;
+        query[h][7] = q1.w;
+        query[h][8] = q2.x;
+        query[h][9] = q2.y;
+        query[h][10] = q2.z;
+        query[h][11] = q2.w;
+        query[h][12] = q3.x;
+        query[h][13] = q3.y;
+        query[h][14] = q3.z;
+        query[h][15] = q3.w;
+#else
+        const vec4 low = query_data[base] * q_scale;
+        const vec4 high = query_data[base + 1u] * q_scale;
+        query[h][0] = low.x;
+        query[h][1] = low.y;
+        query[h][2] = low.z;
+        query[h][3] = low.w;
+        query[h][4] = high.x;
+        query[h][5] = high.y;
+        query[h][6] = high.z;
+        query[h][7] = high.w;
+#endif
+    }
+
+    float maximum[HEAD_CHUNK];
+    float denominator[HEAD_CHUNK];
+    float numerator[HEAD_CHUNK][OUT_DIMS];
+    for (uint h = 0; h < HEAD_CHUNK; ++h)
+    {
+        maximum[h] = -3.402823466e+38;
+        denominator[h] = 0.0;
+        for (uint j = 0; j < OUT_DIMS; ++j)
+            numerator[h][j] = 0.0;
+    }
+
+    // Fast interior loop: every token in [block, block + TOKENS) is valid and non-sink.
+    for (uint block = split_begin; block < fast_end; block += TOKENS)
+    {
+        const uint key_index = key_vec_base + (block + token_lane) * token_vec_stride;
+#if Q_DIMS == 16
+        const vec4 key0 = unpack4(key_pairs[key_index]);
+        const vec4 key1 = unpack4(key_pairs[key_index + 1u]);
+        const vec4 key2 = unpack4(key_pairs[key_index + 2u]);
+        const vec4 key3 = unpack4(key_pairs[key_index + 3u]);
+#else
+        const vec4 key_low = unpack4(key_pairs[key_index]);
+        const vec4 key_high = unpack4(key_pairs[key_index + 1u]);
+#endif
+
+        float value_block[TOKENS][OUT_DIMS];
+        for (uint t = 0; t < TOKENS; ++t)
+        {
+            const uint base = value_vec_base + (block + t) * token_vec_stride;
+#if OUT_DIMS == 2
+            const uvec2 pair = value_pairs[base + lane_half];
+            const vec2 v = unpack2(lane_odd == 0u ? pair.x : pair.y);
+            value_block[t][0] = v.x;
+            value_block[t][1] = v.y;
+#elif OUT_DIMS == 4
+            const vec4 value = unpack4(value_pairs[base + lane]);
+            value_block[t][0] = value.x;
+            value_block[t][1] = value.y;
+            value_block[t][2] = value.z;
+            value_block[t][3] = value.w;
+#else
+            const vec4 value_low = unpack4(value_pairs[base + lane * 2u]);
+            const vec4 value_high = unpack4(value_pairs[base + lane * 2u + 1u]);
+            value_block[t][0] = value_low.x;
+            value_block[t][1] = value_low.y;
+            value_block[t][2] = value_low.z;
+            value_block[t][3] = value_low.w;
+            value_block[t][4] = value_high.x;
+            value_block[t][5] = value_high.y;
+            value_block[t][6] = value_high.z;
+            value_block[t][7] = value_high.w;
+#endif
+        }
+
+        for (uint h = 0; h < HEAD_CHUNK; ++h)
+        {
+#if Q_DIMS == 16
+            float qk = dot(vec4(query[h][0], query[h][1], query[h][2], query[h][3]), key0)
+                       + dot(vec4(query[h][4], query[h][5], query[h][6], query[h][7]), key1)
+                       + dot(vec4(query[h][8], query[h][9], query[h][10], query[h][11]), key2)
+                       + dot(vec4(query[h][12], query[h][13], query[h][14], query[h][15]), key3);
+#else
+            float qk = query[h][0] * key_low.x + query[h][1] * key_low.y + query[h][2] * key_low.z
+                       + query[h][3] * key_low.w + query[h][4] * key_high.x + query[h][5] * key_high.y
+                       + query[h][6] * key_high.z + query[h][7] * key_high.w;
+#endif
+#if LANES_PER_TOKEN >= 2
+            qk += subgroupShuffleXor(qk, 1u);
+#endif
+#if LANES_PER_TOKEN >= 4
+            qk += subgroupShuffleXor(qk, 2u);
+#endif
+#if LANES_PER_TOKEN >= 8
+            qk += subgroupShuffleXor(qk, 4u);
+#endif
+#if LANES_PER_TOKEN >= 16
+            qk += subgroupShuffleXor(qk, 8u);
+#endif
+#if LANES_PER_TOKEN >= 32
+            qk += subgroupShuffleXor(qk, 16u);
+#endif
+
+            float weight[TOKENS];
+            for (uint t = 0; t < TOKENS; ++t)
+                weight[t] = subgroupShuffle(qk, t * LANES_PER_TOKEN);
+
+            float block_maximum = weight[0];
+            for (uint t = 1; t < TOKENS; ++t)
+                block_maximum = max(block_maximum, weight[t]);
+            const float next_maximum = max(maximum[h], block_maximum);
+            const float previous_scale = denominator[h] == 0.0 ? 0.0 : exp2(maximum[h] - next_maximum);
+            float block_sum = 0.0;
+            for (uint t = 0; t < TOKENS; ++t)
+            {
+                weight[t] = exp2(weight[t] - next_maximum);
+                block_sum += weight[t];
+            }
+            denominator[h] = denominator[h] * previous_scale + block_sum;
+            maximum[h] = next_maximum;
+            if (previous_scale != 1.0)
+            {
+                for (uint j = 0; j < OUT_DIMS; ++j)
+                    numerator[h][j] *= previous_scale;
+            }
+            for (uint t = 0; t < TOKENS; ++t)
+            {
+                for (uint j = 0; j < OUT_DIMS; ++j)
+                    numerator[h][j] += weight[t] * value_block[t][j];
+            }
+        }
+    }
+
+    // Tail loop handles partial end block and optional attention sink row.
+    for (uint block = fast_end; block < split_end; block += TOKENS)
+    {
+        const uint key_token = min(block + token_lane, last_token);
+        const uint key_index = key_vec_base + key_token * token_vec_stride;
+#if Q_DIMS == 16
+        const vec4 key0 = unpack4(key_pairs[key_index]);
+        const vec4 key1 = unpack4(key_pairs[key_index + 1u]);
+        const vec4 key2 = unpack4(key_pairs[key_index + 2u]);
+        const vec4 key3 = unpack4(key_pairs[key_index + 3u]);
+#else
+        const vec4 key_low = unpack4(key_pairs[key_index]);
+        const vec4 key_high = unpack4(key_pairs[key_index + 1u]);
+#endif
+
+        float value_block[TOKENS][OUT_DIMS];
+        for (uint t = 0; t < TOKENS; ++t)
+        {
+            const uint base = value_vec_base + min(block + t, last_token) * token_vec_stride;
+#if OUT_DIMS == 2
+            const uvec2 pair = value_pairs[base + lane_half];
+            const vec2 v = unpack2(lane_odd == 0u ? pair.x : pair.y);
+            value_block[t][0] = v.x;
+            value_block[t][1] = v.y;
+#elif OUT_DIMS == 4
+            const vec4 value = unpack4(value_pairs[base + lane]);
+            value_block[t][0] = value.x;
+            value_block[t][1] = value.y;
+            value_block[t][2] = value.z;
+            value_block[t][3] = value.w;
+#else
+            const vec4 value_low = unpack4(value_pairs[base + lane * 2u]);
+            const vec4 value_high = unpack4(value_pairs[base + lane * 2u + 1u]);
+            value_block[t][0] = value_low.x;
+            value_block[t][1] = value_low.y;
+            value_block[t][2] = value_low.z;
+            value_block[t][3] = value_low.w;
+            value_block[t][4] = value_high.x;
+            value_block[t][5] = value_high.y;
+            value_block[t][6] = value_high.z;
+            value_block[t][7] = value_high.w;
+#endif
+        }
+
+        for (uint h = 0; h < HEAD_CHUNK; ++h)
+        {
+            const uint head = head_start + h;
+            if (head >= RATIO)
+                break;
+#if Q_DIMS == 16
+            float qk = dot(vec4(query[h][0], query[h][1], query[h][2], query[h][3]), key0)
+                       + dot(vec4(query[h][4], query[h][5], query[h][6], query[h][7]), key1)
+                       + dot(vec4(query[h][8], query[h][9], query[h][10], query[h][11]), key2)
+                       + dot(vec4(query[h][12], query[h][13], query[h][14], query[h][15]), key3);
+#else
+            float qk = query[h][0] * key_low.x + query[h][1] * key_low.y + query[h][2] * key_low.z
+                       + query[h][3] * key_low.w + query[h][4] * key_high.x + query[h][5] * key_high.y
+                       + query[h][6] * key_high.z + query[h][7] * key_high.w;
+#endif
+#if LANES_PER_TOKEN >= 2
+            qk += subgroupShuffleXor(qk, 1u);
+#endif
+#if LANES_PER_TOKEN >= 4
+            qk += subgroupShuffleXor(qk, 2u);
+#endif
+#if LANES_PER_TOKEN >= 8
+            qk += subgroupShuffleXor(qk, 4u);
+#endif
+#if LANES_PER_TOKEN >= 16
+            qk += subgroupShuffleXor(qk, 8u);
+#endif
+#if LANES_PER_TOKEN >= 32
+            qk += subgroupShuffleXor(qk, 16u);
+#endif
+
+            float weight[TOKENS];
+            for (uint t = 0; t < TOKENS; ++t)
+            {
+                const uint token = block + t;
+                weight[t] = subgroupShuffle(qk, t * LANES_PER_TOKEN);
+                if (token >= split_end)
+                    weight[t] = -3.402823466e+38;
+                else if (token == sink_token)
+                    weight[t] = sink_data[head_base + head] * LOG2E;
+            }
+
+            float block_maximum = weight[0];
+            for (uint t = 1; t < TOKENS; ++t)
+                block_maximum = max(block_maximum, weight[t]);
+            const float next_maximum = max(maximum[h], block_maximum);
+            const float previous_scale = denominator[h] == 0.0 ? 0.0 : exp2(maximum[h] - next_maximum);
+            float block_sum = 0.0;
+            for (uint t = 0; t < TOKENS; ++t)
+            {
+                weight[t] = exp2(weight[t] - next_maximum);
+                block_sum += weight[t];
+            }
+            denominator[h] = denominator[h] * previous_scale + block_sum;
+            maximum[h] = next_maximum;
+            if (previous_scale != 1.0)
+            {
+                for (uint j = 0; j < OUT_DIMS; ++j)
+                    numerator[h][j] *= previous_scale;
+            }
+
+            for (uint t = 0; t < TOKENS; ++t)
+            {
+                if (block + t >= split_end || block + t == sink_token || weight[t] == 0.0)
+                    continue;
+                for (uint j = 0; j < OUT_DIMS; ++j)
+                    numerator[h][j] += weight[t] * value_block[t][j];
+            }
+        }
+    }
+
+    for (uint h = 0; h < HEAD_CHUNK; ++h)
+    {
+        const uint head = head_start + h;
+        if (head >= RATIO)
+            break;
+        const uint row = ((head_base + head) * p.split_count + split) * (p.head_dimension + 2u);
+        for (uint j = 0; j < OUT_DIMS; ++j)
+            partial_data[row + out_offset + j] = numerator[h][j];
+        if (lane == 0)
+        {
+            partial_data[row + p.head_dimension] = denominator[h] == 0.0 ? -3.402823466e+38 : (maximum[h] * LN2);
+            partial_data[row + p.head_dimension + 1u] = denominator[h];
+        }
+    }
+#endif
+}

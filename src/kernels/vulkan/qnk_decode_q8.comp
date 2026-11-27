@@ -1,0 +1,119 @@
+#version 450
+
+// Vectorized Q8_0 decode projection: one warp per output row, four rows per
+// 128-thread workgroup. Each lane accumulates four consecutive columns, so a
+// 34-byte Q8_0 block feeds four FMAs instead of one byte-granular FMA. This is
+// the one-row path for dense projections that the loader converted from BF16
+// to Q8_0; other formats keep using qnk_projection.comp.
+
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer input_blob
+{
+    vec4 input_vectors[];
+};
+layout(binding = 1) readonly buffer quantized_blob
+{
+    uint quantized_words[];
+};
+layout(binding = 2) readonly buffer bias_blob
+{
+    float bias_data[];
+};
+layout(binding = 3) writeonly buffer output_blob
+{
+    float output_data[];
+};
+layout(binding = 4) readonly buffer residual_blob
+{
+    float residual_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint input_columns;
+    uint output_columns;
+    uint block_count;
+    uint token_count;
+    uint block_bytes;
+    uint group_size;
+    uint group_count;
+    uint scales_offset;
+    uint zeros_offset;
+    uint groups_offset;
+    uint columns_offset;
+    uint output_stride;
+    uint output_column_offset;
+    uint input_group_count;
+    uint add_residual;
+}
+p;
+
+const uint rows_per_workgroup = 4u;
+
+void main()
+{
+    const uint lane = gl_LocalInvocationID.x & 31u;
+    const uint output_column = gl_WorkGroupID.x * rows_per_workgroup + (gl_LocalInvocationID.x >> 5u);
+    if (output_column >= p.output_columns)
+        return;
+
+    // input_columns % 128 == 0 => block_count % 4 == 0 => row_base % 4 == 0,
+    // and each 4-block step advances by 136 bytes (34 uint words), so block
+    // parity (odd) is loop-invariant per lane.
+    const uint row_base = output_column * p.block_count * 34u;
+    const uint blk_off = (lane >> 3u) * 34u;
+    const uint odd = (lane >> 3u) & 1u;
+    uint scale_w = (row_base + blk_off) >> 2u;
+    uint code_w = (row_base + blk_off + 2u + (lane & 7u) * 4u) >> 2u;
+    uint in_idx = lane;
+    const uint steps = p.input_columns >> 7u;
+
+    float sum = 0.0;
+    if (odd != 0u)
+    {
+        for (uint s = 0u; s < steps; ++s)
+        {
+            const float scale = unpackHalf2x16(quantized_words[scale_w]).y;
+            const uint code = quantized_words[code_w];
+            vec4 codes = unpackUnorm4x8(code) * 255.0;
+            codes -= 256.0 * step(vec4(128.0), codes);
+            sum += scale * dot(codes, input_vectors[in_idx]);
+            scale_w += 34u;
+            code_w += 34u;
+            in_idx += 32u;
+        }
+    }
+    else
+    {
+        for (uint s = 0u; s < steps; ++s)
+        {
+            const float scale = unpackHalf2x16(quantized_words[scale_w]).x;
+            const uint code = (quantized_words[code_w] >> 16u) | (quantized_words[code_w + 1u] << 16u);
+            vec4 codes = unpackUnorm4x8(code) * 255.0;
+            codes -= 256.0 * step(vec4(128.0), codes);
+            sum += scale * dot(codes, input_vectors[in_idx]);
+            scale_w += 34u;
+            code_w += 34u;
+            in_idx += 32u;
+        }
+    }
+
+    float total = 0.0;
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    total = subgroupAdd(sum);
+#endif
+    if (lane == 0u)
+    {
+        const uint out_idx = p.output_column_offset + output_column;
+        float result = total + bias_data[output_column];
+        if (p.add_residual != 0u)
+            result += residual_data[out_idx];
+        output_data[out_idx] = result;
+    }
+}

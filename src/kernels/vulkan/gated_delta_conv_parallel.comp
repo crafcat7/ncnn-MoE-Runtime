@@ -49,6 +49,7 @@ layout(push_constant) uniform parameter
     uint sigmoid_gate;
     uint gate_channels;
     float lower_bound;
+    uint conv_stride;
 }
 p;
 
@@ -64,12 +65,12 @@ void main()
 {
     const uint channel = gl_WorkGroupID.x * 128u + gl_LocalInvocationID.x;
     const uint token = gl_WorkGroupID.y;
-    if (channel >= p.fused_columns || token >= p.token_count)
+    if (channel >= p.conv_stride || token >= p.token_count)
         return;
-    const uint row = token * p.fused_columns + channel;
+    const uint out_row = token * p.conv_stride + channel;
     if (channel >= p.convolution_size)
     {
-        fused_output[row] = fused_input[row];
+        fused_output[out_row] = fused_input[token * p.fused_columns + channel];
         return;
     }
     const uint state_base = channel * p.kernel_size;
@@ -87,5 +88,5 @@ void main()
                                 : convolution_state[state_base + p.kernel_size - uint(-index)];
         sum += value * convolution_weight[state_base + tap];
     }
-    fused_output[row] = sum * sigmoid(sum);
+    fused_output[out_row] = sum * sigmoid(sum);
 }

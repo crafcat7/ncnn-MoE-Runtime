@@ -1,5 +1,10 @@
 #version 450
 
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
 layout(binding = 0) readonly buffer fused_qkv_blob
 {
     float fused_qkv_data[];
@@ -93,25 +98,32 @@ void main()
     const uint source_base = token * p.total_columns
                              + (is_query ? local_head * p.head_dimension
                                          : p.query_columns + local_head * p.head_dimension);
-    float square_sum = 0.0;
-    for (uint dimension = lane; lane < 32u && dimension < p.head_dimension; dimension += 32u)
+    float inverse_rms = 1.0;
+    if (p.query_key_norm != 0u)
     {
-        const float value = fused_qkv_data[source_base + dimension];
-        square_sum += value * value;
-    }
-    if (lane < 32u)
-        partial[lane] = square_sum;
-    barrier();
-    for (uint stride = 16; stride > 0; stride >>= 1)
-    {
-        if (lane < stride)
-            partial[lane] += partial[lane + stride];
+        float square_sum = 0.0;
+        for (uint dimension = lane; lane < 32u && dimension < p.head_dimension; dimension += 32u)
+        {
+            const float value = fused_qkv_data[source_base + dimension];
+            square_sum += value * value;
+        }
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+        const float total_sq = subgroupAdd(square_sum);
+        inverse_rms = inversesqrt(total_sq / float(p.head_dimension) + p.epsilon);
+#else
+        if (lane < 32u)
+            partial[lane] = square_sum;
         barrier();
+        for (uint stride = 16; stride > 0; stride >>= 1)
+        {
+            if (lane < stride)
+                partial[lane] += partial[lane + stride];
+            barrier();
+        }
+        inverse_rms = inversesqrt(partial[0] / float(p.head_dimension) + p.epsilon);
+        barrier();
+#endif
     }
-    const float inverse_rms = p.query_key_norm != 0
-                                  ? inversesqrt(partial[0] / float(p.head_dimension) + p.epsilon)
-                                  : 1.0;
-    barrier();
 
     const uint rope_half = p.rope_dimension / 2;
     if (is_query)

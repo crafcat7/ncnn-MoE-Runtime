@@ -47,6 +47,8 @@
 
 #if NCNN_MOE_WITH_VULKAN
 #include "kernels/vulkan/qnk_projection.comp.hex.h"
+#include "kernels/vulkan/qnk_decode_q8.comp.hex.h"
+#include "kernels/vulkan/qnk_decode_bf16.comp.hex.h"
 #include "kernels/vulkan/qnk_swiglu.comp.hex.h"
 #endif
 #include "linear_impl.h"
@@ -105,42 +107,42 @@ static bool create_qnk_projection_pipeline(const std::shared_ptr<VulkanContext>&
     return true;
 }
 
-static bool create_qnk_swiglu_pipeline(const std::shared_ptr<VulkanContext>& context,
-                                       const ncnn::Option& option,
-                                       std::shared_ptr<ncnn::Pipeline>& destination)
+static bool create_decode_pipeline(const std::shared_ptr<VulkanContext>& context,
+                                   const ncnn::Option& option,
+                                   const char* shader,
+                                   int shader_size,
+                                   std::shared_ptr<ncnn::Pipeline>& destination)
 {
-    const std::shared_ptr<const std::vector<uint32_t>> spirv = context->shader_binary(qnk_swiglu_shader,
-                                                                                      static_cast<int>(sizeof(qnk_swiglu_shader) - 1),
-                                                                                      option,
-                                                                                      0);
-    if (!spirv || spirv->empty())
-        return false;
-
     ncnn::VulkanDevice* device = context->device();
-    destination = context->find_pipeline(qnk_swiglu_shader, 0);
-    if (destination)
-        return true;
-    std::unique_ptr<ncnn::Pipeline> pipeline(new ncnn::Pipeline(device));
-    pipeline->set_optimal_local_size_xyz(128, 1, 1);
-    const std::vector<ncnn::vk_specialization_type> specializations;
-    if (pipeline->create(spirv->data(),
-                         spirv->size() * sizeof(uint32_t),
-                         specializations)
-        != 0)
-    {
+    const uint32_t required_ops = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT;
+    if (device->info.subgroup_size() != 32
+        || (device->info.support_subgroup_ops() & required_ops) != required_ops)
         return false;
-    }
-    destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(),
-                                                  [context = context](ncnn::Pipeline* value) mutable {
-                                                      {
-                                                          const std::lock_guard<std::mutex> lock(context->command_mutex());
-                                                          delete value;
-                                                      }
-                                                      // Weak cache entries retain the deleter control block after disposal.
-                                                      context.reset();
-                                                  });
-    context->cache_pipeline(qnk_swiglu_shader, 0, destination);
-    return true;
+    ncnn::Option compile_option = option;
+    compile_option.use_subgroup_ops = true;
+    return create_cached_pipeline(context, shader, shader_size, compile_option, 0, 0, 128, destination);
+}
+
+bool create_qnk_swiglu_pipe(const std::shared_ptr<VulkanContext>& context,
+                            const ncnn::Option& option,
+                            std::shared_ptr<ncnn::Pipeline>& destination,
+                            bool bf16_out,
+                            bool bf16_in)
+{
+    static const std::string variants[4] = {
+        std::string(qnk_swiglu_shader, sizeof(qnk_swiglu_shader) - 1),
+        prefix_shader(qnk_swiglu_shader, static_cast<int>(sizeof(qnk_swiglu_shader) - 1),
+                      "#define NCNN_QNK_SWIGLU_BF16_OUT\n"),
+        prefix_shader(qnk_swiglu_shader, static_cast<int>(sizeof(qnk_swiglu_shader) - 1),
+                      "#define NCNN_QNK_SWIGLU_BF16_IN\n"),
+        prefix_shader(qnk_swiglu_shader, static_cast<int>(sizeof(qnk_swiglu_shader) - 1),
+                      "#define NCNN_QNK_SWIGLU_BF16_OUT\n#define NCNN_QNK_SWIGLU_BF16_IN\n"),
+    };
+    const std::string& source = variants[(bf16_out ? 1u : 0u) | (bf16_in ? 2u : 0u)];
+    if (source.empty())
+        return false;
+    return create_cached_pipeline(context, source.c_str(), static_cast<int>(source.size()),
+                                  option, 0, 0, 128, destination);
 }
 
 static size_t qnk_shader_type(DType dtype) noexcept
@@ -386,20 +388,32 @@ bool QnkLinear_vulkan::can_fuse(std::span<const TensorData* const> matrices,
 {
     if (matrices.empty() || !matrices.front()) return false;
     const TensorData& first = *matrices.front();
-    if (first.shape.size() != 2 || !is_qnk_dtype(first.dtype)
+    // Dense BF16 projections fuse as well: the decode scan is per-row, so one
+    // wider dispatch replaces a short dispatch per matrix.
+    const bool dense_bfloat16 = first.dtype == DType::BFloat16;
+    if (first.shape.size() != 2 || (!is_qnk_dtype(first.dtype) && !dense_bfloat16)
         || !check_input_columns(first)) return false;
+    if (dense_bfloat16 && (first.shape[1] == 0 || first.shape[1] % 4 != 0)) return false;
     uint64_t rows = 0;
     uint64_t bytes = 0;
     for (const TensorData* matrix : matrices)
     {
         if (!matrix || matrix->shape.size() != 2 || matrix->shape[1] != first.shape[1]
+            || matrix->dtype != first.dtype
             || qnk_projection_storage_type(matrix->dtype) != qnk_projection_storage_type(first.dtype)
             || !matrix->quantization_scales.empty() || matrix->quantization_group_size != 0
             || !matrix->quantization_zero_points.empty() || !matrix->quantization_group_indices.empty()
             || matrix->input_column_indices != first.input_column_indices
-            || !qnk_shape_supported(matrix->dtype, matrix->shape[0], matrix->shape[1])) return false;
+            || (dense_bfloat16
+                    ? (matrix->shape[0] == 0
+                       || matrix->bfloat16_values().size()
+                              != static_cast<size_t>(matrix->shape[0]) * matrix->shape[1])
+                    : !qnk_shape_supported(matrix->dtype, matrix->shape[0], matrix->shape[1])))
+            return false;
         rows += matrix->shape[0];
-        const uint64_t size = projection_storage_bytes(*matrix, alignment);
+        const uint64_t size = dense_bfloat16
+                                  ? static_cast<uint64_t>(matrix->shape[0]) * matrix->shape[1] * sizeof(uint16_t)
+                                  : projection_storage_bytes(*matrix, alignment);
         if (size == 0) return false;
         bytes += size;
         if (rows > static_cast<uint64_t>(std::numeric_limits<int>::max() / 32)
@@ -422,23 +436,36 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_fused(std::span<const
     combined.dtype = qnk_projection_storage_type(matrices.front()->dtype);
     combined.shape = {0, matrices.front()->shape[1]};
     combined.input_column_indices = matrices.front()->input_column_indices;
+    const bool dense_bfloat16 = combined.dtype == DType::BFloat16;
     size_t rows = 0;
     for (const TensorData* matrix : matrices) rows += matrix->shape[0];
-    combined.quantized_data.reserve(static_cast<size_t>(qnk_storage_bytes(combined.dtype, rows, combined.shape[1])));
+    if (dense_bfloat16)
+        combined.bfloat16_data.reserve(rows * combined.shape[1]);
+    else
+        combined.quantized_data.reserve(static_cast<size_t>(qnk_storage_bytes(combined.dtype, rows, combined.shape[1])));
     combined_bias.float32_data.reserve(rows);
     for (size_t index = 0; index < matrices.size(); ++index)
     {
         const TensorData& matrix = *matrices[index];
-        TensorData prepared;
-        const TensorData* storage = &matrix;
-        if (qnk_projection_storage_type(matrix.dtype) != matrix.dtype)
+        if (dense_bfloat16)
         {
-            if (!qnk_prepare_projection(matrix, prepared)) return {};
-            storage = &prepared;
+            const auto values = matrix.bfloat16_values();
+            if (values.size() != static_cast<size_t>(matrix.shape[0]) * matrix.shape[1]) return {};
+            combined.bfloat16_data.insert(combined.bfloat16_data.end(), values.begin(), values.end());
         }
-        const auto raw = storage->qnk_values();
-        if (raw.size() != qnk_storage_bytes(storage->dtype, storage->shape[0], storage->shape[1])) return {};
-        combined.quantized_data.insert(combined.quantized_data.end(), raw.begin(), raw.end());
+        else
+        {
+            TensorData prepared;
+            const TensorData* storage = &matrix;
+            if (qnk_projection_storage_type(matrix.dtype) != matrix.dtype)
+            {
+                if (!qnk_prepare_projection(matrix, prepared)) return {};
+                storage = &prepared;
+            }
+            const auto raw = storage->qnk_values();
+            if (raw.size() != qnk_storage_bytes(storage->dtype, storage->shape[0], storage->shape[1])) return {};
+            combined.quantized_data.insert(combined.quantized_data.end(), raw.begin(), raw.end());
+        }
         const size_t offset = combined.shape[0];
         combined.shape[0] += matrix.shape[0];
         combined_bias.float32_data.resize(combined.shape[0], 0.0f);
@@ -743,11 +770,50 @@ std::shared_ptr<QnkLinear_vulkan> QnkLinear_vulkan::create_with_allocator(const 
             || !create_qnk_projection_pipeline(implementation.vulkan_context, implementation.option, matrix.dtype,
                                                implementation.columns_offset != 0, 4, implementation.prefill_pipeline))
             return {};
+        if (matrix.dtype == DType::Q8_0 && implementation.columns_offset == 0
+            && implementation.input_group_count == 1 && implementation.input_columns % 128u == 0u)
+        {
+            (void)create_decode_pipeline(implementation.vulkan_context, implementation.option,
+                                         qnk_decode_q8_shader,
+                                         static_cast<int>(sizeof(qnk_decode_q8_shader) - 1),
+                                         implementation.decode_q8_pipeline);
+        }
+        if (matrix.dtype == DType::BFloat16 && implementation.columns_offset == 0
+            && implementation.input_group_count == 1 && implementation.block_count == 0
+            && implementation.input_columns % 128u == 0u)
+        {
+            (void)create_decode_pipeline(implementation.vulkan_context, implementation.option,
+                                         qnk_decode_bf16_shader,
+                                         static_cast<int>(sizeof(qnk_decode_bf16_shader) - 1),
+                                         implementation.decode_bf16_pipeline);
+        }
         if (matrix.dtype == DType::BFloat16)
         {
+            implementation.has_nonzero_bias = false;
+            for (float value : coop_bias)
+            {
+                if (value != 0.0f)
+                {
+                    implementation.has_nonzero_bias = true;
+                    break;
+                }
+            }
+            const bool plain_bf16 = activation_variant(implementation.option) == 0
+                                    && implementation.block_count == 0
+                                    && implementation.input_group_count == 1
+                                    && implementation.columns_offset == 0
+                                    && implementation.block_size == static_cast<uint64_t>(implementation.input_columns) * sizeof(uint16_t);
+            if (plain_bf16)
+            {
+                implementation.cm2_ok = create_cm2_gemm(implementation.vulkan_context, implementation.option,
+                                                        implementation.gemm_cm2);
+                if (implementation.cm2_ok)
+                    implementation.cm2_bf16_ok = create_cm2_gemm(implementation.vulkan_context, implementation.option,
+                                                                 implementation.gemm_cm2_bf16, true);
+            }
             (void)create_tile_gemm(implementation.vulkan_context, implementation.option, implementation.tile_gemm);
             // Plain BF16 rows are the only layout ncnn's Gemm can pack as-is.
-            if (implementation.block_count == 0 && implementation.input_group_count == 1
+            if (!implementation.cm2_ok && implementation.block_count == 0 && implementation.input_group_count == 1
                 && implementation.block_size == static_cast<uint64_t>(implementation.input_columns) * sizeof(uint16_t))
                 (void)create_coop_gemm(implementation.vulkan_context, implementation.option,
                                        implementation.input_columns, implementation.output_columns,
@@ -851,15 +917,51 @@ void QnkLinear_vulkan::record(const ncnn::VkMat& input, ncnn::VkMat& output, ncn
 #endif
 }
 
+bool QnkLinear_vulkan::use_cm2() const noexcept
+{
+#if NCNN_MOE_WITH_VULKAN
+    return d->cm2_ok;
+#else
+    return false;
+#endif
+}
+
 void QnkLinear_vulkan::record(const ncnn::VkMat& input,
                               ncnn::VkMat& output,
                               ncnn::VkCompute& command,
                               uint32_t output_column_offset,
                               std::vector<ncnn::VkMat>& bindings,
-                              std::vector<ncnn::vk_constant_type>& constants) const
+                              std::vector<ncnn::vk_constant_type>& constants,
+                              const ncnn::VkMat* res,
+                              bool* res_fused,
+                              bool bf16_out) const
 {
 #if NCNN_MOE_WITH_VULKAN
+    if (res_fused)
+        *res_fused = false;
     const Implementation& implementation = *d;
+    const uint32_t rows = input.dims == 1 ? 1u : static_cast<uint32_t>(input.h);
+    if (rows >= 8u && implementation.cm2_ok)
+    {
+        const TileShape shape{rows,
+                              implementation.input_columns,
+                              implementation.output_columns,
+                              static_cast<uint32_t>(output.w),
+                              output_column_offset,
+                              1};
+        if (bf16_out && implementation.cm2_bf16_ok && output.elemsize == sizeof(uint16_t)
+            && record_cm2_gemm(implementation.gemm_cm2_bf16, input, implementation.quantized,
+                               implementation.bias, implementation.has_nonzero_bias,
+                               output, shape, implementation.vulkan_context.get(), command,
+                               bindings, constants, nullptr, nullptr, true))
+            return;
+        if (!bf16_out
+            && record_cm2_gemm(implementation.gemm_cm2, input, implementation.quantized,
+                               implementation.bias, implementation.has_nonzero_bias,
+                               output, shape, implementation.vulkan_context.get(), command,
+                               bindings, constants, res, res_fused))
+            return;
+    }
     bindings.resize(4);
     bindings[0] = input;
     bindings[1] = implementation.quantized;
@@ -869,7 +971,7 @@ void QnkLinear_vulkan::record(const ncnn::VkMat& input,
     constants[0].u32 = implementation.input_columns;
     constants[1].u32 = implementation.output_columns;
     constants[2].u32 = implementation.block_count;
-    constants[3].u32 = input.dims == 1 ? 1u : static_cast<uint32_t>(input.h);
+    constants[3].u32 = rows;
     constants[4].u32 = implementation.block_size;
     constants[5].u32 = implementation.group_size;
     constants[6].u32 = implementation.group_count;
@@ -910,7 +1012,7 @@ void QnkLinear_vulkan::record(const ncnn::VkMat& input,
         && implementation.block_count == 0
         && implementation.block_size == static_cast<uint64_t>(implementation.input_columns) * sizeof(uint16_t))
     {
-        const TileShape shape{constants[3].u32,
+        const TileShape shape{rows,
                               implementation.input_columns,
                               implementation.output_columns,
                               static_cast<uint32_t>(output.w),
@@ -920,7 +1022,34 @@ void QnkLinear_vulkan::record(const ncnn::VkMat& input,
                              implementation.bias, ncnn::VkMat(), ncnn::VkMat(), output, shape, command))
             return;
     }
-    const uint32_t tile_rows = constants[3].u32 > 1 ? 4u : 1u;
+    const uint32_t tile_rows = rows > 1 ? 4u : 1u;
+    const ncnn::Pipeline* decode_pipeline = implementation.decode_bf16_pipeline
+                                                ? implementation.decode_bf16_pipeline.get()
+                                                : implementation.decode_q8_pipeline.get();
+    const uint64_t decode_groups = (static_cast<uint64_t>(implementation.output_columns) + 3u) / 4u;
+    if (tile_rows == 1 && output_column_offset == 0 && decode_pipeline != nullptr
+        && decode_groups <= implementation.vulkan_context->device()->info.max_workgroup_count_x())
+    {
+        const bool can_fuse = res != nullptr && !res->empty()
+                              && res->elempack == 1
+                              && res->elemsize == sizeof(float)
+                              && res->w == output.w
+                              && (res->dims == 1 || res->h == 1);
+        bindings.resize(5);
+        bindings[4] = can_fuse ? *res : implementation.bias;
+        constants.resize(15);
+        constants[14].u32 = can_fuse ? 1u : 0u;
+        ncnn::VkMat dispatcher;
+        dispatcher.w = static_cast<int>(decode_groups * 128u);
+        dispatcher.h = 1;
+        dispatcher.c = 1;
+        command.record_pipeline_readonly(decode_pipeline, bindings,
+                                         {1, 0, 0, 0, can_fuse ? static_cast<unsigned char>(1) : static_cast<unsigned char>(0)},
+                                         constants, dispatcher);
+        if (res_fused && can_fuse)
+            *res_fused = true;
+        return;
+    }
     const auto& pipeline = tile_rows == 1 ? implementation.pipeline : implementation.prefill_pipeline;
     ncnn::VkMat dispatcher;
     // Vocabulary-sized projections can exceed the guaranteed 65535 workgroups
@@ -1221,11 +1350,27 @@ std::shared_ptr<QnkExpert_vulkan> QnkExpert_vulkan::create_impl(const TensorData
     implementation.interleave_gate_up_rows = fuse_gate_up ? false : gate_up.qnk_interleave_rows;
     {
         const std::lock_guard<std::mutex> lock(implementation.vulkan_context->command_mutex());
-        if (!create_qnk_swiglu_pipeline(implementation.vulkan_context,
-                                        implementation.option,
-                                        implementation.swiglu_pipeline))
+        if (!create_qnk_swiglu_pipe(implementation.vulkan_context,
+                                    implementation.option,
+                                    implementation.swiglu_pipe[0]))
         {
             return {};
+        }
+        if (implementation.down->use_cm2()
+            && (implementation.intermediate_columns & 1u) == 0u)
+        {
+            (void)create_qnk_swiglu_pipe(implementation.vulkan_context,
+                                         implementation.option,
+                                         implementation.swiglu_pipe[1],
+                                         true);
+            if (implementation.gate_up->d->cm2_bf16_ok)
+            {
+                (void)create_qnk_swiglu_pipe(implementation.vulkan_context,
+                                             implementation.option,
+                                             implementation.swiglu_pipe[2],
+                                             true,
+                                             true);
+            }
         }
     }
     return result;
@@ -1353,13 +1498,28 @@ std::vector<uint64_t> QnkExpert_vulkan::scratch_elements(uint32_t intermediate_c
     return result;
 }
 
+bool QnkExpert_vulkan::use_cm2() const noexcept
+{
+#if NCNN_MOE_WITH_VULKAN
+    return d->gate_up && d->gate_up->use_cm2()
+           && (!d->up || d->up->use_cm2())
+           && (!d->router_gate || d->router_gate->use_cm2());
+#else
+    return false;
+#endif
+}
+
 bool QnkExpert_vulkan::record(const ncnn::VkMat& input, ncnn::VkMat& output,
                               ncnn::VkCompute& command,
                               std::vector<ncnn::VkMat>& workspace,
                               std::vector<ncnn::VkMat>& bindings,
-                              std::vector<ncnn::vk_constant_type>& constants) const
+                              std::vector<ncnn::vk_constant_type>& constants,
+                              const ncnn::VkMat* res,
+                              bool* res_fused) const
 {
 #if NCNN_MOE_WITH_VULKAN
+    if (res_fused)
+        *res_fused = false;
     const Implementation& implementation = *d;
     const QnkLinear_vulkan::Implementation& gate = *implementation.gate_up->d;
     const uint32_t rows = input.dims == 1 ? 1u : static_cast<uint32_t>(input.h);
@@ -1373,25 +1533,32 @@ bool QnkExpert_vulkan::record(const ncnn::VkMat& input, ncnn::VkMat& output,
         || gate.output_columns != scratch_columns[0])
         return false;
     size_t scratch_index = 0;
-    const auto create_scratch = [&](ncnn::VkMat& value, uint64_t columns) {
+    const auto create_scratch = [&](ncnn::VkMat& value, uint64_t columns, bool bf16 = false) {
         if (columns == 0 || columns > static_cast<uint64_t>(std::numeric_limits<int>::max())) return false;
-        value.create(static_cast<int>(columns), static_cast<int>(rows), sizeof(float), implementation.vulkan_context->blob_allocator());
+        value.create(static_cast<int>(columns), static_cast<int>(rows),
+                     bf16 ? sizeof(uint16_t) : sizeof(float), 1,
+                     implementation.vulkan_context->blob_allocator());
         return !value.empty();
     };
+    const bool use_bf16_inter = rows >= 8u && implementation.swiglu_pipe[1] != nullptr;
+    const bool use_bf16_gate_up = use_bf16_inter
+                                  && implementation.swiglu_pipe[2] != nullptr
+                                  && gate.cm2_bf16_ok
+                                  && (!implementation.up || implementation.up->d->cm2_bf16_ok);
     ncnn::VkMat gate_gpu;
-    if (!create_scratch(gate_gpu, scratch_columns[scratch_index++])) return false;
     ncnn::VkMat up_gpu;
+    if (!create_scratch(gate_gpu, scratch_columns[scratch_index++], use_bf16_gate_up)) return false;
     if (implementation.up)
-        if (!create_scratch(up_gpu, scratch_columns[scratch_index++])) return false;
+        if (!create_scratch(up_gpu, scratch_columns[scratch_index++], use_bf16_gate_up)) return false;
     ncnn::VkMat intermediate_gpu;
-    if (!create_scratch(intermediate_gpu, scratch_columns[scratch_index++])) return false;
+    if (!create_scratch(intermediate_gpu, scratch_columns[scratch_index++], use_bf16_inter)) return false;
     workspace.push_back(gate_gpu);
     workspace.push_back(intermediate_gpu);
     if (implementation.up)
         workspace.push_back(up_gpu);
-    implementation.gate_up->record(input, gate_gpu, command, 0, bindings, constants);
+    implementation.gate_up->record(input, gate_gpu, command, 0, bindings, constants, nullptr, nullptr, use_bf16_gate_up);
     if (implementation.up)
-        implementation.up->record(input, up_gpu, command, 0, bindings, constants);
+        implementation.up->record(input, up_gpu, command, 0, bindings, constants, nullptr, nullptr, use_bf16_gate_up);
     bindings.resize(3);
     bindings[0] = gate_gpu;
     bindings[1] = intermediate_gpu;
@@ -1404,10 +1571,13 @@ bool QnkExpert_vulkan::record(const ncnn::VkMat& input, ncnn::VkMat& output,
     constants[4].u32 = implementation.up ? 2u : implementation.interleave_gate_up_rows ? 0u
                                                                                        : 1u;
     ncnn::VkMat dispatcher;
-    dispatcher.w = static_cast<int>(implementation.intermediate_columns);
+    dispatcher.w = static_cast<int>(use_bf16_inter ? (implementation.intermediate_columns >> 1u)
+                                                   : implementation.intermediate_columns);
     dispatcher.h = static_cast<int>(rows);
     dispatcher.c = 1;
-    command.record_pipeline(implementation.swiglu_pipeline.get(), bindings, constants, dispatcher);
+    const size_t swiglu_idx = use_bf16_gate_up ? 2u : (use_bf16_inter ? 1u : 0u);
+    command.record_pipeline_readonly(implementation.swiglu_pipe[swiglu_idx].get(),
+                                     bindings, {1, 0, 1}, constants, dispatcher);
     ncnn::VkMat unscaled_output = output;
     ncnn::VkMat router_logits;
     if (implementation.router_gate)
@@ -1417,7 +1587,9 @@ bool QnkExpert_vulkan::record(const ncnn::VkMat& input, ncnn::VkMat& output,
         workspace.push_back(unscaled_output);
         workspace.push_back(router_logits);
     }
-    implementation.down->record(intermediate_gpu, unscaled_output, command, 0, bindings, constants);
+    implementation.down->record(intermediate_gpu, unscaled_output, command, 0, bindings, constants,
+                                implementation.router_gate ? nullptr : res,
+                                implementation.router_gate ? nullptr : res_fused);
     if (implementation.router_gate)
     {
         implementation.router_gate->record(input, router_logits, command, 0, bindings, constants);
@@ -1429,7 +1601,7 @@ bool QnkExpert_vulkan::record(const ncnn::VkMat& input, ncnn::VkMat& output,
         constants[3].f = 0.f;
         constants[4].u32 = 2;
         dispatcher.w = static_cast<int>(implementation.output_columns);
-        command.record_pipeline(implementation.swiglu_pipeline.get(), bindings, constants, dispatcher);
+        command.record_pipeline(implementation.swiglu_pipe[0].get(), bindings, constants, dispatcher);
     }
     return true;
 #else

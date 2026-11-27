@@ -2,6 +2,7 @@
 
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
 
 // Register-resident recurrent gated delta rule: the file name states the
 // implementation, the state lives in registers instead of device memory.
@@ -50,6 +51,7 @@ layout(push_constant) uniform parameter
     uint sigmoid_gate;
     uint gate_channels;
     float lower_bound;
+    uint conv_stride;
 }
 p;
 
@@ -96,7 +98,10 @@ TokenInputs load_token_inputs(uint token, uint key_head, uint value_head, uint v
     const uint query_base = input_row + key_head * p.head_dimension;
     const uint key_base = input_row + key_size + key_head * p.head_dimension;
     const uint value_base = input_row + key_size * 2 + value_head * p.value_head_dimension;
-    result.beta = sigmoid(fused_input[input_row + p.convolution_size + p.value_size + value_head]);
+    float beta_raw = 0.0;
+    if (lane == 0u)
+        beta_raw = sigmoid(fused_input[input_row + p.convolution_size + p.value_size + value_head]);
+    result.beta = subgroupBroadcastFirst(beta_raw);
     const uint alpha_base = input_row + p.convolution_size + p.value_size + p.head_count
                             + value_head * p.gate_channels;
     result.value = fused_input[value_base + value_column];
@@ -104,8 +109,13 @@ TokenInputs load_token_inputs(uint token, uint key_head, uint value_head, uint v
     // the bounded sigmoid form and indexes dt_bias by that channel.
     if (p.gate_channels == 1)
     {
-        const float alpha = fused_input[alpha_base] + time_bias[value_head];
-        const float decay = exp(-a_log * softplus(alpha));
+        float decay = 0.0;
+        if (lane == 0u)
+        {
+            const float alpha = fused_input[alpha_base] + time_bias[value_head];
+            decay = exp(-a_log * softplus(alpha));
+        }
+        decay = subgroupBroadcastFirst(decay);
         result.d0 = decay;
         result.d1 = decay;
         result.d2 = decay;

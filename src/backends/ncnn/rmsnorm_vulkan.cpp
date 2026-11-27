@@ -19,7 +19,7 @@ class RmsNorm_vulkan::Implementation
 public:
 #if NCNN_MOE_WITH_VULKAN
     std::shared_ptr<VulkanContext> context;
-    std::shared_ptr<ncnn::Pipeline> pipeline;
+    std::shared_ptr<ncnn::Pipeline> pipe[2]; // 0: fp32 out, 1: bf16 out
     ncnn::VkMat weight;
     uint32_t columns = 0;
     uint32_t workgroup_size = 0;
@@ -73,44 +73,38 @@ std::shared_ptr<RmsNorm_vulkan> RmsNorm_vulkan::create(const TensorData& weight,
     compile_opt.use_subgroup_ops = opt.use_subgroup_ops
                                    && (impl.context->device()->info.support_subgroup_ops() & required_subgroup_operations)
                                           == required_subgroup_operations;
+    const uint32_t aligned4 = (impl.columns & 3u) == 0u ? 1u : 0u;
     const uint64_t shader_variant = compile_opt.use_subgroup_ops ? 1 : 0;
-    const uint64_t pipeline_variant = shader_variant | (static_cast<uint64_t>(workgroup_size) << 1);
-    static const std::string residual_add_shader = [] {
-        std::string source(activation_rms_norm_shader, sizeof(activation_rms_norm_shader) - 1);
-        const size_t version_end = source.find('\n');
-        if (version_end == std::string::npos)
-            return std::string();
-        source.insert(version_end + 1, "#define NCNN_RMS_NORM_RESIDUAL_ADD\n");
-        return source;
-    }();
-    if (add_norm && residual_add_shader.empty())
+    const uint64_t pipe_variant = shader_variant | (static_cast<uint64_t>(workgroup_size) << 1)
+                                  | (static_cast<uint64_t>(aligned4) << 16);
+    std::vector<ncnn::vk_specialization_type> specs(2);
+    specs[0].u32 = compile_opt.use_subgroup_ops ? 1u : 0u;
+    specs[1].u32 = aligned4;
+
+    static const std::string variants[4] = {
+        std::string(activation_rms_norm_shader, sizeof(activation_rms_norm_shader) - 1),
+        prefix_shader(activation_rms_norm_shader, static_cast<int>(sizeof(activation_rms_norm_shader) - 1),
+                      "#define NCNN_RMS_NORM_RESIDUAL_ADD\n"),
+        prefix_shader(activation_rms_norm_shader, static_cast<int>(sizeof(activation_rms_norm_shader) - 1),
+                      "#define NCNN_RMS_NORM_BF16_OUT\n"),
+        prefix_shader(activation_rms_norm_shader, static_cast<int>(sizeof(activation_rms_norm_shader) - 1),
+                      "#define NCNN_RMS_NORM_RESIDUAL_ADD\n#define NCNN_RMS_NORM_BF16_OUT\n"),
+    };
+    const std::string& f32_src = variants[add_norm ? 1 : 0];
+    if (f32_src.empty())
         return {};
-    const char* shader_source = add_norm ? residual_add_shader.c_str() : activation_rms_norm_shader;
-    const int shader_source_size = add_norm ? static_cast<int>(residual_add_shader.size())
-                                            : static_cast<int>(sizeof(activation_rms_norm_shader) - 1);
     const std::lock_guard<std::mutex> lock(impl.context->command_mutex());
-    impl.pipeline = impl.context->find_pipeline(shader_source, pipeline_variant);
-    if (!impl.pipeline)
+    if (!create_cached_pipeline(impl.context, f32_src.c_str(), static_cast<int>(f32_src.size()),
+                                compile_opt, shader_variant, pipe_variant,
+                                static_cast<int>(workgroup_size), impl.pipe[0], specs))
+        return {};
+    if ((impl.columns & 1u) == 0u)
     {
-        const auto binary = impl.context->shader_binary(shader_source, shader_source_size,
-                                                        compile_opt, shader_variant);
-        if (!binary || binary->empty())
-            return {};
-        auto pipeline = std::make_unique<ncnn::Pipeline>(impl.context->device());
-        pipeline->set_local_size_xyz(static_cast<int>(workgroup_size), 1, 1);
-        std::vector<ncnn::vk_specialization_type> specializations(1);
-        specializations[0].u32 = compile_opt.use_subgroup_ops ? 1 : 0;
-        if (pipeline->create(binary->data(), binary->size() * sizeof(uint32_t), specializations) != 0)
-            return {};
-        impl.pipeline = std::shared_ptr<ncnn::Pipeline>(pipeline.release(), [context = impl.context](ncnn::Pipeline* value) mutable {
-            {
-                const std::lock_guard<std::mutex> lock(context->command_mutex());
-                delete value;
-            }
-            // Weak cache entries retain the deleter control block after disposal.
-            context.reset();
-        });
-        impl.context->cache_pipeline(shader_source, pipeline_variant, impl.pipeline);
+        const std::string& bf16_src = variants[add_norm ? 3 : 2];
+        if (!bf16_src.empty())
+            (void)create_cached_pipeline(impl.context, bf16_src.c_str(), static_cast<int>(bf16_src.size()),
+                                         compile_opt, shader_variant, pipe_variant,
+                                         static_cast<int>(workgroup_size), impl.pipe[1], specs);
     }
     ncnn::VkWeightStagingAllocator staging(impl.context->device());
     ncnn::Option upload_opt = opt;
@@ -177,10 +171,14 @@ bool RmsNorm_vulkan::record(const ncnn::VkMat& input,
                             ncnn::VkMat& output,
                             ncnn::VkCompute& cmd,
                             const ncnn::VkMat* branch,
-                            ncnn::VkMat* residual) const
+                            ncnn::VkMat* residual,
+                            bool bf16_out) const
 {
 #if NCNN_MOE_WITH_VULKAN
     const auto& impl = *d;
+    const auto& pipe = impl.pipe[bf16_out ? 1 : 0];
+    if (!pipe || (bf16_out && (impl.columns & 1u) != 0u))
+        return false;
     if (impl.add_norm)
     {
         if (!branch || !residual)
@@ -202,44 +200,43 @@ bool RmsNorm_vulkan::record(const ncnn::VkMat& input,
     const auto& limits = impl.context->device()->info.physicalDeviceProperties().limits;
     const uint64_t elements = static_cast<uint64_t>(impl.columns) * input.h;
     const uint64_t required_bytes = elements * sizeof(float);
+    const size_t out_elem = bf16_out ? sizeof(uint16_t) : sizeof(float);
+    const uint64_t out_bytes = elements * out_elem;
     if (static_cast<uint32_t>(input.h) > limits.maxComputeWorkGroupCount[1]
         || elements > std::numeric_limits<uint32_t>::max()
         || !rms_norm_buffer_supported(input, required_bytes, limits, impl.context->device())
         || (impl.add_norm
             && !rms_norm_buffer_supported(*branch, required_bytes, limits, impl.context->device())))
         return false;
-    // VkMat::create preserves an existing allocation with matching shape.
-    // A caller may pass a separate view of input as its output variable;
-    // release that view before allocating so residual input stays intact.
     ncnn::VkMat destination = output;
     ncnn::VkMat residual_destination;
     if (impl.add_norm)
         residual_destination = *residual;
     const uint64_t weight_bytes = static_cast<uint64_t>(impl.columns) * sizeof(float);
-    const auto overlaps_source = [&](const ncnn::VkMat& value) {
-        return rms_norm_ranges_overlap(value, required_bytes, input, required_bytes)
-               || rms_norm_ranges_overlap(value, required_bytes, impl.weight, weight_bytes)
+    const auto overlaps_source = [&](const ncnn::VkMat& value, uint64_t bytes) {
+        return rms_norm_ranges_overlap(value, bytes, input, required_bytes)
+               || rms_norm_ranges_overlap(value, bytes, impl.weight, weight_bytes)
                || (impl.add_norm
-                   && rms_norm_ranges_overlap(value, required_bytes, *branch, required_bytes));
+                   && rms_norm_ranges_overlap(value, bytes, *branch, required_bytes));
     };
-    if (overlaps_source(destination)
+    if (overlaps_source(destination, out_bytes)
         || (impl.add_norm
-            && rms_norm_ranges_overlap(destination, required_bytes, residual_destination, required_bytes)))
+            && rms_norm_ranges_overlap(destination, out_bytes, residual_destination, required_bytes)))
         destination.release();
-    destination.create(input.w, input.h, sizeof(float), impl.context->blob_allocator());
-    if (destination.empty() || !rms_norm_buffer_supported(destination, required_bytes, limits, impl.context->device())
-        || overlaps_source(destination))
+    destination.create(input.w, input.h, out_elem, 1, impl.context->blob_allocator());
+    if (destination.empty() || !rms_norm_buffer_supported(destination, out_bytes, limits, impl.context->device())
+        || overlaps_source(destination, out_bytes))
         return false;
     if (impl.add_norm)
     {
-        if (overlaps_source(residual_destination)
-            || rms_norm_ranges_overlap(residual_destination, required_bytes, destination, required_bytes))
+        if (overlaps_source(residual_destination, required_bytes)
+            || rms_norm_ranges_overlap(residual_destination, required_bytes, destination, out_bytes))
             residual_destination.release();
         residual_destination.create(input.w, input.h, sizeof(float), impl.context->blob_allocator());
         if (residual_destination.empty()
             || !rms_norm_buffer_supported(residual_destination, required_bytes, limits, impl.context->device())
-            || overlaps_source(residual_destination)
-            || rms_norm_ranges_overlap(residual_destination, required_bytes, destination, required_bytes))
+            || overlaps_source(residual_destination, required_bytes)
+            || rms_norm_ranges_overlap(residual_destination, required_bytes, destination, out_bytes))
             return false;
     }
     auto& bindings = impl.bindings;
@@ -260,7 +257,7 @@ bool RmsNorm_vulkan::record(const ncnn::VkMat& input,
         dispatcher.w = static_cast<int>(impl.workgroup_size);
         dispatcher.h = input.h;
         dispatcher.c = 1;
-        cmd.record_pipeline_readonly(impl.pipeline.get(), bindings, readonly, constants, dispatcher);
+        cmd.record_pipeline_readonly(pipe.get(), bindings, readonly, constants, dispatcher);
     }
     catch (...)
     {
@@ -280,6 +277,7 @@ bool RmsNorm_vulkan::record(const ncnn::VkMat& input,
     (void)cmd;
     (void)branch;
     (void)residual;
+    (void)bf16_out;
     return false;
 #endif
 }

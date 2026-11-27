@@ -1,0 +1,81 @@
+#version 450
+
+// Split-K merge for attn_prefill_cm2.comp.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer partial_blob
+{ float partial_data[]; };
+#ifdef NCNN_ATTN_CM2_BF16_OUT
+layout(binding = 1) writeonly buffer output_blob
+{ uint output_bf16[]; };
+#else
+layout(binding = 1) writeonly buffer output_blob
+{ float output_data[]; };
+#endif
+
+layout(push_constant) uniform parameter
+{
+    uint query_count;
+    uint head_count;
+    uint head_dimension;
+    uint output_stride;
+    uint split_count;
+}
+p;
+
+#ifdef NCNN_ATTN_CM2_BF16_OUT
+uint f32_to_bf16(float v)
+{
+    const uint bits = floatBitsToUint(v);
+    return (bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16;
+}
+#endif
+
+void main()
+{
+    const uint q_row = gl_WorkGroupID.x;
+    const uint head = gl_WorkGroupID.y;
+    const uint lane = gl_LocalInvocationID.x;
+    if (q_row >= p.query_count || head >= p.head_count)
+        return;
+
+    const uint plane = p.head_count * p.query_count;
+    const uint lm_table = p.split_count * plane * p.head_dimension;
+
+    float total_l = 0.0;
+    for (uint s = 0u; s < p.split_count; ++s)
+    {
+        const uint lm_off = lm_table + ((s * p.head_count + head) * p.query_count + q_row) * 2u;
+        total_l += partial_data[lm_off];
+    }
+
+    const float inv_l = total_l > 0.0 ? (1.0 / total_l) : 0.0;
+    const uint out_base = q_row * p.output_stride + head * p.head_dimension;
+#ifdef NCNN_ATTN_CM2_BF16_OUT
+    const uint half_dim = p.head_dimension >> 1u;
+    for (uint d2 = lane; d2 < half_dim; d2 += 128u)
+    {
+        const uint d = d2 << 1u;
+        float acc0 = 0.0;
+        float acc1 = 0.0;
+        for (uint s = 0u; s < p.split_count; ++s)
+        {
+            const uint o_off = ((s * p.head_count + head) * p.query_count + q_row) * p.head_dimension + d;
+            acc0 += partial_data[o_off];
+            acc1 += partial_data[o_off + 1u];
+        }
+        output_bf16[(out_base >> 1u) + d2] = f32_to_bf16(acc0 * inv_l) | (f32_to_bf16(acc1 * inv_l) << 16);
+    }
+#else
+    for (uint d = lane; d < p.head_dimension; d += 128u)
+    {
+        float acc = 0.0;
+        for (uint s = 0u; s < p.split_count; ++s)
+        {
+            const uint o_off = ((s * p.head_count + head) * p.query_count + q_row) * p.head_dimension + d;
+            acc += partial_data[o_off];
+        }
+        output_data[out_base + d] = acc * inv_l;
+    }
+#endif
+}

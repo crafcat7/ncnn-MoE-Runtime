@@ -1,9 +1,13 @@
 #version 450
 
 // Merge phase of the split decode attention: combines the per-split online
-// softmax states written by attn_decode_split.comp into the final output.
+// softmax states written by the split/GQA scan kernels into the final output.
 //
-// One workgroup owns one head, one invocation per head dimension (at most 256).
+// One workgroup owns one head. The split count can reach 1024 at long context,
+// so the maximum and denominator reductions are spread over the whole
+// workgroup instead of walking the splits on a single lane: a lane-serial walk
+// makes the merge latency bound on global loads and dominates long-context
+// decode once the scan itself is short.
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -24,48 +28,89 @@ layout(push_constant) uniform parameter
 }
 p;
 
-shared float merged_maximum;
-shared float merged_denominator;
-shared float split_scale[16];
+shared float reduction[256];
+shared float split_scale[1024];
+
+float reduce_max(float value, uint lane)
+{
+    reduction[lane] = value;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u)
+    {
+        if (lane < stride)
+            reduction[lane] = max(reduction[lane], reduction[lane + stride]);
+        barrier();
+    }
+    return reduction[0];
+}
+
+float reduce_sum(float value, uint lane)
+{
+    reduction[lane] = value;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u)
+    {
+        if (lane < stride)
+            reduction[lane] += reduction[lane + stride];
+        barrier();
+    }
+    return reduction[0];
+}
 
 void main()
 {
     const uint lane = gl_LocalInvocationID.x;
     const uint head = gl_WorkGroupID.x;
-    if (head >= p.head_count || p.split_count == 0)
+    const uint splits = min(p.split_count, 1024u);
+    if (head >= p.head_count || splits == 0)
         return;
 
-    if (lane == 0)
+    const uint row_elements = p.head_dimension + 2u;
+    const uint head_base = head * splits * row_elements;
+
+    // Phase 1: per-split maximum, reduced across the workgroup.
+    float local_maximum = -3.402823466e+38;
+    for (uint split = lane; split < splits; split += 256u)
+        local_maximum = max(local_maximum, partial_data[head_base + split * row_elements + p.head_dimension]);
+    const float maximum = reduce_max(local_maximum, lane);
+
+    // Phase 2: softmax scale of every split and the merged denominator.
+    float local_denominator = 0.0;
+    for (uint split = lane; split < splits; split += 256u)
     {
-        float maximum = -3.402823466e+38;
-        for (uint split = 0; split < p.split_count; ++split)
-            maximum = max(maximum, partial_data[(head * p.split_count + split) * (p.head_dimension + 2u) + p.head_dimension]);
-        merged_maximum = maximum;
-        float denominator = 0.0;
-        for (uint split = 0; split < p.split_count; ++split)
+        const uint row = head_base + split * row_elements;
+        const float split_maximum = partial_data[row + p.head_dimension];
+        float scale = 0.0;
+        if (split_maximum > -3.402823466e+38)
         {
-            const uint row = (head * p.split_count + split) * (p.head_dimension + 2u);
-            const float split_maximum = partial_data[row + p.head_dimension];
-            float scale = 0.0;
-            if (split_maximum > -3.402823466e+38)
-            {
-                scale = exp(split_maximum - maximum);
-                denominator += partial_data[row + p.head_dimension + 1u] * scale;
-            }
-            split_scale[split] = scale;
+            scale = exp(split_maximum - maximum);
+            local_denominator += partial_data[row + p.head_dimension + 1u] * scale;
         }
-        merged_denominator = denominator;
+        split_scale[split] = scale;
     }
+    const float denominator = reduce_sum(local_denominator, lane);
     barrier();
-    float numerator = 0.0;
+
+    // Phase 3: weighted sum of the per-split numerators, one lane per dimension.
+    // Four independent accumulators keep several split loads in flight instead
+    // of serializing the sum on one dependent add chain.
     if (lane < p.head_dimension)
     {
-        for (uint split = 0; split < p.split_count; ++split)
+        float n0 = 0.0;
+        float n1 = 0.0;
+        float n2 = 0.0;
+        float n3 = 0.0;
+        uint split = 0u;
+        for (; split + 4u <= splits; split += 4u)
         {
-            const uint row = (head * p.split_count + split) * (p.head_dimension + 2u);
-            numerator += partial_data[row + lane] * split_scale[split];
+            n0 += partial_data[head_base + (split + 0u) * row_elements + lane] * split_scale[split + 0u];
+            n1 += partial_data[head_base + (split + 1u) * row_elements + lane] * split_scale[split + 1u];
+            n2 += partial_data[head_base + (split + 2u) * row_elements + lane] * split_scale[split + 2u];
+            n3 += partial_data[head_base + (split + 3u) * row_elements + lane] * split_scale[split + 3u];
         }
-        const float sum = merged_denominator;
-        output_data[head * p.head_dimension + lane] = sum == 0.0 ? 0.0 : numerator / sum;
+        float numerator = (n0 + n1) + (n2 + n3);
+        for (; split < splits; ++split)
+            numerator += partial_data[head_base + split * row_elements + lane] * split_scale[split];
+        output_data[head * p.head_dimension + lane] = denominator == 0.0 ? 0.0 : numerator / denominator;
     }
 }

@@ -12,8 +12,8 @@
 #include <limits>
 #include <new>
 #include <span>
-#include <thread>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace ncnn {
@@ -831,6 +831,51 @@ int VulkanComputeBatch::reset() noexcept
     return result;
 }
 
+std::string prefix_shader(const char* src, int len, const char* defines)
+{
+    std::string source(src, static_cast<size_t>(len));
+    const size_t version_end = source.find('\n');
+    if (version_end == std::string::npos)
+        return {};
+    source.insert(version_end + 1, defines);
+    return source;
+}
+
+bool create_cached_pipeline(const std::shared_ptr<VulkanContext>& context,
+                            const char* src,
+                            int len,
+                            const ncnn::Option& opt,
+                            uint64_t shader_variant,
+                            uint64_t pipeline_variant,
+                            int lx,
+                            std::shared_ptr<ncnn::Pipeline>& destination,
+                            const std::vector<ncnn::vk_specialization_type>& specs,
+                            int subgroup_size)
+{
+    destination = context->find_pipeline(src, pipeline_variant);
+    if (destination)
+        return true;
+    const auto spirv = context->shader_binary(src, len, opt, shader_variant);
+    if (!spirv || spirv->empty())
+        return false;
+    std::unique_ptr<ncnn::Pipeline> pipe(new ncnn::Pipeline(context->device()));
+    if (subgroup_size > 0)
+        pipe->set_subgroup_size(subgroup_size);
+    pipe->set_local_size_xyz(lx, 1, 1);
+    if (pipe->create(spirv->data(), spirv->size() * sizeof(uint32_t), specs) != 0)
+        return false;
+    destination = std::shared_ptr<ncnn::Pipeline>(pipe.release(),
+                                                  [context = context](ncnn::Pipeline* value) mutable {
+                                                      {
+                                                          const std::lock_guard<std::mutex> lock(context->command_mutex());
+                                                          delete value;
+                                                      }
+                                                      context.reset();
+                                                  });
+    context->cache_pipeline(src, pipeline_variant, destination);
+    return true;
+}
+
 int submit_compute_and_wait(ncnn::VkCompute& command,
                             const ncnn::VulkanDevice* probe_device)
 {
@@ -891,7 +936,42 @@ void VulkanContext::release_resources() noexcept
         staging_alloc = nullptr;
     }
     blob_alloc = nullptr;
+    cm2_scratch_buffer.release();
+    kv_alloc.reset();
     graph_allocator.reset();
+}
+
+ncnn::VkMat VulkanContext::cm2_scratch(int w, int h, size_t elemsize)
+{
+    if (!kv_alloc || w <= 0 || h < 0 || elemsize == 0)
+        return {};
+    const uint64_t elements = h > 0 ? static_cast<uint64_t>(w) * static_cast<uint64_t>(h)
+                                    : static_cast<uint64_t>(w);
+    const uint64_t bytes = elements * elemsize;
+    if (elements > static_cast<uint64_t>(std::numeric_limits<int>::max())
+        || bytes > static_cast<uint64_t>(std::numeric_limits<int>::max()))
+        return {};
+    if (cm2_scratch_buffer.empty() || cm2_scratch_buffer.buffer_capacity() < bytes)
+    {
+        cm2_scratch_buffer.release();
+        cm2_scratch_buffer.create(static_cast<int>(bytes), sizeof(uint8_t), 1, kv_alloc.get());
+        if (cm2_scratch_buffer.empty())
+            return {};
+    }
+    ncnn::VkMat view = cm2_scratch_buffer;
+    view.dims = h > 0 ? 2 : 1;
+    view.w = w;
+    view.h = h > 0 ? h : 1;
+    view.d = 1;
+    view.c = 1;
+    view.elemsize = elemsize;
+    view.elempack = 1;
+    view.cstep = static_cast<size_t>(elements);
+#if NCNN_BATCH
+    view.n = 1;
+    view.nstep = static_cast<size_t>(elements);
+#endif
+    return view;
 }
 
 bool VulkanContext::reserve_graph_compute(uint64_t bytes)
@@ -1044,6 +1124,7 @@ VulkanContext::VulkanContext(ncnn::VulkanDevice* device,
         weight_transfer_pool = std::make_unique<VulkanExpertTransferPool>(device);
         graph_allocator = std::make_unique<VulkanGraphAllocator>(device);
         blob_alloc = graph_allocator.get();
+        kv_alloc = std::make_unique<ncnn::VkBlobAllocator>(device);
         staging_alloc = device->acquire_staging_allocator();
         for (VulkanTransferSlot& slot : transfer_slots)
             slot.staging_allocator = device->acquire_staging_allocator();

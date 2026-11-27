@@ -1,0 +1,236 @@
+#version 450
+
+// Subgroup-scope cooperative-matrix decode for grouped-query attention.
+//
+// One subgroup (32 lanes) owns one KV head and one slice of the cache, and
+// evaluates the whole query group of that KV head. Unlike the workgroup-scope
+// matrix path, the tensor tiles are 16 rows, so a group of 4-8 query heads
+// fills a much larger fraction of the M dimension, and the per-element softmax
+// work covers 16x16 scores instead of 32x32.
+//
+// QK: Q(MxK) * K^T(KxN), P*V: P(MxN) * V(NxK), probabilities converted to BF16
+// with a single pass (FP32 accumulate), matching llama.cpp's flash decode.
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_NV_cooperative_matrix2 : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint HEAD_DIM = 64;
+layout(constant_id = 1) const uint TM = 16;
+layout(constant_id = 2) const uint TN = 16;
+layout(constant_id = 3) const uint TK = 16;
+
+#define KTILES (HEAD_DIM / TK)
+#define NTILES (HEAD_DIM / TN)
+
+layout(binding = 0) readonly buffer query_blob
+{ float query_data[]; };
+layout(binding = 1) readonly buffer key_blob
+{ uint key_data[]; };
+layout(binding = 2) readonly buffer value_blob
+{ uint value_data[]; };
+layout(binding = 3) readonly buffer sink_blob
+{ float sink_data[]; };
+layout(binding = 4) writeonly buffer partial_blob
+{ float partial_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    uint head_dimension;
+    uint destination_count;
+    uint head_count;
+    uint key_value_head_count;
+    uint query_cstep;
+    uint key_cstep;
+    uint value_cstep;
+    uint use_attention_sink;
+    float scale;
+    uint split_count;
+    uint split_tokens;
+}
+p;
+
+#define ACCUM_MATRIX coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>
+#define SCORE_MATRIX coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>
+#define OUT_MATRIX   coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>
+
+float reduce_max(const in float a, const in float b)
+{
+    return max(a, b);
+}
+
+float reduce_sum(const in float a, const in float b)
+{
+    return a + b;
+}
+
+float element_max(const in uint row, const in uint column,
+                  const in float a, const in float b)
+{
+    return max(a, b);
+}
+
+float element_exp(const in uint row, const uint column_unused, const in float value)
+{
+    return exp(value);
+}
+
+float broadcast_row(const in float a, const in float b)
+{
+    return a;
+}
+
+float mask_padding(const in uint row, const in uint column,
+                   const in float value, const in float replacement,
+                   const in uint rows, const in uint columns)
+{
+    return row < rows && column < columns ? value : replacement;
+}
+
+float store_numerator(const in uint row, const in uint column,
+                      const in float value, const in uint first_head,
+                      const in uint rows, const in uint split,
+                      const in uint dim_offset)
+{
+    if (row < rows)
+    {
+        const uint offset = ((first_head + row) * p.split_count + split) * (p.head_dimension + 2u)
+                            + dim_offset + column;
+        partial_data[offset] = value;
+    }
+    return value;
+}
+
+float store_statistic(const in uint row, const in uint column,
+                      const in float value, const in uint first_head,
+                      const in uint rows, const in uint split,
+                      const in uint statistic)
+{
+    if (row < rows && column == 0)
+    {
+        const uint offset = ((first_head + row) * p.split_count + split) * (p.head_dimension + 2u)
+                            + p.head_dimension + statistic;
+        partial_data[offset] = value;
+    }
+    return value;
+}
+
+void main()
+{
+    const uint lane = gl_SubgroupInvocationID;
+    const uint task = gl_WorkGroupID.x * 4u + gl_SubgroupID;
+    const uint task_count = p.key_value_head_count * p.split_count;
+    if (task >= task_count)
+        return;
+    const uint kv = task % p.key_value_head_count;
+    const uint split = task / p.key_value_head_count;
+    if (split >= p.split_count || p.split_tokens == 0)
+        return;
+    if (p.head_dimension != HEAD_DIM)
+        return;
+    const uint group_size = p.head_count / p.key_value_head_count;
+    if (group_size == 0 || group_size > TM)
+        return;
+    const uint first_head = kv * group_size;
+    const uint rows = group_size;
+
+    const uint split_begin = min(p.destination_count, split * p.split_tokens);
+    const uint split_end = min(p.destination_count, split_begin + p.split_tokens);
+    if (split_begin >= split_end)
+        return;
+
+    const float negative_max = uintBitsToFloat(0xfeffffffu);
+
+    // Query tiles: A matrices (TM x TK) per head-dimension tile, converted from
+    // the FP32 projection output.
+    coopmat<bfloat16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> qmat[KTILES];
+    {
+        tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> qlayout = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+        qlayout = setTensorLayoutDimensionNV(qlayout, rows, HEAD_DIM);
+        qlayout = setTensorLayoutStrideNV(qlayout, p.query_cstep, 1);
+        for (uint kt = 0; kt < KTILES; ++kt)
+        {
+            coopmat<float, gl_ScopeSubgroup, TM, TK, gl_MatrixUseAccumulator> qf;
+            coopMatLoadTensorNV(qf, query_data, first_head * p.query_cstep,
+                                sliceTensorLayoutNV(qlayout, 0, TM, int(kt * TK), int(TK)));
+            qmat[kt] = coopmat<bfloat16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA>(qf);
+        }
+    }
+
+    // K/V tensor layouts over the contiguous ring view. The ring stores one
+    // KV-head slice per base offset, and token rows are head_dim apart.
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> kv_layout = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    kv_layout = setTensorLayoutDimensionNV(kv_layout, split_end, HEAD_DIM);
+    kv_layout = setTensorLayoutStrideNV(kv_layout, HEAD_DIM, 1);
+    const tensorViewNV<2, false, 1, 0> transpose = createTensorViewNV(2, false, 1, 0);
+
+    OUT_MATRIX numerator[NTILES];
+    for (uint nt = 0; nt < NTILES; ++nt)
+        numerator[nt] = OUT_MATRIX(0.0);
+    SCORE_MATRIX row_max = SCORE_MATRIX(negative_max);
+    SCORE_MATRIX row_sum = SCORE_MATRIX(0.0);
+
+    // The softmax base is fixed from the first key block of the split instead of
+    // being re-maximised every block: later blocks may exceed it, but the shift
+    // is common to the whole row and the final division removes it, so the
+    // result is identical up to the (large) dynamic range of FP32. This removes
+    // two row reductions and the accumulator rescale from every later block,
+    // which dominate the decode scan now that it is only a few blocks long.
+    bool have_base = false;
+    for (uint token = split_begin; token < split_end; token += TN)
+    {
+        SCORE_MATRIX scores = SCORE_MATRIX(0.0);
+        for (uint kt = 0; kt < KTILES; ++kt)
+        {
+            coopmat<bfloat16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> kmat;
+            coopMatLoadTensorNV(kmat, key_data, (kv * p.key_cstep) / 2,
+                                sliceTensorLayoutNV(kv_layout, int(token), int(TN), int(kt * TK), int(TK)),
+                                transpose);
+            scores = coopMatMulAdd(qmat[kt], kmat, scores);
+        }
+        scores *= p.scale;
+
+        const uint columns = min(TN, split_end - token);
+        if (rows != TM || columns != TN)
+            coopMatPerElementNV(scores, scores, mask_padding, negative_max, rows, columns);
+
+        SCORE_MATRIX probabilities;
+        if (!have_base)
+        {
+            have_base = true;
+            coopMatReduceNV(row_max, scores, gl_CooperativeMatrixReduceRowNV, reduce_max);
+            coopMatPerElementNV(probabilities, scores - row_max, element_exp);
+        }
+        else
+        {
+            coopMatPerElementNV(probabilities, scores - row_max, element_exp);
+        }
+        if (rows != TM || columns != TN)
+            coopMatPerElementNV(probabilities, probabilities, mask_padding, 0.0, rows, columns);
+
+        SCORE_MATRIX tile_sum;
+        coopMatReduceNV(tile_sum, probabilities, gl_CooperativeMatrixReduceRowNV, reduce_sum);
+        row_sum = row_sum + tile_sum;
+
+        coopmat<bfloat16_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseA> probability_bf16 = coopmat<bfloat16_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseA>(probabilities);
+
+        for (uint nt = 0; nt < NTILES; ++nt)
+        {
+            coopmat<bfloat16_t, gl_ScopeSubgroup, TN, TN, gl_MatrixUseB> vmat;
+            coopMatLoadTensorNV(vmat, value_data, (kv * p.value_cstep) / 2,
+                                sliceTensorLayoutNV(kv_layout, int(token), int(TN), int(nt * TN), int(TN)));
+            numerator[nt] = coopMatMulAdd(probability_bf16, vmat, numerator[nt]);
+        }
+    }
+
+    // Store the per-split online-softmax state. The merge pass combines them.
+    for (uint nt = 0; nt < NTILES; ++nt)
+        coopMatPerElementNV(numerator[nt], numerator[nt], store_numerator, first_head, rows, split, nt * TN);
+    coopMatPerElementNV(row_max, row_max, store_statistic, first_head, rows, split, 0u);
+    coopMatPerElementNV(row_sum, row_sum, store_statistic, first_head, rows, split, 1u);
+}

@@ -1,0 +1,191 @@
+#version 450
+
+// GQA split decode with vectorized 16-bit KV loads: one warp per query head,
+// lanes own four consecutive head-dimension values so every K/V read is one
+// aligned 8-byte pair. The scalar variant (attn_decode_gqa.comp) stays for
+// head dimensions that cannot fill a 4-value lane group.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
+
+#ifndef ATTN_HEAD_DIM
+#define ATTN_HEAD_DIM 128u
+#endif
+#ifndef ATTN_TOKENS
+#define ATTN_TOKENS 8u
+#endif
+const uint HEAD_DIM = ATTN_HEAD_DIM;
+const uint VECS = HEAD_DIM / 128u; // one 4-value group per 128 dimensions
+const uint WARPS = 8u;
+const uint TOKENS = ATTN_TOKENS;
+
+layout(binding = 0) readonly buffer query_blob
+{
+    vec4 query_data[];
+};
+layout(binding = 1) readonly buffer key_blob
+{
+    uvec2 key_pairs[];
+};
+layout(binding = 2) readonly buffer value_blob
+{
+    uvec2 value_pairs[];
+};
+layout(binding = 3) readonly buffer sink_blob
+{
+    float sink_data[];
+};
+layout(binding = 4) writeonly buffer partial_blob
+{
+    float partial_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint head_dimension;
+    uint destination_count;
+    uint head_count;
+    uint key_value_head_count;
+    uint query_cstep;
+    uint key_cstep;
+    uint value_cstep;
+    uint use_attention_sink;
+    float scale;
+    uint split_count;
+    uint split_tokens;
+}
+p;
+
+vec4 unpack4(uvec2 pair)
+{
+#if NCNN_bf16_storage
+    return vec4(uintBitsToFloat((pair.x & 65535u) << 16u),
+                uintBitsToFloat(pair.x & 0xffff0000u),
+                uintBitsToFloat((pair.y & 65535u) << 16u),
+                uintBitsToFloat(pair.y & 0xffff0000u));
+#else
+    return vec4(unpackHalf2x16(pair.x), unpackHalf2x16(pair.y));
+#endif
+}
+
+void main()
+{
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    const uint lane = gl_SubgroupInvocationID;
+    const uint head = gl_WorkGroupID.z * WARPS + gl_SubgroupID;
+    const uint split = gl_WorkGroupID.y;
+    if (head >= p.head_count || split >= p.split_count || p.split_tokens == 0)
+        return;
+
+    const uint split_begin = min(p.destination_count, split * p.split_tokens);
+    const uint split_end = min(p.destination_count, split_begin + p.split_tokens);
+    if (split_begin >= split_end)
+        return;
+
+    const uint heads_per_group = p.head_count / p.key_value_head_count;
+    const uint key_value_head = head / heads_per_group;
+    // Vector indexes count 4-value groups, so the stride per token is HEAD_DIM/4.
+    const uint query_base = head * p.query_cstep;
+    const uint key_base = key_value_head * (p.key_cstep >> 2u);
+    const uint value_base = key_value_head * (p.value_cstep >> 2u);
+    const uint token_stride = p.head_dimension >> 2u;
+    const uint last_token = split_end - 1u;
+    // The sink row is fixed for the whole scan; keep the test out of the loop.
+    const uint sink_token = p.use_attention_sink != 0 ? p.destination_count - 1u : 0xffffffffu;
+
+    vec4 query[VECS];
+    for (uint i = 0; i < VECS; ++i)
+        query[i] = query_data[(query_base >> 2u) + lane + i * 32u];
+
+    float maximum = -3.402823466e+38;
+    float denominator = 0.0;
+    vec4 numerator[VECS];
+    for (uint i = 0; i < VECS; ++i)
+        numerator[i] = vec4(0.0);
+
+    for (uint block = split_begin; block < split_end; block += TOKENS)
+    {
+        vec4 key_block[TOKENS][VECS];
+        for (uint t = 0; t < TOKENS; ++t)
+        {
+            const uint token = min(block + t, last_token);
+            for (uint i = 0; i < VECS; ++i)
+                key_block[t][i] = unpack4(key_pairs[key_base + token * token_stride + lane + i * 32u]);
+        }
+
+        float scores[TOKENS];
+        for (uint t = 0; t < TOKENS; ++t)
+        {
+            const uint token = block + t;
+            if (token >= split_end)
+            {
+                scores[t] = -3.402823466e+38;
+                continue;
+            }
+            if (token == sink_token)
+            {
+                scores[t] = sink_data[head];
+                continue;
+            }
+            float score = 0.0;
+            for (uint i = 0; i < VECS; ++i)
+                score += dot(query[i], key_block[t][i]);
+            scores[t] = subgroupAdd(score) * p.scale;
+        }
+
+        float block_maximum = -3.402823466e+38;
+        for (uint t = 0; t < TOKENS; ++t)
+            block_maximum = max(block_maximum, scores[t]);
+        const float next_maximum = max(maximum, block_maximum);
+        const float previous_scale = denominator == 0.0 ? 0.0 : exp(maximum - next_maximum);
+        float weights[TOKENS];
+        float block_sum = 0.0;
+        for (uint t = 0; t < TOKENS; ++t)
+        {
+            weights[t] = exp(scores[t] - next_maximum);
+            block_sum += weights[t];
+        }
+        denominator = denominator * previous_scale + block_sum;
+        maximum = next_maximum;
+        if (previous_scale != 1.0)
+        {
+            for (uint i = 0; i < VECS; ++i)
+                numerator[i] *= previous_scale;
+        }
+
+        vec4 value_block[TOKENS][VECS];
+        for (uint t = 0; t < TOKENS; ++t)
+        {
+            const uint token = min(block + t, last_token);
+            for (uint i = 0; i < VECS; ++i)
+                value_block[t][i] = unpack4(value_pairs[value_base + token * token_stride + lane + i * 32u]);
+        }
+        for (uint t = 0; t < TOKENS; ++t)
+        {
+            if (block + t >= split_end || weights[t] == 0.0)
+                continue;
+            for (uint i = 0; i < VECS; ++i)
+                numerator[i] += weights[t] * value_block[t][i];
+        }
+    }
+
+    const uint row = (head * p.split_count + split) * (p.head_dimension + 2u);
+    for (uint i = 0; i < VECS; ++i)
+    {
+        const uint dim = lane * 4u + i * 128u;
+        partial_data[row + dim + 0u] = numerator[i].x;
+        partial_data[row + dim + 1u] = numerator[i].y;
+        partial_data[row + dim + 2u] = numerator[i].z;
+        partial_data[row + dim + 3u] = numerator[i].w;
+    }
+    if (lane == 0)
+    {
+        partial_data[row + p.head_dimension] = maximum;
+        partial_data[row + p.head_dimension + 1u] = denominator;
+    }
+#endif
+}

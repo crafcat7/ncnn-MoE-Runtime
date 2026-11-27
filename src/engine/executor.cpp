@@ -289,10 +289,18 @@ static void scale_rows(ActivationBuffer& hidden, float scale)
 {
     if (scale == 1.0f)
         return;
-    for (size_t row = 0; row < hidden.rows(); ++row)
+    const size_t rows = hidden.rows();
+    const uint32_t columns = hidden.columns();
+    const int threads = rows > 1
+                            ? static_cast<int>(std::min<size_t>(rows, static_cast<size_t>(cpu_linear_num_threads())))
+                            : 1;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) num_threads(threads) if (threads > 1)
+#endif
+    for (int64_t row = 0; row < static_cast<int64_t>(rows); ++row)
     {
-        float* values = hidden.row(row);
-        for (uint32_t column = 0; column < hidden.columns(); ++column)
+        float* values = hidden.row(static_cast<size_t>(row));
+        for (uint32_t column = 0; column < columns; ++column)
             values[column] *= scale;
     }
 }
@@ -800,8 +808,8 @@ Result<void> forward_model(const CompiledModel& model,
             return Error{ErrorCode::InternalError, "token embedding node has an invalid weight binding"};
         forward_embedding(weights.at(node->weights[0]),
                           input_ids,
-                          hidden);
-        scale_rows(hidden, model.descriptor.embed_scale);
+                          hidden,
+                          model.descriptor.embed_scale);
         hyper_connection_expand(hidden, model.descriptor.hyper_connection_multiplier, state.expert_scratch.staged_output);
         if (model.resident_submission_rows != 0)
         {
@@ -1778,8 +1786,8 @@ Result<void> forward_decode_batch(const CompiledModel& model,
         }
         forward_embedding(model.weights.at(node->weights[0]),
                           input_ids,
-                          scratch.staged_output);
-        scale_rows(scratch.staged_output, model.descriptor.embed_scale);
+                          scratch.staged_output,
+                          model.descriptor.embed_scale);
         if (hyper_multiplier > 1)
         {
             hyper_connection_expand(scratch.staged_output, hyper_multiplier, scratch.staged_merged);

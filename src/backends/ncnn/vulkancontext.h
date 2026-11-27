@@ -259,6 +259,19 @@ bool copy_staging_to_cpu_batches(ncnn::VkMat& staging,
 bool prepare_float_tensor_upload(const TensorData& source,
                                  ncnn::Mat& destination);
 
+[[nodiscard]] std::string prefix_shader(const char* src, int len, const char* defines);
+
+[[nodiscard]] bool create_cached_pipeline(const std::shared_ptr<VulkanContext>& context,
+                                          const char* src,
+                                          int len,
+                                          const ncnn::Option& opt,
+                                          uint64_t shader_variant,
+                                          uint64_t pipeline_variant,
+                                          int lx,
+                                          std::shared_ptr<ncnn::Pipeline>& destination,
+                                          const std::vector<ncnn::vk_specialization_type>& specs = {},
+                                          int subgroup_size = 0);
+
 class VulkanRuntime
 {
 public:
@@ -374,6 +387,16 @@ public:
         return staging_alloc;
     }
 
+    // Device-local, growable storage for long-lived per-session caches.
+    [[nodiscard]] ncnn::VkAllocator* kv_allocator() const noexcept
+    {
+        return kv_alloc.get();
+    }
+
+    // Persistent device-local scratch reused under command_mutex().
+    // h == 0 creates a 1D view of w elements; h > 0 creates a 2D (w, h) view.
+    [[nodiscard]] ncnn::VkMat cm2_scratch(int w, int h, size_t elemsize);
+
     [[nodiscard]] uint64_t optimization_flags() const noexcept
     {
         return flags;
@@ -451,6 +474,13 @@ private:
     ncnn::VkAllocator* blob_alloc = nullptr;
     std::unique_ptr<VulkanGraphAllocator> graph_allocator;
     ncnn::VkAllocator* staging_alloc = nullptr;
+    // Device-local storage for the attention KV rings. The graph arena is
+    // sealed after its reservation, while the ring grows token by token, so it
+    // needs an allocator that can still grow. Host-visible staging memory must
+    // not back it: reading the whole ring over the BAR costs an order of
+    // magnitude more bandwidth per decode step.
+    std::unique_ptr<ncnn::VkBlobAllocator> kv_alloc;
+    ncnn::VkMat cm2_scratch_buffer;
     std::mutex command_lock;
     // Staging slots require independent allocators while commands are in flight.
     std::array<VulkanTransferSlot, 2> transfer_slots;

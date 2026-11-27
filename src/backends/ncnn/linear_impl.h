@@ -28,6 +28,8 @@ public:
     std::unique_ptr<ncnn::VkWeightStagingAllocator> weight_staging_allocator;
     std::shared_ptr<ncnn::Pipeline> pipeline;
     std::shared_ptr<ncnn::Pipeline> single_row_pipeline;
+    // One-row decode with BF16 activations: four output columns per workgroup.
+    std::shared_ptr<ncnn::Pipeline> single_row_bf16_pipeline;
     std::shared_ptr<ncnn::Pipeline> cooperative_pipeline;
     // ncnn's cooperative-matrix Gemm for prefill; the tiled shader below is the
     // fallback and serves decode.
@@ -35,8 +37,13 @@ public:
     ncnn::Option coop_opt = {};
     // Tiled FP16-staged FP32-accumulate projection geometries, pipe[0] wide.
     TileGemm tile_gemm[2];
+    // Native NV cooperative_matrix2 BF16 GEMM geometries (preferred for prefill).
+    Cm2Gemm gemm_cm2[4];
+    bool cm2_ok = false;
+    bool has_nonzero_bias = false;
     std::shared_ptr<ncnn::Pipeline> row_rms_scale_pipeline;
     mutable std::shared_ptr<ncnn::Pipeline> swiglu_down_pipeline;
+    mutable std::shared_ptr<ncnn::Pipeline> swiglu_pipe;
     std::shared_ptr<ncnn::Pipeline> rms_norm_projection_pipeline;
     ncnn::VkMat packed;
     ncnn::VkMat bias;
@@ -171,8 +178,18 @@ public:
     std::unique_ptr<ncnn::VkWeightStagingAllocator> weight_staging_allocator;
     std::shared_ptr<ncnn::Pipeline> pipeline;
     std::shared_ptr<ncnn::Pipeline> prefill_pipeline;
+    // One-row Q8_0 decode: four output rows per workgroup, four columns per lane.
+    std::shared_ptr<ncnn::Pipeline> decode_q8_pipeline;
+    // One-row dense BF16 decode with the same row/column mapping.
+    std::shared_ptr<ncnn::Pipeline> decode_bf16_pipeline;
     // Tiled FP16-staged FP32-accumulate projection geometries, pipe[0] wide.
     TileGemm tile_gemm[2];
+    // Native NV cooperative_matrix2 BF16 GEMM geometries (preferred for BF16 prefill).
+    Cm2Gemm gemm_cm2[4];
+    Cm2Gemm gemm_cm2_bf16[4];
+    bool cm2_ok = false;
+    bool cm2_bf16_ok = false;
+    bool has_nonzero_bias = false;
     // Plain BF16 rows can run prefill through ncnn's cooperative-matrix Gemm; it
     // is created only for weight layouts the Gemm layer can pack on the host.
     std::shared_ptr<ncnn::Layer> coop_gemm;
@@ -207,7 +224,7 @@ public:
     std::shared_ptr<QnkLinear_vulkan> down;
     std::shared_ptr<QnkLinear_vulkan> router_gate;
     std::shared_ptr<VulkanContext> vulkan_context;
-    std::shared_ptr<ncnn::Pipeline> swiglu_pipeline;
+    std::shared_ptr<ncnn::Pipeline> swiglu_pipe[3]; // 0: f32, 1: bf16_out, 2: bf16_io
     ncnn::Option option;
 #endif
     uint32_t intermediate_columns = 0;

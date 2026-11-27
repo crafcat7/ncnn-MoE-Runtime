@@ -1,0 +1,227 @@
+#version 450
+
+// Workgroup-scope NV cooperative_matrix2 BF16 GEMM for prefill projections.
+//
+// Computes out[M, output_offset : output_offset + N] =
+//     in_bf16[M, K] * W_bf16[N, K]^T + (has_bias ? bias[N] : 0)
+//
+// Both A (activations) and B (weights) are loaded directly as native BF16
+// cooperative matrices (UseA / UseB) with ZERO register-layout conversion or
+// shared-memory barriers inside the K-loop. Supports wg=128 and wg=256 tiles.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_NV_cooperative_matrix2 : require
+
+layout(constant_id = 0) const uint BM = 64;
+layout(constant_id = 1) const uint BN = 128;
+layout(constant_id = 2) const uint BK = 64;
+
+layout(binding = 0) readonly buffer input_blob
+{ uint input_data[]; };
+layout(binding = 1) readonly buffer weight_blob
+{ uint weight_data[]; };
+layout(binding = 2) readonly buffer bias_blob
+{ float bias_data[]; };
+#ifdef NCNN_GEMM_CM2_BF16_OUT
+layout(binding = 3) writeonly buffer output_blob
+{ uint output_data[]; };
+#else
+layout(binding = 3) writeonly buffer output_blob
+{ float output_data[]; };
+#endif
+layout(binding = 4) readonly buffer residual_blob
+{ float residual_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    uint M;
+    uint N;
+    uint K;
+    uint output_stride;
+    uint output_offset;
+    uint flags; // bit 0: has_bias, bit 1: has_residual
+}
+p;
+
+float add_bias(const in uint row, const in uint col, const in float value, const in uint col_base)
+{
+    const uint column = col_base + col;
+    return column < p.N ? value + bias_data[column] : value;
+}
+
+void main()
+{
+    const uint blocks_m = (p.M + BM - 1u) / BM;
+    const uint blocks_n = (p.N + BN - 1u) / BN;
+
+    // L2-friendly tile swizzling: group up to 8 M-tiles together so all M-tiles
+    // sharing a weight panel execute concurrently and hit L2 on W.
+    const uint group_m = min(blocks_m, 8u);
+    const uint tiles_per_group = group_m * blocks_n;
+    const uint linear = gl_WorkGroupID.y * blocks_m + gl_WorkGroupID.x;
+    const uint group_id = linear / tiles_per_group;
+    const uint first_m = group_id * group_m;
+    const uint current_group_m = min(blocks_m - first_m, group_m);
+    const uint in_group = linear - group_id * tiles_per_group;
+    const uint tile_m = first_m + (in_group % current_group_m);
+    const uint tile_n = in_group / current_group_m;
+
+    const uint row_base = tile_m * BM;
+    const uint col_base = tile_n * BN;
+    if (row_base >= p.M || col_base >= p.N)
+        return;
+
+    tensorViewNV<2, false, 1, 0> transpose = createTensorViewNV(2, false, 1, 0);
+    coopmat<float, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator> acc = coopmat<float, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator>(0.0);
+
+    const bool fast_tile = (row_base + BM <= p.M)
+                           && (col_base + BN <= p.N)
+                           && ((p.K & (BK - 1u)) == 0u)
+                           && ((p.K & 7u) == 0u);
+
+    if (fast_tile)
+    {
+        const uint stride_k = p.K & ~7u;
+        tensorLayoutNV<2, gl_CooperativeMatrixClampModeUndefinedNV> a_fast = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeUndefinedNV);
+        a_fast = setTensorLayoutDimensionNV(a_fast, p.M, p.K);
+        a_fast = setTensorLayoutStrideNV(a_fast, stride_k, 1);
+
+        tensorLayoutNV<2, gl_CooperativeMatrixClampModeUndefinedNV> b_fast = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeUndefinedNV);
+        b_fast = setTensorLayoutDimensionNV(b_fast, p.N, p.K);
+        b_fast = setTensorLayoutStrideNV(b_fast, stride_k, 1);
+
+        uint k = 0u;
+        // Deep unroll while the K remainder allows it (K=1024/3072 hit it
+        // exactly), then an 8-step unroll for the middle part (e.g. K=896),
+        // then single steps. The deeper unroll lets the compiler overlap more
+        // tensor loads with mma and measured ~5% faster on the dense shapes.
+        const uint unroll_step_16 = BK * 16u;
+        [[dont_unroll]]
+        for (; k + unroll_step_16 <= p.K; k += unroll_step_16)
+        {
+            [[unroll]] for (uint u = 0u; u < 16u; ++u)
+            {
+                const uint kk = k + u * BK;
+                coopmat<bfloat16_t, gl_ScopeWorkgroup, BM, BK, gl_MatrixUseA> mat_a;
+                coopmat<bfloat16_t, gl_ScopeWorkgroup, BK, BN, gl_MatrixUseB> mat_b;
+                coopMatLoadTensorNV(mat_a, input_data, 0,
+                                    sliceTensorLayoutNV(a_fast, int(row_base), BM, int(kk), BK));
+                coopMatLoadTensorNV(mat_b, weight_data, 0,
+                                    sliceTensorLayoutNV(b_fast, int(col_base), BN, int(kk), BK),
+                                    transpose);
+                acc = coopMatMulAdd(mat_a, mat_b, acc);
+            }
+        }
+        const uint unroll_step = BK * 8u;
+        [[dont_unroll]]
+        for (; k + unroll_step <= p.K; k += unroll_step)
+        {
+            [[unroll]] for (uint u = 0u; u < 8u; ++u)
+            {
+                const uint kk = k + u * BK;
+                coopmat<bfloat16_t, gl_ScopeWorkgroup, BM, BK, gl_MatrixUseA> mat_a;
+                coopmat<bfloat16_t, gl_ScopeWorkgroup, BK, BN, gl_MatrixUseB> mat_b;
+                coopMatLoadTensorNV(mat_a, input_data, 0,
+                                    sliceTensorLayoutNV(a_fast, int(row_base), BM, int(kk), BK));
+                coopMatLoadTensorNV(mat_b, weight_data, 0,
+                                    sliceTensorLayoutNV(b_fast, int(col_base), BN, int(kk), BK),
+                                    transpose);
+                acc = coopMatMulAdd(mat_a, mat_b, acc);
+            }
+        }
+        [[dont_unroll]]
+        for (; k < p.K; k += BK)
+        {
+            coopmat<bfloat16_t, gl_ScopeWorkgroup, BM, BK, gl_MatrixUseA> mat_a;
+            coopmat<bfloat16_t, gl_ScopeWorkgroup, BK, BN, gl_MatrixUseB> mat_b;
+            coopMatLoadTensorNV(mat_a, input_data, 0,
+                                sliceTensorLayoutNV(a_fast, int(row_base), BM, int(k), BK));
+            coopMatLoadTensorNV(mat_b, weight_data, 0,
+                                sliceTensorLayoutNV(b_fast, int(col_base), BN, int(k), BK),
+                                transpose);
+            acc = coopMatMulAdd(mat_a, mat_b, acc);
+        }
+    }
+    else
+    {
+        tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> a_clamp = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+        a_clamp = setTensorLayoutDimensionNV(a_clamp, p.M, p.K);
+        a_clamp = setTensorLayoutStrideNV(a_clamp, p.K, 1);
+
+        tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> b_clamp = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+        b_clamp = setTensorLayoutDimensionNV(b_clamp, p.N, p.K);
+        b_clamp = setTensorLayoutStrideNV(b_clamp, p.K, 1);
+
+        [[dont_unroll]]
+        for (uint k = 0u; k < p.K; k += BK)
+        {
+            coopmat<bfloat16_t, gl_ScopeWorkgroup, BM, BK, gl_MatrixUseA> mat_a;
+            coopmat<bfloat16_t, gl_ScopeWorkgroup, BK, BN, gl_MatrixUseB> mat_b;
+            coopMatLoadTensorNV(mat_a, input_data, 0,
+                                sliceTensorLayoutNV(a_clamp, int(row_base), BM, int(k), BK));
+            coopMatLoadTensorNV(mat_b, weight_data, 0,
+                                sliceTensorLayoutNV(b_clamp, int(col_base), BN, int(k), BK),
+                                transpose);
+            acc = coopMatMulAdd(mat_a, mat_b, acc);
+        }
+    }
+
+    if ((p.flags & 1u) != 0u)
+        coopMatPerElementNV(acc, acc, add_bias, col_base);
+
+    const bool fast_out = (row_base + BM <= p.M)
+                          && (col_base + BN <= p.N)
+                          && ((p.output_stride & 3u) == 0u)
+                          && ((p.output_offset & 3u) == 0u);
+    if (fast_out)
+    {
+        const uint out_stride_aligned = p.output_stride & ~3u;
+        const uint out_offset_aligned = p.output_offset & ~3u;
+        tensorLayoutNV<2, gl_CooperativeMatrixClampModeUndefinedNV> out_fast = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeUndefinedNV);
+        out_fast = setTensorLayoutDimensionNV(out_fast, p.M, p.N);
+        out_fast = setTensorLayoutStrideNV(out_fast, out_stride_aligned, 1);
+        if ((p.flags & 2u) != 0u)
+        {
+            coopmat<float, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator> res;
+            coopMatLoadTensorNV(res, residual_data, out_offset_aligned,
+                                sliceTensorLayoutNV(out_fast, int(row_base), BM, int(col_base), BN));
+            acc += res;
+        }
+#ifdef NCNN_GEMM_CM2_BF16_OUT
+        coopmat<bfloat16_t, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator> acc_bf16 = coopmat<bfloat16_t, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator>(acc);
+        coopMatStoreTensorNV(acc_bf16, output_data, out_offset_aligned >> 1u,
+                             sliceTensorLayoutNV(out_fast, int(row_base), BM, int(col_base), BN));
+#else
+        coopMatStoreTensorNV(acc, output_data, out_offset_aligned,
+                             sliceTensorLayoutNV(out_fast, int(row_base), BM, int(col_base), BN));
+#endif
+    }
+    else
+    {
+        tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> out_layout = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+        out_layout = setTensorLayoutDimensionNV(out_layout, p.M, p.N);
+        out_layout = setTensorLayoutStrideNV(out_layout, p.output_stride, 1);
+
+        if ((p.flags & 2u) != 0u)
+        {
+            coopmat<float, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator> res;
+            coopMatLoadTensorNV(res, residual_data, p.output_offset,
+                                sliceTensorLayoutNV(out_layout, int(row_base), BM, int(col_base), BN));
+            acc += res;
+        }
+
+#ifdef NCNN_GEMM_CM2_BF16_OUT
+        coopmat<bfloat16_t, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator> acc_bf16 = coopmat<bfloat16_t, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator>(acc);
+        coopMatStoreTensorNV(acc_bf16, output_data, p.output_offset >> 1u,
+                             sliceTensorLayoutNV(out_layout, int(row_base), BM, int(col_base), BN));
+#else
+        coopMatStoreTensorNV(acc, output_data, p.output_offset,
+                             sliceTensorLayoutNV(out_layout, int(row_base), BM, int(col_base), BN));
+#endif
+    }
+}

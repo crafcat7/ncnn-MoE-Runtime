@@ -1,5 +1,19 @@
 #version 450
 
+#ifdef NCNN_ATTN_GATE_BF16_OUT
+layout(binding = 0) readonly buffer attention_blob
+{
+    float attention_data[];
+};
+layout(binding = 1) readonly buffer gate_blob
+{
+    float gate_data[];
+};
+layout(binding = 2) writeonly buffer output_bf16_blob
+{
+    uint output_bf16[];
+};
+#else
 layout(binding = 0) buffer attention_blob
 {
     float attention_data[];
@@ -8,6 +22,7 @@ layout(binding = 1) readonly buffer gate_blob
 {
     float gate_data[];
 };
+#endif
 
 layout(push_constant) uniform parameter
 {
@@ -15,10 +30,29 @@ layout(push_constant) uniform parameter
 }
 p;
 
+#ifdef NCNN_ATTN_GATE_BF16_OUT
+uint f32_to_bf16_rne(float v)
+{
+    const uint bits = floatBitsToUint(v);
+    const uint rounding = 0x7fffu + ((bits >> 16) & 1u);
+    return (bits + rounding) >> 16;
+}
+#endif
+
 void main()
 {
+#ifdef NCNN_ATTN_GATE_BF16_OUT
+    const uint pair_idx = gl_GlobalInvocationID.x;
+    if (pair_idx >= (p.elements >> 1u))
+        return;
+    const uint i0 = pair_idx << 1u;
+    const float v0 = attention_data[i0] * gate_data[i0];
+    const float v1 = attention_data[i0 + 1u] * gate_data[i0 + 1u];
+    output_bf16[pair_idx] = f32_to_bf16_rne(v0) | (f32_to_bf16_rne(v1) << 16);
+#else
     const uint index = gl_GlobalInvocationID.x;
     if (index >= p.elements)
         return;
     attention_data[index] *= gate_data[index];
+#endif
 }

@@ -142,10 +142,23 @@ const std::shared_ptr<VulkanContext>& SharedFfn_vulkan::context() const noexcept
 }
 
 #if NCNN_MOE_WITH_VULKAN
+bool SharedFfn_vulkan::use_cm2() const noexcept
+{
+    if (d->bfloat16)
+        return d->bfloat16->use_cm2();
+    if (d->qnk)
+        return d->qnk->use_cm2();
+    return false;
+}
+
 bool SharedFfn_vulkan::record(const ncnn::VkMat& normalized, ncnn::VkMat& output,
                               ncnn::VkCompute& command, std::vector<ncnn::VkMat>& workspace,
-                              FfnRecordStatistics_vulkan& statistics) const
+                              FfnRecordStatistics_vulkan& statistics,
+                              const ncnn::VkMat* res,
+                              bool* res_fused) const
 {
+    if (res_fused)
+        *res_fused = false;
     if (d->qnk)
     {
         workspace.reserve(workspace.size() + 7);
@@ -155,7 +168,7 @@ bool SharedFfn_vulkan::record(const ncnn::VkMat& normalized, ncnn::VkMat& output
         workspace.push_back(result);
         std::vector<ncnn::VkMat> bindings;
         std::vector<ncnn::vk_constant_type> constants;
-        if (!d->qnk->record(normalized, result, command, workspace, bindings, constants)) return false;
+        if (!d->qnk->record(normalized, result, command, workspace, bindings, constants, res, res_fused)) return false;
         output = result;
         statistics.dispatches += d->qnk->record_dispatches();
         statistics.int4_dispatches += d->qnk->int4_operations();
@@ -164,7 +177,8 @@ bool SharedFfn_vulkan::record(const ncnn::VkMat& normalized, ncnn::VkMat& output
     if (d->bfloat16)
         return d->bfloat16->record_swiglu_chain(normalized, *d->bfloat16_down, d->intermediate_columns,
                                                 d->activation, d->activation_limit, d->router_gate,
-                                                output, command, workspace, statistics);
+                                                output, command, workspace, statistics,
+                                                res, res_fused);
     return d->float8
            && d->float8->record_swiglu_chain(normalized, *d->float8_up, *d->float8_down,
                                              d->activation, d->activation_limit, output, command, workspace, statistics);

@@ -1,0 +1,299 @@
+#version 450
+
+// Workgroup-scope NV cooperative_matrix2 flash attention for multi-row prefill.
+// Supports HEAD_DIM = 64, 128, 256 with BF16/FP32 KV, optional split-K, and
+// unclamped/unmasked fast loops on strictly-historical KV blocks.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_NV_cooperative_matrix2 : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BR = 64;
+layout(constant_id = 1) const uint BC = 64;
+layout(constant_id = 2) const uint HEAD_DIM = 64;
+layout(constant_id = 3) const uint KV_BF16 = 1;
+layout(constant_id = 4) const uint HAS_WIN = 0;
+
+layout(binding = 0) readonly buffer query_blob
+{ float query_data[]; };
+layout(binding = 1) readonly buffer key_blob
+{ uint key_data[]; };
+layout(binding = 2) readonly buffer value_blob
+{ uint value_data[]; };
+#ifdef NCNN_ATTN_CM2_BF16_OUT
+layout(binding = 3) writeonly buffer output_blob
+{ uint output_data[]; };
+#else
+layout(binding = 3) writeonly buffer output_blob
+{ float output_data[]; };
+#endif
+layout(binding = 4) writeonly buffer partial_blob
+{ float partial_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    uint query_count;
+    uint destination_count;
+    uint head_count;
+    uint kv_head_count;
+    uint query_cstep;
+    uint key_cstep;
+    uint value_cstep;
+    uint output_stride;
+    uint position_offset;
+    uint cache_start;
+    uint sliding_window;
+    float scale;
+    uint split_count;
+}
+p;
+
+#define SCORE_MAT coopmat<float, gl_ScopeWorkgroup, BR, BC, gl_MatrixUseAccumulator>
+#define PROB_MAT  coopmat<bfloat16_t, gl_ScopeWorkgroup, BR, BC, gl_MatrixUseA>
+#define OUT_MAT   coopmat<float, gl_ScopeWorkgroup, BR, HEAD_DIM, gl_MatrixUseAccumulator>
+
+const float LOG2E = 1.4426950408889634;
+const float NEG_INF = -1.0e30;
+
+float reduce_add(const in float a, const in float b)
+{ return a + b; }
+float elem_exp2(const in uint row, const in uint col, const in float v)
+{ return exp2(min(v, 80.0)); }
+
+float apply_causal_mask(const in uint row, const in uint col, const in float v,
+                        const in uint q_base, const in uint k_off)
+{
+    const uint g_row = q_base + row;
+    const uint g_key = k_off + col;
+    if (g_row >= p.query_count || g_key >= p.destination_count)
+        return NEG_INF;
+    const uint q_pos = p.position_offset + g_row;
+    const uint k_pos = p.cache_start + g_key;
+    if (k_pos > q_pos)
+        return NEG_INF;
+    if (HAS_WIN != 0u && k_pos + p.sliding_window <= q_pos)
+        return NEG_INF;
+    return v;
+}
+
+shared float row_sum_s[BR];
+
+float write_row_sum(const in uint row, const in uint col, const in float v, const in uint unused)
+{
+    if (col == 0u && row < BR)
+        row_sum_s[row] = v;
+    return v;
+}
+
+float div_row_sum(const in uint row, const in uint col, const in float v, const in uint unused)
+{
+    const float sum = row < BR ? row_sum_s[row] : 0.0;
+    return sum > 0.0 ? (v / sum) : 0.0;
+}
+
+float store_stat_col0(const in uint row, const in uint col, const in float v,
+                      const in uint lm_base, const in uint q_base)
+{
+    const uint g_row = q_base + row;
+    if (col == 0u && g_row < p.query_count)
+        partial_data[lm_base + g_row * 2u] = v;
+    return v;
+}
+
+#define LOAD_KV_STEP(LAYOUT, KEY_OFF, MASKED)                                                           \
+    {                                                                                                   \
+        coopmat<bfloat16_t, gl_ScopeWorkgroup, HEAD_DIM, BC, gl_MatrixUseB> K_T;                        \
+        if (KV_BF16 != 0u)                                                                              \
+        {                                                                                               \
+            coopMatLoadTensorNV(K_T, key_data, k_base,                                                  \
+                                sliceTensorLayoutNV(LAYOUT, int(KEY_OFF), BC, 0, HEAD_DIM), transpose); \
+        }                                                                                               \
+        else                                                                                            \
+        {                                                                                               \
+            coopmat<float, gl_ScopeWorkgroup, HEAD_DIM, BC, gl_MatrixUseAccumulator> K_f32;             \
+            coopMatLoadTensorNV(K_f32, key_data, k_base,                                                \
+                                sliceTensorLayoutNV(LAYOUT, int(KEY_OFF), BC, 0, HEAD_DIM), transpose); \
+            K_T = coopmat<bfloat16_t, gl_ScopeWorkgroup, HEAD_DIM, BC, gl_MatrixUseB>(K_f32);           \
+        }                                                                                               \
+        SCORE_MAT S = coopMatMulAdd(Q_bf16, K_T, SCORE_MAT(0.0));                                       \
+        if (MASKED)                                                                                     \
+            coopMatPerElementNV(S, S, apply_causal_mask, q_base, KEY_OFF);                              \
+        coopMatPerElementNV(S, S, elem_exp2);                                                           \
+        SCORE_MAT rowsum;                                                                               \
+        coopMatReduceNV(rowsum, S, gl_CooperativeMatrixReduceRowNV, reduce_add);                        \
+        L += rowsum;                                                                                    \
+        PROB_MAT P_A = PROB_MAT(S);                                                                     \
+        coopmat<bfloat16_t, gl_ScopeWorkgroup, BC, HEAD_DIM, gl_MatrixUseB> V;                          \
+        if (KV_BF16 != 0u)                                                                              \
+        {                                                                                               \
+            coopMatLoadTensorNV(V, value_data, v_base,                                                  \
+                                sliceTensorLayoutNV(LAYOUT, int(KEY_OFF), BC, 0, HEAD_DIM));            \
+        }                                                                                               \
+        else                                                                                            \
+        {                                                                                               \
+            coopmat<float, gl_ScopeWorkgroup, BC, HEAD_DIM, gl_MatrixUseAccumulator> V_f32;             \
+            coopMatLoadTensorNV(V_f32, value_data, v_base,                                              \
+                                sliceTensorLayoutNV(LAYOUT, int(KEY_OFF), BC, 0, HEAD_DIM));            \
+            V = coopmat<bfloat16_t, gl_ScopeWorkgroup, BC, HEAD_DIM, gl_MatrixUseB>(V_f32);             \
+        }                                                                                               \
+        O = coopMatMulAdd(P_A, V, O);                                                                   \
+    }
+
+void store_partial(in OUT_MAT O, inout SCORE_MAT L, uint splits, uint split_idx, uint head, uint q_base)
+{
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> po_layout = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    po_layout = setTensorLayoutDimensionNV(po_layout, p.query_count, HEAD_DIM);
+    po_layout = setTensorLayoutStrideNV(po_layout, HEAD_DIM, 1);
+    const uint po_off = (split_idx * p.head_count + head) * p.query_count * HEAD_DIM;
+    coopMatStoreTensorNV(O, partial_data, po_off, sliceTensorLayoutNV(po_layout, int(q_base), BR, 0, HEAD_DIM));
+    const uint lm_base = splits * p.head_count * p.query_count * HEAD_DIM
+                         + (split_idx * p.head_count + head) * p.query_count * 2u;
+    coopMatPerElementNV(L, L, store_stat_col0, lm_base, q_base);
+}
+
+void store_output(in OUT_MAT O, uint head, uint q_base)
+{
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> out_layout = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    out_layout = setTensorLayoutDimensionNV(out_layout, p.query_count, HEAD_DIM);
+    out_layout = setTensorLayoutStrideNV(out_layout, p.output_stride, 1);
+#ifdef NCNN_ATTN_CM2_BF16_OUT
+    coopmat<bfloat16_t, gl_ScopeWorkgroup, BR, HEAD_DIM, gl_MatrixUseAccumulator> O_bf16 = coopmat<bfloat16_t, gl_ScopeWorkgroup, BR, HEAD_DIM, gl_MatrixUseAccumulator>(O);
+    coopMatStoreTensorNV(O_bf16, output_data, (head * HEAD_DIM) >> 1u,
+                         sliceTensorLayoutNV(out_layout, int(q_base), BR, 0, HEAD_DIM));
+#else
+    coopMatStoreTensorNV(O, output_data, head * HEAD_DIM,
+                         sliceTensorLayoutNV(out_layout, int(q_base), BR, 0, HEAD_DIM));
+#endif
+}
+
+void main()
+{
+    const uint group_size = p.head_count / p.kv_head_count;
+    const uint splits = max(1u, p.split_count);
+    const uint kv_head = gl_WorkGroupID.z;
+    const uint head = kv_head * group_size + (gl_WorkGroupID.x % group_size);
+    const uint split_idx = gl_WorkGroupID.x / group_size;
+    const uint query_tiles = (p.query_count + BR - 1u) / BR;
+    const uint q_base = (query_tiles - 1u - gl_WorkGroupID.y) * BR;
+    if (head >= p.head_count || q_base >= p.query_count)
+        return;
+
+    const uint tile_rows = min(BR, p.query_count - q_base);
+    const uint min_q_pos = p.position_offset + q_base;
+    const uint max_q_pos = p.position_offset + q_base + tile_rows - 1u;
+
+    OUT_MAT O = OUT_MAT(0.0);
+    SCORE_MAT L = SCORE_MAT(0.0);
+
+    if (p.destination_count == 0u || max_q_pos < p.cache_start)
+    {
+        if (splits > 1u)
+            store_partial(O, L, splits, split_idx, head, q_base);
+        else
+            store_output(O, head, q_base);
+        return;
+    }
+
+    const uint max_key = min(p.destination_count, (max_q_pos - p.cache_start) + 1u);
+    uint start_key = 0u;
+    uint full_start = 0u;
+    if (HAS_WIN != 0u)
+    {
+        if (min_q_pos >= p.sliding_window)
+        {
+            const uint wpos = min_q_pos - p.sliding_window + 1u;
+            if (wpos > p.cache_start)
+                start_key = ((wpos - p.cache_start) / BC) * BC;
+        }
+        if (max_q_pos >= p.sliding_window)
+        {
+            const uint wpos = max_q_pos - p.sliding_window + 1u;
+            if (wpos > p.cache_start)
+                full_start = ((wpos - p.cache_start + BC - 1u) / BC) * BC;
+        }
+    }
+
+    uint full_end = 0u;
+    if (min_q_pos >= p.cache_start)
+        full_end = (min(p.destination_count, (min_q_pos - p.cache_start) + 1u) / BC) * BC;
+    full_start = min(max(full_start, start_key), max_key);
+    full_end = max(full_end, full_start);
+
+    uint my_start = start_key;
+    uint my_end = max_key;
+    if (splits > 1u)
+    {
+        const uint active_keys = max_key > start_key ? (max_key - start_key) : 0u;
+        const uint blk_per_split = ((active_keys + BC - 1u) / BC + splits - 1u) / splits;
+        my_start = min(max_key, start_key + split_idx * blk_per_split * BC);
+        my_end = min(max_key, my_start + blk_per_split * BC);
+    }
+    if (my_start >= my_end)
+    {
+        store_partial(O, L, splits, split_idx, head, q_base);
+        return;
+    }
+
+    const uint lead_end = min(my_end, full_start);
+    const uint fast_begin = max(my_start, full_start);
+    const uint fast_end = min(my_end, full_end);
+    const uint tail_begin = max(my_start, full_end);
+
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> q_layout = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    q_layout = setTensorLayoutDimensionNV(q_layout, p.query_count, HEAD_DIM);
+    q_layout = setTensorLayoutStrideNV(q_layout, HEAD_DIM, 1);
+
+    OUT_MAT Q_f32;
+    coopMatLoadTensorNV(Q_f32, query_data, head * p.query_cstep,
+                        sliceTensorLayoutNV(q_layout, int(q_base), BR, 0, HEAD_DIM));
+    Q_f32 *= (p.scale * LOG2E);
+    coopmat<bfloat16_t, gl_ScopeWorkgroup, BR, HEAD_DIM, gl_MatrixUseA> Q_bf16 = coopmat<bfloat16_t, gl_ScopeWorkgroup, BR, HEAD_DIM, gl_MatrixUseA>(Q_f32);
+
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeUndefinedNV> kv_fast = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeUndefinedNV);
+    kv_fast = setTensorLayoutDimensionNV(kv_fast, p.destination_count, HEAD_DIM);
+    kv_fast = setTensorLayoutStrideNV(kv_fast, HEAD_DIM, 1);
+
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> kv_clamp = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    kv_clamp = setTensorLayoutDimensionNV(kv_clamp, p.destination_count, HEAD_DIM);
+    kv_clamp = setTensorLayoutStrideNV(kv_clamp, HEAD_DIM, 1);
+    kv_clamp = setTensorLayoutClampValueNV(kv_clamp, 0u);
+
+    tensorViewNV<2, false, 1, 0> transpose = createTensorViewNV(2, false, 1, 0);
+
+    const uint k_raw = (KV_BF16 != 0u) ? ((kv_head * p.key_cstep) >> 1) : (kv_head * p.key_cstep);
+    const uint v_raw = (KV_BF16 != 0u) ? ((kv_head * p.value_cstep) >> 1) : (kv_head * p.value_cstep);
+    const uint k_base = ((k_raw & 3u) == 0u) ? (k_raw & ~3u) : k_raw;
+    const uint v_base = ((v_raw & 3u) == 0u) ? (v_raw & ~3u) : v_raw;
+
+    if (HAS_WIN != 0u)
+    {
+        [[dont_unroll]]
+        for (uint k_off = my_start; k_off < lead_end; k_off += BC)
+            LOAD_KV_STEP(kv_clamp, k_off, true);
+    }
+
+    [[dont_unroll]]
+    for (uint k_off = fast_begin; k_off < fast_end; k_off += BC)
+        LOAD_KV_STEP(kv_fast, k_off, false);
+
+    [[dont_unroll]]
+    for (uint k_off = tail_begin; k_off < my_end; k_off += BC)
+        LOAD_KV_STEP(kv_clamp, k_off, true);
+
+    if (splits > 1u)
+    {
+        store_partial(O, L, splits, split_idx, head, q_base);
+        return;
+    }
+
+    coopMatPerElementNV(L, L, write_row_sum, 0u);
+    barrier();
+    coopMatPerElementNV(O, O, div_row_sum, 0u);
+    store_output(O, head, q_base);
+}

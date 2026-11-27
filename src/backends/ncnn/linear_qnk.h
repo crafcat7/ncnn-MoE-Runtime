@@ -57,13 +57,17 @@ private:
     friend class LatentAttention_vulkan;
     [[nodiscard]] bool record_forward(const ncnn::VkMat& input, ncnn::VkMat& output,
                                       ncnn::VkCompute& command) const;
+    [[nodiscard]] bool use_cm2() const noexcept;
     void record(const ncnn::VkMat& input, ncnn::VkMat& output, ncnn::VkCompute& command, uint32_t output_column_offset = 0) const;
     void record(const ncnn::VkMat& input,
                 ncnn::VkMat& output,
                 ncnn::VkCompute& command,
                 uint32_t output_column_offset,
                 std::vector<ncnn::VkMat>& bindings,
-                std::vector<ncnn::vk_constant_type>& constants) const;
+                std::vector<ncnn::vk_constant_type>& constants,
+                const ncnn::VkMat* res = nullptr,
+                bool* res_fused = nullptr,
+                bool bf16_out = false) const;
     [[nodiscard]] const std::shared_ptr<VulkanContext>& vulkan_context() const noexcept;
     [[nodiscard]] const ncnn::Option& option() const noexcept;
 
@@ -125,12 +129,15 @@ public:
     [[nodiscard]] uint32_t int4_operations() const noexcept;
     [[nodiscard]] uint32_t record_dispatches() const noexcept;
     [[nodiscard]] const std::shared_ptr<VulkanContext>& vulkan_context() const noexcept;
+    [[nodiscard]] bool use_cm2() const noexcept;
     // Caller holds the context lock and retains all operands until completion.
     [[nodiscard]] bool record(const ncnn::VkMat& input, ncnn::VkMat& output,
                               ncnn::VkCompute& command,
                               std::vector<ncnn::VkMat>& workspace,
                               std::vector<ncnn::VkMat>& bindings,
-                              std::vector<ncnn::vk_constant_type>& constants) const;
+                              std::vector<ncnn::vk_constant_type>& constants,
+                              const ncnn::VkMat* res = nullptr,
+                              bool* res_fused = nullptr) const;
 
 private:
     friend class VulkanExpertBackend;

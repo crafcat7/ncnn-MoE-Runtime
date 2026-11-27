@@ -67,7 +67,7 @@ struct Mxfp4Scratch
 // choosing between operator-level and outer task parallelism.
 [[nodiscard]] int cpu_linear_team_size(uint64_t operation_count, DType dtype) noexcept;
 void forward_embedding_row(const TensorData& embedding, uint32_t row, float* output);
-void forward_embedding(const TensorData& embedding, std::span<const int32_t> input_ids, ActivationBuffer& output);
+void forward_embedding(const TensorData& embedding, std::span<const int32_t> input_ids, ActivationBuffer& output, float scale = 1.0f);
 [[nodiscard]] ActivationBuffer forward_linear(const TensorData& matrix, const ActivationBuffer& input, uint64_t optimization_flags, const CompiledOperator* op = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu);
 // A quantized input scratch, when supplied, must not alias input or output.
 // Float32 scratch also holds gathered inputs for quantized column permutations.

@@ -95,6 +95,7 @@ private:
     friend class GpuSegmentContinuation_vulkan;
 
 #if NCNN_MOE_WITH_VULKAN
+    [[nodiscard]] bool use_cm2() const noexcept;
     // Internal record-only path: caller owns submission, operand/workspace
     // lifetime, and publication of the collected statistics after completion.
     [[nodiscard]] bool record_swiglu_chain(const ncnn::VkMat& input,
@@ -103,7 +104,9 @@ private:
                                            float activation_limit, bool apply_router_gate,
                                            ncnn::VkMat& output, ncnn::VkCompute& command,
                                            std::vector<ncnn::VkMat>& workspace,
-                                           FfnRecordStatistics_vulkan& statistics) const;
+                                           FfnRecordStatistics_vulkan& statistics,
+                                           const ncnn::VkMat* res = nullptr,
+                                           bool* res_fused = nullptr) const;
 #endif
 
     // Caller provides an allocated output and holds the context lock; the scalar

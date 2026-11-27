@@ -55,10 +55,22 @@ layout(push_constant) uniform parameter
 }
 p;
 
-const uint D = @NCNN_MOE_ATTN_PREFILL_HEAD_DIM@;
-const uint M = @NCNN_MOE_ATTN_PREFILL_QUERY_TILE@;
-const uint N = @NCNN_MOE_ATTN_PREFILL_KEY_TILE@;
-const uint ROWS = @NCNN_MOE_ATTN_PREFILL_ROWS@;
+#ifndef ATTN_D
+#define ATTN_D 64u
+#endif
+#ifndef ATTN_M
+#define ATTN_M 64u
+#endif
+#ifndef ATTN_N
+#define ATTN_N 64u
+#endif
+#ifndef ATTN_ROWS
+#define ATTN_ROWS 8u
+#endif
+const uint D = ATTN_D;
+const uint M = ATTN_M;
+const uint N = ATTN_N;
+const uint ROWS = ATTN_ROWS;
 const uint PAIRS = D / 2u;
 const uint KEYS = N / 32u;
 const uint VALUE_PAIRS = PAIRS / 32u;

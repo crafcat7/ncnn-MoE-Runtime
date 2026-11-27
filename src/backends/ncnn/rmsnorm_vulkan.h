@@ -40,7 +40,8 @@ public:
     [[nodiscard]] bool record(const ncnn::VkMat& input, ncnn::VkMat& output,
                               ncnn::VkCompute& cmd,
                               const ncnn::VkMat* branch = nullptr,
-                              ncnn::VkMat* residual = nullptr) const;
+                              ncnn::VkMat* residual = nullptr,
+                              bool bf16_out = false) const;
 
 private:
     class Implementation;

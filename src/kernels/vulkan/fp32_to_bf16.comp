@@ -1,0 +1,36 @@
+#version 450
+
+// Vectorized FP32 -> packed BF16 (2 elements per uint32) with round-to-nearest-even.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer src_blob
+{
+    vec2 src_pairs[];
+};
+layout(binding = 1) writeonly buffer dst_blob
+{
+    uint dst_words[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint pair_count;
+}
+p;
+
+uint f32_to_bf16_rne(float v)
+{
+    const uint bits = floatBitsToUint(v);
+    const uint rounding = 0x7fffu + ((bits >> 16) & 1u);
+    return (bits + rounding) >> 16;
+}
+
+void main()
+{
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.pair_count)
+        return;
+    const vec2 v = src_pairs[idx];
+    dst_words[idx] = f32_to_bf16_rne(v.x) | (f32_to_bf16_rne(v.y) << 16);
+}

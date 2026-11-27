@@ -16,10 +16,18 @@ void hyper_connection_expand(ActivationBuffer& hidden, uint32_t multiplier, Acti
     if (multiplier <= 1)
         return;
     scratch.reset(hidden.rows(), hidden.columns() * multiplier, false);
-    for (size_t row_index = 0; row_index < hidden.rows(); ++row_index)
+    const size_t rows = hidden.rows();
+    const size_t columns = hidden.columns();
+    const int threads = rows > 1
+                            ? static_cast<int>(std::min<size_t>(rows, static_cast<size_t>(cpu_linear_num_threads())))
+                            : 1;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) num_threads(threads) if (threads > 1)
+#endif
+    for (int64_t row_index = 0; row_index < static_cast<int64_t>(rows); ++row_index)
     {
         for (uint32_t copy = 0; copy < multiplier; ++copy)
-            std::copy_n(hidden.row(row_index), hidden.columns(), scratch.row(row_index) + static_cast<size_t>(copy) * hidden.columns());
+            std::copy_n(hidden.row(static_cast<size_t>(row_index)), columns, scratch.row(static_cast<size_t>(row_index)) + static_cast<size_t>(copy) * columns);
     }
     hidden.swap(scratch);
 }

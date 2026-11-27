@@ -1,0 +1,179 @@
+#version 450
+
+// GQA split decode: one warp owns one query head and scans its split of the KV
+// ring. Lanes are interleaved over the head dimension so every K/V load is a
+// coalesced 32-lane row segment; the QK dot reduces through a subgroup
+// arithmetic op instead of shared-memory scratch. Each warp runs an online
+// softmax state (maximum, denominator, numerator) and writes the same partial
+// layout as attn_decode_split.comp, so attn_decode_merge.comp finishes it.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
+
+// Head dimension and token block are template parameters so the per-lane
+// dimension count and the register tile are compile-time constants.
+#ifndef ATTN_HEAD_DIM
+#define ATTN_HEAD_DIM 64u
+#endif
+#ifndef ATTN_TOKENS
+#define ATTN_TOKENS 8u
+#endif
+const uint HEAD_DIM = ATTN_HEAD_DIM;
+const uint DIMS = HEAD_DIM / 32u;
+const uint WARPS = 8u;
+const uint TOKENS = ATTN_TOKENS;
+
+layout(binding = 0) readonly buffer query_blob
+{
+    float query_data[];
+};
+layout(binding = 1) readonly buffer key_blob
+{
+    sfp key_data[];
+};
+layout(binding = 2) readonly buffer value_blob
+{
+    sfp value_data[];
+};
+layout(binding = 3) readonly buffer sink_blob
+{
+    float sink_data[];
+};
+layout(binding = 4) writeonly buffer partial_blob
+{
+    float partial_data[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint head_dimension;
+    uint destination_count;
+    uint head_count;
+    uint key_value_head_count;
+    uint query_cstep;
+    uint key_cstep;
+    uint value_cstep;
+    uint use_attention_sink;
+    float scale;
+    uint split_count;
+    uint split_tokens;
+}
+p;
+
+void main()
+{
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    const uint lane = gl_SubgroupInvocationID;
+    const uint head = gl_WorkGroupID.z * WARPS + gl_SubgroupID;
+    const uint split = gl_WorkGroupID.y;
+    if (head >= p.head_count || split >= p.split_count || p.split_tokens == 0)
+        return;
+
+    const uint split_begin = min(p.destination_count, split * p.split_tokens);
+    const uint split_end = min(p.destination_count, split_begin + p.split_tokens);
+    if (split_begin >= split_end)
+        return;
+
+    const uint heads_per_group = p.head_count / p.key_value_head_count;
+    const uint key_value_head = head / heads_per_group;
+    const uint query_base = head * p.query_cstep;
+    const uint key_base = key_value_head * p.key_cstep;
+    const uint value_base = key_value_head * p.value_cstep;
+    const uint last_token = split_end - 1u;
+    // The sink row is fixed for the whole scan; keep the test out of the loop.
+    const uint sink_token = p.use_attention_sink != 0 ? p.destination_count - 1u : 0xffffffffu;
+
+    float query[DIMS];
+    for (uint i = 0; i < DIMS; ++i)
+        query[i] = query_data[query_base + lane + i * 32u];
+
+    float maximum = -3.402823466e+38;
+    float denominator = 0.0;
+    float numerator[DIMS];
+    for (uint i = 0; i < DIMS; ++i)
+        numerator[i] = 0.0;
+
+    for (uint block = split_begin; block < split_end; block += TOKENS)
+    {
+        // Preload the whole K block first: the loads are independent, which
+        // keeps enough requests in flight to reach streaming bandwidth.
+        float key_block[TOKENS][DIMS];
+        for (uint t = 0; t < TOKENS; ++t)
+        {
+            const uint token = min(block + t, last_token);
+            for (uint i = 0; i < DIMS; ++i)
+                key_block[t][i] = buffer_ld1(key_data, key_base + token * p.head_dimension + lane + i * 32u);
+        }
+
+        float scores[TOKENS];
+        for (uint t = 0; t < TOKENS; ++t)
+        {
+            const uint token = block + t;
+            if (token >= split_end)
+            {
+                scores[t] = -3.402823466e+38;
+                continue;
+            }
+            if (token == sink_token)
+            {
+                // A sink row has no KV vector; its probability joins the
+                // denominator and contributes nothing to the numerator.
+                scores[t] = sink_data[head];
+                continue;
+            }
+            float dot = 0.0;
+            for (uint i = 0; i < DIMS; ++i)
+                dot += query[i] * key_block[t][i];
+            scores[t] = subgroupAdd(dot) * p.scale;
+        }
+
+        float block_maximum = -3.402823466e+38;
+        for (uint t = 0; t < TOKENS; ++t)
+            block_maximum = max(block_maximum, scores[t]);
+        const float next_maximum = max(maximum, block_maximum);
+        const float previous_scale = denominator == 0.0 ? 0.0 : exp(maximum - next_maximum);
+        float weights[TOKENS];
+        float block_sum = 0.0;
+        for (uint t = 0; t < TOKENS; ++t)
+        {
+            weights[t] = exp(scores[t] - next_maximum);
+            block_sum += weights[t];
+        }
+        denominator = denominator * previous_scale + block_sum;
+        maximum = next_maximum;
+        if (previous_scale != 1.0)
+        {
+            for (uint i = 0; i < DIMS; ++i)
+                numerator[i] *= previous_scale;
+        }
+
+        float value_block[TOKENS][DIMS];
+        for (uint t = 0; t < TOKENS; ++t)
+        {
+            const uint token = min(block + t, last_token);
+            for (uint i = 0; i < DIMS; ++i)
+                value_block[t][i] = buffer_ld1(value_data, value_base + token * p.head_dimension + lane + i * 32u);
+        }
+        for (uint t = 0; t < TOKENS; ++t)
+        {
+            if (block + t >= split_end || weights[t] == 0.0)
+                continue;
+            for (uint i = 0; i < DIMS; ++i)
+                numerator[i] += weights[t] * value_block[t][i];
+        }
+    }
+
+    const uint row = (head * p.split_count + split) * (p.head_dimension + 2u);
+    for (uint i = 0; i < DIMS; ++i)
+        partial_data[row + lane + i * 32u] = numerator[i];
+    if (lane == 0)
+    {
+        partial_data[row + p.head_dimension] = maximum;
+        partial_data[row + p.head_dimension + 1u] = denominator;
+    }
+#endif
+}

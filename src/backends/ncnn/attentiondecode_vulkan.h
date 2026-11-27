@@ -11,6 +11,9 @@ namespace moe {
 
 [[nodiscard]] AttentionDecodeCapabilities query_attention_decode_capabilities(const ncnn::GpuInfo& info);
 
+// Resident workgroup target of the device: sizes the decode KV split.
+[[nodiscard]] uint32_t query_attention_device_parallelism(const ncnn::GpuInfo& info);
+
 // Configure once for the selected matrix shape, then record varying KV lengths.
 // Allocation/compilation/recording failures are terminal for this selected path.
 class AttentionDecodeVulkan

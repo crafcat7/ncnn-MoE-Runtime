@@ -683,9 +683,11 @@ public:
             }
             first += count;
         }
+        const bool bf16_ffn_norm = d->dense && positions.size() >= 16 && d->ffn_norm
+                                   && d->dense->use_cm2();
         if (d->add_norm)
         {
-            if (!d->ffn_norm->record(input, normalized, command, &branch, &residual))
+            if (!d->ffn_norm->record(input, normalized, command, &branch, &residual, bf16_ffn_norm))
                 return fail("cannot record fused Vulkan Attention residual and FFN norm");
         }
         else
@@ -696,7 +698,7 @@ public:
             ++ffn_statistics.dispatches;
             const bool norm_recorded = d->layer_norm
                                            ? d->layer_norm->record(residual, normalized, command)
-                                           : d->ffn_norm->record(residual, normalized, command);
+                                           : d->ffn_norm->record(residual, normalized, command, nullptr, nullptr, bf16_ffn_norm);
             if (!norm_recorded)
                 return fail("cannot record Vulkan FFN norm");
         }
@@ -705,15 +707,25 @@ public:
         if (d->dense)
         {
             ncnn::VkMat ffn_output;
-            if (!d->dense->record(normalized, ffn_output, command, storage, ffn_statistics))
+            bool residual_fused = false;
+            if (!d->dense->record(normalized, ffn_output, command, storage, ffn_statistics,
+                                  &residual, &residual_fused))
                 return fail("cannot record Vulkan dense FFN");
-            std::vector<ncnn::VkMat> added(1);
-            if (d->add->forward({residual, ffn_output}, added, command, d->option) != 0 || added[0].empty())
-                return fail("cannot record Vulkan dense FFN residual");
-            storage.push_back(ffn_output);
-            storage.push_back(added[0]);
-            ++ffn_statistics.dispatches;
-            dense_output = added[0];
+            if (residual_fused)
+            {
+                storage.push_back(ffn_output);
+                dense_output = ffn_output;
+            }
+            else
+            {
+                std::vector<ncnn::VkMat> added(1);
+                if (d->add->forward({residual, ffn_output}, added, command, d->option) != 0 || added[0].empty())
+                    return fail("cannot record Vulkan dense FFN residual");
+                storage.push_back(ffn_output);
+                storage.push_back(added[0]);
+                ++ffn_statistics.dispatches;
+                dense_output = added[0];
+            }
             return true;
         }
         if (!d->router->record(normalized, options, router_work, command))
@@ -1284,7 +1296,7 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
     // recorded chunk heavier, so keep the command size roughly constant
     // instead of using the short-context divisor.
     const uint64_t context_tokens = caches.empty() ? 0 : caches.front()->token_count;
-    double divisor = 40.0;
+    double divisor = 4.0;
     if (context->device()->info.type() == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU)
     {
         const double scaled = static_cast<double>(context_tokens) / 64.0;
@@ -1375,14 +1387,24 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
             if (target.dense)
             {
                 ncnn::VkMat output;
-                if (!target.dense->record(current.normalized, output, command, current.storage, current.ffn_statistics))
+                bool res_fused = false;
+                if (!target.dense->record(current.normalized, output, command, current.storage,
+                                          current.ffn_statistics, &current.residual, &res_fused))
                     return fail("cannot record resident dense FFN");
-                std::vector<ncnn::VkMat> added(1);
-                if (target.add->forward({current.residual, output}, added, command, target.option) != 0 || added[0].empty())
-                    return fail("cannot record resident dense FFN residual");
-                hidden = added[0];
-                current.storage.push_back(hidden);
-                ++current.ffn_statistics.dispatches;
+                if (res_fused)
+                {
+                    hidden = output;
+                    current.storage.push_back(hidden);
+                }
+                else
+                {
+                    std::vector<ncnn::VkMat> added(1);
+                    if (target.add->forward({current.residual, output}, added, command, target.option) != 0 || added[0].empty())
+                        return fail("cannot record resident dense FFN residual");
+                    hidden = added[0];
+                    current.storage.push_back(hidden);
+                    ++current.ffn_statistics.dispatches;
+                }
             }
             else
             {

@@ -2690,7 +2690,8 @@ Result<void> prepare_model_pipeline(CompiledModel& compiled, const CompilerOptio
                 if (!resources.allocation_fits(device, request))
                     return Error{ErrorCode::InvalidArgument, "resident dense graph exceeds the live device budget"};
                 resources.commit(device, request);
-                compiled.resident_submission_rows = default_prefill_rows;
+                const uint32_t max_layers = static_cast<uint32_t>(std::max<size_t>(1, compiled.net.layer_plans.size()));
+                compiled.resident_submission_rows = default_prefill_rows * std::min<uint32_t>(32u, max_layers);
             }
         }
         // A mixed graph may contain a dense FFN beside routed layers. The

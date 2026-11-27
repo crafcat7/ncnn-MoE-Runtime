@@ -6,6 +6,7 @@
 #endif
 
 layout(constant_id = 0) const uint use_subgroup_reductions = 0;
+layout(constant_id = 1) const uint aligned4 = 0;
 
 layout(binding = 0) readonly buffer input_blob
 {
@@ -28,10 +29,17 @@ layout(binding = 4) buffer residual_blob
 #else
 #define NCNN_RMS_NORM_DATA input_data
 #endif
+#ifdef NCNN_RMS_NORM_BF16_OUT
+layout(binding = 2) writeonly buffer output_blob
+{
+    uint output_bf16[];
+};
+#else
 layout(binding = 2) writeonly buffer output_blob
 {
     float output_data[];
 };
+#endif
 layout(push_constant) uniform parameter
 {
     uint columns;
@@ -44,45 +52,17 @@ p;
 
 shared float partial[256];
 
-void main()
+#ifdef NCNN_RMS_NORM_BF16_OUT
+uint f32_to_bf16_rne(float v)
 {
-    const uint row = gl_WorkGroupID.y;
-    const uint lane = gl_LocalInvocationID.x;
-    const uint row_offset = row * p.columns;
-#ifdef NCNN_RMS_NORM_RESIDUAL_ADD
-    for (uint column = lane * 4u; column < p.columns; column += p.workgroup_size * 4u)
-    {
-        precise float value0 = input_data[row_offset + column] + branch_data[row_offset + column];
-        residual_data[row_offset + column] = value0;
-        if (column + 1u < p.columns)
-        {
-            precise float value1 = input_data[row_offset + column + 1u] + branch_data[row_offset + column + 1u];
-            residual_data[row_offset + column + 1u] = value1;
-        }
-        if (column + 2u < p.columns)
-        {
-            precise float value2 = input_data[row_offset + column + 2u] + branch_data[row_offset + column + 2u];
-            residual_data[row_offset + column + 2u] = value2;
-        }
-        if (column + 3u < p.columns)
-        {
-            precise float value3 = input_data[row_offset + column + 3u] + branch_data[row_offset + column + 3u];
-            residual_data[row_offset + column + 3u] = value3;
-        }
-    }
-    memoryBarrierBuffer();
-    barrier();
+    const uint bits = floatBitsToUint(v);
+    const uint rounding = 0x7fffu + ((bits >> 16) & 1u);
+    return (bits + rounding) >> 16;
+}
 #endif
-    float square_sum = 0.0;
-    for (uint column = lane * 4u; column < p.columns; column += p.workgroup_size * 4u)
-    {
-        vec4 values = vec4(NCNN_RMS_NORM_DATA[row_offset + column], 0.0, 0.0, 0.0);
-        if (column + 1u < p.columns) values.y = NCNN_RMS_NORM_DATA[row_offset + column + 1u];
-        if (column + 2u < p.columns) values.z = NCNN_RMS_NORM_DATA[row_offset + column + 2u];
-        if (column + 3u < p.columns) values.w = NCNN_RMS_NORM_DATA[row_offset + column + 3u];
-        square_sum += dot(values, values);
-    }
-    float inverse_rms = 0.0;
+
+float reduce_inverse_rms(float square_sum, uint lane)
+{
 #if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
     if (use_subgroup_reductions != 0u)
     {
@@ -92,8 +72,6 @@ void main()
         barrier();
         if (gl_SubgroupID == 0u)
         {
-            // Each subgroup contributes one value. A subgroup may contain 32 or
-            // 64 lanes; no lane-count assumption is needed by either reduction.
             float value = 0.0;
             for (uint subgroup = gl_SubgroupInvocationID; subgroup < gl_NumSubgroups; subgroup += gl_SubgroupSize)
                 value += partial[subgroup];
@@ -102,23 +80,199 @@ void main()
                 partial[0] = inversesqrt(total / float(p.columns) + p.epsilon);
         }
         barrier();
-        inverse_rms = partial[0];
+        return partial[0];
     }
-    else
 #endif
+    partial[lane] = square_sum;
+    barrier();
+    for (uint stride = p.workgroup_size >> 1u; stride > 0u; stride >>= 1u)
     {
-        partial[lane] = square_sum;
+        if (lane < stride)
+            partial[lane] += partial[lane + stride];
         barrier();
-        for (uint stride = p.workgroup_size >> 1u; stride > 0u; stride >>= 1u)
-        {
-            if (lane < stride)
-                partial[lane] += partial[lane + stride];
-            barrier();
-        }
-        inverse_rms = inversesqrt(partial[0] / float(p.columns) + p.epsilon);
     }
+    return inversesqrt(partial[0] / float(p.columns) + p.epsilon);
+}
+
+void main()
+{
+    const uint row = gl_WorkGroupID.y;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint row_offset = row * p.columns;
+
+    if (p.columns <= p.workgroup_size * 4u)
+    {
+        const uint col = lane * 4u;
+        vec4 values = vec4(0.0);
+        if (col < p.columns)
+        {
+            const uint base = row_offset + col;
+            if (aligned4 != 0u)
+            {
+#ifdef NCNN_RMS_NORM_RESIDUAL_ADD
+                precise float v0 = input_data[base] + branch_data[base];
+                precise float v1 = input_data[base + 1u] + branch_data[base + 1u];
+                precise float v2 = input_data[base + 2u] + branch_data[base + 2u];
+                precise float v3 = input_data[base + 3u] + branch_data[base + 3u];
+                residual_data[base] = v0;
+                residual_data[base + 1u] = v1;
+                residual_data[base + 2u] = v2;
+                residual_data[base + 3u] = v3;
+                values = vec4(v0, v1, v2, v3);
+#else
+                values = vec4(input_data[base], input_data[base + 1u], input_data[base + 2u], input_data[base + 3u]);
+#endif
+            }
+            else
+            {
+#ifdef NCNN_RMS_NORM_RESIDUAL_ADD
+                precise float v0 = input_data[base] + branch_data[base];
+                residual_data[base] = v0;
+                values.x = v0;
+                if (col + 1u < p.columns)
+                {
+                    precise float v1 = input_data[base + 1u] + branch_data[base + 1u];
+                    residual_data[base + 1u] = v1;
+                    values.y = v1;
+                }
+                if (col + 2u < p.columns)
+                {
+                    precise float v2 = input_data[base + 2u] + branch_data[base + 2u];
+                    residual_data[base + 2u] = v2;
+                    values.z = v2;
+                }
+                if (col + 3u < p.columns)
+                {
+                    precise float v3 = input_data[base + 3u] + branch_data[base + 3u];
+                    residual_data[base + 3u] = v3;
+                    values.w = v3;
+                }
+#else
+                values.x = input_data[base];
+                if (col + 1u < p.columns) values.y = input_data[base + 1u];
+                if (col + 2u < p.columns) values.z = input_data[base + 2u];
+                if (col + 3u < p.columns) values.w = input_data[base + 3u];
+#endif
+            }
+        }
+        const float inv_rms = reduce_inverse_rms(dot(values, values), lane);
+        if (col < p.columns)
+        {
+            const uint base = row_offset + col;
+#ifdef NCNN_RMS_NORM_BF16_OUT
+            const uint out_half = base >> 1u;
+            const float o0 = values.x * inv_rms * (weight_data[col] + p.weight_offset);
+            const float o1 = values.y * inv_rms * (weight_data[col + 1u] + p.weight_offset);
+            output_bf16[out_half] = f32_to_bf16_rne(o0) | (f32_to_bf16_rne(o1) << 16);
+            if (aligned4 != 0u || col + 2u < p.columns)
+            {
+                const float o2 = values.z * inv_rms * (weight_data[col + 2u] + p.weight_offset);
+                const float o3 = values.w * inv_rms * (weight_data[col + 3u] + p.weight_offset);
+                output_bf16[out_half + 1u] = f32_to_bf16_rne(o2) | (f32_to_bf16_rne(o3) << 16);
+            }
+#else
+            if (aligned4 != 0u)
+            {
+                output_data[base] = values.x * inv_rms * (weight_data[col] + p.weight_offset);
+                output_data[base + 1u] = values.y * inv_rms * (weight_data[col + 1u] + p.weight_offset);
+                output_data[base + 2u] = values.z * inv_rms * (weight_data[col + 2u] + p.weight_offset);
+                output_data[base + 3u] = values.w * inv_rms * (weight_data[col + 3u] + p.weight_offset);
+            }
+            else
+            {
+                output_data[base] = values.x * inv_rms * (weight_data[col] + p.weight_offset);
+                if (col + 1u < p.columns) output_data[base + 1u] = values.y * inv_rms * (weight_data[col + 1u] + p.weight_offset);
+                if (col + 2u < p.columns) output_data[base + 2u] = values.z * inv_rms * (weight_data[col + 2u] + p.weight_offset);
+                if (col + 3u < p.columns) output_data[base + 3u] = values.w * inv_rms * (weight_data[col + 3u] + p.weight_offset);
+            }
+#endif
+        }
+        return;
+    }
+
+    float square_sum = 0.0;
     for (uint column = lane * 4u; column < p.columns; column += p.workgroup_size * 4u)
-        for (uint item = 0u; item < 4u && column + item < p.columns; ++item)
-            output_data[row_offset + column + item] = NCNN_RMS_NORM_DATA[row_offset + column + item]
-                                                      * inverse_rms * (weight_data[column + item] + p.weight_offset);
+    {
+        const uint base = row_offset + column;
+        vec4 values = vec4(0.0);
+        if (aligned4 != 0u)
+        {
+#ifdef NCNN_RMS_NORM_RESIDUAL_ADD
+            precise float v0 = input_data[base] + branch_data[base];
+            precise float v1 = input_data[base + 1u] + branch_data[base + 1u];
+            precise float v2 = input_data[base + 2u] + branch_data[base + 2u];
+            precise float v3 = input_data[base + 3u] + branch_data[base + 3u];
+            residual_data[base] = v0;
+            residual_data[base + 1u] = v1;
+            residual_data[base + 2u] = v2;
+            residual_data[base + 3u] = v3;
+            values = vec4(v0, v1, v2, v3);
+#else
+            values = vec4(input_data[base], input_data[base + 1u], input_data[base + 2u], input_data[base + 3u]);
+#endif
+        }
+        else
+        {
+#ifdef NCNN_RMS_NORM_RESIDUAL_ADD
+            precise float v0 = input_data[base] + branch_data[base];
+            residual_data[base] = v0;
+            values.x = v0;
+            if (column + 1u < p.columns)
+            {
+                precise float v1 = input_data[base + 1u] + branch_data[base + 1u];
+                residual_data[base + 1u] = v1;
+                values.y = v1;
+            }
+            if (column + 2u < p.columns)
+            {
+                precise float v2 = input_data[base + 2u] + branch_data[base + 2u];
+                residual_data[base + 2u] = v2;
+                values.z = v2;
+            }
+            if (column + 3u < p.columns)
+            {
+                precise float v3 = input_data[base + 3u] + branch_data[base + 3u];
+                residual_data[base + 3u] = v3;
+                values.w = v3;
+            }
+#else
+            values.x = input_data[base];
+            if (column + 1u < p.columns) values.y = input_data[base + 1u];
+            if (column + 2u < p.columns) values.z = input_data[base + 2u];
+            if (column + 3u < p.columns) values.w = input_data[base + 3u];
+#endif
+        }
+        square_sum += dot(values, values);
+    }
+    const float inv_rms = reduce_inverse_rms(square_sum, lane);
+    for (uint column = lane * 4u; column < p.columns; column += p.workgroup_size * 4u)
+    {
+        const uint base = row_offset + column;
+#ifdef NCNN_RMS_NORM_BF16_OUT
+        const uint out_half = base >> 1u;
+        const float o0 = NCNN_RMS_NORM_DATA[base] * inv_rms * (weight_data[column] + p.weight_offset);
+        const float o1 = NCNN_RMS_NORM_DATA[base + 1u] * inv_rms * (weight_data[column + 1u] + p.weight_offset);
+        output_bf16[out_half] = f32_to_bf16_rne(o0) | (f32_to_bf16_rne(o1) << 16);
+        if (aligned4 != 0u || column + 2u < p.columns)
+        {
+            const float o2 = NCNN_RMS_NORM_DATA[base + 2u] * inv_rms * (weight_data[column + 2u] + p.weight_offset);
+            const float o3 = NCNN_RMS_NORM_DATA[base + 3u] * inv_rms * (weight_data[column + 3u] + p.weight_offset);
+            output_bf16[out_half + 1u] = f32_to_bf16_rne(o2) | (f32_to_bf16_rne(o3) << 16);
+        }
+#else
+        if (aligned4 != 0u)
+        {
+            output_data[base] = NCNN_RMS_NORM_DATA[base] * inv_rms * (weight_data[column] + p.weight_offset);
+            output_data[base + 1u] = NCNN_RMS_NORM_DATA[base + 1u] * inv_rms * (weight_data[column + 1u] + p.weight_offset);
+            output_data[base + 2u] = NCNN_RMS_NORM_DATA[base + 2u] * inv_rms * (weight_data[column + 2u] + p.weight_offset);
+            output_data[base + 3u] = NCNN_RMS_NORM_DATA[base + 3u] * inv_rms * (weight_data[column + 3u] + p.weight_offset);
+        }
+        else
+        {
+            for (uint item = 0u; item < 4u && column + item < p.columns; ++item)
+                output_data[base + item] = NCNN_RMS_NORM_DATA[base + item]
+                                           * inv_rms * (weight_data[column + item] + p.weight_offset);
+        }
+#endif
+    }
 }

@@ -98,7 +98,12 @@ struct AttentionDecodePlan
 
     const uint64_t base_groups = query_groups * shape.kv_heads;
     const uint64_t blocks = divide_up(shape.kv_tokens, capabilities.kv_tile);
-    const uint64_t desired_splits = divide_up(capabilities.device_parallelism, base_groups);
+    // One workgroup per (split, query group, kv head) leaves a single resident
+    // workgroup per SM. The scan is latency bound on K/V loads, so target
+    // several resident workgroups per SM to keep the memory pipeline busy.
+    constexpr uint64_t resident_workgroups_per_sm = 4;
+    const uint64_t desired_splits = divide_up(capabilities.device_parallelism * resident_workgroups_per_sm,
+                                              base_groups);
     const uint64_t split_capacity = std::min({blocks, desired_splits,
                                               static_cast<uint64_t>(capabilities.max_workgroups_x)});
     const uint64_t blocks_per_split = divide_up(blocks, split_capacity);

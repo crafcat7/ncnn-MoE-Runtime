@@ -1,12 +1,14 @@
 #version 450
 
-// Per-head RMS norm and output gate for the gated delta rule. One workgroup owns
-// one (value head, token) pair so the reduction spans all value columns of that
-// head while tokens spread across the grid: the reduction is per token, so the
-// token loop this kernel used to run serially bought nothing but barriers.
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
 
-// The token index comes from gl_WorkGroupID.y, which is only equal to the token
-// when local_size_y is 1.
+// Per-head RMS norm and output gate for the gated delta rule. One 128-thread
+// workgroup owns one (value head, token) pair. Uses subgroup reductions
+// (1 barrier instead of 7) when subgroup arithmetic is available.
+
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) readonly buffer fused_input_blob
@@ -21,6 +23,12 @@ layout(binding = 2) buffer output_blob
 {
     float output_data[];
 };
+#ifdef NCNN_GDN_NORM_BF16_OUT
+layout(binding = 3) writeonly buffer output_bf16_blob
+{
+    uint output_bf16[];
+};
+#endif
 
 layout(push_constant) uniform parameter
 {
@@ -37,6 +45,7 @@ layout(push_constant) uniform parameter
     uint sigmoid_gate;
     uint gate_channels;
     float lower_bound;
+    uint conv_stride;
 }
 p;
 
@@ -57,38 +66,65 @@ void main()
     const uint token = gl_WorkGroupID.y;
     if (token >= p.token_count)
         return;
+
+    const uint input_row = token * p.fused_columns;
+    const uint output_base = token * p.value_size + value_head * p.value_head_dimension;
+    float square_sum = 0.0;
+    for (uint value_column = lane; value_column < p.value_head_dimension; value_column += 128u)
     {
-        const uint input_row = token * p.fused_columns;
-        const uint output_base = token * p.value_size
-                                 + value_head * p.value_head_dimension;
-        float square_sum = 0.0;
-        for (uint value_column = lane;
-             value_column < p.value_head_dimension;
-             value_column += 128)
-        {
-            const float value = output_data[output_base + value_column];
-            square_sum += value * value;
-        }
-        partial_sum[lane] = square_sum;
-        barrier();
-        for (uint stride = 64; stride > 0; stride >>= 1)
-        {
-            if (lane < stride)
-                partial_sum[lane] += partial_sum[lane + stride];
-            barrier();
-        }
-        const float inverse_rms = 1.0 / sqrt(partial_sum[0] / float(p.value_head_dimension) + p.norm_epsilon);
-        const uint gate_base = input_row + p.convolution_size;
-        for (uint value_column = lane;
-             value_column < p.value_head_dimension;
-             value_column += 128)
-        {
-            const float gate = fused_input[gate_base
-                                           + value_head * p.value_head_dimension
-                                           + value_column];
-            output_data[output_base + value_column] *= inverse_rms
-                                                       * norm_weight[value_column]
-                                                       * (p.sigmoid_gate != 0 ? sigmoid(gate) : gate * sigmoid(gate));
-        }
+        const float value = output_data[output_base + value_column];
+        square_sum += value * value;
     }
+
+    float inverse_rms;
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    square_sum = subgroupAdd(square_sum);
+    if (gl_SubgroupInvocationID == 0u)
+        partial_sum[gl_SubgroupID] = square_sum;
+    barrier();
+    float total = 0.0;
+    for (uint s = 0u; s < gl_NumSubgroups; ++s)
+        total += partial_sum[s];
+    inverse_rms = inversesqrt(total / float(p.value_head_dimension) + p.norm_epsilon);
+#else
+    partial_sum[lane] = square_sum;
+    barrier();
+    for (uint stride = 64u; stride > 0u; stride >>= 1u)
+    {
+        if (lane < stride)
+            partial_sum[lane] += partial_sum[lane + stride];
+        barrier();
+    }
+    inverse_rms = inversesqrt(partial_sum[0] / float(p.value_head_dimension) + p.norm_epsilon);
+#endif
+
+#ifdef NCNN_GDN_NORM_BF16_OUT
+    const uint gate_base = input_row + p.convolution_size;
+    const uint half_dim = p.value_head_dimension >> 1u;
+    const uint bf16_base = (token * p.value_size + value_head * p.value_head_dimension) >> 1u;
+    for (uint col2 = lane; col2 < half_dim; col2 += 128u)
+    {
+        const uint c0 = col2 << 1u;
+        const float g0 = fused_input[gate_base + value_head * p.value_head_dimension + c0];
+        const float g1 = fused_input[gate_base + value_head * p.value_head_dimension + c0 + 1u];
+        const float v0 = output_data[output_base + c0] * inverse_rms * norm_weight[c0]
+                         * (p.sigmoid_gate != 0u ? sigmoid(g0) : g0 * sigmoid(g0));
+        const float v1 = output_data[output_base + c0 + 1u] * inverse_rms * norm_weight[c0 + 1u]
+                         * (p.sigmoid_gate != 0u ? sigmoid(g1) : g1 * sigmoid(g1));
+        const uint b0 = floatBitsToUint(v0);
+        const uint b1 = floatBitsToUint(v1);
+        const uint h0 = (b0 + (0x7fffu + ((b0 >> 16) & 1u))) >> 16;
+        const uint h1 = (b1 + (0x7fffu + ((b1 >> 16) & 1u))) >> 16;
+        output_bf16[bf16_base + col2] = h0 | (h1 << 16);
+    }
+#else
+    const uint gate_base = input_row + p.convolution_size;
+    for (uint value_column = lane; value_column < p.value_head_dimension; value_column += 128u)
+    {
+        const float gate = fused_input[gate_base + value_head * p.value_head_dimension + value_column];
+        output_data[output_base + value_column] *= inverse_rms
+                                                   * norm_weight[value_column]
+                                                   * (p.sigmoid_gate != 0u ? sigmoid(gate) : gate * sigmoid(gate));
+    }
+#endif
 }

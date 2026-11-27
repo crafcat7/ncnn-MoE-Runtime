@@ -1070,8 +1070,8 @@ void qnk_quantize_input(const ActivationBuffer& input, QnkQ8Input& quantized) no
 #if defined(__aarch64__) || defined(_M_ARM64)
     const bool supported = neon_qnk_q8_supported();
 #elif defined(NCNN_MOE_MSVC_X86_SIMD)
-    const bool supported = mxfp4_kernel_kind() == Mxfp4KernelKind::X86Avx2
-                           || mxfp4_kernel_kind() == Mxfp4KernelKind::X86Avx512;
+    const bool supported = mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2
+                           || mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512;
 #else
     const bool supported = false;
 #endif
@@ -1095,8 +1095,9 @@ void qnk_quantize_input(const ActivationBuffer& input, QnkQ8Input& quantized) no
         const int team_size = 1;
 #endif
 #pragma omp parallel for schedule(static) num_threads(team_size) if (team_size > 1)
-        for (size_t token = 0; token < input.rows(); ++token)
+        for (int64_t token_index = 0; token_index < static_cast<int64_t>(input.rows()); ++token_index)
         {
+            const auto token = static_cast<std::size_t>(token_index);
             int8_t* token_codes = codes + token * static_cast<std::size_t>(input.columns());
             float* token_scales = scales + token * static_cast<std::size_t>(block_count);
             int32_t* token_sums = sums + token * static_cast<std::size_t>(block_count);

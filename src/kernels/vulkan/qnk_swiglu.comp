@@ -4,15 +4,30 @@ layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) readonly buffer gate_up_blob
 {
+#ifdef NCNN_QNK_SWIGLU_BF16_IN
+    uint gate_up_data[];
+#else
     float gate_up_data[];
+#endif
 };
+#ifdef NCNN_QNK_SWIGLU_BF16_OUT
+layout(binding = 1) writeonly buffer activated_blob
+{
+    uint activated_bf16[];
+};
+#else
 layout(binding = 1) writeonly buffer activated_blob
 {
     float activated_data[];
 };
+#endif
 layout(binding = 2) readonly buffer up_blob
 {
+#ifdef NCNN_QNK_SWIGLU_BF16_IN
+    uint up_data[];
+#else
     float up_data[];
+#endif
 };
 
 layout(push_constant) uniform parameter
@@ -25,11 +40,96 @@ layout(push_constant) uniform parameter
 }
 p;
 
+#ifdef NCNN_QNK_SWIGLU_BF16_IN
+float gate_at(uint index)
+{
+    const uint packed = gate_up_data[index >> 1u];
+    const uint bits = (index & 1u) != 0u ? (packed >> 16u) : (packed & 0xffffu);
+    return uintBitsToFloat(bits << 16u);
+}
+
+float up_at(uint index)
+{
+    const uint packed = up_data[index >> 1u];
+    const uint bits = (index & 1u) != 0u ? (packed >> 16u) : (packed & 0xffffu);
+    return uintBitsToFloat(bits << 16u);
+}
+#else
+float gate_at(uint index)
+{
+    return gate_up_data[index];
+}
+
+float up_at(uint index)
+{
+    return up_data[index];
+}
+#endif
+
+float gelu_tanh(float x)
+{
+    return 0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)));
+}
+
+float eval_gated(uint token, uint column)
+{
+    const bool separate = p.packed_gate_up == 2u;
+    const bool with_router = p.packed_gate_up == 3u;
+    const uint row_stride = separate ? p.intermediate_columns
+                                     : (p.intermediate_columns * 2u + (with_router ? 1u : 0u));
+    const uint base = token * row_stride;
+    const uint gate_index = p.packed_gate_up != 0u
+                                ? base + column
+                                : base + column * 2u;
+    const uint up_index = p.packed_gate_up != 0u
+                              ? base + p.intermediate_columns + column
+                              : base + column * 2u + 1u;
+    float gate = gate_at(gate_index);
+    float up = separate ? up_at(base + column) : gate_at(up_index);
+    if (p.activation_limit > 0.0)
+    {
+        gate = min(gate, p.activation_limit);
+        up = clamp(up, -p.activation_limit, p.activation_limit);
+    }
+    float out_v;
+    if (p.activation == 0u)
+        out_v = (gate / (1.0 + exp(-1.702 * gate))) * (up + 1.0);
+    else if (p.activation == 3u)
+        out_v = gelu_tanh(gate) * up;
+    else
+        out_v = (gate / (1.0 + exp(-gate))) * up;
+    if (with_router)
+        out_v /= (1.0 + exp(-gate_at(base + p.intermediate_columns * 2u)));
+    return out_v;
+}
+
+#ifdef NCNN_QNK_SWIGLU_BF16_OUT
+uint f32_to_bf16_rne(float v)
+{
+    const uint bits = floatBitsToUint(v);
+    const uint rounding = 0x7fffu + ((bits >> 16) & 1u);
+    return (bits + rounding) >> 16;
+}
+#endif
+
 void main()
 {
-    const uint column = gl_GlobalInvocationID.x;
     const uint token = gl_GlobalInvocationID.y;
-    if (column >= p.intermediate_columns || token >= p.token_count)
+    if (token >= p.token_count)
+        return;
+
+#ifdef NCNN_QNK_SWIGLU_BF16_OUT
+    const uint pair_col = gl_GlobalInvocationID.x;
+    const uint half_cols = p.intermediate_columns >> 1u;
+    if (pair_col >= half_cols)
+        return;
+    const uint c0 = pair_col << 1u;
+    const float v0 = eval_gated(token, c0);
+    const float v1 = eval_gated(token, c0 + 1u);
+    activated_bf16[token * half_cols + pair_col] = f32_to_bf16_rne(v0) | (f32_to_bf16_rne(v1) << 16);
+#else
+    const uint column = gl_GlobalInvocationID.x;
+    if (column >= p.intermediate_columns)
         return;
 
     // Shared Expert router gate: the projection is one scalar per token.
@@ -40,30 +140,6 @@ void main()
         return;
     }
 
-    const bool separate = p.packed_gate_up == 2u;
-    const uint base = token * p.intermediate_columns * (separate ? 1u : 2u);
-    const uint gate_index = p.packed_gate_up != 0u
-                                ? base + column
-                                : base + column * 2u;
-    const uint up_index = p.packed_gate_up != 0u
-                              ? base + p.intermediate_columns + column
-                              : base + column * 2u + 1u;
-    float gate = gate_up_data[gate_index];
-    float up = separate ? up_data[base + column] : gate_up_data[up_index];
-    if (p.activation_limit > 0.0)
-    {
-        gate = min(gate, p.activation_limit);
-        up = clamp(up, -p.activation_limit, p.activation_limit);
-    }
-
-    if (p.activation == 0u)
-    {
-        const float silu = gate / (1.0 + exp(-1.702 * gate));
-        activated_data[token * p.intermediate_columns + column] = silu * (up + 1.0);
-    }
-    else
-    {
-        const float silu = gate / (1.0 + exp(-gate));
-        activated_data[token * p.intermediate_columns + column] = silu * up;
-    }
+    activated_data[token * p.intermediate_columns + column] = eval_gated(token, column);
+#endif
 }

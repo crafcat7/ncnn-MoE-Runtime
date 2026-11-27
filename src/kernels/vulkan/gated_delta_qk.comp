@@ -1,13 +1,14 @@
 #version 450
 
-// Query/key RMS norm for the gated delta rule. One workgroup owns one (key head,
-// token) pair and lanes cover its columns, so the reduction is a workgroup tree
-// and tokens spread across the grid. The per-token reduction is independent, so
-// the token loop this kernel used to run bought nothing but barriers: with only
-// kv_head_count workgroups the GPU was idle for most of the stage.
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
 
-// The token index comes from gl_WorkGroupID.y, which is only equal to the token
-// when local_size_y is 1.
+// Query/key L2 norm for the gated delta rule. One 128-thread workgroup owns
+// one (key head, token) pair. Uses subgroup reductions (1 barrier instead of 7)
+// when subgroup arithmetic is available.
+
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) buffer fused_input_blob
@@ -30,6 +31,7 @@ layout(push_constant) uniform parameter
     uint sigmoid_gate;
     uint gate_channels;
     float lower_bound;
+    uint conv_stride;
 }
 p;
 
@@ -46,31 +48,54 @@ void main()
     const uint key_size = p.kv_head_count * p.head_dimension;
     const bool valid = lane < p.head_dimension;
 
-    {
-        const uint input_row = token * p.fused_columns;
-        const uint query_base = input_row + key_head * p.head_dimension;
-        const uint key_base = input_row + key_size + key_head * p.head_dimension;
+    const uint input_row = token * p.conv_stride;
+    const uint query_base = input_row + key_head * p.head_dimension;
+    const uint key_base = input_row + key_size + key_head * p.head_dimension;
 
-        const float query = valid ? fused_input[query_base + lane] : 0.0;
-        const float key = valid ? fused_input[key_base + lane] : 0.0;
-        query_sum[lane] = query * query;
-        key_sum[lane] = key * key;
+    const float query = valid ? fused_input[query_base + lane] : 0.0;
+    const float key = valid ? fused_input[key_base + lane] : 0.0;
+    float q_sq = query * query;
+    float k_sq = key * key;
+
+    float query_inverse;
+    float key_inverse;
+#if ncnn_subgroup_basic && ncnn_subgroup_arithmetic
+    q_sq = subgroupAdd(q_sq);
+    k_sq = subgroupAdd(k_sq);
+    if (gl_SubgroupInvocationID == 0u)
+    {
+        query_sum[gl_SubgroupID] = q_sq;
+        key_sum[gl_SubgroupID] = k_sq;
+    }
+    barrier();
+    float q_tot = 0.0;
+    float k_tot = 0.0;
+    for (uint s = 0u; s < gl_NumSubgroups; ++s)
+    {
+        q_tot += query_sum[s];
+        k_tot += key_sum[s];
+    }
+    query_inverse = inversesqrt(q_tot + 1e-6);
+    key_inverse = inversesqrt(k_tot + 1e-6);
+#else
+    query_sum[lane] = q_sq;
+    key_sum[lane] = k_sq;
+    barrier();
+    for (uint stride = 64u; stride > 0u; stride >>= 1u)
+    {
+        if (lane < stride)
+        {
+            query_sum[lane] += query_sum[lane + stride];
+            key_sum[lane] += key_sum[lane + stride];
+        }
         barrier();
-        for (uint stride = 64; stride > 0; stride >>= 1)
-        {
-            if (lane < stride)
-            {
-                query_sum[lane] += query_sum[lane + stride];
-                key_sum[lane] += key_sum[lane + stride];
-            }
-            barrier();
-        }
-        const float query_inverse = 1.0 / sqrt(query_sum[0] + 1e-6);
-        const float key_inverse = 1.0 / sqrt(key_sum[0] + 1e-6);
-        if (valid)
-        {
-            fused_input[query_base + lane] *= query_inverse;
-            fused_input[key_base + lane] *= key_inverse;
-        }
+    }
+    query_inverse = inversesqrt(query_sum[0] + 1e-6);
+    key_inverse = inversesqrt(key_sum[0] + 1e-6);
+#endif
+    if (valid)
+    {
+        fused_input[query_base + lane] = query * query_inverse;
+        fused_input[key_base + lane] = key * key_inverse;
     }
 }

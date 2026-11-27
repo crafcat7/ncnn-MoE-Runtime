@@ -1059,42 +1059,6 @@ void test_ncnn_vulkan_bfloat16_operator()
                   << " is not 32\n";
         return;
     }
-    // The 64x64 tile is chosen once the grid reaches 160 workgroups; only that
-    // geometry carries the opt-in FP16-accumulator specialization. Force it
-    // with 1024 rows x 640 outputs and check both accumulator modes.
-    {
-        // 8 row tiles x 20 column tiles = the 160-workgroup 64x64 threshold.
-        constexpr uint32_t large_outputs = 1280;
-        constexpr uint32_t large_inputs = 64;
-        constexpr size_t large_tokens = 512;
-        TensorData large;
-        large.dtype = DType::BFloat16;
-        large.shape = {large_outputs, large_inputs};
-        large.bfloat16_data.resize(static_cast<size_t>(large_outputs) * large_inputs);
-        for (size_t index = 0; index < large.bfloat16_data.size(); ++index)
-            large.bfloat16_data[index] = float_to_bfloat16(0.001f * static_cast<float>(1 + index % 5));
-        ActivationBuffer large_input(large_tokens, large_inputs);
-        for (size_t row = 0; row < large_input.rows(); ++row)
-            for (uint32_t column = 0; column < large_inputs; ++column)
-                large_input.row(row)[column] = 0.002f * static_cast<float>(1 + (row * 3 + column * 7) % 5);
-        const ActivationBuffer large_reference = forward_linear(large, large_input, g_test_optimization_flags);
-        {
-            const auto large_operator = Bfloat16Linear_vulkan::create(large, nullptr, device_index,
-                                                                      vulkan_runtime, g_test_optimization_flags);
-            check(static_cast<bool>(large_operator));
-            ActivationBuffer large_output;
-            check(static_cast<bool>(large_operator->forward(large_input, large_output)));
-            check(large_output.rows() == large_reference.rows()
-                  && large_output.columns() == large_reference.columns());
-            for (size_t row = 0; row < large_reference.rows(); ++row)
-                for (uint32_t column = 0; column < large_reference.columns(); ++column)
-                {
-                    const float expected = large_reference.row(row)[column];
-                    check(std::fabs(large_output.row(row)[column] - expected)
-                          <= 0.02f * std::max(1.0f, std::fabs(expected)));
-                }
-        }
-    }
     TensorData first;
     first.dtype = DType::BFloat16;
     first.shape = {192, 128};

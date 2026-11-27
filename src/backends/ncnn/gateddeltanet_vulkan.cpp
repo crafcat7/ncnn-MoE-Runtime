@@ -11,6 +11,7 @@
 #include "kernels/vulkan/gated_delta_conv_history.comp.hex.h"
 #include "kernels/vulkan/gated_delta_conv_parallel.comp.hex.h"
 #include "kernels/vulkan/gated_delta_rule.comp.hex.h"
+#include "kernels/vulkan/gated_delta_rule_fast.comp.hex.h"
 #include "kernels/vulkan/gated_delta_rule_reg.comp.hex.h"
 #include "kernels/vulkan/gated_delta_norm.comp.hex.h"
 #include "kernels/vulkan/gated_delta_qk.comp.hex.h"
@@ -26,6 +27,7 @@
 #include <algorithm>
 #include <array>
 #include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
 #endif
@@ -81,6 +83,11 @@ std::vector<uint64_t> GatedDeltaNet_vulkan::scratch_elements(uint32_t head_count
     // writes its windowed result into a second fused-sized buffer. The sequential
     // kernel rewrites the fused input in place, so the extra buffer is only
     // recorded for multi-row chunks; shape-only callers include it either way.
+    if (rows >= 8)
+    {
+        const uint64_t bf16_stage = saturating_multiply_u64((value_columns + 1u) / 2u, rows);
+        return {fused_elements, recurrent_elements, fused_elements, bf16_stage, bf16_stage};
+    }
     return {fused_elements, recurrent_elements, fused_elements};
 }
 
@@ -93,42 +100,14 @@ static bool create_pipeline(const std::shared_ptr<VulkanContext>& context,
                             const ncnn::Option& opt,
                             const char* source,
                             int source_size,
-                            std::shared_ptr<ncnn::Pipeline>& destination)
+                            std::shared_ptr<ncnn::Pipeline>& destination,
+                            int local_size_x = 128,
+                            uint64_t variant = 0,
+                            const std::vector<ncnn::vk_specialization_type>& specializations = {})
 {
-    const std::shared_ptr<const std::vector<uint32_t>> spirv = context->shader_binary(source,
-                                                                                      source_size,
-                                                                                      opt,
-                                                                                      0);
-    if (!spirv || spirv->empty())
-        return false;
-
-    ncnn::VulkanDevice* device = context->device();
-    destination = context->find_pipeline(source, 0);
-    if (destination)
-    {
-        return true;
-    }
-    std::unique_ptr<ncnn::Pipeline> pipeline(new ncnn::Pipeline(device));
-    pipeline->set_local_size_xyz(128, 1, 1);
-    const std::vector<ncnn::vk_specialization_type> specializations;
-    if (pipeline->create(spirv->data(),
-                         spirv->size() * sizeof(uint32_t),
-                         specializations)
-        != 0)
-    {
-        return false;
-    }
-    destination = std::shared_ptr<ncnn::Pipeline>(pipeline.release(),
-                                                  [context = context](ncnn::Pipeline* value) mutable {
-                                                      {
-                                                          const std::lock_guard<std::mutex> lock(context->command_mutex());
-                                                          delete value;
-                                                      }
-                                                      // Weak cache entries retain the deleter control block after disposal.
-                                                      context.reset();
-                                                  });
-    context->cache_pipeline(source, 0, destination);
-    return true;
+    return create_cached_pipeline(context, source, source_size, opt, 0, variant,
+                                  local_size_x, destination, specializations,
+                                  local_size_x == 32 ? 32 : 0);
 }
 
 // Records one dispatch; group counts are 128-lane workgroups.
@@ -144,7 +123,7 @@ static void record_dispatch(ncnn::VkCompute& cmd,
                             uint32_t rows = 1)
 {
     ncnn::VkMat dispatcher;
-    dispatcher.w = static_cast<int>(128 * groups);
+    dispatcher.w = static_cast<int>(static_cast<uint32_t>(pipeline->local_size_x()) * groups);
     dispatcher.h = static_cast<int>(rows);
     dispatcher.c = 1;
     cmd.record_pipeline_readonly(pipeline.get(), bindings, readonly, constants, dispatcher);
@@ -345,6 +324,7 @@ public:
     ncnn::VkMat conv_out;
     ncnn::VkMat row_scale;
     ncnn::VkMat recurrent_output;
+    ncnn::VkMat rec_bf16;
     ncnn::VkMat projected;
     size_t rows = 0;
     uint32_t dispatches = 0;
@@ -459,7 +439,9 @@ public:
     std::unique_ptr<ncnn::VkWeightAllocator> weight_allocator;
     std::unique_ptr<ncnn::VkWeightStagingAllocator> weight_staging_allocator;
     std::shared_ptr<ncnn::Pipeline> rule;
-    // Register-resident variant used when the head geometry fits one subgroup.
+    // Register-resident variants: fast vec4 (decode + prefill) and legacy scalar reg.
+    std::shared_ptr<ncnn::Pipeline> rule_dec;
+    std::shared_ptr<ncnn::Pipeline> rule_pref;
     std::shared_ptr<ncnn::Pipeline> rule_reg;
     std::shared_ptr<ncnn::Pipeline> conv;
     // Token-parallel prefill convolution plus the window rewrite that follows it.
@@ -467,6 +449,7 @@ public:
     std::shared_ptr<ncnn::Pipeline> conv_hist;
     std::shared_ptr<ncnn::Pipeline> qk;
     std::shared_ptr<ncnn::Pipeline> norm;
+    std::shared_ptr<ncnn::Pipeline> norm_bf16;
     std::vector<ncnn::vk_constant_type> constants;
     ncnn::VkMat convolution_weight;
     ncnn::VkMat time_bias;
@@ -1003,8 +986,8 @@ GatedDeltaNet_vulkan::create_impl(const std::shared_ptr<Bfloat16Linear_vulkan>& 
     implementation.sigmoid_gate = sigmoid_gate;
     implementation.gate_channels = gate_channels;
     implementation.lower_bound = lower_bound;
-    // Shader ABI constants; only the token count changes per recording.
-    implementation.constants.resize(13);
+    // Shader ABI constants; only the token count and conv_stride change per recording.
+    implementation.constants.resize(14);
     implementation.constants[0].u32 = implementation.convolution_size;
     implementation.constants[1].u32 = implementation.value_size;
     implementation.constants[2].u32 = implementation.fused_columns;
@@ -1018,6 +1001,7 @@ GatedDeltaNet_vulkan::create_impl(const std::shared_ptr<Bfloat16Linear_vulkan>& 
     implementation.constants[10].u32 = implementation.sigmoid_gate ? 1u : 0u;
     implementation.constants[11].u32 = implementation.gate_channels;
     implementation.constants[12].f = implementation.lower_bound;
+    implementation.constants[13].u32 = implementation.fused_columns;
     {
         const std::lock_guard<std::mutex> lock(implementation.vulkan_context->command_mutex());
         if (!create_pipeline(implementation.vulkan_context,
@@ -1065,6 +1049,48 @@ GatedDeltaNet_vulkan::create_impl(const std::shared_ptr<Bfloat16Linear_vulkan>& 
                                 implementation.norm))
         {
             return {};
+        }
+        const auto& dev_info = implementation.vulkan_context->device()->info;
+        const uint32_t fast_required_ops = VK_SUBGROUP_FEATURE_BASIC_BIT
+                                           | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT
+                                           | VK_SUBGROUP_FEATURE_BALLOT_BIT
+                                           | VK_SUBGROUP_FEATURE_SHUFFLE_BIT
+                                           | VK_SUBGROUP_FEATURE_CLUSTERED_BIT;
+        if (dev_info.subgroup_size() == 32
+            && (dev_info.support_subgroup_ops() & fast_required_ops) == fast_required_ops
+            && head_dimension == 128u
+            && value_head_dimension % 8u == 0
+            && (convolution_size % 4u) == 0
+            && (fused_columns % 4u) == 0
+            && gate_channels == 1u)
+        {
+            ncnn::Option fast_opt = implementation.opt;
+            fast_opt.use_subgroup_ops = true;
+            std::vector<ncnn::vk_specialization_type> spec(1);
+            spec[0].u32 = 4u;
+            if (!create_pipeline(implementation.vulkan_context, fast_opt,
+                                 gated_delta_rule_fast_shader,
+                                 static_cast<int>(sizeof(gated_delta_rule_fast_shader) - 1),
+                                 implementation.rule_dec, 32, 4u, spec))
+                implementation.rule_dec.reset();
+            spec[0].u32 = 16u;
+            if (!create_pipeline(implementation.vulkan_context, fast_opt,
+                                 gated_delta_rule_fast_shader,
+                                 static_cast<int>(sizeof(gated_delta_rule_fast_shader) - 1),
+                                 implementation.rule_pref, 32, 16u, spec))
+                implementation.rule_pref.reset();
+        }
+        if (!quantized && output_projection && output_projection->use_cm2()
+            && (value_head_dimension & 1u) == 0u)
+        {
+            static const std::string norm_bf16_shader = prefix_shader(gated_delta_norm_shader,
+                                                                      static_cast<int>(sizeof(gated_delta_norm_shader) - 1),
+                                                                      "#define NCNN_GDN_NORM_BF16_OUT\n");
+            if (!norm_bf16_shader.empty()
+                && !create_pipeline(implementation.vulkan_context, implementation.opt,
+                                    norm_bf16_shader.c_str(), static_cast<int>(norm_bf16_shader.size()),
+                                    implementation.norm_bf16))
+                implementation.norm_bf16.reset();
         }
     }
 
@@ -1241,8 +1267,10 @@ bool GatedDeltaNet_vulkan::record_forward(const ncnn::VkMat& input, LayerCache& 
     // sequential kernel stays for decode and short chunks.
     const bool par_conv = implementation.conv_par && implementation.conv_hist && token_count >= 8
                           && token_count >= implementation.convolution_kernel_size;
+    const bool compact_conv = par_conv && implementation.rule_dec != nullptr;
+    const uint32_t conv_stride = compact_conv ? implementation.convolution_size : implementation.fused_columns;
     if (par_conv)
-        pending.conv_out.create(static_cast<int>(implementation.fused_columns), static_cast<int>(token_count),
+        pending.conv_out.create(static_cast<int>(conv_stride), static_cast<int>(token_count),
                                 sizeof(float), implementation.vulkan_context->blob_allocator());
     if (pending.fused.empty() || pending.recurrent_output.empty() || pending.projected.empty()
         || (par_conv && pending.conv_out.empty()))
@@ -1254,11 +1282,12 @@ bool GatedDeltaNet_vulkan::record_forward(const ncnn::VkMat& input, LayerCache& 
                             &pending.row_scale);
     std::vector<ncnn::vk_constant_type> constants = implementation.constants;
     constants[8].u32 = static_cast<uint32_t>(token_count);
+    constants[13].u32 = conv_stride;
     if (par_conv)
     {
         record_dispatch(command, implementation.conv_par,
                         {pending.fused, pending.conv_out, state.convolution, implementation.convolution_weight},
-                        {1, 0, 1, 1}, constants, (implementation.fused_columns + 127) / 128,
+                        {1, 0, 1, 1}, constants, (conv_stride + 127) / 128,
                         static_cast<uint32_t>(token_count));
         record_dispatch(command, implementation.conv_hist, {pending.fused, state.convolution}, {1, 0}, constants,
                         (implementation.convolution_size + 127) / 128);
@@ -1270,26 +1299,61 @@ bool GatedDeltaNet_vulkan::record_forward(const ncnn::VkMat& input, LayerCache& 
                         (implementation.convolution_size + 127) / 128);
     }
     const ncnn::VkMat& conv = par_conv ? pending.conv_out : pending.fused;
-    const std::vector<ncnn::VkMat> rule_bindings = {conv, state.recurrent, implementation.time_bias,
-                                                    implementation.decay_log, pending.recurrent_output};
-    const std::vector<ncnn::VkMat> norm_bindings = {conv, implementation.norm_weight, pending.recurrent_output};
     record_dispatch(command, implementation.qk, {conv}, {0}, constants, implementation.kv_head_count,
                     static_cast<uint32_t>(token_count));
-    if (implementation.rule_reg)
+    if (token_count >= 16u && implementation.rule_pref)
     {
-        record_dispatch(command, implementation.rule_reg, rule_bindings, {1, 0, 1, 1, 0}, constants,
+        record_dispatch(command, implementation.rule_pref,
+                        {conv, state.recurrent, implementation.time_bias, implementation.decay_log, pending.recurrent_output, pending.fused},
+                        {1, 0, 1, 1, 0, 1}, constants,
+                        implementation.head_count * (implementation.value_head_dimension / 2u));
+    }
+    else if (implementation.rule_dec)
+    {
+        record_dispatch(command, implementation.rule_dec,
+                        {conv, state.recurrent, implementation.time_bias, implementation.decay_log, pending.recurrent_output, pending.fused},
+                        {1, 0, 1, 1, 0, 1}, constants,
+                        implementation.head_count * (implementation.value_head_dimension / 8u));
+    }
+    else if (implementation.rule_reg)
+    {
+        record_dispatch(command, implementation.rule_reg,
+                        {conv, state.recurrent, implementation.time_bias, implementation.decay_log, pending.recurrent_output},
+                        {1, 0, 1, 1, 0}, constants,
                         implementation.head_count * (implementation.value_head_dimension / 4));
     }
     else
     {
-        record_dispatch(command, implementation.rule, rule_bindings, {1, 0, 1, 1, 0}, constants,
+        record_dispatch(command, implementation.rule,
+                        {conv, state.recurrent, implementation.time_bias, implementation.decay_log, pending.recurrent_output},
+                        {1, 0, 1, 1, 0}, constants,
                         implementation.head_count * ((implementation.value_head_dimension + 31) / 32));
     }
-    record_dispatch(command, implementation.norm, norm_bindings, {1, 1, 0}, constants, implementation.head_count,
-                    static_cast<uint32_t>(token_count));
+    const bool use_norm_bf16 = token_count >= 8 && implementation.norm_bf16 != nullptr;
+    if (use_norm_bf16)
+    {
+        pending.rec_bf16.create(static_cast<int>(implementation.value_size),
+                                static_cast<int>(token_count),
+                                sizeof(uint16_t), 1,
+                                implementation.vulkan_context->blob_allocator());
+        if (pending.rec_bf16.empty())
+            return false;
+        record_dispatch(command, implementation.norm_bf16,
+                        {pending.fused, implementation.norm_weight, pending.recurrent_output, pending.rec_bf16},
+                        {1, 1, 1, 0}, constants, implementation.head_count,
+                        static_cast<uint32_t>(token_count));
+    }
+    else
+    {
+        record_dispatch(command, implementation.norm,
+                        {pending.fused, implementation.norm_weight, pending.recurrent_output},
+                        {1, 1, 0}, constants, implementation.head_count,
+                        static_cast<uint32_t>(token_count));
+    }
     if (!state.record_transaction_row(command))
         return false;
-    record_output_projection(pending.recurrent_output, pending.projected, command);
+    record_output_projection(use_norm_bf16 ? pending.rec_bf16 : pending.recurrent_output,
+                             pending.projected, command);
     projected = pending.projected;
     pending.dispatches = (implementation.quantized_output ? 4u : 1u) + 5;
     pending.int4_ops = implementation.int4_ops;

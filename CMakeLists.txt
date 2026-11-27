@@ -479,9 +479,11 @@ if(NCNN_MOE_USE_NCNN)
 
     # Disable unneeded upstream layers to keep the dependency small. Packing,
     # Flatten and Softmax are instantiated by ncnn's Vulkan helpers; the other
-    # entries are created directly by the Vulkan operators.
+    # entries are created directly by the Vulkan operators. Cast is required by
+    # VkTransfer::record_upload, which converts FP32 host weights to FP16/BF16
+    # when the Vulkan option enables those storage formats.
     set(NCNN_MOE_REQUIRED_LAYERS
-        binaryop flatten gemm innerproduct packing permute reshape rotaryembed
+        binaryop cast flatten gemm innerproduct packing permute reshape rotaryembed
         sdpa slice softmax)
     if(NCNN_MOE_USE_VULKAN)
         # The RMSNorm path reuses the LayerNorm Vulkan shaders.
@@ -540,20 +542,29 @@ if(NCNN_MOE_WITH_VULKAN)
         src/kernels/vulkan/attn_decode_merge.comp
         src/kernels/vulkan/attention_decode_sdpa.comp
         src/kernels/vulkan/attn_decode_split.comp
+        src/kernels/vulkan/attn_decode_gqa.comp
+        src/kernels/vulkan/attn_decode_gqa_vec.comp
+        src/kernels/vulkan/attn_decode_gqa_share.comp
+        src/kernels/vulkan/attn_prefill.comp
+        src/kernels/vulkan/attn_prefill_cm2.comp
+        src/kernels/vulkan/attn_prefill_cm2_merge.comp
         src/kernels/vulkan/attention_gqa_matrix.comp
         src/kernels/vulkan/attention_gqa_reduce.comp
+        src/kernels/vulkan/attention_gqa_subgroup.comp
         src/kernels/vulkan/attention_output_gate.comp
         src/kernels/vulkan/attention_qkv_norm_rope.comp
         src/kernels/vulkan/attention_qkv_rope.comp
         src/kernels/vulkan/attention_ring_append.comp
         src/kernels/vulkan/attention_ring_zero.comp
         src/kernels/vulkan/bfloat16_cooperative_projection.comp
+        src/kernels/vulkan/bfloat16_gemm_cm2.comp
         src/kernels/vulkan/bfloat16_projection.comp
         src/kernels/vulkan/bfloat16_rms_norm_projection.comp
         src/kernels/vulkan/bfloat16_row_rms.comp
         src/kernels/vulkan/bfloat16_swiglu_down.comp
         src/kernels/vulkan/bfloat16_tile_64x64.comp
         src/kernels/vulkan/bfloat16_tile_32x64.comp
+        src/kernels/vulkan/fp32_to_bf16.comp
         src/kernels/vulkan/float8_projection.comp
         src/kernels/vulkan/float8_quantize.comp
         src/kernels/vulkan/float8_rms_norm_quantize.comp
@@ -563,6 +574,7 @@ if(NCNN_MOE_WITH_VULKAN)
         src/kernels/vulkan/gated_delta_conv_history.comp
         src/kernels/vulkan/gated_delta_conv_parallel.comp
         src/kernels/vulkan/gated_delta_rule.comp
+        src/kernels/vulkan/gated_delta_rule_fast.comp
         src/kernels/vulkan/gated_delta_rule_reg.comp
         src/kernels/vulkan/gated_delta_qk.comp
         src/kernels/vulkan/gated_delta_norm.comp
@@ -604,31 +616,10 @@ if(NCNN_MOE_WITH_VULKAN)
         src/kernels/vulkan/mxfp4_projection.comp
         src/kernels/vulkan/mxfp4_route_aggregation.comp
         src/kernels/vulkan/qnk_projection.comp
+        src/kernels/vulkan/qnk_decode_q8.comp
+        src/kernels/vulkan/qnk_decode_bf16.comp
         src/kernels/vulkan/qnk_swiglu.comp
     )
-    set(NCNN_MOE_ATTN_PREFILL_TEMPLATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/vulkan/attn_prefill.comp.in")
-    set(NCNN_MOE_ATTN_PREFILL_HEAD_DIM 64)
-    set(NCNN_MOE_ATTN_PREFILL_QUERY_TILE 64)
-    set(NCNN_MOE_ATTN_PREFILL_KEY_TILE 64)
-    set(NCNN_MOE_ATTN_PREFILL_ROWS 8)
-    configure_file(
-        "${NCNN_MOE_ATTN_PREFILL_TEMPLATE}"
-        "${CMAKE_CURRENT_BINARY_DIR}/kernels/vulkan/attn_prefill64.comp"
-        @ONLY)
-    set(NCNN_MOE_ATTN_PREFILL_HEAD_DIM 128)
-    set(NCNN_MOE_ATTN_PREFILL_QUERY_TILE 32)
-    set(NCNN_MOE_ATTN_PREFILL_KEY_TILE 32)
-    set(NCNN_MOE_ATTN_PREFILL_ROWS 4)
-    configure_file(
-        "${NCNN_MOE_ATTN_PREFILL_TEMPLATE}"
-        "${CMAKE_CURRENT_BINARY_DIR}/kernels/vulkan/attn_prefill128.comp"
-        @ONLY)
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-        "${NCNN_MOE_ATTN_PREFILL_TEMPLATE}")
-    list(APPEND NCNN_MOE_VULKAN_SHADER_SOURCES
-        "${CMAKE_CURRENT_BINARY_DIR}/kernels/vulkan/attn_prefill64.comp"
-        "${CMAKE_CURRENT_BINARY_DIR}/kernels/vulkan/attn_prefill128.comp")
 
     set(NCNN_MOE_VULKAN_SHADER_HEADERS)
     foreach(NCNN_MOE_SHADER_SOURCE IN LISTS NCNN_MOE_VULKAN_SHADER_SOURCES)

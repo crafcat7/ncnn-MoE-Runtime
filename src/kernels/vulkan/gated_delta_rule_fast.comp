@@ -1,0 +1,199 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_clustered : require
+
+// Vectorized (vec4 / 128-bit coalesced) register-resident gated delta rule
+// for head_dimension = 128, scalar gate_channels = 1.
+//
+// Specialization constant LANES_PER_COLUMN in {4, 8, 16, 32}:
+//   - LANES_PER_COLUMN = 16: 2 value cols/warp, 2 vec4 state/lane (1024 warps -> optimal prefill)
+//   - LANES_PER_COLUMN =  4: 8 value cols/warp, 8 vec4 state/lane (256 warps -> low-overhead decode)
+//
+// Computes beta/decay 32 tokens in parallel across all 32 warp lanes and
+// broadcasts via subgroupShuffle, and prefetches Q alongside K to overlap
+// Q memory latency with the first subgroup reduction.
+
+layout(constant_id = 0) const uint LANES_PER_COLUMN = 16u;
+
+const uint COLS_PER_WG = 32u / LANES_PER_COLUMN;
+const uint VECS_PER_LANE = 32u / LANES_PER_COLUMN; // 128 floats = 32 vec4s
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer conv_input_blob
+{
+    vec4 conv_v4[];
+};
+layout(binding = 1) buffer recurrent_state_blob
+{
+    float recurrent_state[];
+};
+layout(binding = 2) readonly buffer time_bias_blob
+{
+    float time_bias[];
+};
+layout(binding = 3) readonly buffer decay_log_blob
+{
+    float decay_log[];
+};
+layout(binding = 4) buffer output_blob
+{
+    float output_data[];
+};
+layout(binding = 5) readonly buffer fused_input_blob
+{
+    float fused_input[];
+};
+
+layout(push_constant) uniform parameter
+{
+    uint convolution_size;
+    uint value_size;
+    uint fused_columns;
+    uint head_count;
+    uint kv_head_count;
+    uint head_dimension;
+    uint value_head_dimension;
+    uint kernel_size;
+    uint token_count;
+    float norm_epsilon;
+    uint sigmoid_gate;
+    uint gate_channels;
+    float lower_bound;
+    uint conv_stride;
+}
+p;
+
+float sigmoid(float value)
+{
+    if (value >= 0.0)
+        return 1.0 / (1.0 + exp(-value));
+    const float exponential = exp(value);
+    return exponential / (1.0 + exponential);
+}
+
+float softplus(float value)
+{
+    if (value > 20.0)
+        return value;
+    if (value < -20.0)
+        return exp(value);
+    return log(1.0 + exp(value));
+}
+
+float reduce_col(float partial)
+{
+    if (LANES_PER_COLUMN == 32u)
+        return subgroupAdd(partial);
+    if (LANES_PER_COLUMN == 16u)
+        return subgroupClusteredAdd(partial, 16u);
+    if (LANES_PER_COLUMN == 8u)
+        return subgroupClusteredAdd(partial, 8u);
+    return subgroupClusteredAdd(partial, 4u);
+}
+
+void main()
+{
+    const uint sg_lane = gl_SubgroupInvocationID;
+    const uint lane = sg_lane & (LANES_PER_COLUMN - 1u);
+    const uint col_in_wg = sg_lane / LANES_PER_COLUMN;
+    const uint blocks = p.value_head_dimension / COLS_PER_WG;
+    const uint value_head = gl_WorkGroupID.x / blocks;
+    const uint value_column = (gl_WorkGroupID.x % blocks) * COLS_PER_WG + col_in_wg;
+
+    const uint head_ratio = p.head_count / p.kv_head_count;
+    const uint key_head = value_head / head_ratio;
+    const uint key_size_v4 = (p.kv_head_count * p.head_dimension) >> 2u;
+    const uint conv_stride_v4 = p.conv_stride >> 2u;
+    const uint value_columns = p.value_head_dimension;
+    const uint recurrent_base = value_head * p.head_dimension * value_columns;
+    const float query_scale = 1.0 / sqrt(float(p.head_dimension));
+    const float a_log = exp(decay_log[value_head]);
+    const float tb = time_bias[value_head];
+
+    vec4 s[VECS_PER_LANE];
+    [[unroll]] for (uint i = 0u; i < VECS_PER_LANE; ++i)
+    {
+        const uint r0 = (i * LANES_PER_COLUMN + lane) << 2u;
+        s[i] = vec4(recurrent_state[recurrent_base + (r0 + 0u) * value_columns + value_column],
+                    recurrent_state[recurrent_base + (r0 + 1u) * value_columns + value_column],
+                    recurrent_state[recurrent_base + (r0 + 2u) * value_columns + value_column],
+                    recurrent_state[recurrent_base + (r0 + 3u) * value_columns + value_column]);
+    }
+
+    const uint beta_offset = p.convolution_size + p.value_size + value_head;
+    const uint alpha_offset = p.convolution_size + p.value_size + p.head_count + value_head;
+    const uint q_head_v4 = key_head * 32u + lane;
+    const uint k_head_v4 = key_size_v4 + key_head * 32u + lane;
+    const uint v_col_elem = (key_size_v4 << 3u) + value_head * value_columns + value_column;
+    const uint v_col_v4 = v_col_elem >> 2u;
+    const uint v_col_comp = v_col_elem & 3u;
+    const uint out_col_offset = value_head * value_columns + value_column;
+
+    for (uint t_base = 0u; t_base < p.token_count; t_base += 32u)
+    {
+        // Compute beta and decay for up to 32 tokens in parallel across all 32 warp lanes.
+        float beta_lane = 0.0;
+        float decay_lane = 1.0;
+        const uint t_load = t_base + sg_lane;
+        if (t_load < p.token_count)
+        {
+            const uint f_row = t_load * p.fused_columns;
+            beta_lane = sigmoid(fused_input[f_row + beta_offset]);
+            decay_lane = exp(-a_log * softplus(fused_input[f_row + alpha_offset] + tb));
+        }
+
+        const uint t_end = min(p.token_count - t_base, 32u);
+        for (uint dt = 0u; dt < t_end; ++dt)
+        {
+            const uint token = t_base + dt;
+            const uint conv_row_v4 = token * conv_stride_v4;
+
+            const float beta_val = subgroupShuffle(beta_lane, dt);
+            const float decay_val = subgroupShuffle(decay_lane, dt);
+            const float val = conv_v4[conv_row_v4 + v_col_v4][v_col_comp];
+
+            vec4 k[VECS_PER_LANE];
+            vec4 q[VECS_PER_LANE];
+            float mem = 0.0;
+            const uint k_base = conv_row_v4 + k_head_v4;
+            const uint q_base = conv_row_v4 + q_head_v4;
+            // Issue Q loads alongside K so Q memory latency overlaps with reduce_col.
+            [[unroll]] for (uint i = 0u; i < VECS_PER_LANE; ++i)
+            {
+                const vec4 kv = conv_v4[k_base + i * LANES_PER_COLUMN];
+                q[i] = conv_v4[q_base + i * LANES_PER_COLUMN];
+                k[i] = kv;
+                mem += dot(s[i], kv);
+            }
+
+            const float delta = (val - reduce_col(mem * decay_val)) * beta_val;
+
+            float attn = 0.0;
+            [[unroll]] for (uint i = 0u; i < VECS_PER_LANE; ++i)
+            {
+                const vec4 updated = s[i] * decay_val + k[i] * delta;
+                s[i] = updated;
+                attn += dot(updated, q[i]);
+            }
+
+            const float reduced = reduce_col(attn);
+            if (lane == 0u)
+                output_data[token * p.value_size + out_col_offset] = reduced * query_scale;
+        }
+    }
+
+    [[unroll]] for (uint i = 0u; i < VECS_PER_LANE; ++i)
+    {
+        const uint r0 = (i * LANES_PER_COLUMN + lane) << 2u;
+        recurrent_state[recurrent_base + (r0 + 0u) * value_columns + value_column] = s[i].x;
+        recurrent_state[recurrent_base + (r0 + 1u) * value_columns + value_column] = s[i].y;
+        recurrent_state[recurrent_base + (r0 + 2u) * value_columns + value_column] = s[i].z;
+        recurrent_state[recurrent_base + (r0 + 3u) * value_columns + value_column] = s[i].w;
+    }
+}

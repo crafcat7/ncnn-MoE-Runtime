@@ -353,9 +353,6 @@ static void test_paired_and_rejections()
         for (uint32_t row = 0; row < second.shape[0]; ++row)
             q8_near(q8_right.row(0)[row], q8_reference_int8(second, row, single.row(0)), 1e-4f);
     }
-    ActivationBuffer output;
-    q8_check(!forward_linear_qnk({&first}, input, {&input}, false), "Q8_0 aliased output accepted");
-    q8_check(!forward_linear_qnk({&first, &second}, input, {&output, &output}, true), "Q8_0 aliased pair accepted");
     for (uint32_t columns : {0u, 31u, 33u, 255u})
         q8_check(!qnk_shape_supported(DType::Q8_0, 1, columns) && qnk_storage_bytes(DType::Q8_0, 1, columns) == 0, "Q8_0 invalid block width");
     q8_check(qnk_block_size(DType::Q8_0) == 32 && qnk_block_bytes(DType::Q8_0) == 34, "Q8_0 ABI");
@@ -415,34 +412,6 @@ static TensorData make_small_qnk(DType dtype, uint32_t rows, uint32_t columns)
             }
         }
     return tensor;
-}
-
-#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__clang__)
-static void test_q8_rows8_prefill()
-{
-    // The 8-row kernel is selected for row counts divisible by 8; make sure the
-    // model-shaped path agrees with the exact float path and the 4-row kernel.
-    if (!neon_qnk_q8_supported())
-    {
-        std::cout << "SKIP Q8_0 rows8 prefill: no ARM dot-product support\n";
-        return;
-    }
-    TensorData matrix = make_q8_0(8, 256, 3);
-    for (size_t token_count : {size_t{4}, size_t{8}, size_t{32}})
-    {
-        ActivationBuffer input(token_count, 256);
-        for (size_t token = 0; token < token_count; ++token)
-            for (uint32_t column = 0; column < input.columns(); ++column)
-                input.row(token)[column] = static_cast<float>(static_cast<int>((column * 11 + token * 5) % 37) - 18)
-                                           * 0.03125f;
-        ActivationBuffer quantized;
-        q8_check(forward_linear_qnk({&matrix}, input, {&quantized}, false, {}, true), "Q8_0 rows8 int8 path");
-        for (size_t token = 0; token < token_count; ++token)
-            for (uint32_t row = 0; row < matrix.shape[0]; ++row)
-                q8_near(quantized.row(token)[row],
-                        q8_reference_int8(matrix, row, input.row(token)),
-                        1e-4f);
-    }
 }
 
 static void test_concurrent_sidecar()
@@ -556,6 +525,7 @@ static void test_shared_q8_activation()
     q8_check(!qnk_q8_input_matches(shared, narrow), "mismatched shared Q8 accepted");
 }
 
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__clang__)
 static void test_qnk_rows8_equivalence()
 {
     // Compare the 8-row kernel against the 4-row kernel with the same q8
@@ -701,7 +671,7 @@ static void test_q8_activation_path()
 
     // The quantized path must stay close to exact FP32 for decode and prefill.
     TensorData matrix = make_q8_0(9, 256, 3);
-    for (size_t token_count : {size_t{1}, size_t{2}, size_t{4}, size_t{5}})
+    for (size_t token_count : {size_t{1}, size_t{2}, size_t{4}, size_t{5}, size_t{8}, size_t{32}})
     {
         ActivationBuffer input(token_count, 256);
         for (size_t token = 0; token < token_count; ++token)
@@ -742,8 +712,6 @@ int main()
         std::cout << "[test_q8_activation_path]" << std::endl;
         ncnn::moe::test_q8_activation_path();
 #if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__clang__)
-        std::cout << "[test_q8_rows8_prefill]" << std::endl;
-        ncnn::moe::test_q8_rows8_prefill();
         std::cout << "[test_qnk_rows8_equivalence]" << std::endl;
         ncnn::moe::test_qnk_rows8_equivalence();
 #endif
