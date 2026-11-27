@@ -748,6 +748,34 @@ if(APPLE AND TARGET ncnn_moe_worker)
         "$<$<CONFIG:Release>:LINKER:-dead_strip>")
 endif()
 
+# The worker uses std::jthread and std::stop_token. Apple's libc++ only provides
+# them with -fexperimental-library, so enable it when the plain check fails.
+if(TARGET ncnn_moe_worker)
+    include(CheckCXXSourceCompiles)
+    set(_ncnn_moe_jthread_probe [=[
+#include <stop_token>
+#include <thread>
+int main()
+{
+    std::jthread worker([](std::stop_token stop) { (void)stop.stop_requested(); });
+    return 0;
+}
+]=])
+    set(CMAKE_REQUIRED_FLAGS "${CMAKE_CXX20_STANDARD_COMPILE_OPTION}")
+    check_cxx_source_compiles("${_ncnn_moe_jthread_probe}" NCNN_MOE_HAS_JTHREAD)
+    if(NOT NCNN_MOE_HAS_JTHREAD)
+        set(CMAKE_REQUIRED_FLAGS "${CMAKE_CXX20_STANDARD_COMPILE_OPTION} -fexperimental-library")
+        check_cxx_source_compiles("${_ncnn_moe_jthread_probe}" NCNN_MOE_HAS_EXPERIMENTAL_JTHREAD)
+        if(NCNN_MOE_HAS_EXPERIMENTAL_JTHREAD)
+            target_compile_options(ncnn_moe_worker PRIVATE -fexperimental-library)
+            target_link_options(ncnn_moe_worker PRIVATE -fexperimental-library)
+        else()
+            message(WARNING "std::jthread is unavailable; ncnn_moe_worker may fail to build")
+        endif()
+    endif()
+    unset(CMAKE_REQUIRED_FLAGS)
+endif()
+
 # ==============================================================================
 # Installed SDK
 # ==============================================================================
