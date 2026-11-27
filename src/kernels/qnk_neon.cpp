@@ -9,6 +9,8 @@
 #include "qnk.h"
 #include "ops.h"
 #include "vector.h"
+#include "engine/cpu.h"
+#include "ncnn/moe/runtime.h"
 
 #if defined(__aarch64__) || defined(_M_ARM64)
 
@@ -21,13 +23,6 @@
 
 #if defined(_OPENMP)
 #include <omp.h>
-#endif
-
-#if defined(__APPLE__)
-#include <sys/sysctl.h>
-#elif defined(__linux__)
-#include <asm/hwcap.h>
-#include <sys/auxv.h>
 #endif
 
 namespace ncnn {
@@ -65,13 +60,15 @@ inline uint8x16_t q5_high_bits(const uint8_t* high, uint32_t half) noexcept
     return vandq_u8(vceqq_u8(vandq_u8(bytes, masks), masks), vdupq_n_u8(0x10));
 }
 
-#if defined(__clang__)
-#define NCNN_MOE_ARM_DOTPROD __attribute__((target("+dotprod")))
+#if defined(__clang__) && defined(__aarch64__)
+#define NCNN_MOE_ARM_DOTPROD_KERNEL 1
+#define NCNN_MOE_ARM_DOTPROD        __attribute__((target("+dotprod")))
 #else
+#define NCNN_MOE_ARM_DOTPROD_KERNEL 0
 #define NCNN_MOE_ARM_DOTPROD
 #endif
 
-#if defined(__clang__)
+#if NCNN_MOE_ARM_DOTPROD_KERNEL
 NCNN_MOE_ARM_DOTPROD __attribute__((always_inline)) inline int32x4_t dot32_vec(int8x16_t first,
                                                                                int8x16_t second,
                                                                                const int8_t* input) noexcept
@@ -92,13 +89,8 @@ NCNN_MOE_ARM_DOTPROD __attribute__((always_inline)) inline int32_t dot32(int8x16
 
 bool neon_qnk_q8_supported() noexcept
 {
-#if defined(__clang__) && defined(__APPLE__)
-    int value = 0;
-    std::size_t size = sizeof(value);
-    return sysctlbyname("hw.optional.arm.FEAT_DotProd", &value, &size, nullptr, 0) == 0
-           && value != 0;
-#elif defined(__clang__) && defined(__linux__) && defined(HWCAP_ASIMDDP)
-    return (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
+#if NCNN_MOE_ARM_DOTPROD_KERNEL
+    return (cpu_isa_flags() & CpuIsaArmDotProd) != 0;
 #else
     return false;
 #endif
@@ -213,7 +205,7 @@ void neon_qnk_q8_quant(const float* source,
     }
 }
 
-#if defined(__clang__)
+#if NCNN_MOE_ARM_DOTPROD_KERNEL
 NCNN_MOE_ARM_DOTPROD static float q8_0_row(const uint8_t* weights,
                                            std::size_t block_stride,
                                            uint32_t block_count,

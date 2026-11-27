@@ -47,6 +47,8 @@ class ModelAdapter;
 #define NCNN_MOE_ISA_X86_AMX_TILE_BIT    8
 #define NCNN_MOE_ISA_X86_AMX_INT8_BIT    9
 #define NCNN_MOE_ISA_X86_AMX_BF16_BIT    10
+#define NCNN_MOE_ISA_ARM_DOTPROD_BIT     11
+#define NCNN_MOE_ISA_ARM_I8MM_BIT        12
 
 // Runtime capability flags.
 enum RuntimeFlag : uint32_t
@@ -82,7 +84,9 @@ enum CpuIsaFlag : uint64_t
     CpuIsaX86Avx512Bf16 = UINT64_C(1) << NCNN_MOE_ISA_X86_AVX512_BF16_BIT,
     CpuIsaX86AmxTile = UINT64_C(1) << NCNN_MOE_ISA_X86_AMX_TILE_BIT,
     CpuIsaX86AmxInt8 = UINT64_C(1) << NCNN_MOE_ISA_X86_AMX_INT8_BIT,
-    CpuIsaX86AmxBf16 = UINT64_C(1) << NCNN_MOE_ISA_X86_AMX_BF16_BIT
+    CpuIsaX86AmxBf16 = UINT64_C(1) << NCNN_MOE_ISA_X86_AMX_BF16_BIT,
+    CpuIsaArmDotProd = UINT64_C(1) << NCNN_MOE_ISA_ARM_DOTPROD_BIT,
+    CpuIsaArmI8mm = UINT64_C(1) << NCNN_MOE_ISA_ARM_I8MM_BIT
 };
 
 struct RuntimeInfo

@@ -4,8 +4,8 @@
 #include "kernels/qnk.h"
 #include "kernels/int4.h"
 #include "models/tensornames.h"
-#include "backends/ncnn/modelpipeline.h"
-#include "backends/ncnn/expertbackend_vulkan.h"
+#include "backends/ncnn/net/model.h"
+#include "backends/ncnn/expert/backend.h"
 #include "storage/expertcache.h"
 #include "engine/expert.h"
 

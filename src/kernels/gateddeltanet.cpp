@@ -5,7 +5,7 @@
 #include "ops.h"
 #include "vector.h"
 #include "statecache.h"
-#include "backends/ncnn/linear.h"
+#include "backends/ncnn/linear/linear.h"
 #include "graph/compiledoperator.h"
 #include "engine/cpu.h"
 #include "ncnn/moe/option.h"

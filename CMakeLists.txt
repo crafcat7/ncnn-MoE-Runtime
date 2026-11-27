@@ -120,38 +120,8 @@ endif()
 # ==============================================================================
 # Runtime library
 # ==============================================================================
-# Backend files also provide CPU-only stubs.
+# Runtime sources (Vulkan backend or stub.cpp is attached after NCNN_MOE_WITH_VULKAN resolves).
 set(NCNN_MOE_SOURCES
-    # ncnn backends
-    src/backends/ncnn/attention_vulkan.cpp
-    src/backends/ncnn/attentiondecode_vulkan.cpp
-    src/backends/ncnn/expertbackend_vulkan.cpp
-    src/backends/ncnn/experttransfer_vulkan.cpp
-    src/backends/ncnn/graphallocator_vulkan.cpp
-    src/backends/ncnn/gateddeltanet_vulkan.cpp
-    src/backends/ncnn/gatedresidual_vulkan.cpp
-    src/backends/ncnn/gatedresiduallayer_vulkan.cpp
-    src/backends/ncnn/gpusegment_vulkan.cpp
-    src/backends/ncnn/expertbank_vulkan.cpp
-    src/backends/ncnn/sharedffn_vulkan.cpp
-    src/backends/ncnn/qsaattention_vulkan.cpp
-    src/backends/ncnn/hyperconnection_vulkan.cpp
-    src/backends/ncnn/rmsnorm_vulkan.cpp
-    src/backends/ncnn/layernorm_vulkan.cpp
-    src/backends/ncnn/router_vulkan.cpp
-    src/backends/ncnn/layerhead_vulkan.cpp
-    src/backends/ncnn/latentlayer_vulkan.cpp
-    src/backends/ncnn/moecombine_vulkan.cpp
-    src/backends/ncnn/residentffn_vulkan.cpp
-    src/backends/ncnn/latentattention_vulkan.cpp
-    src/backends/ncnn/linear.cpp
-    src/backends/ncnn/linear_bf16.cpp
-    src/backends/ncnn/linear_expert.cpp
-    src/backends/ncnn/linear_float8.cpp
-    src/backends/ncnn/linear_mxfp4.cpp
-    src/backends/ncnn/linear_qnk.cpp
-    src/backends/ncnn/modelpipeline.cpp
-    src/backends/ncnn/vulkancontext.cpp
     # Execution
     src/engine/cpu.cpp
     src/engine/executor.cpp
@@ -524,6 +494,41 @@ if(NCNN_MOE_USE_NCNN)
             target_include_directories(ncnn_moe PRIVATE
                 ${NCNN_MOE_NCNN_SOURCE_DIR}/src/layer)
             set(NCNN_MOE_WITH_VULKAN ON)
+            set(NCNN_MOE_VULKAN_BACKEND_SOURCES
+                src/backends/ncnn/core/context.cpp
+                src/backends/ncnn/core/memory.cpp
+                src/backends/ncnn/core/tensor.cpp
+                src/backends/ncnn/core/transfer.cpp
+                src/backends/ncnn/linear/linear.cpp
+                src/backends/ncnn/linear/bf16.cpp
+                src/backends/ncnn/linear/float8.cpp
+                src/backends/ncnn/linear/mxfp4.cpp
+                src/backends/ncnn/linear/qnk.cpp
+                src/backends/ncnn/layer/attention_vulkan.cpp
+                src/backends/ncnn/layer/attentiondecode_vulkan.cpp
+                src/backends/ncnn/layer/latentattention_vulkan.cpp
+                src/backends/ncnn/layer/gateddeltanet_vulkan.cpp
+                src/backends/ncnn/layer/qsaattention_vulkan.cpp
+                src/backends/ncnn/layer/gatedresidual_vulkan.cpp
+                src/backends/ncnn/layer/hyperconnection_vulkan.cpp
+                src/backends/ncnn/layer/moecombine_vulkan.cpp
+                src/backends/ncnn/layer/router_vulkan.cpp
+                src/backends/ncnn/layer/rmsnorm_vulkan.cpp
+                src/backends/ncnn/layer/layernorm_vulkan.cpp
+                src/backends/ncnn/expert/backend.cpp
+                src/backends/ncnn/expert/bank.cpp
+                src/backends/ncnn/expert/dispatch.cpp
+                src/backends/ncnn/expert/ffn_region.cpp
+                src/backends/ncnn/expert/shared_ffn.cpp
+                src/backends/ncnn/net/layer_head.cpp
+                src/backends/ncnn/net/latent_layer.cpp
+                src/backends/ncnn/net/memory.cpp
+                src/backends/ncnn/net/model.cpp
+                src/backends/ncnn/net/residual_layer.cpp
+                src/backends/ncnn/net/segment.cpp
+            )
+            target_sources(ncnn_moe PRIVATE ${NCNN_MOE_VULKAN_BACKEND_SOURCES})
+            source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${NCNN_MOE_VULKAN_BACKEND_SOURCES})
             if(APPLE)
                 target_compile_definitions(ncnn_moe PRIVATE
                     NCNN_MOE_MOLTENVK_LIBRARY_PATH="${NCNN_MOE_MOLTENVK_LIBRARY}"
@@ -531,6 +536,10 @@ if(NCNN_MOE_USE_NCNN)
             endif()
         endif()
     endif()
+endif()
+if(NOT NCNN_MOE_WITH_VULKAN)
+    target_sources(ncnn_moe PRIVATE src/backends/ncnn/stub.cpp)
+    source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES src/backends/ncnn/stub.cpp)
 endif()
 
 # ==============================================================================

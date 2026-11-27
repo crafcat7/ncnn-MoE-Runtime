@@ -1,8 +1,8 @@
 #include "statecache.h"
 
-#include "backends/ncnn/gateddeltanet_vulkan.h"
-#include "backends/ncnn/qsaattention_vulkan.h"
-#include "backends/ncnn/gatedresiduallayer_vulkan.h"
+#include "backends/ncnn/layer/gateddeltanet_vulkan.h"
+#include "backends/ncnn/layer/qsaattention_vulkan.h"
+#include "backends/ncnn/net/residual_layer.h"
 
 namespace ncnn {
 namespace moe {

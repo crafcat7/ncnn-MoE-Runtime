@@ -8,9 +8,9 @@
 #include "engine/expert.h"
 #include "engine/expertbackend.h"
 #include "engine/sessionstate.h"
-#include "backends/ncnn/expertbackend_vulkan.h"
-#include "backends/ncnn/modelpipeline.h"
-#include "backends/ncnn/linear_qnk.h"
+#include "backends/ncnn/expert/backend.h"
+#include "backends/ncnn/net/model.h"
+#include "backends/ncnn/linear/qnk.h"
 #include "backends/ncnn/vulkan.h"
 #include "ncnn/moe/runtime.h"
 #include "ncnn/moe/session.h"
@@ -672,7 +672,7 @@ static bool test_dynamic_gpu_cache(const std::filesystem::path& root, const GpuI
               "fully resident dense FFNs retained an unnecessary demand cache");
         for (const CompiledLayerPlan& layer : model.net.layer_plans)
         {
-            check(!layer.dense_ffn.use_gpu_cache && support_vulkan_dense_ffn(model.operators, layer.dense_ffn),
+            check(!layer.dense_ffn.use_gpu_cache && support_vulkan_ffn(model.operators, layer.dense_ffn),
                   "automatic dense placement did not prepare a complete persistent GPU FFN");
             for (TensorHandle handle : {layer.dense_ffn.gate_weight, layer.dense_ffn.up_weight, layer.dense_ffn.down_weight})
                 check(model.weights.at(handle).bfloat16_values().empty(), "resident dense FFN retained its host weights");

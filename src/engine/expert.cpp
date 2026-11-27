@@ -12,9 +12,9 @@
 #include "kernels/vector.h"
 #include "storage/expertcache.h"
 #include "storage/weightstore.h"
-#include "backends/ncnn/linear.h"
-#include "backends/ncnn/modelpipeline.h"
-#include "backends/ncnn/residentffn_vulkan.h"
+#include "backends/ncnn/linear/linear.h"
+#include "backends/ncnn/net/model.h"
+#include "backends/ncnn/expert/ffn_region.h"
 #include "ncnn/moe/session.h"
 
 #include <algorithm>
@@ -2390,6 +2390,9 @@ try
             if (active.device_output && !active.device_output->empty()
                 && active.device_output->rows() == active.batch.routes.size()
                 && active.device_output->columns() == model.descriptor.hidden_size) continue;
+            if (active.output.rows() != active.batch.routes.size()
+                || active.output.columns() != model.descriptor.hidden_size)
+                return gpu_error("Vulkan Expert backend did not publish a complete route output");
         }
     }
 

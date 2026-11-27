@@ -1,0 +1,2319 @@
+#include "backends/ncnn/layer/latentattention_vulkan.h"
+#include "backends/ncnn/core/context.h"
+#include "backends/ncnn/layer/rmsnorm_vulkan.h"
+#include "backends/ncnn/linear/linear.h"
+
+#include "graph/compiledoperator.h"
+#include "kernels/attention.h"
+#include "kernels/latentattention.h"
+#include "kernels/ops.h"
+#include "kernels/statecache.h"
+#include "kernels/vulkan/latent_attention_cache_append.comp.hex.h"
+#include "kernels/vulkan/latent_attention_compress.comp.hex.h"
+#include "kernels/vulkan/latent_attention_core.comp.hex.h"
+#include "kernels/vulkan/latent_attention_index_merge.comp.hex.h"
+#include "kernels/vulkan/latent_attention_index_score.comp.hex.h"
+#include "kernels/vulkan/latent_attention_index_sort.comp.hex.h"
+#include "kernels/vulkan/latent_attention_index_topk.comp.hex.h"
+#include "kernels/vulkan/latent_attention_query.comp.hex.h"
+#include "kernels/vulkan/latent_attention_score.comp.hex.h"
+#include "kernels/vulkan/latent_attention_scored_core.comp.hex.h"
+#include "kernels/vulkan/latent_attention_transform.comp.hex.h"
+#include "storage/weightstore.h"
+
+#include <command.h>
+#include <gpu.h>
+#include <pipeline.h>
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <mutex>
+#include <utility>
+#include <vector>
+
+namespace ncnn {
+namespace moe {
+
+std::vector<uint64_t> LatentAttention_vulkan::scratch_elements(const AttentionBlockPlan& plan, uint32_t hidden,
+                                                               uint32_t rows, uint32_t context_tokens)
+{
+    const uint64_t query = saturating_multiply_u64(plan.head_count, plan.head_dimension);
+    const uint64_t rank = plan.query_lora_rank;
+    std::vector<uint64_t> columns = {hidden, rank, rank, query, plan.head_dimension, query, query,
+                                     saturating_multiply_u64(plan.output_lora_rank, std::max(1u, plan.output_group_count))};
+    if (plan.compression_ratio != 0)
+    {
+        columns.insert(columns.end(), {plan.head_dimension, plan.head_dimension});
+        if (plan.compression_ratio == 4)
+            columns.insert(columns.end(), {plan.index_head_dimension, plan.index_head_dimension});
+    }
+    const uint64_t compressed = context_tokens / std::max(1u, plan.compression_ratio);
+    // Per-row RoPE, window update, and compressed publication operands stay live until the single wait.
+    columns.insert(columns.end(), {plan.rope_head_dimension, plan.head_dimension});
+    if (plan.compression_ratio != 0)
+    {
+        const uint64_t banks = plan.compression_ratio == 4 ? 4 : 2;
+        columns.insert(columns.end(), {plan.rope_head_dimension, plan.head_dimension,
+                                       saturating_multiply_u64(plan.head_dimension, banks), plan.head_dimension});
+        if (plan.compression_ratio == 4)
+        {
+            columns.insert(columns.end(), {plan.index_head_dimension,
+                                           saturating_multiply_u64(plan.index_head_dimension, banks), plan.index_head_dimension});
+        }
+    }
+    const uint64_t candidates = std::min<uint64_t>(context_tokens, plan.sliding_window)
+                                + (plan.compression_ratio == 0 ? 0 : std::min<uint64_t>(compressed, plan.index_top_k == 0 ? compressed : plan.index_top_k));
+    if (candidates >= 8)
+        columns.push_back(saturating_multiply_u64(plan.head_count, candidates));
+    if (plan.compression_ratio == 4 && compressed > plan.index_top_k)
+    {
+        const uint64_t index = saturating_multiply_u64(plan.index_head_count, plan.index_head_dimension);
+        columns.insert(columns.end(), {index, plan.index_head_count, index, compressed, plan.index_top_k});
+        const uint64_t runs = (compressed + 1023) / 1024;
+        if (runs > 1)
+        {
+            columns.insert(columns.end(), {saturating_multiply_u64(runs, plan.index_top_k),
+                                           saturating_multiply_u64((runs + 1) / 2, plan.index_top_k)});
+        }
+    }
+    for (uint64_t& columns_per_row : columns)
+        columns_per_row = saturating_multiply_u64(columns_per_row, rows);
+    return columns;
+}
+
+static void prepare_latent_rope(const AttentionBlockPlan& plan,
+                                uint64_t position,
+                                std::vector<float>& coefficients)
+{
+    const uint32_t dimension = plan.rope_head_dimension;
+    coefficients.assign(std::max(2u, dimension), 0.0f);
+    if (dimension < 2)
+        return;
+
+    const bool yarn = plan.compression_ratio != 0;
+    const float base = yarn ? plan.compressed_rope_theta : plan.rope_theta;
+    const uint32_t half = dimension / 2;
+    std::vector<float> frequencies(half);
+    compute_yarn_inv_freq(dimension, dimension, base,
+                          yarn ? plan.rope_scaling_factor : 1.0f,
+                          plan.rope_ntk_alpha, plan.rope_ntk_beta,
+                          plan.initial_context_length, frequencies.data());
+    for (uint32_t pair = 0; pair < half; ++pair)
+    {
+        const float angle = static_cast<float>(position) * frequencies[pair];
+        coefficients[pair * 2] = std::cos(angle);
+        coefficients[pair * 2 + 1] = std::sin(angle);
+    }
+}
+
+static bool allocate_latent_buffer(ncnn::VkMat& destination,
+                                   uint64_t count,
+                                   const std::shared_ptr<VulkanContext>& context)
+{
+    if (count == 0 || count > static_cast<uint64_t>(std::numeric_limits<int>::max()))
+        return false;
+
+    // Reserved allocator blocks can satisfy this request even when free heap budget reads 0.
+    destination.create(static_cast<int>(count), sizeof(float), context->blob_allocator());
+    return !destination.empty();
+}
+
+static bool record_latent_parallel_topk(const std::shared_ptr<ncnn::Pipeline>& sort_pipeline,
+                                        const std::shared_ptr<ncnn::Pipeline>& merge_pipeline,
+                                        const ncnn::VkMat& scores,
+                                        uint32_t count,
+                                        uint32_t top_k,
+                                        ncnn::VkMat& indices,
+                                        const std::shared_ptr<VulkanContext>& context,
+                                        std::vector<ncnn::VkMat>& storage,
+                                        ncnn::VkCompute& cmd)
+{
+    if (!sort_pipeline || !merge_pipeline || top_k == 0 || top_k > 1024 || count < top_k)
+        return false;
+
+    uint32_t runs = (count + 1023u) / 1024u;
+    ncnn::VkMat temporary[2];
+    // Allocate all merge scratch before recording so failure leaves no partial sort in cmd.
+    if (runs > 1
+        && (!allocate_latent_buffer(temporary[0], static_cast<uint64_t>(runs) * top_k, context)
+            || !allocate_latent_buffer(temporary[1], static_cast<uint64_t>((runs + 1) / 2) * top_k, context)))
+    {
+        return false;
+    }
+
+    ncnn::VkMat sorted = runs == 1 ? indices : temporary[0];
+    std::vector<ncnn::vk_constant_type> constants(2);
+    constants[0].u32 = count;
+    constants[1].u32 = top_k;
+    ncnn::VkMat dispatcher;
+    dispatcher.w = static_cast<int>(std::min(runs, 65535u) * 128u);
+    dispatcher.h = static_cast<int>((runs + 65534u) / 65535u);
+    dispatcher.c = 1;
+    cmd.record_pipeline(sort_pipeline.get(), {scores, sorted}, constants, dispatcher);
+
+    uint32_t span = 1024;
+    uint32_t next_buffer = 1;
+    while (runs > 1)
+    {
+        ncnn::VkMat merged = runs <= 2 ? indices : temporary[next_buffer];
+        constants.resize(4);
+        constants[0].u32 = count;
+        constants[1].u32 = top_k;
+        constants[2].u32 = runs;
+        constants[3].u32 = span;
+        const uint32_t candidates = runs * top_k;
+        constexpr uint32_t row_width = 65535u * 128u;
+        dispatcher.w = static_cast<int>(std::min(candidates, row_width));
+        dispatcher.h = static_cast<int>((candidates + row_width - 1u) / row_width);
+        cmd.record_pipeline(merge_pipeline.get(), {scores, sorted, merged}, constants, dispatcher);
+        sorted = merged;
+        runs = (runs + 1u) / 2u;
+        span *= 2u;
+        next_buffer ^= 1u;
+    }
+    if (!temporary[0].empty())
+        storage.push_back(std::move(temporary[0]));
+    if (!temporary[1].empty())
+        storage.push_back(std::move(temporary[1]));
+    return true;
+}
+
+static bool record_latent_copy(const ncnn::Pipeline* pipeline,
+                               const ncnn::VkMat& source,
+                               ncnn::VkMat& destination,
+                               uint64_t count,
+                               uint64_t destination_offset,
+                               ncnn::VkCompute& cmd,
+                               uint64_t source_offset = 0)
+{
+    if (count == 0)
+        return true;
+    if (!pipeline || source.empty() || destination.empty())
+    {
+        return false;
+    }
+
+    const std::vector<ncnn::VkMat> bindings = {source, destination};
+    std::vector<ncnn::vk_constant_type> constants(3);
+    constants[0].u32 = static_cast<uint32_t>(count);
+    constants[1].u32 = static_cast<uint32_t>(destination_offset);
+    constants[2].u32 = static_cast<uint32_t>(source_offset);
+    ncnn::VkMat dispatcher;
+    dispatcher.w = static_cast<int>(count);
+    dispatcher.h = 1;
+    dispatcher.c = 1;
+    cmd.record_pipeline(pipeline, bindings, constants, dispatcher);
+    return true;
+}
+
+class LatentAttention_vulkan::Implementation
+{
+public:
+    AttentionBlockPlan plan;
+    CompiledOperator output_a;
+    CompiledOperator output_b;
+    std::shared_ptr<VulkanContext> context;
+    ncnn::Option opt;
+    std::vector<float> host_sinks;
+    ncnn::VkMat sinks;
+    std::shared_ptr<ncnn::Pipeline> query_pipeline;
+    std::shared_ptr<ncnn::Pipeline> append_pipeline;
+    std::shared_ptr<ncnn::Pipeline> attention_pipeline;
+    std::shared_ptr<ncnn::Pipeline> score_pipeline;
+    std::shared_ptr<ncnn::Pipeline> scored_attention_pipeline;
+    std::shared_ptr<ncnn::Pipeline> transform_pipeline;
+    std::shared_ptr<ncnn::Pipeline> compressor_pipeline;
+    std::shared_ptr<ncnn::Pipeline> index_score_pipeline;
+    std::shared_ptr<ncnn::Pipeline> index_topk_pipeline;
+    std::shared_ptr<ncnn::Pipeline> index_sort_pipeline;
+    std::shared_ptr<ncnn::Pipeline> index_merge_pipeline;
+    CompiledOperator query_a;
+    CompiledOperator query_b;
+    CompiledOperator key_value;
+    CompiledOperator gate;
+    CompiledOperator index_query;
+    CompiledOperator index_weights;
+    CompiledOperator compressor_value;
+    CompiledOperator compressor_gate;
+    CompiledOperator index_compressor_value;
+    CompiledOperator index_compressor_gate;
+    std::shared_ptr<RmsNorm_vulkan> input_norm;
+    std::shared_ptr<RmsNorm_vulkan> query_rank_norm;
+    ncnn::VkMat key_norm;
+    ncnn::VkMat compressor_norm;
+    ncnn::VkMat compressor_position;
+    ncnn::VkMat index_compressor_norm;
+    ncnn::VkMat index_compressor_position;
+    bool prepared = false;
+};
+
+uint64_t LatentCache_vulkan::allocated_bytes() const noexcept
+{
+    return static_cast<uint64_t>(window.total()) * window.elemsize
+           + static_cast<uint64_t>(compressed.total()) * compressed.elemsize
+           + static_cast<uint64_t>(compressor_state.total()) * compressor_state.elemsize
+           + static_cast<uint64_t>(index_compressor_state.total()) * index_compressor_state.elemsize
+           + static_cast<uint64_t>(index_compressed.total()) * index_compressed.elemsize;
+}
+
+LatentAttention_vulkan::LatentAttention_vulkan()
+    : d(new Implementation)
+{
+}
+
+LatentAttention_vulkan::~LatentAttention_vulkan() = default;
+
+static CompiledOperator latent_projection(const CompiledOperator& op)
+{
+    // A query entry can already own this MLA operator; retain only projection
+    // handles to avoid introducing a shared_ptr cycle.
+    CompiledOperator result;
+    result.float8 = op.float8;
+    result.bfloat16 = op.bfloat16;
+    result.qnk = op.qnk;
+    result.linear = op.linear;
+    return result;
+}
+
+std::shared_ptr<VulkanContext> LatentAttention_vulkan::projection_context(const CompiledOperator& op) noexcept
+{
+    if (op.float8)
+        return op.float8->context();
+    if (op.bfloat16)
+        return op.bfloat16->context();
+    if (op.qnk)
+        return op.qnk->context();
+    return op.linear ? op.linear->context() : nullptr;
+}
+
+const ncnn::Option* LatentAttention_vulkan::projection_option(const CompiledOperator& op) noexcept
+{
+    if (op.float8)
+        return &op.float8->option();
+    if (op.bfloat16)
+        return &op.bfloat16->option();
+    if (op.qnk)
+        return &op.qnk->option();
+    return op.linear ? &op.linear->option() : nullptr;
+}
+
+uint32_t LatentAttention_vulkan::projection_input_columns(const CompiledOperator& op) noexcept
+{
+    if (op.float8)
+        return op.float8->input_columns();
+    if (op.bfloat16)
+        return op.bfloat16->input_columns();
+    if (op.qnk)
+        return op.qnk->input_columns();
+    return op.linear ? op.linear->input_columns() : 0;
+}
+
+uint32_t LatentAttention_vulkan::projection_output_columns(const CompiledOperator& op) noexcept
+{
+    if (op.float8)
+        return op.float8->output_columns();
+    if (op.bfloat16)
+        return op.bfloat16->output_columns();
+    if (op.qnk)
+        return op.qnk->output_columns();
+    return op.linear ? op.linear->output_columns() : 0;
+}
+
+bool LatentAttention_vulkan::record_projection(const CompiledOperator& op,
+                                               const ncnn::VkMat& input,
+                                               ncnn::VkMat& output,
+                                               ncnn::VkCompute& cmd,
+                                               std::vector<ncnn::VkMat>& storage) const
+{
+    if (op.float8)
+        return op.float8->record_forward(input, output, cmd, storage);
+    if (op.bfloat16)
+        return op.bfloat16->forward(input, output, cmd, d->opt) == 0;
+    if (op.qnk)
+        return op.qnk->record_forward(input, output, cmd);
+    return op.linear && op.linear->forward(input, output, cmd, d->opt) == 0;
+}
+
+std::shared_ptr<LatentAttention_vulkan> LatentAttention_vulkan::create(const AttentionBlockPlan& plan,
+                                                                       const TensorData* sinks,
+                                                                       std::shared_ptr<Float8Linear_vulkan> output_a,
+                                                                       std::shared_ptr<Float8Linear_vulkan> output_b)
+{
+    CompiledOperator projection_a;
+    CompiledOperator projection_b;
+    projection_a.float8 = std::move(output_a);
+    projection_b.float8 = std::move(output_b);
+    return create(plan, sinks, projection_a, projection_b);
+}
+
+std::shared_ptr<LatentAttention_vulkan> LatentAttention_vulkan::create(const AttentionBlockPlan& plan,
+                                                                       const TensorData* sinks,
+                                                                       const CompiledOperator& output_a,
+                                                                       const CompiledOperator& output_b)
+{
+    const bool latent_value = has_flag(plan.flags, AttentionBlockLatentValue);
+    auto result = std::shared_ptr<LatentAttention_vulkan>(new LatentAttention_vulkan);
+    Implementation& implementation = *result->d;
+    implementation.plan = plan;
+    implementation.output_a = latent_projection(output_a);
+    implementation.output_b = latent_projection(output_b);
+    implementation.context = projection_context(output_a);
+    if (!implementation.context)
+        return {};
+    implementation.opt = make_vk_opt(*implementation.context);
+    if (sinks)
+        implementation.host_sinks.assign(sinks->float32_values().begin(), sinks->float32_values().end());
+    else
+        implementation.host_sinks.assign(plan.head_count, -1.0e30f);
+
+    {
+        const std::lock_guard<std::mutex> lock(implementation.context->command_mutex());
+        struct PipelineSpec
+        {
+            const char* src;
+            int len;
+            std::shared_ptr<ncnn::Pipeline>* dst;
+        };
+        const PipelineSpec required[] = {
+            {latent_attention_query_shader, static_cast<int>(sizeof(latent_attention_query_shader) - 1), &implementation.query_pipeline},
+            {latent_attention_cache_append_shader, static_cast<int>(sizeof(latent_attention_cache_append_shader) - 1), &implementation.append_pipeline},
+            {latent_attention_core_shader, static_cast<int>(sizeof(latent_attention_core_shader) - 1), &implementation.attention_pipeline},
+        };
+        for (const PipelineSpec& entry : required)
+        {
+            if (!create_pipeline(implementation.context, entry.src, entry.len,
+                                 implementation.opt, 0, 0, 128, *entry.dst))
+            {
+                return {};
+            }
+        }
+        // Parallel scoring is optional; expanded-value MLA records its core directly.
+        if (!latent_value)
+        {
+            (void)create_pipeline(implementation.context, latent_attention_score_shader,
+                                  static_cast<int>(sizeof(latent_attention_score_shader) - 1),
+                                  implementation.opt, 0, 0, 128, implementation.score_pipeline);
+            (void)create_pipeline(implementation.context, latent_attention_scored_core_shader,
+                                  static_cast<int>(sizeof(latent_attention_scored_core_shader) - 1),
+                                  implementation.opt, 0, 0, 128, implementation.scored_attention_pipeline);
+        }
+    }
+    return result;
+}
+
+bool LatentAttention_vulkan::forward_batch(std::span<const uint64_t> positions,
+                                           std::span<LayerCache* const> caches,
+                                           std::span<const LatentAttentionRowContext> contexts,
+                                           const ActivationBuffer& query,
+                                           const DeviceTensor_vulkan* device_query,
+                                           ActivationBuffer& output) const
+{
+    Implementation& implementation = *d;
+    const AttentionBlockPlan& plan = implementation.plan;
+    if (has_flag(plan.flags, AttentionBlockLatentValue))
+        return false;
+
+    const size_t rows = positions.size();
+    const uint32_t query_columns = plan.head_count * plan.head_dimension;
+    if (rows == 0 || rows != caches.size() || rows != contexts.size()
+        || rows > static_cast<size_t>(std::numeric_limits<int>::max()))
+    {
+        return false;
+    }
+
+    const ncnn::VkMat* retained_query = device_query ? device_query->value() : nullptr;
+    const uint64_t window_elements = static_cast<uint64_t>(plan.sliding_window) * plan.head_dimension;
+
+    for (size_t row = 0; row < rows; ++row)
+    {
+        const LayerCache* cache = caches[row];
+        const LatentAttentionRowContext& context = contexts[row];
+        if (!cache || positions[row] == std::numeric_limits<uint64_t>::max()
+            || cache->latent_token_count != positions[row] + 1
+            || cache->latent_window.size() != window_elements
+            || cache->latent_compressed.size() % plan.head_dimension != 0
+            || cache->latent_compressed.size() / plan.head_dimension != context.compressed_count
+            || context.window_count == 0 || context.window_count > plan.sliding_window
+            || context.window_begin > positions[row]
+            || positions[row] + 1 - context.window_begin != context.window_count)
+        {
+            return false;
+        }
+        for (size_t previous = 0; previous < row; ++previous)
+        {
+            if (caches[previous] == cache)
+                return false;
+        }
+        if (context.selected_compressed_indices)
+        {
+            if (context.compressed_indices.size() > std::numeric_limits<uint32_t>::max())
+                return false;
+            for (uint32_t index : context.compressed_indices)
+            {
+                if (index >= context.compressed_count)
+                    return false;
+            }
+        }
+    }
+
+    struct RowWork
+    {
+        std::shared_ptr<LatentCache_vulkan> state;
+        ncnn::VkMat window_staging;
+        ncnn::VkMat compressed_staging;
+        ncnn::VkMat index_staging;
+        ncnn::VkMat rope_staging;
+        ncnn::VkMat uploaded_window;
+        ncnn::VkMat uploaded_compressed;
+        ncnn::VkMat indices;
+        ncnn::VkMat rope;
+        ncnn::VkMat previous_compressed;
+        std::vector<float> coefficients;
+    };
+    std::vector<RowWork> work(rows);
+    VulkanRuntimeState& runtime_state = implementation.context->runtime_state();
+    struct MirrorGuard
+    {
+        std::span<LayerCache* const> caches;
+        VulkanRuntimeState& runtime_state;
+        bool committed = false;
+
+        ~MirrorGuard()
+        {
+            if (committed)
+                return;
+            runtime_state.attention_cpu_fallbacks += caches.size();
+            for (LayerCache* cache : caches)
+            {
+                cache->latent_device_state.reset();
+                cache->device_allocated_size = 0;
+            }
+        }
+    } mirror_guard{caches, runtime_state};
+
+    VkTransferLease transfer_lease = implementation.context->acquire_transfer_slot();
+    VkTransferSlot& transfer_slot = transfer_lease.slot();
+    const std::lock_guard<std::mutex> lock(implementation.context->command_mutex());
+    ncnn::VkCompute& cmd = *transfer_slot.command;
+    if (transfer_slot.command_used && cmd.reset() != 0)
+        return false;
+    transfer_slot.command_used = true;
+
+    uint64_t uploads = 0;
+    ncnn::VkMat sink_staging;
+    ncnn::VkMat next_sinks = implementation.sinks;
+    if (next_sinks.empty())
+    {
+        if (!fill_staging_values(implementation.host_sinks.data(), implementation.host_sinks.size(), sizeof(float),
+                                 sink_staging, transfer_slot.staging_allocator)
+            || !record_mapped_upload(sink_staging, next_sinks, cmd, implementation.opt))
+        {
+            return false;
+        }
+        ++uploads;
+    }
+
+    ncnn::VkMat raw_query;
+    if (retained_query)
+    {
+        device_query->prepare_read();
+        raw_query = *retained_query;
+    }
+    else
+    {
+        if (!fill_staging_upload(query, transfer_slot.upload, transfer_slot.staging_allocator)
+            || !record_mapped_upload(transfer_slot.upload, raw_query, cmd, implementation.opt))
+        {
+            return false;
+        }
+        ++uploads;
+    }
+
+    ncnn::VkMat normalized_query;
+    ncnn::VkMat attention;
+    normalized_query.create(static_cast<int>(query_columns), static_cast<int>(rows),
+                            sizeof(float), implementation.context->blob_allocator());
+    attention.create(static_cast<int>(query_columns), static_cast<int>(rows),
+                     sizeof(float), implementation.context->blob_allocator());
+    if (normalized_query.empty() || attention.empty())
+        return false;
+
+    for (size_t row = 0; row < rows; ++row)
+    {
+        RowWork& current = work[row];
+        LayerCache& cache = *caches[row];
+        const LatentAttentionRowContext& context = contexts[row];
+        const bool shared_state = cache.latent_device_state && cache.latent_device_state.use_count() != 1;
+        std::shared_ptr<LatentCache_vulkan> state = cache.latent_device_state;
+        const bool refresh = shared_state || !state || state->context != implementation.context
+                             || state->dimension != plan.head_dimension || state->window_capacity != plan.sliding_window
+                             || state->token_count != positions[row] || state->compressed_count > context.compressed_count;
+        if (refresh)
+        {
+            state = std::make_shared<LatentCache_vulkan>();
+            state->context = implementation.context;
+            state->dimension = plan.head_dimension;
+            state->window_capacity = plan.sliding_window;
+            if (!allocate_latent_buffer(state->window, window_elements, implementation.context))
+                return false;
+        }
+        current.state = state;
+        cache.latent_device_state = state;
+
+        // Before the ring fills, only slots 0 through position can be read.
+        const uint64_t window_count = refresh
+                                          ? std::min<uint64_t>(positions[row] + 1, plan.sliding_window) * plan.head_dimension
+                                          : plan.head_dimension;
+        const uint64_t window_offset = refresh ? 0 : positions[row] % plan.sliding_window * plan.head_dimension;
+        if (!fill_staging_values(cache.latent_window.data() + window_offset, static_cast<size_t>(window_count), sizeof(float),
+                                 current.window_staging, transfer_slot.staging_allocator)
+            || !record_mapped_upload(current.window_staging, current.uploaded_window, cmd, implementation.opt)
+            || !record_latent_copy(implementation.append_pipeline.get(), current.uploaded_window, state->window,
+                                   window_count, window_offset, cmd))
+        {
+            return false;
+        }
+        ++uploads;
+
+        if (context.compressed_count > state->compressed_capacity)
+        {
+            const uint64_t doubled = std::max<uint64_t>(32, static_cast<uint64_t>(state->compressed_capacity) * 2);
+            const uint64_t capacity = std::max<uint64_t>(context.compressed_count, doubled);
+            ncnn::VkMat next_compressed;
+            if (!allocate_latent_buffer(next_compressed, capacity * plan.head_dimension, implementation.context))
+                return false;
+            if (!refresh && state->compressed_count != 0)
+            {
+                current.previous_compressed = state->compressed;
+                if (!record_latent_copy(implementation.append_pipeline.get(), current.previous_compressed, next_compressed,
+                                        static_cast<uint64_t>(state->compressed_count) * plan.head_dimension, 0, cmd))
+                {
+                    return false;
+                }
+            }
+            state->compressed = std::move(next_compressed);
+            state->compressed_capacity = static_cast<uint32_t>(capacity);
+        }
+
+        const uint32_t previous_count = refresh ? 0 : state->compressed_count;
+        if (context.compressed_count > previous_count)
+        {
+            const uint64_t offset = static_cast<uint64_t>(previous_count) * plan.head_dimension;
+            const uint64_t count = static_cast<uint64_t>(context.compressed_count - previous_count) * plan.head_dimension;
+            if (!fill_staging_values(cache.latent_compressed.data() + offset, static_cast<size_t>(count), sizeof(float),
+                                     current.compressed_staging, transfer_slot.staging_allocator)
+                || !record_mapped_upload(current.compressed_staging, current.uploaded_compressed, cmd, implementation.opt)
+                || !record_latent_copy(implementation.append_pipeline.get(), current.uploaded_compressed, state->compressed,
+                                       count, offset, cmd))
+            {
+                return false;
+            }
+            ++uploads;
+        }
+
+        if (context.selected_compressed_indices && !context.compressed_indices.empty())
+        {
+            if (!fill_staging_values(context.compressed_indices.data(), context.compressed_indices.size(), sizeof(uint32_t),
+                                     current.index_staging, transfer_slot.staging_allocator)
+                || !record_mapped_upload(current.index_staging, current.indices, cmd, implementation.opt))
+            {
+                return false;
+            }
+            ++uploads;
+        }
+        else
+        {
+            current.indices = state->window;
+        }
+
+        prepare_latent_rope(plan, positions[row], current.coefficients);
+        if (!fill_staging_values(current.coefficients.data(), current.coefficients.size(), sizeof(float),
+                                 current.rope_staging, transfer_slot.staging_allocator)
+            || !record_mapped_upload(current.rope_staging, current.rope, cmd, implementation.opt))
+        {
+            return false;
+        }
+        ++uploads;
+
+        {
+            const std::vector<ncnn::VkMat> bindings = {raw_query, current.rope, normalized_query};
+            std::vector<ncnn::vk_constant_type> constants(5);
+            constants[0].u32 = plan.head_dimension;
+            constants[1].u32 = plan.head_count;
+            constants[2].u32 = plan.rope_head_dimension;
+            constants[3].u32 = static_cast<uint32_t>(row);
+            constants[4].f = plan.norm_epsilon;
+            ncnn::VkMat dispatcher;
+            dispatcher.w = 128;
+            dispatcher.h = 1;
+            dispatcher.c = static_cast<int>(plan.head_count);
+            cmd.record_pipeline(implementation.query_pipeline.get(), bindings, constants, dispatcher);
+        }
+        {
+            const std::vector<ncnn::VkMat> bindings = {
+                normalized_query, state->window,
+                state->compressed.empty() ? state->window : state->compressed,
+                current.indices, next_sinks, current.rope, attention, normalized_query};
+            std::vector<ncnn::vk_constant_type> constants(12);
+            constants[0].u32 = plan.head_dimension;
+            constants[1].u32 = plan.head_count;
+            constants[2].u32 = plan.rope_head_dimension;
+            constants[3].u32 = static_cast<uint32_t>(row);
+            constants[4].u32 = plan.sliding_window;
+            constants[5].u32 = static_cast<uint32_t>(context.window_begin % plan.sliding_window);
+            constants[6].u32 = context.window_count;
+            constants[7].u32 = context.selected_compressed_indices
+                                   ? static_cast<uint32_t>(context.compressed_indices.size())
+                                   : context.compressed_count;
+            constants[8].u32 = context.selected_compressed_indices ? 1 : 0;
+            constants[9].f = 1.0f / std::sqrt(static_cast<float>(plan.head_dimension));
+            constants[10].u32 = 1;
+            constants[11].u32 = 0;
+            ncnn::VkMat dispatcher;
+            dispatcher.w = 128;
+            dispatcher.h = 1;
+            dispatcher.c = static_cast<int>(plan.head_count);
+            cmd.record_pipeline(implementation.attention_pipeline.get(), bindings, constants, dispatcher);
+        }
+    }
+
+    ncnn::VkMat output_rank;
+    ncnn::VkMat final_output;
+    std::vector<ncnn::VkMat> projection_storage;
+    const uint32_t output_columns = projection_output_columns(implementation.output_b);
+    const DType output_dtype = output.dtype();
+    if (!record_projection(implementation.output_a, attention, output_rank, cmd, projection_storage)
+        || !record_projection(implementation.output_b, output_rank, final_output, cmd, projection_storage)
+        || !prepare_staging_batch(transfer_slot.download, rows, output_columns,
+                                  transfer_slot.staging_allocator, output.element_size())
+        || !record_staging_download(final_output, rows, output_columns, transfer_slot.download, cmd,
+                                    implementation.context->device(), implementation.opt, output_dtype))
+    {
+        return false;
+    }
+    if (submit_wait(cmd, implementation.context->device()) != 0)
+        return false;
+
+    ActivationBuffer completed(rows, output_columns, output_dtype);
+    if (!copy_staging_to_cpu_batch(transfer_slot.download, completed))
+        return false;
+
+    output.swap(completed);
+    implementation.sinks = std::move(next_sinks);
+    for (size_t row = 0; row < rows; ++row)
+    {
+        work[row].state->token_count = positions[row] + 1;
+        work[row].state->compressed_count = contexts[row].compressed_count;
+        // This compatibility path did not update compressor pending state.
+        work[row].state->complete_state = false;
+        caches[row]->device_allocated_size = work[row].state->allocated_bytes();
+    }
+    mirror_guard.committed = true;
+    ++runtime_state.compute_submissions;
+    runtime_state.batch_uploads += uploads;
+    ++runtime_state.batch_downloads;
+    runtime_state.attention_blocks += rows;
+    return true;
+}
+
+struct LatentRecordedRow_vulkan
+{
+    LayerCache* cache = nullptr;
+    uint64_t position = 0;
+    uint32_t selected_count = 0;
+    std::shared_ptr<LatentCache_vulkan> state;
+    ncnn::VkMat window_shadow;
+    ncnn::VkMat compressor_shadow;
+    ncnn::VkMat index_compressor_shadow;
+    ncnn::VkMat compressed_shadow;
+    ncnn::VkMat index_compressed_shadow;
+    ncnn::VkMat selected_shadow;
+    std::vector<float> window_values;
+    std::vector<float> compressor_values;
+    std::vector<float> index_compressor_values;
+    std::vector<float> compressed_values;
+    std::vector<float> index_compressed_values;
+    std::vector<uint32_t> selected_indices;
+};
+
+static bool read_latent_shadow(ncnn::VkMat& staging, std::vector<float>& destination)
+{
+    if (staging.empty())
+        return true;
+
+    staging.allocator->invalidate(staging.data);
+    const ncnn::Mat mapped = staging.mapped();
+    const float* values = static_cast<const float*>(mapped.data);
+    // mapped.total() includes padding; packed shadows carry logical counts.
+    destination.assign(values, values + static_cast<size_t>(staging.w) * staging.h);
+    (void)bind_host_out(staging);
+    return true;
+}
+
+static void commit_compressor_shadow(const AttentionBlockPlan& plan,
+                                     uint64_t position,
+                                     uint32_t dimension,
+                                     const std::vector<float>& shadow,
+                                     std::vector<float>& pending_values,
+                                     std::vector<float>& pending_scores,
+                                     std::vector<float>& previous_values,
+                                     std::vector<float>& previous_scores)
+{
+    const uint32_t multiplier = plan.compression_ratio == 4 ? 2 : 1;
+    const size_t columns = static_cast<size_t>(multiplier) * dimension;
+    const size_t pending_size = static_cast<size_t>(plan.compression_ratio) * columns;
+    if (pending_values.size() != pending_size)
+    {
+        pending_values.assign(pending_size, 0.0f);
+        pending_scores.assign(pending_size, 0.0f);
+    }
+
+    const size_t slot = position % plan.compression_ratio;
+    std::copy_n(shadow.data(), columns, pending_values.data() + slot * columns);
+    std::copy_n(shadow.data() + columns, columns, pending_scores.data() + slot * columns);
+    if (multiplier == 2 && slot + 1 == plan.compression_ratio)
+    {
+        const size_t previous_size = static_cast<size_t>(plan.compression_ratio) * dimension;
+        previous_values.resize(previous_size);
+        previous_scores.resize(previous_size);
+        for (uint32_t token = 0; token < plan.compression_ratio; ++token)
+        {
+            std::copy_n(pending_values.data() + token * columns, dimension,
+                        previous_values.data() + static_cast<size_t>(token) * dimension);
+            std::copy_n(pending_scores.data() + token * columns, dimension,
+                        previous_scores.data() + static_cast<size_t>(token) * dimension);
+        }
+    }
+}
+
+static ncnn::VkMat latent_flat_view(const ncnn::VkMat& source, uint64_t offset, uint32_t count)
+{
+    ncnn::VkMat result = source;
+    result.dims = 2;
+    result.w = static_cast<int>(count);
+    result.h = 1;
+    result.d = 1;
+    result.c = 1;
+    result.cstep = count;
+    result.offset += static_cast<size_t>(offset) * sizeof(float);
+    return result;
+}
+
+static bool record_latent_shadow(const ncnn::VkMat& source,
+                                 uint32_t columns,
+                                 ncnn::VkMat& staging)
+{
+    if (source.empty() || source.total() < columns)
+        return false;
+
+    // Keep the device result live; shadows are copied and downloaded once after projections.
+    staging = latent_flat_view(source, 0, columns);
+    return true;
+}
+
+static bool record_latent_transform(const std::shared_ptr<ncnn::Pipeline>& pipeline,
+                                    const ncnn::VkMat& input,
+                                    const ncnn::VkMat& norm,
+                                    const ncnn::VkMat& rope,
+                                    ncnn::VkMat& output,
+                                    uint32_t dimension,
+                                    uint32_t rope_dimension,
+                                    uint32_t input_offset,
+                                    uint32_t output_offset,
+                                    uint32_t flags,
+                                    uint32_t head_count,
+                                    float epsilon,
+                                    ncnn::VkCompute& cmd,
+                                    uint32_t norm_dimension = 0)
+{
+    if (!pipeline || input.empty() || output.empty())
+        return false;
+    if (norm_dimension == 0)
+        norm_dimension = dimension;
+
+    const std::vector<ncnn::VkMat> bindings = {input, norm, rope, output};
+    std::vector<ncnn::vk_constant_type> constants(7);
+    constants[0].u32 = dimension;
+    constants[1].u32 = rope_dimension;
+    constants[2].u32 = input_offset;
+    constants[3].u32 = output_offset;
+    constants[4].u32 = flags;
+    constants[5].f = epsilon;
+    constants[6].u32 = norm_dimension;
+    ncnn::VkMat dispatcher;
+    dispatcher.w = 128;
+    dispatcher.h = 1;
+    dispatcher.c = static_cast<int>(head_count);
+    cmd.record_pipeline(pipeline.get(), bindings, constants, dispatcher);
+    return true;
+}
+
+class LatentValueWork_vulkan::Implementation
+{
+public:
+    struct Entry
+    {
+        LayerCache* cache = nullptr;
+        uint64_t position = 0;
+        uint32_t width = 0;
+        std::shared_ptr<LatentCache_vulkan> state;
+    };
+
+    std::vector<Entry> entries;
+    bool committed = false;
+
+    ~Implementation()
+    {
+        if (!committed)
+        {
+            for (Entry& entry : entries)
+            {
+                entry.cache->latent_device_state.reset();
+                entry.cache->device_allocated_size = 0;
+            }
+        }
+    }
+};
+
+LatentValueWork_vulkan::LatentValueWork_vulkan()
+    : d(new Implementation)
+{
+}
+
+LatentValueWork_vulkan::~LatentValueWork_vulkan() = default;
+
+bool LatentValueWork_vulkan::commit() noexcept
+{
+    Implementation& work = *d;
+    if (work.committed || work.entries.empty())
+        return false;
+
+    for (Implementation::Entry& entry : work.entries)
+    {
+        entry.cache->latent_device_state = entry.state;
+        entry.cache->columns = entry.width;
+        entry.cache->latent_cache = true;
+        entry.cache->latent_token_count = entry.position + 1;
+        entry.cache->capacity_tokens = entry.state->window_capacity;
+        entry.cache->device_allocated_size = entry.state->allocated_bytes();
+    }
+    work.committed = true;
+    return true;
+}
+
+void LatentValueWork_vulkan::abort() noexcept
+{
+    Implementation& work = *d;
+    for (Implementation::Entry& entry : work.entries)
+    {
+        entry.cache->latent_device_state.reset();
+        entry.cache->device_allocated_size = 0;
+    }
+    work.committed = true;
+}
+
+class LatentAttentionWork_vulkan::Implementation
+{
+public:
+    std::shared_ptr<VulkanContext> context;
+    AttentionBlockPlan plan;
+    std::vector<LatentRecordedRow_vulkan> rows;
+    std::vector<ncnn::VkMat> storage;
+    ncnn::VkMat shadow_staging;
+    uint64_t uploads = 0;
+    uint64_t downloads = 0;
+    bool committed = false;
+
+    ~Implementation()
+    {
+        if (!committed)
+        {
+            for (LatentRecordedRow_vulkan& row : rows)
+            {
+                row.cache->latent_device_state.reset();
+                row.cache->device_allocated_size = 0;
+            }
+        }
+    }
+};
+
+LatentAttentionWork_vulkan::LatentAttentionWork_vulkan()
+    : d(new Implementation)
+{
+}
+
+LatentAttentionWork_vulkan::~LatentAttentionWork_vulkan() = default;
+
+bool LatentAttentionWork_vulkan::commit()
+{
+    Implementation& work = *d;
+    if (!work.context || work.committed || work.rows.empty())
+        return false;
+
+    for (LatentRecordedRow_vulkan& row : work.rows)
+    {
+        if (!read_latent_shadow(row.window_shadow, row.window_values)
+            || !read_latent_shadow(row.compressor_shadow, row.compressor_values)
+            || !read_latent_shadow(row.index_compressor_shadow, row.index_compressor_values)
+            || !read_latent_shadow(row.compressed_shadow, row.compressed_values)
+            || !read_latent_shadow(row.index_compressed_shadow, row.index_compressed_values))
+        {
+            return false;
+        }
+        if (!row.selected_shadow.empty())
+        {
+            row.selected_shadow.allocator->invalidate(row.selected_shadow.data);
+            const ncnn::Mat mapped = row.selected_shadow.mapped();
+            const uint32_t* values = static_cast<const uint32_t*>(mapped.data);
+            row.selected_indices.assign(values, values + row.selected_count);
+            (void)bind_host_out(row.selected_shadow);
+        }
+    }
+
+    const AttentionBlockPlan& plan = work.plan;
+    for (LatentRecordedRow_vulkan& row : work.rows)
+    {
+        LayerCache& cache = *row.cache;
+        record_latent_cache_transaction_row(cache, plan, row.position);
+        cache.columns = plan.head_dimension;
+        cache.capacity_tokens = plan.sliding_window;
+        cache.latent_cache = true;
+        const size_t window_size = static_cast<size_t>(plan.sliding_window) * plan.head_dimension;
+        if (cache.latent_window.size() != window_size)
+            cache.latent_window.assign(window_size, 0.0f);
+        std::copy_n(row.window_values.data(), plan.head_dimension,
+                    cache.latent_window.data() + static_cast<size_t>(row.position % plan.sliding_window) * plan.head_dimension);
+        if (plan.compression_ratio != 0)
+        {
+            commit_compressor_shadow(plan, row.position, plan.head_dimension, row.compressor_values,
+                                     cache.compressor_pending_values, cache.compressor_pending_scores,
+                                     cache.compressor_previous_values, cache.compressor_previous_scores);
+            cache.latent_compressed.insert(cache.latent_compressed.end(),
+                                           row.compressed_values.begin(), row.compressed_values.end());
+            if (plan.compression_ratio == 4)
+            {
+                commit_compressor_shadow(plan, row.position, plan.index_head_dimension, row.index_compressor_values,
+                                         cache.index_compressor_pending_values, cache.index_compressor_pending_scores,
+                                         cache.index_compressor_previous_values, cache.index_compressor_previous_scores);
+                cache.latent_index_compressed.insert(cache.latent_index_compressed.end(),
+                                                     row.index_compressed_values.begin(), row.index_compressed_values.end());
+            }
+        }
+        cache.latent_selected_indices = row.selected_indices;
+        cache.latent_token_count = row.position + 1;
+        cache.latent_device_state = row.state;
+        cache.device_allocated_size = row.state->allocated_bytes();
+    }
+
+    work.context->runtime_state().batch_uploads += work.uploads;
+    work.context->runtime_state().batch_downloads += work.downloads;
+    work.context->runtime_state().attention_blocks += work.rows.size();
+    work.committed = true;
+    return true;
+}
+
+bool LatentAttention_vulkan::forward_value_batch(std::span<const uint64_t> positions,
+                                                 std::span<LayerCache* const> caches,
+                                                 const ActivationBuffer& query,
+                                                 const ActivationBuffer& key_value,
+                                                 const ActivationBuffer& gate,
+                                                 ActivationBuffer& output) const
+{
+    Implementation& implementation = *d;
+    const AttentionBlockPlan& plan = implementation.plan;
+    const size_t rows = positions.size();
+    const uint32_t width = plan.head_dimension;
+    const uint32_t query_columns = plan.head_count * width;
+    if (!has_flag(plan.flags, AttentionBlockLatentValue) || rows == 0 || rows != caches.size()
+        || rows > static_cast<size_t>(std::numeric_limits<int>::max())
+        || width > 640 || plan.rope_head_dimension > width)
+    {
+        return false;
+    }
+
+    for (size_t row = 0; row < rows; ++row)
+    {
+        const LayerCache* cache = caches[row];
+        if (!cache || cache->transaction.latent_active
+            || positions[row] == std::numeric_limits<uint64_t>::max()
+            || cache->latent_token_count < positions[row] + 1
+            || cache->latent_window.size() < static_cast<size_t>(positions[row] + 1) * width
+            || positions[row] + 1 > std::numeric_limits<uint32_t>::max())
+        {
+            return false;
+        }
+    }
+
+    struct MirrorGuard
+    {
+        std::span<LayerCache* const> caches;
+        bool committed = false;
+
+        ~MirrorGuard()
+        {
+            if (committed)
+                return;
+            for (LayerCache* cache : caches)
+            {
+                cache->latent_device_state.reset();
+                cache->device_allocated_size = 0;
+            }
+        }
+    } mirror_guard{caches};
+
+    VkTransferLease transfer_lease = implementation.context->acquire_transfer_slot();
+    VkTransferSlot& transfer_slot = transfer_lease.slot();
+    const std::lock_guard<std::mutex> lock(implementation.context->command_mutex());
+    ncnn::VkCompute& cmd = *transfer_slot.command;
+    if (transfer_slot.command_used && cmd.reset() != 0)
+        return false;
+    transfer_slot.command_used = true;
+    uint64_t uploads = 0;
+
+    // Staging buffers must stay resident until the single submission completes.
+    ncnn::VkMat sink_staging;
+    ncnn::VkMat query_staging;
+    ncnn::VkMat kv_staging;
+    ncnn::VkMat gate_staging;
+    ncnn::VkMat refresh_staging;
+    ncnn::VkMat next_sinks = implementation.sinks;
+    if (next_sinks.empty())
+    {
+        if (!fill_staging_values(implementation.host_sinks.data(), implementation.host_sinks.size(), sizeof(float),
+                                 sink_staging, transfer_slot.staging_allocator)
+            || !record_mapped_upload(sink_staging, next_sinks, cmd, implementation.opt))
+        {
+            return false;
+        }
+        ++uploads;
+    }
+
+    ncnn::VkMat uploaded_query;
+    if (!fill_staging_values(query.row(0), rows * query_columns, sizeof(float),
+                             query_staging, transfer_slot.staging_allocator)
+        || !record_mapped_upload(query_staging, uploaded_query, cmd, implementation.opt))
+    {
+        return false;
+    }
+    ++uploads;
+
+    ncnn::VkMat uploaded_kv;
+    if (!fill_staging_values(key_value.row(0), rows * width, sizeof(float),
+                             kv_staging, transfer_slot.staging_allocator)
+        || !record_mapped_upload(kv_staging, uploaded_kv, cmd, implementation.opt))
+    {
+        return false;
+    }
+    ++uploads;
+
+    ncnn::VkMat uploaded_gate;
+    if (!fill_staging_values(gate.row(0), rows * plan.head_count, sizeof(float),
+                             gate_staging, transfer_slot.staging_allocator)
+        || !record_mapped_upload(gate_staging, uploaded_gate, cmd, implementation.opt))
+    {
+        return false;
+    }
+    ++uploads;
+
+    ncnn::VkMat attention;
+    attention.create(static_cast<int>(query_columns), static_cast<int>(rows),
+                     sizeof(float), implementation.context->blob_allocator());
+    if (attention.empty())
+        return false;
+
+    const float scale = 1.0f / std::sqrt(static_cast<float>(width));
+    for (size_t first = 0; first < rows;)
+    {
+        size_t last = first;
+        while (last + 1 < rows && caches[last + 1] == caches[first])
+            ++last;
+
+        LayerCache& cache = *caches[first];
+        std::shared_ptr<LatentCache_vulkan> state = cache.latent_device_state;
+        const bool shared_state = state && state.use_count() != 1;
+        const bool refresh = shared_state || !state || state->context != implementation.context
+                             || state->dimension != width
+                             || (state->token_count != positions[first] && state->token_count != positions[last] + 1);
+        if (refresh)
+        {
+            state = std::make_shared<LatentCache_vulkan>();
+            state->context = implementation.context;
+            state->dimension = width;
+            uint64_t capacity = 128;
+            while (capacity < cache.latent_token_count)
+                capacity *= 2;
+            state->window_capacity = static_cast<uint32_t>(capacity);
+            if (!allocate_latent_buffer(state->window, capacity * width, implementation.context))
+                return false;
+            if (cache.latent_token_count != 0)
+            {
+                const uint64_t count = cache.latent_token_count * width;
+                ncnn::VkMat uploaded;
+                if (!fill_staging_values(cache.latent_window.data(), static_cast<size_t>(count), sizeof(float),
+                                         refresh_staging, transfer_slot.staging_allocator)
+                    || !record_mapped_upload(refresh_staging, uploaded, cmd, implementation.opt)
+                    || !record_latent_copy(implementation.append_pipeline.get(), uploaded, state->window, count, 0, cmd))
+                {
+                    return false;
+                }
+                ++uploads;
+                state->token_count = cache.latent_token_count;
+            }
+        }
+        else if (state->token_count == positions[first])
+        {
+            const uint64_t count = static_cast<uint64_t>(last - first + 1) * width;
+            if (state->window_capacity < cache.latent_token_count)
+            {
+                uint32_t capacity = state->window_capacity;
+                while (capacity < cache.latent_token_count)
+                    capacity *= 2;
+                ncnn::VkMat grown;
+                if (!allocate_latent_buffer(grown, static_cast<uint64_t>(capacity) * width, implementation.context)
+                    || !record_latent_copy(implementation.append_pipeline.get(), state->window, grown,
+                                           static_cast<uint64_t>(state->token_count) * width, 0, cmd))
+                {
+                    return false;
+                }
+                state->window = std::move(grown);
+                state->window_capacity = capacity;
+            }
+            if (!record_latent_copy(implementation.append_pipeline.get(), uploaded_kv, state->window, count,
+                                    static_cast<uint64_t>(positions[first]) * width, cmd,
+                                    static_cast<uint64_t>(first) * width))
+            {
+                return false;
+            }
+            state->token_count = positions[last] + 1;
+        }
+        cache.latent_device_state = state;
+        rearm_read(state->window);
+
+        for (size_t row = first; row <= last; ++row)
+        {
+            const std::vector<ncnn::VkMat> bindings = {uploaded_query, state->window, state->window, state->window,
+                                                       next_sinks, state->window, attention, uploaded_gate};
+            std::vector<ncnn::vk_constant_type> constants(12);
+            constants[0].u32 = width;
+            constants[1].u32 = plan.head_count;
+            constants[2].u32 = plan.rope_head_dimension;
+            constants[3].u32 = static_cast<uint32_t>(row);
+            constants[4].u32 = state->window_capacity;
+            constants[5].u32 = 0;
+            constants[6].u32 = static_cast<uint32_t>(positions[row] + 1);
+            constants[7].u32 = 0;
+            constants[8].u32 = 0;
+            constants[9].f = scale;
+            constants[10].u32 = 0;
+            constants[11].u32 = 1;
+            ncnn::VkMat dispatcher;
+            dispatcher.w = 128;
+            dispatcher.h = 1;
+            dispatcher.c = static_cast<int>(plan.head_count);
+            cmd.record_pipeline(implementation.attention_pipeline.get(), bindings, constants, dispatcher);
+        }
+        first = last + 1;
+    }
+
+    ncnn::VkMat output_rank;
+    ncnn::VkMat final_output;
+    std::vector<ncnn::VkMat> projection_storage;
+    const uint32_t output_columns = projection_output_columns(implementation.output_b);
+    const DType output_dtype = output.dtype();
+    if (!record_projection(implementation.output_a, attention, output_rank, cmd, projection_storage)
+        || !record_projection(implementation.output_b, output_rank, final_output, cmd, projection_storage)
+        || !prepare_staging_batch(transfer_slot.download, rows, output_columns,
+                                  transfer_slot.staging_allocator, output.element_size())
+        || !record_staging_download(final_output, rows, output_columns, transfer_slot.download, cmd,
+                                    implementation.context->device(), implementation.opt, output_dtype))
+    {
+        return false;
+    }
+    if (submit_wait(cmd, implementation.context->device()) != 0)
+        return false;
+
+    ActivationBuffer completed(rows, output_columns, output_dtype);
+    if (!copy_staging_to_cpu_batch(transfer_slot.download, completed))
+        return false;
+
+    output.swap(completed);
+    implementation.sinks = std::move(next_sinks);
+    for (LayerCache* cache : caches)
+    {
+        if (cache->latent_device_state)
+            cache->device_allocated_size = cache->latent_device_state->allocated_bytes();
+    }
+    VulkanRuntimeState& runtime_state = implementation.context->runtime_state();
+    runtime_state.batch_uploads += uploads;
+    runtime_state.batch_downloads += 1;
+    runtime_state.attention_blocks += rows;
+    mirror_guard.committed = true;
+    return true;
+}
+
+bool LatentAttention_vulkan::forward_projected_batch(const ActivationBuffer& input,
+                                                     std::span<const uint64_t> positions,
+                                                     std::span<LayerCache* const> caches,
+                                                     ActivationBuffer& output) const
+{
+    const std::lock_guard<std::mutex> lock(d->context->command_mutex());
+    ncnn::VkCompute cmd(d->context->device());
+    ncnn::VkMat input_staging;
+    ncnn::VkMat device_input;
+    ncnn::VkMat device_output;
+    ncnn::VkMat output_staging;
+    LatentAttentionWork_vulkan work;
+    VulkanRuntimeState& state = d->context->runtime_state();
+    if (!fill_staging_upload(input, input_staging, d->context->staging_allocator())
+        || !record_mapped_act_upload(input_staging, device_input, cmd, d->context->device(), d->opt, input.dtype())
+        || !record_batch(device_input, positions, caches, device_output, cmd, work)
+        || !prepare_staging_batch(output_staging, input.rows(), static_cast<uint32_t>(device_output.w),
+                                  d->context->staging_allocator(), output.element_size())
+        || !record_staging_download(device_output, input.rows(), static_cast<uint32_t>(device_output.w), output_staging,
+                                    cmd, d->context->device(), d->opt, output.dtype()))
+    {
+        return false;
+    }
+    if (submit_wait(cmd, d->context->device()) != 0)
+        return false;
+
+    ActivationBuffer completed(input.rows(), static_cast<uint32_t>(device_output.w), output.dtype());
+    if (!copy_staging_to_cpu_batch(output_staging, completed) || !work.commit())
+        return false;
+
+    output.swap(completed);
+    ++state.compute_submissions;
+    ++state.batch_uploads;
+    ++state.batch_downloads;
+    return true;
+}
+
+bool LatentAttention_vulkan::prepare(const WeightStore& weights, const CompiledOperatorTable& operators, uint64_t optimization_flags)
+{
+    Implementation& implementation = *d;
+    const AttentionBlockPlan& plan = implementation.plan;
+    const uint64_t flags = optimization_flags;
+    if (!has_flag(flags, OptimizationVulkanAttention)
+        || !has_flag(flags, OptimizationVulkanLatentInputRmsNorm)
+        || (plan.compression_ratio != 0 && !has_flag(flags, OptimizationVulkanLatentCompressor))
+        || (plan.compression_ratio != 0 && plan.compression_ratio != 4 && plan.compression_ratio != 128)
+        || (plan.compression_ratio == 4
+            && (plan.index_head_dimension == 0 || plan.index_head_dimension > 512
+                || (plan.index_head_dimension & (plan.index_head_dimension - 1)) != 0
+                || plan.rope_head_dimension > plan.index_head_dimension || plan.index_head_count == 0)))
+    {
+        return false;
+    }
+
+    const CompiledOperator& query_a = operators.at_weight(plan.query_a_weight);
+    const CompiledOperator& query_b = operators.at_weight(plan.query_b_weight);
+    const CompiledOperator& key_value = operators.at_weight(plan.key_value_weight);
+    if (!(query_a.float8 && query_b.float8 && key_value.float8)
+        && !(query_a.bfloat16 && query_b.bfloat16 && key_value.bfloat16)
+        && !(query_a.qnk && query_b.qnk && key_value.qnk))
+    {
+        return false;
+    }
+    if (projection_context(query_a) != implementation.context
+        || projection_context(query_b) != implementation.context
+        || projection_context(key_value) != implementation.context
+        || projection_input_columns(query_a) != projection_input_columns(key_value)
+        || projection_output_columns(query_a) != projection_input_columns(query_b)
+        || projection_output_columns(query_b) != plan.head_count * plan.head_dimension
+        || projection_output_columns(key_value) != plan.head_dimension)
+    {
+        return false;
+    }
+
+    implementation.query_a = latent_projection(query_a);
+    implementation.query_b = latent_projection(query_b);
+    implementation.key_value = latent_projection(key_value);
+    if (query_a.qnk)
+    {
+        implementation.input_norm = RmsNorm_vulkan::create(weights.at(plan.pre_attention_norm_weight), plan.norm_epsilon,
+                                                           0.0f, implementation.context, implementation.opt);
+        implementation.query_rank_norm = RmsNorm_vulkan::create(weights.at(plan.query_norm_weight), plan.norm_epsilon,
+                                                                0.0f, implementation.context, implementation.opt);
+        if (!implementation.input_norm || !implementation.query_rank_norm)
+            return false;
+    }
+
+    if (plan.compression_ratio != 0)
+    {
+        implementation.compressor_value = latent_projection(operators.at_weight(plan.compressor_key_value_weight));
+        implementation.compressor_gate = latent_projection(operators.at_weight(plan.compressor_gate_weight));
+        const uint32_t multiplier = plan.compression_ratio == 4 ? 2 : 1;
+        const auto valid_projection = [&](const CompiledOperator& value, uint32_t columns) {
+            return projection_context(value) == implementation.context
+                   && projection_input_columns(value) == projection_input_columns(query_a)
+                   && projection_output_columns(value) == columns;
+        };
+        if (!valid_projection(implementation.compressor_value, multiplier * plan.head_dimension)
+            || !valid_projection(implementation.compressor_gate, multiplier * plan.head_dimension))
+        {
+            return false;
+        }
+        if (plan.compression_ratio == 4)
+        {
+            implementation.index_compressor_value = latent_projection(operators.at_weight(plan.indexer_compressor_key_value_weight));
+            implementation.index_compressor_gate = latent_projection(operators.at_weight(plan.indexer_compressor_gate_weight));
+            if (!valid_projection(implementation.index_compressor_value, 2 * plan.index_head_dimension)
+                || !valid_projection(implementation.index_compressor_gate, 2 * plan.index_head_dimension))
+            {
+                return false;
+            }
+            implementation.index_query = latent_projection(operators.at_weight(plan.indexer_query_weight));
+            implementation.index_weights = latent_projection(operators.at_weight(plan.indexer_weights_weight));
+            const auto valid_index = [&](const CompiledOperator& value, uint32_t input_columns, uint32_t output_columns) {
+                return projection_context(value) == implementation.context
+                       && projection_input_columns(value) == input_columns
+                       && projection_output_columns(value) == output_columns;
+            };
+            if (!valid_index(implementation.index_query, projection_output_columns(query_a),
+                             plan.index_head_count * plan.index_head_dimension)
+                || !valid_index(implementation.index_weights, projection_input_columns(query_a), plan.index_head_count))
+            {
+                return false;
+            }
+        }
+    }
+
+    const std::lock_guard<std::mutex> lock(implementation.context->command_mutex());
+    struct PipelineSpec
+    {
+        const char* src;
+        int len;
+        std::shared_ptr<ncnn::Pipeline>* dst;
+    };
+    const PipelineSpec required[] = {
+        {latent_attention_transform_shader, static_cast<int>(sizeof(latent_attention_transform_shader) - 1), &implementation.transform_pipeline},
+        {latent_attention_compress_shader, static_cast<int>(sizeof(latent_attention_compress_shader) - 1), &implementation.compressor_pipeline},
+        {latent_attention_index_score_shader, static_cast<int>(sizeof(latent_attention_index_score_shader) - 1), &implementation.index_score_pipeline},
+        {latent_attention_index_topk_shader, static_cast<int>(sizeof(latent_attention_index_topk_shader) - 1), &implementation.index_topk_pipeline},
+    };
+    for (const PipelineSpec& entry : required)
+    {
+        if (!create_pipeline(implementation.context, entry.src, entry.len,
+                             implementation.opt, 0, 0, 128, *entry.dst))
+        {
+            return false;
+        }
+    }
+
+    // Parallel selection is optional: unusual K or small shared memory falls back to GPU heap top-k.
+    if (plan.index_top_k > 0 && plan.index_top_k <= 1024
+        && implementation.context->device()->info.max_shared_memory_size() >= 8192)
+    {
+        (void)create_pipeline(implementation.context, latent_attention_index_sort_shader,
+                              static_cast<int>(sizeof(latent_attention_index_sort_shader) - 1),
+                              implementation.opt, 0, 0, 128, implementation.index_sort_pipeline);
+        (void)create_pipeline(implementation.context, latent_attention_index_merge_shader,
+                              static_cast<int>(sizeof(latent_attention_index_merge_shader) - 1),
+                              implementation.opt, 0, 0, 128, implementation.index_merge_pipeline);
+    }
+
+    ncnn::VkCompute cmd(implementation.context->device());
+    std::vector<ncnn::VkMat> staging;
+    const auto upload_constant = [&](const TensorData& tensor, uint64_t count, ncnn::VkMat& destination) {
+        ncnn::Mat host;
+        if (tensor.element_count() != count || !prepare_float_upload(tensor, host))
+            return false;
+        staging.emplace_back();
+        return fill_staging_values(host.data, count, sizeof(float), staging.back(), implementation.context->staging_allocator())
+               && record_mapped_upload(staging.back(), destination, cmd, implementation.opt);
+    };
+    if (!upload_constant(weights.at(plan.key_value_norm_weight), plan.head_dimension, implementation.key_norm)
+        || !upload_constant(weights.at(plan.sinks), plan.head_count, implementation.sinks))
+    {
+        return false;
+    }
+    if (plan.compression_ratio != 0)
+    {
+        const uint32_t multiplier = plan.compression_ratio == 4 ? 2 : 1;
+        if (!upload_constant(weights.at(plan.compressor_norm_weight), plan.head_dimension, implementation.compressor_norm)
+            || !upload_constant(weights.at(plan.compressor_position),
+                                static_cast<uint64_t>(plan.compression_ratio) * multiplier * plan.head_dimension,
+                                implementation.compressor_position))
+        {
+            return false;
+        }
+        if (plan.compression_ratio == 4
+            && (!upload_constant(weights.at(plan.indexer_compressor_norm_weight), plan.index_head_dimension,
+                                 implementation.index_compressor_norm)
+                || !upload_constant(weights.at(plan.indexer_compressor_position),
+                                    static_cast<uint64_t>(plan.compression_ratio) * 2 * plan.index_head_dimension,
+                                    implementation.index_compressor_position)))
+        {
+            return false;
+        }
+    }
+    if (submit_wait(cmd, implementation.context->device()) != 0)
+        return false;
+
+    implementation.context->runtime_state().compute_submissions += 1;
+    implementation.context->runtime_state().batch_uploads += staging.size();
+    implementation.prepared = true;
+    return true;
+}
+
+bool LatentAttention_vulkan::prepare_value(const WeightStore& weights,
+                                           const CompiledOperatorTable& operators)
+{
+    Implementation& implementation = *d;
+    const AttentionBlockPlan& plan = implementation.plan;
+    if (!has_flag(plan.flags, AttentionBlockLatentValue) || implementation.prepared)
+        return false;
+
+    const CompiledOperator& query_a = operators.at_weight(plan.query_a_weight);
+    const CompiledOperator& query_b = operators.at_weight(plan.query_b_absorbed_weight);
+    const CompiledOperator& key_value = operators.at_weight(plan.key_value_weight);
+    const CompiledOperator& gate = operators.at_weight(plan.output_gate_weight);
+    if (!projection_context(query_a) || !projection_option(query_a)
+        || projection_context(query_a) != implementation.context
+        || projection_context(query_b) != implementation.context
+        || projection_context(key_value) != implementation.context
+        || projection_context(gate) != implementation.context
+        || projection_input_columns(query_a) != projection_input_columns(key_value)
+        || projection_input_columns(query_a) != projection_input_columns(gate)
+        || projection_output_columns(query_a) != plan.query_lora_rank
+        || projection_input_columns(query_b) != plan.query_lora_rank
+        || projection_output_columns(query_b) != plan.head_count * plan.head_dimension
+        || projection_output_columns(key_value) != plan.head_dimension
+        || projection_output_columns(gate) != plan.head_count)
+    {
+        return false;
+    }
+
+    implementation.query_a = latent_projection(query_a);
+    implementation.query_b = latent_projection(query_b);
+    implementation.key_value = latent_projection(key_value);
+    implementation.gate = latent_projection(gate);
+    implementation.query_rank_norm = RmsNorm_vulkan::create(weights.at(plan.query_norm_weight),
+                                                            plan.norm_epsilon, 0.0f,
+                                                            implementation.context, implementation.opt);
+    if (!implementation.query_rank_norm)
+        return false;
+
+    ncnn::Mat norm_values;
+    if (weights.at(plan.key_value_norm_weight).element_count() != plan.kv_lora_rank
+        || !prepare_float_upload(weights.at(plan.key_value_norm_weight), norm_values))
+    {
+        return false;
+    }
+
+    const std::lock_guard<std::mutex> lock(implementation.context->command_mutex());
+    ncnn::VkCompute cmd(implementation.context->device());
+    std::vector<ncnn::VkMat> staging;
+    const auto upload = [&](const void* values, size_t count, ncnn::VkMat& destination) {
+        staging.emplace_back();
+        return fill_staging_values(values, count, sizeof(float), staging.back(),
+                                   implementation.context->staging_allocator())
+               && record_mapped_upload(staging.back(), destination, cmd, implementation.opt);
+    };
+    if (!upload(norm_values.data, static_cast<size_t>(norm_values.w), implementation.key_norm)
+        || !upload(implementation.host_sinks.data(), implementation.host_sinks.size(), implementation.sinks))
+    {
+        return false;
+    }
+    if (!create_pipeline(implementation.context, latent_attention_transform_shader,
+                         static_cast<int>(sizeof(latent_attention_transform_shader) - 1),
+                         implementation.opt, 0, 0, 128, implementation.transform_pipeline))
+    {
+        return false;
+    }
+    if (submit_wait(cmd, implementation.context->device()) != 0)
+        return false;
+
+    implementation.context->runtime_state().compute_submissions += 1;
+    implementation.context->runtime_state().batch_uploads += staging.size();
+    implementation.prepared = true;
+    return true;
+}
+
+bool LatentAttention_vulkan::record_value_forward(const ncnn::VkMat& input,
+                                                  std::span<const uint64_t> positions,
+                                                  std::span<LayerCache* const> caches,
+                                                  ncnn::VkMat& output,
+                                                  ncnn::VkCompute& cmd,
+                                                  LatentValueWork_vulkan& work,
+                                                  std::vector<ncnn::VkMat>& storage) const
+{
+    const Implementation& implementation = *d;
+    const AttentionBlockPlan& plan = implementation.plan;
+    const size_t rows = positions.size();
+    const uint32_t heads = plan.head_count;
+    const uint32_t width = plan.head_dimension;
+    const uint32_t lora = plan.kv_lora_rank;
+    const uint32_t rope = plan.rope_head_dimension;
+    const auto allocate = [&](ncnn::VkMat& destination, uint64_t columns, size_t row_count) {
+        if (columns == 0 || row_count == 0
+            || columns > static_cast<uint64_t>(std::numeric_limits<int>::max())
+            || row_count > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+        destination.create(static_cast<int>(columns), static_cast<int>(row_count), sizeof(float),
+                           implementation.opt.blob_vkallocator);
+        return !destination.empty();
+    };
+
+    ncnn::VkMat query_rank;
+    ncnn::VkMat query_rank_normed;
+    ncnn::VkMat query;
+    ncnn::VkMat key_value;
+    ncnn::VkMat gate;
+    ncnn::VkMat query_rope;
+    ncnn::VkMat kv_rope;
+    ncnn::VkMat latent;
+    ncnn::VkMat output_rank;
+    if (!allocate(query_rank, plan.query_lora_rank, rows)
+        || !allocate(query_rank_normed, plan.query_lora_rank, rows)
+        || !allocate(query, static_cast<uint64_t>(heads) * width, rows)
+        || !allocate(key_value, width, rows)
+        || !allocate(gate, heads, rows)
+        || !allocate(query_rope, static_cast<uint64_t>(heads) * width, rows)
+        || !allocate(kv_rope, width, rows)
+        || !allocate(latent, static_cast<uint64_t>(heads) * width, rows))
+    {
+        return false;
+    }
+
+    if (!record_projection(implementation.query_a, input, query_rank, cmd, storage)
+        || !implementation.query_rank_norm->record(query_rank, query_rank_normed, cmd)
+        || !record_projection(implementation.query_b, query_rank_normed, query, cmd, storage)
+        || !record_projection(implementation.key_value, input, key_value, cmd, storage)
+        || !record_projection(implementation.gate, input, gate, cmd, storage))
+    {
+        return false;
+    }
+
+    for (size_t row = 0; row < rows; ++row)
+    {
+        LayerCache& cache = *caches[row];
+        const uint64_t position = positions[row];
+        std::vector<float> coefficients;
+        prepare_latent_rope(plan, position, coefficients);
+        ncnn::VkMat rope_staging;
+        ncnn::VkMat rope_values;
+        if (!fill_staging_values(coefficients.data(), coefficients.size(), sizeof(float),
+                                 rope_staging, implementation.context->staging_allocator())
+            || !record_mapped_upload(rope_staging, rope_values, cmd, implementation.opt))
+        {
+            return false;
+        }
+        storage.push_back(std::move(rope_staging));
+        storage.push_back(rope_values);
+
+        if (!record_latent_transform(implementation.transform_pipeline, query, implementation.key_norm,
+                                     rope_values, query_rope, width, rope,
+                                     static_cast<uint32_t>(row) * heads * width,
+                                     static_cast<uint32_t>(row) * heads * width,
+                                     0, heads, plan.norm_epsilon, cmd, width)
+            || !record_latent_transform(implementation.transform_pipeline, key_value, implementation.key_norm,
+                                        rope_values, kv_rope, width, rope,
+                                        static_cast<uint32_t>(row) * width,
+                                        static_cast<uint32_t>(row) * width,
+                                        1, 1, plan.norm_epsilon, cmd, lora))
+        {
+            return false;
+        }
+
+        std::shared_ptr<LatentCache_vulkan> state = cache.latent_device_state;
+        const bool refresh = !state || state->context != implementation.context
+                             || state->dimension != width || state->token_count != position;
+        if (refresh)
+        {
+            state = std::make_shared<LatentCache_vulkan>();
+            state->context = implementation.context;
+            state->dimension = width;
+            uint64_t capacity = 128;
+            while (capacity < position + 1)
+                capacity *= 2;
+            state->window_capacity = static_cast<uint32_t>(capacity);
+            if (!allocate_latent_buffer(state->window, capacity * width, implementation.context))
+                return false;
+            if (cache.latent_window.empty() && position != 0)
+                return false;
+            if (!cache.latent_window.empty())
+            {
+                ncnn::VkMat staging;
+                ncnn::VkMat uploaded;
+                const uint64_t count = static_cast<uint64_t>(cache.latent_token_count) * width;
+                if (!fill_staging_values(cache.latent_window.data(), static_cast<size_t>(count), sizeof(float),
+                                         staging, implementation.context->staging_allocator())
+                    || !record_mapped_upload(staging, uploaded, cmd, implementation.opt)
+                    || !record_latent_copy(implementation.append_pipeline.get(), uploaded, state->window,
+                                           count, 0, cmd))
+                {
+                    return false;
+                }
+                storage.push_back(std::move(staging));
+                storage.push_back(uploaded);
+                state->token_count = cache.latent_token_count;
+            }
+        }
+        if (state->window_capacity < position + 1)
+        {
+            uint32_t capacity = state->window_capacity;
+            while (capacity < position + 1)
+                capacity *= 2;
+            ncnn::VkMat grown;
+            if (!allocate_latent_buffer(grown, static_cast<uint64_t>(capacity) * width, implementation.context)
+                || !record_latent_copy(implementation.append_pipeline.get(), state->window, grown,
+                                       static_cast<uint64_t>(state->token_count) * width, 0, cmd))
+            {
+                return false;
+            }
+            state->window = std::move(grown);
+            state->window_capacity = capacity;
+        }
+        if (!record_latent_copy(implementation.append_pipeline.get(), kv_rope, state->window, width,
+                                position * width, cmd, static_cast<uint64_t>(row) * width))
+        {
+            return false;
+        }
+        state->token_count = position + 1;
+        rearm_read(state->window);
+        cache.latent_device_state = state;
+        if (!work.d->entries.empty()
+            && work.d->entries.back().cache == &cache
+            && work.d->entries.back().position + 1 == position)
+        {
+            work.d->entries.back().position = position;
+        }
+        else
+        {
+            work.d->entries.push_back({&cache, position, width, state});
+        }
+
+        const std::vector<ncnn::VkMat> bindings = {query_rope, state->window, state->window, state->window,
+                                                   implementation.sinks, state->window, latent, gate};
+        std::vector<ncnn::vk_constant_type> constants(12);
+        constants[0].u32 = width;
+        constants[1].u32 = heads;
+        constants[2].u32 = rope;
+        constants[3].u32 = static_cast<uint32_t>(row);
+        constants[4].u32 = state->window_capacity;
+        constants[5].u32 = 0;
+        constants[6].u32 = static_cast<uint32_t>(position + 1);
+        constants[7].u32 = 0;
+        constants[8].u32 = 0;
+        constants[9].f = 1.0f / std::sqrt(static_cast<float>(width));
+        constants[10].u32 = 0;
+        constants[11].u32 = 1;
+        ncnn::VkMat dispatcher;
+        dispatcher.w = 128;
+        dispatcher.h = 1;
+        dispatcher.c = static_cast<int>(heads);
+        cmd.record_pipeline(implementation.attention_pipeline.get(), bindings, constants, dispatcher);
+    }
+
+    if (!record_projection(implementation.output_a, latent, output_rank, cmd, storage)
+        || !record_projection(implementation.output_b, output_rank, output, cmd, storage))
+    {
+        return false;
+    }
+    return !output.empty();
+}
+
+bool LatentAttention_vulkan::can_record() const noexcept
+{
+    return d->prepared;
+}
+
+const std::shared_ptr<VulkanContext>& LatentAttention_vulkan::context() const noexcept
+{
+    return d->context;
+}
+
+const ncnn::Option& LatentAttention_vulkan::option() const noexcept
+{
+    return d->opt;
+}
+
+bool LatentAttention_vulkan::record_batch(const ncnn::VkMat& input,
+                                          std::span<const uint64_t> positions,
+                                          std::span<LayerCache* const> caches,
+                                          ncnn::VkMat& output,
+                                          ncnn::VkCompute& cmd,
+                                          LatentAttentionWork_vulkan& work) const
+{
+    Implementation& implementation = *d;
+    const AttentionBlockPlan& plan = implementation.plan;
+    LatentAttentionWork_vulkan::Implementation& recording = *work.d;
+    const size_t rows = positions.size();
+    std::vector<std::pair<LayerCache*, uint64_t>> next_positions;
+    for (size_t row = 0; row < rows; ++row)
+    {
+        if (!caches[row] || positions[row] == std::numeric_limits<uint64_t>::max())
+            return false;
+        auto next = std::find_if(next_positions.begin(), next_positions.end(),
+                                 [&](const auto& item) { return item.first == caches[row]; });
+        const uint64_t expected = next == next_positions.end() ? caches[row]->latent_token_count : next->second;
+        if (positions[row] != expected || caches[row]->latent_compressed.size() % plan.head_dimension != 0
+            || (plan.compression_ratio == 4
+                && caches[row]->latent_index_compressed.size() / plan.index_head_dimension
+                       != caches[row]->latent_compressed.size() / plan.head_dimension))
+        {
+            return false;
+        }
+        if (next == next_positions.end())
+            next_positions.push_back({caches[row], positions[row] + 1});
+        else
+            next->second = positions[row] + 1;
+    }
+
+    for (const ncnn::VkMat* value : {&implementation.sinks, &implementation.key_norm, &implementation.compressor_norm,
+                                     &implementation.compressor_position, &implementation.index_compressor_norm,
+                                     &implementation.index_compressor_position})
+    {
+        rearm_read(*value);
+    }
+
+    recording.context = implementation.context;
+    recording.plan = plan;
+    recording.rows.reserve(rows);
+    recording.storage.reserve(rows * 24 + 16);
+
+    const auto upload_values = [&](const std::vector<float>& values, ncnn::VkMat& destination) {
+        if (values.empty())
+            return true;
+        recording.storage.emplace_back();
+        if (!fill_staging_values(values.data(), values.size(), sizeof(float), recording.storage.back(),
+                                 implementation.context->staging_allocator())
+            || !record_mapped_upload(recording.storage.back(), destination, cmd, implementation.opt))
+        {
+            return false;
+        }
+        ++recording.uploads;
+        return true;
+    };
+    const auto allocate = [&](ncnn::VkMat& destination, uint64_t count) {
+        return allocate_latent_buffer(destination, count, implementation.context);
+    };
+
+    ncnn::VkMat normalized;
+    ncnn::VkMat query;
+    ncnn::VkMat key_value;
+    ncnn::VkMat query_rank;
+    bool projected = false;
+    if (implementation.query_a.qnk)
+    {
+        ncnn::VkMat unnormalized_rank;
+        projected = implementation.input_norm->record(input, normalized, cmd)
+                    && record_projection(implementation.query_a, normalized, unnormalized_rank, cmd, recording.storage)
+                    && implementation.query_rank_norm->record(unnormalized_rank, query_rank, cmd)
+                    && record_projection(implementation.query_b, query_rank, query, cmd, recording.storage)
+                    && record_projection(implementation.key_value, normalized, key_value, cmd, recording.storage);
+        recording.storage.push_back(std::move(unnormalized_rank));
+    }
+    else
+    {
+        projected = implementation.query_a.float8
+                        ? implementation.query_a.float8->record_input_normalization(input, normalized, cmd)
+                              && implementation.query_a.float8->record_rms_norm_chain_parallel(normalized, *implementation.query_b.float8,
+                                                                                               *implementation.key_value.float8,
+                                                                                               query, key_value, query_rank, cmd, recording.storage)
+                        : implementation.query_a.bfloat16->record_input_normalization(input, normalized, cmd)
+                              && implementation.query_a.bfloat16->record_rms_norm_chain_parallel(normalized, *implementation.query_b.bfloat16,
+                                                                                                 *implementation.key_value.bfloat16,
+                                                                                                 query, key_value, query_rank, cmd, recording.storage);
+    }
+    if (!projected)
+        return false;
+
+    recording.storage.push_back(normalized);
+    recording.storage.push_back(query);
+    recording.storage.push_back(key_value);
+    recording.storage.push_back(query_rank);
+
+    ncnn::VkMat compressor_values;
+    ncnn::VkMat compressor_scores;
+    ncnn::VkMat index_compressor_values;
+    ncnn::VkMat index_compressor_scores;
+    ncnn::VkMat index_query;
+    ncnn::VkMat index_weights;
+    bool index_projection_ready = false;
+    if (plan.compression_ratio != 0)
+    {
+        if (!record_projection(implementation.compressor_value, normalized, compressor_values, cmd, recording.storage)
+            || !record_projection(implementation.compressor_gate, normalized, compressor_scores, cmd, recording.storage))
+        {
+            return false;
+        }
+        recording.storage.push_back(compressor_values);
+        recording.storage.push_back(compressor_scores);
+        if (plan.compression_ratio == 4)
+        {
+            if (!record_projection(implementation.index_compressor_value, normalized, index_compressor_values, cmd, recording.storage)
+                || !record_projection(implementation.index_compressor_gate, normalized, index_compressor_scores, cmd, recording.storage))
+            {
+                return false;
+            }
+            recording.storage.push_back(index_compressor_values);
+            recording.storage.push_back(index_compressor_scores);
+        }
+    }
+
+    ncnn::VkMat normalized_query;
+    ncnn::VkMat attention;
+    const uint32_t query_columns = plan.head_count * plan.head_dimension;
+    normalized_query.create(static_cast<int>(query_columns), static_cast<int>(rows),
+                            sizeof(float), implementation.context->blob_allocator());
+    attention.create(static_cast<int>(query_columns), static_cast<int>(rows),
+                     sizeof(float), implementation.context->blob_allocator());
+    if (normalized_query.empty() || attention.empty())
+        return false;
+    recording.storage.push_back(normalized_query);
+    recording.storage.push_back(attention);
+
+    for (size_t row = 0; row < rows; ++row)
+    {
+        LayerCache& cache = *caches[row];
+        const uint64_t position = positions[row];
+        recording.rows.emplace_back();
+        LatentRecordedRow_vulkan& current = recording.rows.back();
+        current.cache = &cache;
+        current.position = position;
+        auto earlier = std::find_if(recording.rows.begin(), recording.rows.end() - 1,
+                                    [&](const LatentRecordedRow_vulkan& item) { return item.cache == &cache; });
+        std::shared_ptr<LatentCache_vulkan> state;
+        if (earlier != recording.rows.end() - 1)
+        {
+            state = earlier->state;
+        }
+        else
+        {
+            const bool shared_state = cache.latent_device_state && cache.latent_device_state.use_count() != 1;
+            state = cache.latent_device_state;
+            const uint32_t count = static_cast<uint32_t>(cache.latent_compressed.size() / plan.head_dimension);
+            if (shared_state || !state || !state->complete_state || state->context != implementation.context
+                || state->dimension != plan.head_dimension || state->window_capacity != plan.sliding_window
+                || state->token_count != position || state->compressed_count != count)
+            {
+                state = std::make_shared<LatentCache_vulkan>();
+                state->context = implementation.context;
+                state->dimension = plan.head_dimension;
+                state->window_capacity = plan.sliding_window;
+                state->token_count = position;
+                state->compressed_count = count;
+                state->complete_state = true;
+                const uint64_t window_elements = static_cast<uint64_t>(plan.sliding_window) * plan.head_dimension;
+                if (!allocate(state->window, window_elements))
+                    return false;
+                if (position != 0)
+                {
+                    const size_t valid = static_cast<size_t>(std::min<uint64_t>(position, plan.sliding_window)) * plan.head_dimension;
+                    if (cache.latent_window.size() < valid)
+                        return false;
+                    std::vector<float> values(cache.latent_window.begin(), cache.latent_window.begin() + valid);
+                    ncnn::VkMat uploaded;
+                    if (!upload_values(values, uploaded)
+                        || !record_latent_copy(implementation.append_pipeline.get(), uploaded, state->window, valid, 0, cmd))
+                    {
+                        return false;
+                    }
+                    recording.storage.push_back(uploaded);
+                }
+                if (plan.compression_ratio != 0)
+                {
+                    const auto restore_compressor = [&](uint32_t dimension,
+                                                        const std::vector<float>& pending_values,
+                                                        const std::vector<float>& pending_scores,
+                                                        const std::vector<float>& previous_values,
+                                                        const std::vector<float>& previous_scores,
+                                                        ncnn::VkMat& destination) {
+                        const uint32_t multiplier = plan.compression_ratio == 4 ? 2 : 1;
+                        const size_t pending = static_cast<size_t>(plan.compression_ratio) * multiplier * dimension;
+                        const size_t previous = multiplier == 2 ? static_cast<size_t>(plan.compression_ratio) * dimension : 0;
+                        std::vector<float> values(pending * 2 + previous * 2, 0.0f);
+                        if (!pending_values.empty())
+                        {
+                            if (pending_values.size() != pending || pending_scores.size() != pending)
+                                return false;
+                            std::copy(pending_values.begin(), pending_values.end(), values.begin());
+                            std::copy(pending_scores.begin(), pending_scores.end(), values.begin() + pending);
+                        }
+                        if (!previous_values.empty())
+                        {
+                            if (previous_values.size() != previous || previous_scores.size() != previous)
+                                return false;
+                            std::copy(previous_values.begin(), previous_values.end(), values.begin() + pending * 2);
+                            std::copy(previous_scores.begin(), previous_scores.end(), values.begin() + pending * 2 + previous);
+                        }
+                        return upload_values(values, destination);
+                    };
+                    if (!restore_compressor(plan.head_dimension, cache.compressor_pending_values, cache.compressor_pending_scores,
+                                            cache.compressor_previous_values, cache.compressor_previous_scores, state->compressor_state))
+                    {
+                        return false;
+                    }
+                    if (plan.compression_ratio == 4
+                        && !restore_compressor(plan.index_head_dimension, cache.index_compressor_pending_values,
+                                               cache.index_compressor_pending_scores, cache.index_compressor_previous_values,
+                                               cache.index_compressor_previous_scores, state->index_compressor_state))
+                    {
+                        return false;
+                    }
+                }
+                if (count != 0)
+                {
+                    state->compressed_capacity = std::max(32u, count);
+                    if (!allocate(state->compressed, static_cast<uint64_t>(state->compressed_capacity) * plan.head_dimension))
+                        return false;
+                    ncnn::VkMat uploaded;
+                    if (!upload_values(cache.latent_compressed, uploaded)
+                        || !record_latent_copy(implementation.append_pipeline.get(), uploaded, state->compressed,
+                                               cache.latent_compressed.size(), 0, cmd))
+                    {
+                        return false;
+                    }
+                    recording.storage.push_back(uploaded);
+                    if (plan.compression_ratio == 4)
+                    {
+                        if (!allocate(state->index_compressed, static_cast<uint64_t>(state->compressed_capacity) * plan.index_head_dimension)
+                            || !upload_values(cache.latent_index_compressed, uploaded)
+                            || !record_latent_copy(implementation.append_pipeline.get(), uploaded, state->index_compressed,
+                                                   cache.latent_index_compressed.size(), 0, cmd))
+                        {
+                            return false;
+                        }
+                        recording.storage.push_back(uploaded);
+                    }
+                }
+            }
+        }
+        current.state = state;
+        cache.latent_device_state = state;
+        // Re-arm persistent buffers after any previously abandoned recorder.
+        for (const ncnn::VkMat* value : {&state->window, &state->compressed, &state->compressor_state,
+                                         &state->index_compressor_state, &state->index_compressed})
+        {
+            rearm_read(*value);
+        }
+
+        std::vector<float> coefficients;
+        prepare_latent_rope(plan, position, coefficients);
+        ncnn::VkMat rope;
+        if (!upload_values(coefficients, rope))
+            return false;
+        recording.storage.push_back(rope);
+
+        ncnn::VkMat window_update;
+        if (!allocate(window_update, plan.head_dimension)
+            || !record_latent_transform(implementation.transform_pipeline, key_value, implementation.key_norm, rope, window_update,
+                                        plan.head_dimension, plan.rope_head_dimension, static_cast<uint32_t>(row) * plan.head_dimension,
+                                        0, 1 | 4, 1, plan.norm_epsilon, cmd)
+            || !record_latent_copy(implementation.append_pipeline.get(), window_update, state->window, plan.head_dimension,
+                                   position % plan.sliding_window * plan.head_dimension, cmd)
+            || !record_latent_shadow(window_update, plan.head_dimension, current.window_shadow))
+        {
+            return false;
+        }
+        recording.storage.push_back(window_update);
+
+        const bool completes = plan.compression_ratio != 0 && position % plan.compression_ratio + 1 == plan.compression_ratio;
+        const uint32_t next_count = state->compressed_count + (completes ? 1 : 0);
+        if (next_count > state->compressed_capacity)
+        {
+            const uint32_t capacity = std::max(next_count, std::max(32u, state->compressed_capacity * 2));
+            const auto grow = [&](ncnn::VkMat& value, uint32_t dimension) {
+                ncnn::VkMat replacement;
+                if (!allocate(replacement, static_cast<uint64_t>(capacity) * dimension))
+                    return false;
+                if (state->compressed_count != 0
+                    && !record_latent_copy(implementation.append_pipeline.get(), value, replacement,
+                                           static_cast<uint64_t>(state->compressed_count) * dimension, 0, cmd))
+                {
+                    return false;
+                }
+                recording.storage.push_back(value);
+                value = std::move(replacement);
+                return true;
+            };
+            if (!grow(state->compressed, plan.head_dimension)
+                || (plan.compression_ratio == 4 && !grow(state->index_compressed, plan.index_head_dimension)))
+            {
+                return false;
+            }
+            state->compressed_capacity = capacity;
+        }
+
+        if (plan.compression_ratio != 0)
+        {
+            std::vector<float> compressed_coefficients;
+            if (completes)
+                prepare_latent_rope(plan, position + 1 - plan.compression_ratio, compressed_coefficients);
+            // Upload into distinct storage: same-shape VkMat upload reuses its allocation.
+            ncnn::VkMat compressed_rope;
+            if (completes)
+            {
+                if (!upload_values(compressed_coefficients, compressed_rope))
+                    return false;
+            }
+            else
+            {
+                compressed_rope = rope;
+            }
+            recording.storage.push_back(compressed_rope);
+
+            const auto compress = [&](bool indexer,
+                                      const ncnn::VkMat& values,
+                                      const ncnn::VkMat& scores,
+                                      ncnn::VkMat& compressor_state,
+                                      ncnn::VkMat& compressed,
+                                      ncnn::VkMat& shadow,
+                                      ncnn::VkMat& compressed_shadow) {
+                const uint32_t dimension = indexer ? plan.index_head_dimension : plan.head_dimension;
+                const uint32_t multiplier = plan.compression_ratio == 4 ? 2 : 1;
+                ncnn::VkMat pooled;
+                ncnn::VkMat pending_update;
+                if (!allocate(pooled, dimension) || !allocate(pending_update, 2 * multiplier * dimension))
+                    return false;
+
+                const std::vector<ncnn::VkMat> bindings = {
+                    values, scores,
+                    indexer ? implementation.index_compressor_position : implementation.compressor_position,
+                    compressor_state, pooled, pending_update};
+                std::vector<ncnn::vk_constant_type> constants(5);
+                constants[0].u32 = dimension;
+                constants[1].u32 = plan.compression_ratio;
+                constants[2].u32 = static_cast<uint32_t>(row);
+                constants[3].u32 = static_cast<uint32_t>(position % plan.compression_ratio);
+                constants[4].u32 = plan.compression_ratio == 4 && state->compressed_count != 0 ? 1 : 0;
+                ncnn::VkMat dispatcher;
+                dispatcher.w = 128;
+                dispatcher.h = 1;
+                dispatcher.c = 1;
+                cmd.record_pipeline(implementation.compressor_pipeline.get(), bindings, constants, dispatcher);
+                if (!record_latent_shadow(pending_update, 2 * multiplier * dimension, shadow))
+                    return false;
+                recording.storage.push_back(pooled);
+                recording.storage.push_back(pending_update);
+                if (completes)
+                {
+                    ncnn::VkMat completed;
+                    if (!allocate(completed, dimension)
+                        || !record_latent_transform(implementation.transform_pipeline, pooled,
+                                                    indexer ? implementation.index_compressor_norm : implementation.compressor_norm,
+                                                    compressed_rope, completed, dimension, plan.rope_head_dimension, 0, 0,
+                                                    indexer ? 1 | 2 | 8 : 1 | 4, 1, plan.norm_epsilon, cmd)
+                        || !record_latent_copy(implementation.append_pipeline.get(), completed, compressed, dimension,
+                                               static_cast<uint64_t>(state->compressed_count) * dimension, cmd)
+                        || !record_latent_shadow(completed, dimension, compressed_shadow))
+                    {
+                        return false;
+                    }
+                    recording.storage.push_back(completed);
+                }
+                return true;
+            };
+            if (!compress(false, compressor_values, compressor_scores, state->compressor_state, state->compressed,
+                          current.compressor_shadow, current.compressed_shadow)
+                || (plan.compression_ratio == 4
+                    && !compress(true, index_compressor_values, index_compressor_scores,
+                                 state->index_compressor_state, state->index_compressed,
+                                 current.index_compressor_shadow, current.index_compressed_shadow)))
+            {
+                return false;
+            }
+        }
+
+        ncnn::VkMat indices;
+        const bool selected = plan.compression_ratio == 4 && next_count > plan.index_top_k;
+        if (!selected)
+            indices = state->window;
+        if (selected)
+        {
+            if (!index_projection_ready)
+            {
+                if (!record_projection(implementation.index_query, query_rank, index_query, cmd, recording.storage)
+                    || !record_projection(implementation.index_weights, normalized, index_weights, cmd, recording.storage))
+                {
+                    return false;
+                }
+                recording.storage.push_back(index_query);
+                recording.storage.push_back(index_weights);
+                index_projection_ready = true;
+            }
+            ncnn::VkMat transformed_query;
+            ncnn::VkMat scores;
+            if (!allocate(transformed_query, static_cast<uint64_t>(plan.index_head_count) * plan.index_head_dimension)
+                || !allocate(scores, next_count) || !allocate(indices, std::max(1u, plan.index_top_k))
+                || !record_latent_transform(implementation.transform_pipeline, index_query, implementation.key_norm,
+                                            rope, transformed_query, plan.index_head_dimension, plan.rope_head_dimension,
+                                            static_cast<uint32_t>(row) * plan.index_head_count * plan.index_head_dimension,
+                                            0, 2 | 8, plan.index_head_count, plan.norm_epsilon, cmd))
+            {
+                return false;
+            }
+            {
+                const std::vector<ncnn::VkMat> bindings = {transformed_query, state->index_compressed, index_weights, scores};
+                std::vector<ncnn::vk_constant_type> constants(6);
+                constants[0].u32 = plan.index_head_dimension;
+                constants[1].u32 = plan.index_head_count;
+                constants[2].u32 = next_count;
+                constants[3].u32 = 0;
+                constants[4].u32 = static_cast<uint32_t>(row) * plan.index_head_count;
+                constants[5].f = 1.0f / std::sqrt(static_cast<float>(plan.index_head_dimension * plan.index_head_count));
+                ncnn::VkMat dispatcher;
+                dispatcher.w = static_cast<int>(std::min(next_count, 65535u) * 128);
+                dispatcher.h = static_cast<int>((next_count + 65534) / 65535);
+                dispatcher.c = 1;
+                cmd.record_pipeline(implementation.index_score_pipeline.get(), bindings, constants, dispatcher);
+            }
+            const bool parallel_selection = record_latent_parallel_topk(implementation.index_sort_pipeline,
+                                                                        implementation.index_merge_pipeline,
+                                                                        scores, next_count, plan.index_top_k, indices,
+                                                                        implementation.context, recording.storage, cmd);
+            if (!parallel_selection)
+            {
+                const std::vector<ncnn::VkMat> bindings = {scores, indices};
+                std::vector<ncnn::vk_constant_type> constants(2);
+                constants[0].u32 = next_count;
+                constants[1].u32 = plan.index_top_k;
+                ncnn::VkMat dispatcher;
+                dispatcher.w = 128;
+                dispatcher.h = 1;
+                dispatcher.c = 1;
+                cmd.record_pipeline(implementation.index_topk_pipeline.get(), bindings, constants, dispatcher);
+            }
+            current.selected_count = plan.index_top_k;
+            if (current.selected_count != 0)
+            {
+                if (!record_latent_shadow(indices, current.selected_count, current.selected_shadow))
+                    return false;
+            }
+            recording.storage.push_back(transformed_query);
+            recording.storage.push_back(scores);
+            recording.storage.push_back(indices);
+        }
+
+        {
+            const std::vector<ncnn::VkMat> bindings = {query, rope, normalized_query};
+            std::vector<ncnn::vk_constant_type> constants(5);
+            constants[0].u32 = plan.head_dimension;
+            constants[1].u32 = plan.head_count;
+            constants[2].u32 = plan.rope_head_dimension;
+            constants[3].u32 = static_cast<uint32_t>(row);
+            constants[4].f = plan.norm_epsilon;
+            ncnn::VkMat dispatcher;
+            dispatcher.w = 128;
+            dispatcher.h = 1;
+            dispatcher.c = static_cast<int>(plan.head_count);
+            cmd.record_pipeline(implementation.query_pipeline.get(), bindings, constants, dispatcher);
+        }
+        {
+            const std::vector<ncnn::VkMat> bindings = {
+                normalized_query, state->window,
+                state->compressed.empty() ? state->window : state->compressed,
+                indices, implementation.sinks, rope, attention, normalized_query};
+            std::vector<ncnn::vk_constant_type> constants(12);
+            constants[0].u32 = plan.head_dimension;
+            constants[1].u32 = plan.head_count;
+            constants[2].u32 = plan.rope_head_dimension;
+            constants[3].u32 = static_cast<uint32_t>(row);
+            constants[4].u32 = plan.sliding_window;
+            const uint64_t window_begin = position + 1 > plan.sliding_window ? position + 1 - plan.sliding_window : 0;
+            constants[5].u32 = static_cast<uint32_t>(window_begin % plan.sliding_window);
+            constants[6].u32 = static_cast<uint32_t>(position + 1 - window_begin);
+            constants[7].u32 = selected ? current.selected_count : next_count;
+            constants[8].u32 = selected ? 1 : 0;
+            constants[9].f = 1.0f / std::sqrt(static_cast<float>(plan.head_dimension));
+            constants[10].u32 = 1;
+            constants[11].u32 = 0;
+            ncnn::VkMat dispatcher;
+            dispatcher.w = 128;
+            dispatcher.h = 1;
+            dispatcher.c = static_cast<int>(plan.head_count);
+
+            // Parallelize dot products above 8 candidates while keeping canonical online softmax order.
+            ncnn::VkMat scores;
+            const uint32_t candidate_count = constants[6].u32 + constants[7].u32;
+            if (candidate_count >= 8 && implementation.score_pipeline && implementation.scored_attention_pipeline
+                && allocate(scores, static_cast<uint64_t>(plan.head_count) * candidate_count))
+            {
+                const std::vector<ncnn::VkMat> score_bindings = {bindings[0], bindings[1], bindings[2], bindings[3], scores};
+                ncnn::VkMat score_dispatcher;
+                score_dispatcher.w = static_cast<int>(std::min(candidate_count, 65535u) * 128);
+                score_dispatcher.h = static_cast<int>((candidate_count + 65534) / 65535);
+                score_dispatcher.c = static_cast<int>(plan.head_count);
+                cmd.record_pipeline(implementation.score_pipeline.get(), score_bindings, constants, score_dispatcher);
+                std::vector<ncnn::VkMat> scored_bindings(bindings.begin(), bindings.begin() + 7);
+                scored_bindings[0] = scores;
+                cmd.record_pipeline(implementation.scored_attention_pipeline.get(), scored_bindings, constants, dispatcher);
+                recording.storage.push_back(scores);
+            }
+            else
+            {
+                cmd.record_pipeline(implementation.attention_pipeline.get(), bindings, constants, dispatcher);
+            }
+        }
+        state->token_count = position + 1;
+        state->compressed_count = next_count;
+    }
+
+    ncnn::VkMat output_rank;
+    if (!record_projection(implementation.output_a, attention, output_rank, cmd, recording.storage)
+        || !record_projection(implementation.output_b, output_rank, output, cmd, recording.storage))
+    {
+        return false;
+    }
+    recording.storage.push_back(output_rank);
+    recording.storage.push_back(output);
+
+    struct ShadowView
+    {
+        ncnn::VkMat* value;
+        uint64_t offset;
+        uint32_t count;
+    };
+    std::vector<ShadowView> shadow_views;
+    uint64_t shadow_count = 0;
+    for (LatentRecordedRow_vulkan& row : recording.rows)
+    {
+        for (ncnn::VkMat* value : {&row.window_shadow, &row.compressor_shadow, &row.index_compressor_shadow,
+                                   &row.compressed_shadow, &row.index_compressed_shadow, &row.selected_shadow})
+        {
+            if (value->empty())
+                continue;
+            const uint64_t count = value->total();
+            if (count > std::numeric_limits<uint32_t>::max()
+                || shadow_count + count > static_cast<uint64_t>(std::numeric_limits<int>::max()))
+            {
+                return false;
+            }
+            shadow_views.push_back({value, shadow_count, static_cast<uint32_t>(count)});
+            shadow_count += count;
+        }
+    }
+
+    ncnn::VkMat packed_shadow;
+    if (!allocate(packed_shadow, shadow_count))
+        return false;
+    for (const ShadowView& view : shadow_views)
+    {
+        if (!record_latent_copy(implementation.append_pipeline.get(), *view.value, packed_shadow,
+                                view.count, view.offset, cmd))
+        {
+            return false;
+        }
+    }
+    if (!prepare_staging_batch(recording.shadow_staging, 1, static_cast<uint32_t>(shadow_count),
+                               implementation.context->staging_allocator())
+        || !record_staging_download(latent_flat_view(packed_shadow, 0, static_cast<uint32_t>(shadow_count)),
+                                    1, static_cast<uint32_t>(shadow_count), recording.shadow_staging, cmd,
+                                    implementation.context->device(), implementation.opt))
+    {
+        return false;
+    }
+    for (const ShadowView& view : shadow_views)
+        *view.value = latent_flat_view(recording.shadow_staging, view.offset, view.count);
+    recording.storage.push_back(packed_shadow);
+    ++recording.downloads;
+    return true;
+}
+
+} // namespace moe
+} // namespace ncnn

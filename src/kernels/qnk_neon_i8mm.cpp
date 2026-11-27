@@ -6,6 +6,8 @@
 #include "qnk.h"
 #include "ops.h"
 #include "vector.h"
+#include "engine/cpu.h"
+#include "ncnn/moe/runtime.h"
 
 #if defined(__aarch64__) || defined(_M_ARM64)
 
@@ -15,13 +17,6 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
-
-#if defined(__APPLE__)
-#include <sys/sysctl.h>
-#elif defined(__linux__)
-#include <asm/hwcap.h>
-#include <sys/auxv.h>
-#endif
 
 #if defined(_OPENMP)
 #include <omp.h>
@@ -42,15 +37,8 @@ bool neon_qnk_i8mm_supported() noexcept
     // Without the compile-time feature the kernels below are empty stubs;
     // claiming support would leave the projection output unwritten.
     return false;
-#elif defined(__APPLE__)
-    int value = 0;
-    std::size_t size = sizeof(value);
-    return sysctlbyname("hw.optional.arm.FEAT_I8MM", &value, &size, nullptr, 0) == 0
-           && value != 0;
-#elif defined(__linux__) && defined(HWCAP_I8MM)
-    return (getauxval(AT_HWCAP2) & HWCAP_I8MM) != 0;
 #else
-    return false;
+    return (cpu_isa_flags() & CpuIsaArmI8mm) != 0;
 #endif
 }
 

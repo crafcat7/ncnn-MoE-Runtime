@@ -1,8 +1,8 @@
 #include "latentattention.h"
 
 #include "attention.h"
-#include "backends/ncnn/linear.h"
-#include "backends/ncnn/latentattention_vulkan.h"
+#include "backends/ncnn/linear/linear.h"
+#include "backends/ncnn/layer/latentattention_vulkan.h"
 #include "fastmath.h"
 #include "float8.h"
 #include "mxfp4.h"

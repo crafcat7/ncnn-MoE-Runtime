@@ -1,7 +1,7 @@
 #include "test_runtime_decls.h"
 #include "test_runtime_support.h"
 
-#include "backends/ncnn/attention_vulkan.h"
+#include "backends/ncnn/layer/attention_vulkan.h"
 
 namespace ncnn {
 namespace moe {

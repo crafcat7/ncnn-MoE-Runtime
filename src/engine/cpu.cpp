@@ -38,6 +38,14 @@
 #if __has_include(<asm/hwcap.h>)
 #include <asm/hwcap.h>
 #endif
+#ifndef HWCAP_ASIMDDP
+#define NCNN_MOE_HWCAP_ASIMDDP_BIT 20
+#define HWCAP_ASIMDDP              (1UL << NCNN_MOE_HWCAP_ASIMDDP_BIT)
+#endif
+#ifndef HWCAP2_I8MM
+#define NCNN_MOE_HWCAP2_I8MM_BIT 13
+#define HWCAP2_I8MM              (1UL << NCNN_MOE_HWCAP2_I8MM_BIT)
+#endif
 #endif
 
 #if defined(_OPENMP)
@@ -174,6 +182,15 @@ static uint64_t enabled_xstate() noexcept
 }
 #endif
 
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(_M_ARM64))
+static bool apple_arm_feature(const char* name) noexcept
+{
+    int value = 0;
+    std::size_t size = sizeof(value);
+    return sysctlbyname(name, &value, &size, nullptr, 0) == 0 && value != 0;
+}
+#endif
+
 static uint64_t detect_cpu_isa_flags() noexcept
 {
     uint64_t flags = 0;
@@ -197,6 +214,26 @@ static uint64_t detect_cpu_isa_flags() noexcept
     }
 #elif defined(__ARM_FEATURE_SVE2)
     flags |= CpuIsaArmSve2;
+#endif
+#if defined(__linux__) && defined(__aarch64__)
+    if ((getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0)
+        flags |= CpuIsaArmDotProd;
+    if ((getauxval(AT_HWCAP2) & HWCAP2_I8MM) != 0)
+        flags |= CpuIsaArmI8mm;
+#elif defined(__APPLE__)
+    if (apple_arm_feature("hw.optional.arm.FEAT_DotProd"))
+        flags |= CpuIsaArmDotProd;
+    if (apple_arm_feature("hw.optional.arm.FEAT_I8MM"))
+        flags |= CpuIsaArmI8mm;
+#elif defined(_WIN32)
+#ifdef PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE
+    if (IsProcessorFeaturePresent(PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE))
+        flags |= CpuIsaArmDotProd;
+#endif
+#ifdef PF_ARM_V86_I8MM_INSTRUCTIONS_AVAILABLE
+    if (IsProcessorFeaturePresent(PF_ARM_V86_I8MM_INSTRUCTIONS_AVAILABLE))
+        flags |= CpuIsaArmI8mm;
+#endif
 #endif
 #elif defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
     const uint32_t maximum_leaf = maximum_cpuid_leaf();
@@ -347,6 +384,10 @@ std::string cpu_isa_names(uint64_t flags)
         append_name(names, "sve");
     if (has_flag(flags, CpuIsaArmSve2))
         append_name(names, "sve2");
+    if (has_flag(flags, CpuIsaArmDotProd))
+        append_name(names, "dotprod");
+    if (has_flag(flags, CpuIsaArmI8mm))
+        append_name(names, "i8mm");
     if (has_flag(flags, CpuIsaX86Avx2Fma))
         append_name(names, "avx2-fma");
     if (has_flag(flags, CpuIsaX86Avx512))

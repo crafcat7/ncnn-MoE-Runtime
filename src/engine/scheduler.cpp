@@ -155,9 +155,7 @@ Result<std::vector<Result<PrefillResult>>> BatchSchedulerPrivate::prefill(std::s
     std::vector<DecodeBatchEntry> entries;
     entries.reserve(requests.size());
 
-    for (size_t token_index = 0;
-         token_index < maximum_tokens;
-         ++token_index)
+    for (size_t token_index = 0; token_index < maximum_tokens; ++token_index)
     {
         entries.clear();
         for (size_t session_index = 0;

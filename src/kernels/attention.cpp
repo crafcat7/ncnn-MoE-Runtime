@@ -8,8 +8,8 @@
 #include "bfloat16.h"
 #include "statecache.h"
 #include "vector.h"
-#include "backends/ncnn/attention_vulkan.h"
-#include "backends/ncnn/linear.h"
+#include "backends/ncnn/layer/attention_vulkan.h"
+#include "backends/ncnn/linear/linear.h"
 #include "graph/compiledoperator.h"
 #include "ncnn/moe/option.h"
 

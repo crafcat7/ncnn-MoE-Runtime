@@ -1,8 +1,8 @@
 #ifndef NCNN_MOE_VULKAN_H
 #define NCNN_MOE_VULKAN_H
 
-#include "ncnn/moe/types.h"
 #include "ncnn/moe/result.h"
+#include "ncnn/moe/types.h"
 
 #include <cstdint>
 #include <limits>
@@ -12,8 +12,6 @@
 namespace ncnn {
 namespace moe {
 
-// Saturated shape arithmetic lets metadata-only workspace queries report overflow.
-// The graph planner rejects UINT64_MAX before allocating any buffer.
 inline uint64_t saturating_add_u64(uint64_t left, uint64_t right) noexcept
 {
     return right > std::numeric_limits<uint64_t>::max() - left
@@ -29,8 +27,6 @@ inline uint64_t saturating_multiply_u64(uint64_t left, uint64_t right) noexcept
 }
 
 // Opaque ownership token for one model/runtime Vulkan resource domain.
-// Operators created with the same token share command resources; different
-// tokens never share mutable backend state.
 class VulkanRuntime;
 using VulkanRuntimePtr = std::shared_ptr<VulkanRuntime>;
 
@@ -40,23 +36,19 @@ struct VulkanGraphArenaSize
     uint64_t total_physical_size = 0;
 };
 
-// GraphResources retains this opaque Context owner before preparing operators.
-// Keeping it outside VulkanRuntime avoids a runtime/Context ownership cycle.
-[[nodiscard]] std::shared_ptr<void> retain_vulkan_graph_context(const VulkanRuntimePtr& vulkan_runtime,
+// Keeps the model VulkanContext alive outside VulkanRuntime to avoid a cycle.
+[[nodiscard]] std::shared_ptr<void> retain_vulkan_graph_context(const VulkanRuntimePtr& runtime,
                                                                 uint32_t device_index,
-                                                                uint64_t optimization_flags) noexcept;
+                                                                uint64_t opt_flags) noexcept;
 
-// Reserve the already prepared model Context's stable blob/workspace allocator.
-// Physical sizes include Vulkan memory requirements, rather than logical tensor
-// sizes. Preparation is snapshotted by the first reservation; compute is the
-// additional backing retained afterwards. A failed reservation never selects CPU.
-[[nodiscard]] Result<VulkanGraphArenaSize> reserve_vulkan_graph_compute(const VulkanRuntimePtr& vulkan_runtime,
+[[nodiscard]] Result<VulkanGraphArenaSize> reserve_vulkan_graph_compute(const VulkanRuntimePtr& runtime,
                                                                         uint32_t device_index,
-                                                                        uint64_t optimization_flags,
+                                                                        uint64_t opt_flags,
                                                                         uint64_t compute_bytes);
-[[nodiscard]] VulkanGraphArenaSize query_vulkan_graph_compute(const VulkanRuntimePtr& vulkan_runtime,
+
+[[nodiscard]] VulkanGraphArenaSize query_vulkan_graph_compute(const VulkanRuntimePtr& runtime,
                                                               uint32_t device_index,
-                                                              uint64_t optimization_flags) noexcept;
+                                                              uint64_t opt_flags) noexcept;
 
 struct VulkanStatistics
 {
@@ -92,10 +84,8 @@ struct VulkanStatistics
 [[nodiscard]] uint32_t get_gpu_count() noexcept;
 [[nodiscard]] uint32_t get_default_gpu_index() noexcept;
 [[nodiscard]] std::vector<GpuInfo> get_gpu_infos();
-[[nodiscard]] VulkanStatistics get_vulkan_statistics(const VulkanRuntimePtr& vulkan_runtime) noexcept;
-
-[[nodiscard]] VulkanRuntimePtr
-create_vulkan_runtime();
+[[nodiscard]] VulkanStatistics get_vulkan_statistics(const VulkanRuntimePtr& runtime) noexcept;
+[[nodiscard]] VulkanRuntimePtr create_vulkan_runtime();
 
 } // namespace moe
 } // namespace ncnn

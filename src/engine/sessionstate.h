@@ -1,10 +1,10 @@
 #ifndef NCNN_MOE_SESSIONSTATE_H
 #define NCNN_MOE_SESSIONSTATE_H
 
-#include "backends/ncnn/latentlayer_vulkan.h"
-#include "backends/ncnn/moecombine_vulkan.h"
-#include "backends/ncnn/gatedresiduallayer_vulkan.h"
-#include "backends/ncnn/gpusegment_vulkan.h"
+#include "backends/ncnn/net/latent_layer.h"
+#include "backends/ncnn/layer/moecombine_vulkan.h"
+#include "backends/ncnn/net/residual_layer.h"
+#include "backends/ncnn/net/segment.h"
 #include "kernels/attention.h"
 #include "kernels/gateddeltanet.h"
 #include "kernels/hyperconnection.h"

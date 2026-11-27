@@ -10,7 +10,7 @@
 #include "ncnn/moe/option.h"
 #include "ncnn/moe/types.h"
 #include "backends/ncnn/vulkan.h"
-#include "backends/ncnn/expertbankplan_vulkan.h"
+#include "backends/ncnn/expert/plan.h"
 #include "storage/weightstore.h"
 
 #include <cstdint>

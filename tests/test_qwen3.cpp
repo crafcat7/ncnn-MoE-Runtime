@@ -1,5 +1,5 @@
 #include "models/modeladapter_qwen3.h"
-#include "backends/ncnn/gpusegment_vulkan.h"
+#include "backends/ncnn/net/segment.h"
 #include "backends/ncnn/vulkan.h"
 #include "graph/compiler.h"
 #include "engine/executor.h"

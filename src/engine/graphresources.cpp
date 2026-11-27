@@ -1,10 +1,10 @@
 #include "graphresources.h"
 
-#include "backends/ncnn/modelpipeline.h"
-#include "backends/ncnn/gpusegment_vulkan.h"
-#include "backends/ncnn/expertbank_vulkan.h"
+#include "backends/ncnn/net/model.h"
+#include "backends/ncnn/net/segment.h"
+#include "backends/ncnn/expert/bank.h"
 #include "backends/ncnn/vulkan.h"
-#include "backends/ncnn/vulkancontext.h"
+#include "backends/ncnn/core/context.h"
 #include "graph/compiledmodel.h"
 #include "storage/expertcache.h"
 

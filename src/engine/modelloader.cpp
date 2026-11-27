@@ -20,8 +20,8 @@
 #include "storage/mappedfile.h"
 #include "graph/memoryplan.h"
 #include "backends/ncnn/vulkan.h"
-#include "backends/ncnn/modelpipeline.h"
-#include "backends/ncnn/expertbackend_vulkan.h"
+#include "backends/ncnn/net/model.h"
+#include "backends/ncnn/expert/backend.h"
 
 #include <algorithm>
 #include <fstream>

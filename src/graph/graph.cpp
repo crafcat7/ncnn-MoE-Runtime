@@ -1,6 +1,6 @@
 #include "graph.h"
 
-#include "backends/ncnn/modelpipeline.h"
+#include "backends/ncnn/net/model.h"
 #include "compiledmodel.h"
 #include "ncnn/moe/option.h"
 
@@ -667,7 +667,7 @@ Result<void> build_graph(CompiledModel& compiled, bool use_vulkan_experts)
         {
             const bool vulkan = compiled.opt.hybrid_mode != HybridMode::CpuOnly
                                 && ((use_vulkan_experts && layer.dense_ffn.use_gpu_cache)
-                                    || support_vulkan_dense_ffn(compiled.operators, layer.dense_ffn));
+                                    || support_vulkan_ffn(compiled.operators, layer.dense_ffn));
             const BlobId dense_output = add_blob(graph, prefix + "dense_ffn.hidden",
                                                  compiled.descriptor.activation_dtype,
                                                  {0, compiled.descriptor.hidden_size});
@@ -685,7 +685,7 @@ Result<void> build_graph(CompiledModel& compiled, bool use_vulkan_experts)
         {
             const bool vulkan = compiled.opt.hybrid_mode != HybridMode::CpuOnly
                                 && ((use_vulkan_experts && layer.dense_ffn.use_gpu_cache)
-                                    || support_vulkan_dense_ffn(compiled.operators, layer.dense_ffn));
+                                    || support_vulkan_ffn(compiled.operators, layer.dense_ffn));
             const BlobId output = add_blob(graph, prefix + "ffn.hidden", compiled.descriptor.activation_dtype,
                                            {0, compiled.descriptor.hidden_size});
             add_node(graph,
