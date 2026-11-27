@@ -4,6 +4,8 @@
 #include "backends/ncnn/core/transfer.h"
 #include "kernels/activationbuffer.h"
 
+#include <layer.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -416,15 +418,7 @@ bool create_pipeline(const std::shared_ptr<VulkanContext>& ctx,
             return false;
     }
 
-    dst = std::shared_ptr<ncnn::Pipeline>(pipe.release(),
-                                          [ctx = ctx](ncnn::Pipeline* value) mutable {
-                                              {
-                                                  const std::lock_guard<std::mutex> lock(ctx->command_mutex());
-                                                  delete value;
-                                              }
-                                              ctx.reset();
-                                          });
-    ctx->cache_pipeline(src, pipe_variant, dst);
+    dst = ctx->cache_pipeline(src, pipe_variant, std::shared_ptr<ncnn::Pipeline>(pipe.release()));
     return true;
 }
 
@@ -465,17 +459,24 @@ bool create_pipeline_prefixed(const std::shared_ptr<VulkanContext>& ctx,
     if (pipe->create(spirv.data(), spirv.size() * sizeof(uint32_t), specs) != 0)
         return false;
 
-    dst = std::shared_ptr<ncnn::Pipeline>(pipe.release(),
-                                          [ctx = ctx](ncnn::Pipeline* value) mutable {
-                                              {
-                                                  const std::lock_guard<std::mutex> lock(ctx->command_mutex());
-                                                  delete value;
-                                              }
-                                              ctx.reset();
-                                          });
     (void)shader_variant;
-    ctx->cache_pipeline(base_src, pipe_variant, dst);
+    dst = ctx->cache_pipeline(base_src, pipe_variant, std::shared_ptr<ncnn::Pipeline>(pipe.release()));
     return true;
+}
+
+std::shared_ptr<ncnn::Layer> own_vk_layer(const std::shared_ptr<VulkanContext>& ctx,
+                                          ncnn::Layer* layer,
+                                          const ncnn::Option& opt)
+{
+    if (!layer)
+        return {};
+    return std::shared_ptr<ncnn::Layer>(layer, [ctx = ctx, opt](ncnn::Layer* l) mutable {
+        ctx->retire([l, opt]() {
+            l->destroy_pipeline(opt);
+            delete l;
+        });
+        ctx.reset();
+    });
 }
 
 void compute_yarn_inv_freq(uint32_t rope_dim, uint32_t active_dim, float theta,
@@ -576,6 +577,13 @@ void VulkanContext::release_resources() noexcept
     {
         delete slot.command;
         slot.command = nullptr;
+    }
+
+    // Destroy deferred resources and cached pipelines before releasing allocators.
+    drain_retired();
+    {
+        const std::lock_guard<std::mutex> lock(pipeline_cache_mutex);
+        pipelines.clear();
     }
 
     for (VkTransferSlot& slot : transfer_slots)
@@ -759,14 +767,58 @@ std::shared_ptr<ncnn::Pipeline> VulkanContext::find_pipeline(const char* src, ui
 {
     const std::lock_guard<std::mutex> lock(pipeline_cache_mutex);
     const auto it = pipelines.find({src, variant});
-    return it == pipelines.end() ? std::shared_ptr<ncnn::Pipeline>{} : it->second.lock();
+    return it == pipelines.end() ? std::shared_ptr<ncnn::Pipeline>{} : it->second;
 }
 
-void VulkanContext::cache_pipeline(const char* src, uint64_t variant,
-                                   const std::shared_ptr<ncnn::Pipeline>& pipe)
+std::shared_ptr<ncnn::Pipeline> VulkanContext::cache_pipeline(const char* src, uint64_t variant,
+                                                              std::shared_ptr<ncnn::Pipeline> pipe)
 {
-    const std::lock_guard<std::mutex> lock(pipeline_cache_mutex);
-    pipelines[{src, variant}] = pipe;
+    std::shared_ptr<ncnn::Pipeline> out;
+    {
+        const std::lock_guard<std::mutex> lock(pipeline_cache_mutex);
+        auto [it, inserted] = pipelines.try_emplace(ShaderKey{src, variant}, std::move(pipe));
+        out = it->second;
+    }
+    if (pipe)
+        retire([dup = std::move(pipe)]() mutable { dup.reset(); });
+    return out;
+}
+
+void VulkanContext::retire(std::function<void()> fn) noexcept
+{
+    if (!fn)
+        return;
+    try
+    {
+        const std::lock_guard<std::mutex> lock(retire_lock);
+        retired.push_back(std::move(fn));
+        has_retired.store(true, std::memory_order_release);
+    }
+    catch (...)
+    {
+    }
+}
+
+void VulkanContext::drain_retired() noexcept
+{
+    if (!has_retired.load(std::memory_order_acquire))
+        return;
+    std::vector<std::function<void()>> pending;
+    {
+        const std::lock_guard<std::mutex> lock(retire_lock);
+        pending.swap(retired);
+        has_retired.store(false, std::memory_order_release);
+    }
+    for (auto& fn : pending)
+    {
+        try
+        {
+            fn();
+        }
+        catch (...)
+        {
+        }
+    }
 }
 
 VkTransferLease VulkanContext::acquire_transfer_slot()

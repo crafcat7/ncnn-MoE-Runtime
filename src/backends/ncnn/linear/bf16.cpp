@@ -275,20 +275,6 @@ bool create_cm2_gemm(const std::shared_ptr<VulkanContext>& context,
     if (device->info.subgroup_size() != 32)
         return false;
 
-    ncnn::Option cast_opt = option;
-    cast_opt.use_fp16_packed = false;
-    cast_opt.use_fp16_storage = false;
-    cast_opt.use_fp16_arithmetic = false;
-    cast_opt.use_bf16_packed = false;
-    cast_opt.use_bf16_storage = false;
-    std::shared_ptr<ncnn::Pipeline> cast_pipeline;
-    if (!create_pipeline(context, fp32_to_bf16_shader,
-                         static_cast<int>(sizeof(fp32_to_bf16_shader) - 1),
-                         cast_opt, 0, 0, 256, cast_pipeline))
-    {
-        return false;
-    }
-
     struct Geometry
     {
         uint32_t bm;
@@ -302,6 +288,14 @@ bool create_cm2_gemm(const std::shared_ptr<VulkanContext>& context,
         {64, 64, 64, 128},
         {32, 64, 64, 128},
     };
+
+    ncnn::Option cast_opt = option;
+    cast_opt.use_fp16_packed = false;
+    cast_opt.use_fp16_storage = false;
+    cast_opt.use_fp16_arithmetic = false;
+    cast_opt.use_bf16_packed = false;
+    cast_opt.use_bf16_storage = false;
+    std::shared_ptr<ncnn::Pipeline> cast_pipeline;
 
     ncnn::Option compile_option = cast_opt;
     compile_option.use_bf16_storage = true;
@@ -323,6 +317,10 @@ bool create_cm2_gemm(const std::shared_ptr<VulkanContext>& context,
                 item.bk = 32u;
             else
                 continue;
+        }
+        if (!cast_pipeline && !create_pipeline(context, fp32_to_bf16_shader, static_cast<int>(sizeof(fp32_to_bf16_shader) - 1), cast_opt, 0, 0, 256, cast_pipeline))
+        {
+            return false;
         }
 
         const uint64_t variant = static_cast<uint64_t>(item.bm)
@@ -649,12 +647,7 @@ bool create_coop_gemm(const std::shared_ptr<VulkanContext>& context,
     option.workspace_vkallocator = base.workspace_vkallocator;
     option.staging_vkallocator = base.staging_vkallocator;
 
-    std::shared_ptr<ncnn::Layer> layer(raw, [option](ncnn::Layer* value) {
-        if (!value)
-            return;
-        value->destroy_pipeline(option);
-        delete value;
-    });
+    std::shared_ptr<ncnn::Layer> layer = own_vk_layer(context, raw, option);
     raw->vkdev = device;
 
     ncnn::ParamDict pd;

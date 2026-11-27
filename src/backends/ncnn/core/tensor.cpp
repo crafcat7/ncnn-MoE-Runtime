@@ -221,6 +221,7 @@ int VkComputeBatch::reset() noexcept
     recorded = 0;
     submitted = 0;
     completion_error = res;
+    context.drain_retired();
     return res;
 }
 

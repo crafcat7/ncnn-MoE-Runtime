@@ -35,12 +35,7 @@ namespace moe {
 static std::shared_ptr<ncnn::Layer> segment_add(const std::shared_ptr<VulkanContext>& context,
                                                 const ncnn::Option& option)
 {
-    auto result = std::shared_ptr<ncnn::Layer>(ncnn::create_layer_vulkan(ncnn::LayerType::BinaryOp), [context, option](ncnn::Layer* layer) {
-        if (!layer) return;
-        const std::lock_guard<std::mutex> lock(context->command_mutex());
-        layer->destroy_pipeline(option);
-        delete layer;
-    });
+    auto result = own_vk_layer(context, ncnn::create_layer_vulkan(ncnn::LayerType::BinaryOp), option);
     if (!result) return {};
 
     const std::lock_guard<std::mutex> lock(context->command_mutex());

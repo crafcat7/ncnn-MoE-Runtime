@@ -26,6 +26,7 @@
 #endif
 
 namespace ncnn {
+class Layer;
 namespace moe {
 
 inline constexpr uint64_t vulkan_weight_block_size = 64 * 1024;
@@ -261,7 +262,8 @@ public:
                                                                              const ncnn::Option& opt,
                                                                              uint64_t variant);
     [[nodiscard]] std::shared_ptr<ncnn::Pipeline> find_pipeline(const char* src, uint64_t variant) const;
-    void cache_pipeline(const char* src, uint64_t variant, const std::shared_ptr<ncnn::Pipeline>& pipe);
+    [[nodiscard]] std::shared_ptr<ncnn::Pipeline> cache_pipeline(const char* src, uint64_t variant,
+                                                                 std::shared_ptr<ncnn::Pipeline> pipe);
 
     [[nodiscard]] VkTransferLease acquire_transfer_slot();
 
@@ -288,9 +290,14 @@ private:
     };
 
     friend class VkComputeBatch;
+    friend std::shared_ptr<ncnn::Layer> own_vk_layer(const std::shared_ptr<VulkanContext>& ctx,
+                                                     ncnn::Layer* layer,
+                                                     const ncnn::Option& opt);
 
     VulkanContext(ncnn::VulkanDevice* device, VulkanRuntimePtr runtime, uint64_t opt_flags);
     void release_resources() noexcept;
+    void retire(std::function<void()> fn) noexcept;
+    void drain_retired() noexcept;
 
     // Reused under command_mutex(); each batch drains before releasing the lock.
     std::vector<std::unique_ptr<ncnn::VkCompute>> ordered_commands;
@@ -312,7 +319,11 @@ private:
 
     mutable std::mutex pipeline_cache_mutex;
     std::unordered_map<ShaderKey, std::shared_ptr<const std::vector<uint32_t>>, ShaderKeyHash> shader_binaries;
-    std::unordered_map<ShaderKey, std::weak_ptr<ncnn::Pipeline>, ShaderKeyHash> pipelines;
+    std::unordered_map<ShaderKey, std::shared_ptr<ncnn::Pipeline>, ShaderKeyHash> pipelines;
+
+    std::mutex retire_lock;
+    std::atomic<bool> has_retired{false};
+    std::vector<std::function<void()>> retired;
 };
 
 // --- Common inline primitives ------------------------------------------------
@@ -447,7 +458,7 @@ bool prepare_float_upload(const TensorData& src, ncnn::Mat& dst);
 
 [[nodiscard]] std::string prefix_shader(const char* src, int len, const char* defines);
 
-// Compiles/caches a compute pipeline with a command-mutex-guarded deleter.
+// Compiles and caches a compute pipeline owned by VulkanContext.
 [[nodiscard]] bool create_pipeline(const std::shared_ptr<VulkanContext>& ctx,
                                    const char* src,
                                    int len,
@@ -476,6 +487,12 @@ bool prepare_float_upload(const TensorData& src, ncnn::Mat& dst);
                                             int subgroup_size = 0,
                                             int ly = 1,
                                             int lz = 1);
+
+// Wraps a Vulkan ncnn::Layer so destruction defers to VulkanContext teardown
+// or idle batch reset instead of locking command_mutex() in a deleter.
+[[nodiscard]] std::shared_ptr<ncnn::Layer> own_vk_layer(const std::shared_ptr<VulkanContext>& ctx,
+                                                        ncnn::Layer* layer,
+                                                        const ncnn::Option& opt);
 
 void compute_yarn_inv_freq(uint32_t rope_dim, uint32_t active_dim, float theta,
                            float scale, float ntk_alpha, float ntk_beta,

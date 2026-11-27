@@ -48,15 +48,7 @@ static bool create_mxfp4_pipeline(const std::shared_ptr<VulkanContext>& context,
     if (pipe->create(spirv->data(), spirv->size() * sizeof(uint32_t), specs) != 0)
         return false;
 
-    dst = std::shared_ptr<ncnn::Pipeline>(pipe.release(),
-                                          [context = context](ncnn::Pipeline* value) mutable {
-                                              {
-                                                  const std::lock_guard<std::mutex> lock(context->command_mutex());
-                                                  delete value;
-                                              }
-                                              context.reset();
-                                          });
-    context->cache_pipeline(src, key, dst);
+    dst = context->cache_pipeline(src, key, std::shared_ptr<ncnn::Pipeline>(pipe.release()));
     return true;
 }
 

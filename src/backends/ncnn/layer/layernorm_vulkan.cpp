@@ -59,15 +59,7 @@ std::shared_ptr<LayerNorm_vulkan> LayerNorm_vulkan::create(const TensorData& wei
     if (!raw_layer)
         return {};
 
-    impl.layer = std::shared_ptr<ncnn::Layer>(raw_layer, [context = impl.context, option = upload_opt](ncnn::Layer* layer) mutable {
-        if (!layer)
-            return;
-        {
-            const std::lock_guard<std::mutex> lock(context->command_mutex());
-            layer->destroy_pipeline(option);
-        }
-        delete layer;
-    });
+    impl.layer = own_vk_layer(impl.context, raw_layer, upload_opt);
 
     raw_layer->vkdev = impl.context->device();
     ncnn::ParamDict params;
