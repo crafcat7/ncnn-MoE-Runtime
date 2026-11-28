@@ -1,6 +1,8 @@
 #ifndef NCNN_MOE_MXFP4_H
 #define NCNN_MOE_MXFP4_H
 
+#include "kernels/cpu/cpu_caps.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -8,15 +10,6 @@
 
 namespace ncnn {
 namespace moe {
-
-enum class MxFp4KernelKind
-{
-    Scalar,
-    ArmNeon,
-    ArmSve2,
-    X86Avx2,
-    X86Avx512
-};
 
 [[nodiscard]] MxFp4KernelKind mxfp4_kernel_kind() noexcept;
 [[nodiscard]] const char* mxfp4_kernel_name() noexcept;

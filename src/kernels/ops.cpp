@@ -8,7 +8,7 @@
 #include "mxfp4.h"
 #include "qnk.h"
 #include "vector.h"
-#include "backends/ncnn/linear/linear.h"
+#include "backends/dispatch.h"
 #include "engine/cpu.h"
 #include "graph/compiledoperator.h"
 #include "ncnn/moe/option.h"
@@ -851,14 +851,19 @@ bool forward_linear(std::initializer_list<const TensorData*> matrices,
         for (size_t i = 0; i < matrix_count; ++i)
         {
             const CompiledOperator* op = owners ? owners[i] : nullptr;
-            if (op && (op->linear || op->bfloat16 || op->float8 || op->qnk))
+            if (has_vulkan_linear_operator(op))
                 return false;
         }
         std::array<std::shared_ptr<const QnKPack>*, 2> sidecars{};
+        bool allow_pack = true;
         if (owners)
         {
             for (size_t i = 0; i < matrix_count; ++i)
-                sidecars[i] = owners[i] ? &owners[i]->qnk_packed : nullptr;
+            {
+                const bool owner_allows = !owners[i] || owners[i]->cpu.allows_cpu_pack();
+                allow_pack = allow_pack && owner_allows;
+                sidecars[i] = owners[i] && owner_allows ? &owners[i]->cpu.qnk_packed : nullptr;
+            }
         }
         const auto sidecar_span = std::span<std::shared_ptr<const QnKPack>* const>(sidecars.data(), matrix_count);
         std::array<DType, 2> activation_dtypes{};
@@ -867,7 +872,7 @@ bool forward_linear(std::initializer_list<const TensorData*> matrices,
         return forward_linear_qnk(matrices,
                                   input,
                                   outputs,
-                                  has_flag(optimization_flags, OptimizationCpuPackedWeights),
+                                  allow_pack && has_flag(optimization_flags, OptimizationCpuPackedWeights),
                                   sidecar_span,
                                   qnk_q8_act(activation_dtypes.data(), matrix_count),
                                   q8_input);
@@ -893,7 +898,7 @@ bool forward_linear(std::initializer_list<const TensorData*> matrices,
         if (matrix.dtype != dtype
             || matrix.shape.size() != 2
             || matrix.shape[1] != input_columns
-            || (op && (op->linear || op->bfloat16 || op->float8 || op->qnk))
+            || has_vulkan_linear_operator(op)
             || !dense_host_storage_available(matrix))
         {
             return false;
@@ -1071,7 +1076,7 @@ bool forward_linear_rms_norm_float8(const TensorData& matrix,
     if (!cpu_float8_fused_projections_enabled(optimization_flags)
         || matrix.dtype != DType::Float8E4M3 || matrix.shape.size() != 2
         || matrix.shape[1] != input.columns()
-        || (op && (op->float8 || op->linear))
+        || has_vulkan_float8_or_linear_operator(op)
         || (norm_weight.dtype != DType::Float32
             && norm_weight.dtype != DType::BFloat16)
         || norm_weight.element_count() != input.columns()
@@ -1150,32 +1155,6 @@ get_mxfp4_q8_packed_weights(const TensorData& matrix,
     return packed;
 }
 
-static bool forward_linear_vulkan(const CompiledOperator* op,
-                                  const ActivationBuffer& input,
-                                  ActivationBuffer& output,
-                                  ExecutionBackend backend)
-{
-    if (backend != ExecutionBackend::Vulkan)
-        return false;
-    if (!op)
-        throw std::runtime_error("Vulkan linear was selected without a compiled operator");
-    bool executed = false;
-    if (op->bfloat16)
-        executed = op->bfloat16->forward(input, output);
-    else if (op->float8)
-        executed = op->float8->forward(input, output);
-    else if (op->qnk)
-        executed = op->qnk->forward(input, output);
-    else if (op->linear)
-        executed = op->linear->forward(input, output);
-    else
-        throw std::runtime_error("Vulkan linear was selected without a device operator");
-
-    if (!executed)
-        throw std::runtime_error("Vulkan linear execution failed");
-    return true;
-}
-
 void forward_linear(const TensorData& matrix, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, const CompiledOperator* op, ExecutionBackend backend, ActivationBuffer* quantized_input_scratch, QnkQ8Input* q8_input)
 {
     assert(!quantized_input_scratch
@@ -1196,7 +1175,7 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
 
     // Vulkan QnKLinear applies input_column_indices in its shader, so pass it
     // the original activation buffer. CPU kernels gather below when needed.
-    if (forward_linear_vulkan(op, input, output, backend))
+    if (dispatch_vulkan_linear(op, input, output, backend))
         return;
 
     const ActivationBuffer* linear_input = &input;
@@ -1230,12 +1209,13 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
     if (is_qnk_dtype(matrix.dtype))
     {
         require_dense_host_storage(matrix, "linear weight");
-        std::array<std::shared_ptr<const QnKPack>*, 1> sidecars = {op ? &op->qnk_packed : nullptr};
+        const bool allow_pack = !op || op->cpu.allows_cpu_pack();
+        std::array<std::shared_ptr<const QnKPack>*, 1> sidecars = {op && allow_pack ? &op->cpu.qnk_packed : nullptr};
         const auto sidecar_span = std::span<std::shared_ptr<const QnKPack>* const>(sidecars.data(), sidecars.size());
         if (forward_linear_qnk({&matrix},
                                *linear_input,
                                {&output},
-                               has_flag(optimization_flags, OptimizationCpuPackedWeights),
+                               allow_pack && has_flag(optimization_flags, OptimizationCpuPackedWeights),
                                sidecar_span,
                                qnk_q8_act(&matrix.dtype, 1),
                                q8_input))
@@ -1249,9 +1229,6 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
     const int64_t parallel_output_columns = static_cast<int64_t>(output_columns);
     const uint64_t operation_count = static_cast<uint64_t>(output_columns) * input_columns * input.rows();
     const int linear_team_size = cpu_linear_team_size(operation_count, matrix.dtype);
-#if defined(NCNN_MOE_MSVC_X86_SIMD)                \
-    || ((defined(__x86_64__) || defined(__i386__)) \
-        && (defined(__GNUC__) || defined(__clang__)))
     if (matrix.dtype == DType::BFloat16
         && forward_linear_bf16(matrix.bfloat16_values().data(),
                                input.row(0),
@@ -1266,7 +1243,6 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
     {
         return;
     }
-#endif
     if (matrix.dtype == DType::Float32
         && float32_linear_gemm_tile_into(matrix, input, output, linear_team_size))
     {
@@ -1368,12 +1344,13 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
                                     input_columns,
                                     q8_input);
             if (has_flag(optimization_flags, OptimizationCpuPackedWeights)
+                && (!op || op->cpu.allows_cpu_pack())
                 && output_columns >= 4
                 && mxfp4_q8_ready())
             {
                 const std::shared_ptr<const Mxfp4Q8PackedMatrix>
                     packed_weights = get_mxfp4_q8_packed_weights(matrix,
-                                                                 op ? &op->mxfp4_q8_packed : nullptr,
+                                                                 op ? &op->cpu.mxfp4_q8_packed : nullptr,
                                                                  blocks_per_row,
                                                                  output_columns);
                 if (packed_weights)
@@ -1992,11 +1969,12 @@ static bool forward_mxfp4_decode(std::span<const Mxfp4Task> tasks,
         {
             q8_down_enabled[task_index] = 1;
             if (has_flag(optimization_flags, OptimizationCpuPackedWeights)
+                && (!task.down_operator || task.down_operator->cpu.allows_cpu_pack())
                 && task.down->shape[0] >= 4
                 && mxfp4_q8_ready())
             {
                 q8_down_packed[task_index] = get_mxfp4_q8_packed_weights(*task.down,
-                                                                         task.down_operator ? &task.down_operator->mxfp4_q8_packed : nullptr,
+                                                                         task.down_operator ? &task.down_operator->cpu.mxfp4_q8_packed : nullptr,
                                                                          intermediate_size / 32,
                                                                          task.down->shape[0]);
             }
@@ -2017,6 +1995,7 @@ static bool forward_mxfp4_decode(std::span<const Mxfp4Task> tasks,
                                         q8_inputs[input_owner]);
             }
             if (has_flag(optimization_flags, OptimizationCpuPackedWeights)
+                && (!task.gate_up_operator || task.gate_up_operator->cpu.allows_cpu_pack())
                 && task.gate_up->shape[0] >= 4
                 && mxfp4_q8_ready())
             {
@@ -2076,7 +2055,7 @@ static bool forward_mxfp4_decode(std::span<const Mxfp4Task> tasks,
             const size_t input_owner = q8_input_owner[static_cast<size_t>(task_index)];
             const std::shared_ptr<const Mxfp4Q8PackedMatrix>
                 packed_weights = get_mxfp4_q8_packed_weights(*task.gate_up,
-                                                             task.gate_up_operator ? &task.gate_up_operator->mxfp4_q8_packed : nullptr,
+                                                             task.gate_up_operator ? &task.gate_up_operator->cpu.mxfp4_q8_packed : nullptr,
                                                              task.input->columns() / 32,
                                                              task.gate_up->shape[0]);
             if (!packed_weights)
@@ -2816,7 +2795,7 @@ void forward_linear(const TensorData& matrix, const TensorData& bias, const Acti
         output.reset(0, output_columns, false);
         return;
     }
-    if (forward_linear_vulkan(op, input, output, backend))
+    if (dispatch_vulkan_linear(op, input, output, backend))
         return;
     forward_linear(matrix, input, output, optimization_flags, op, ExecutionBackend::Cpu, quantized_input_scratch);
     require_dense_host_storage(bias, "linear bias");

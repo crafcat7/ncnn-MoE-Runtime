@@ -17,6 +17,7 @@
 #include "kernels/float8.h"
 #include "kernels/ops.h"
 #include "storage/expertcache.h"
+#include "backends/capabilities.h"
 #include "backends/ncnn/vulkan.h"
 
 #include <algorithm>
@@ -114,11 +115,12 @@ Runtime::Runtime()
     runtime_info.cpu_count = std::max(1u, std::thread::hardware_concurrency());
     const uint32_t physical_cpu_count = get_physical_cpu_count();
     runtime_info.physical_cpu_count = physical_cpu_count == 0 ? runtime_info.cpu_count : physical_cpu_count;
-    runtime_info.cpu_isa_flags = cpu_isa_flags();
+    const BackendCapabilities backend_caps = query_backend_capabilities();
+    runtime_info.cpu_isa_flags = backend_caps.cpu.detected_isa_flags;
     runtime_info.cpu_linear_num_threads = cpu_linear_num_threads();
     runtime_info.float8_linear_row_group_size = float8_linear_row_group_size(OptimizationDefaultFlags);
-    runtime_info.mxfp4_decode_row_pair_group_size = mxfp4_decode_row_pair_group_size();
-    const MxFp4KernelKind kernel = mxfp4_kernel_kind();
+    runtime_info.mxfp4_decode_row_pair_group_size = backend_caps.cpu.mxfp4_decode_pair_group;
+    const MxFp4KernelKind kernel = backend_caps.cpu.mxfp4_kind;
     if (kernel == MxFp4KernelKind::ArmNeon)
         runtime_info.flags |= RuntimeMxfp4Neon;
     else if (kernel == MxFp4KernelKind::ArmSve2)

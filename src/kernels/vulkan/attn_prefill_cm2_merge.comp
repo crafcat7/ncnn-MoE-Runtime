@@ -12,6 +12,8 @@ layout(binding = 1) writeonly buffer output_blob
 layout(binding = 1) writeonly buffer output_blob
 { float output_data[]; };
 #endif
+layout(binding = 2) readonly buffer sink_blob
+{ float sink_data[]; };
 
 layout(push_constant) uniform parameter
 {
@@ -20,6 +22,7 @@ layout(push_constant) uniform parameter
     uint head_dimension;
     uint output_stride;
     uint split_count;
+    uint has_sink;
 }
 p;
 
@@ -42,7 +45,7 @@ void main()
     const uint plane = p.head_count * p.query_count;
     const uint lm_table = p.split_count * plane * p.head_dimension;
 
-    float total_l = 0.0;
+    float total_l = p.has_sink != 0u ? exp2(min(sink_data[head] * 1.4426950408889634, 80.0)) : 0.0;
     for (uint s = 0u; s < p.split_count; ++s)
     {
         const uint lm_off = lm_table + ((s * p.head_count + head) * p.query_count + q_row) * 2u;

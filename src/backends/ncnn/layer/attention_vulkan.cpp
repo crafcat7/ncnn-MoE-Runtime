@@ -123,17 +123,21 @@ std::vector<uint64_t> Attention_vulkan::scratch_elements(const AttentionConfig_v
         columns.push_back((config.hidden_size + 1u) / 2u);
         columns.push_back((query + 1u) / 2u);
     }
+    const uint64_t effective_context = config.sliding_window != 0
+                                           ? std::min<uint64_t>(context_tokens,
+                                                                saturating_add_u64(config.sliding_window, rows > 0 ? rows - 1 : 0))
+                                           : context_tokens;
     const bool decode_sdpa = rows == 1
                              && (config.head_dimension <= 128
-                                 || (static_cast<uint64_t>(context_tokens) + (has_flag(config.flags, AttentionSink) ? 1 : 0)
+                                 || (static_cast<uint64_t>(effective_context) + (has_flag(config.flags, AttentionSink) ? 1 : 0)
                                          > decode_single_workgroup_tokens
                                      && config.head_dimension <= 256))
-                             && (config.sliding_window == 0 || context_tokens <= config.sliding_window)
+                             && (config.sliding_window == 0 || effective_context <= config.sliding_window)
                              && has_flag(config.optimization_flags, OptimizationVulkanDecodeSdpa);
     std::vector<uint64_t> elements;
     if (!decode_sdpa)
     {
-        const uint64_t destinations = saturating_add_u64(context_tokens, has_flag(config.flags, AttentionSink) ? 1 : 0);
+        const uint64_t destinations = saturating_add_u64(effective_context, has_flag(config.flags, AttentionSink) ? 1 : 0);
         if (!flash && kv_element_size == sizeof(uint16_t))
         {
             // General SDPA expands two KV operands per Session, with VkMat's
@@ -161,7 +165,7 @@ std::vector<uint64_t> Attention_vulkan::scratch_elements(const AttentionConfig_v
         // Split decode keeps one online-softmax state per split and one merged
         // output, both allocated from this arena. Reserve the widest split
         // because decode destinations outgrow the planned context before replanning.
-        const uint64_t destinations = saturating_add_u64(context_tokens, has_flag(config.flags, AttentionSink) ? 1 : 0);
+        const uint64_t destinations = saturating_add_u64(effective_context, has_flag(config.flags, AttentionSink) ? 1 : 0);
         if (split_range(destinations, true).splits != 0)
         {
             const uint64_t per_head_reserve = std::min<uint64_t>(split_max, std::max<uint64_t>(2, destinations / 8));
@@ -641,7 +645,7 @@ static bool supports_workgroup_cm2_matrix(const ncnn::GpuInfo& info, uint32_t wo
 
 static bool create_prefill_cm2_pipeline(const std::shared_ptr<VulkanContext>& context,
                                         uint32_t br, uint32_t bc, uint32_t head_dimension,
-                                        bool kv_bfloat16, bool has_window,
+                                        bool kv_bfloat16, bool has_window, bool has_sink,
                                         std::shared_ptr<ncnn::Pipeline>& destination,
                                         bool out_bfloat16 = false)
 {
@@ -650,15 +654,17 @@ static bool create_prefill_cm2_pipeline(const std::shared_ptr<VulkanContext>& co
                              | (static_cast<uint64_t>(bc) << 24)
                              | (static_cast<uint64_t>(kv_bfloat16 ? 1u : 0u) << 36)
                              | (static_cast<uint64_t>(out_bfloat16 ? 1u : 0u) << 37)
-                             | (static_cast<uint64_t>(has_window ? 1u : 0u) << 38);
+                             | (static_cast<uint64_t>(has_window ? 1u : 0u) << 38)
+                             | (static_cast<uint64_t>(has_sink ? 1u : 0u) << 39);
     ncnn::Option compile_option = make_vk_opt(*context);
     compile_option.use_bf16_storage = true;
-    std::vector<ncnn::vk_specialization_type> specs(5);
+    std::vector<ncnn::vk_specialization_type> specs(6);
     specs[0].u32 = br;
     specs[1].u32 = bc;
     specs[2].u32 = head_dimension;
     specs[3].u32 = kv_bfloat16 ? 1u : 0u;
     specs[4].u32 = has_window ? 1u : 0u;
+    specs[5].u32 = has_sink ? 1u : 0u;
     const int base_len = static_cast<int>(sizeof(attn_prefill_cm2_shader) - 1);
     const int subgroup_size = static_cast<int>(context->device()->info.subgroup_size());
     if (out_bfloat16)
@@ -997,6 +1003,7 @@ static bool record_attention_output_gate(const ncnn::Pipeline* pipeline,
 // is written directly in token-major (query_columns, rows) layout.
 static bool record_flash(const ncnn::Pipeline* pipeline, const ncnn::VkMat& query,
                          const ncnn::VkMat& key, const ncnn::VkMat& value,
+                         const ncnn::VkMat& sinks,
                          const AttentionConfig_vulkan& config,
                          uint64_t query_count, uint64_t destination_count,
                          uint64_t position_offset, uint64_t cache_start_position,
@@ -1011,8 +1018,8 @@ static bool record_flash(const ncnn::Pipeline* pipeline, const ncnn::VkMat& quer
     if (output.empty())
         return false;
 
-    const std::vector<ncnn::VkMat> bindings = {query, key, value, output};
-    std::vector<ncnn::vk_constant_type> constants(12);
+    const std::vector<ncnn::VkMat> bindings = {query, key, value, output, sinks};
+    std::vector<ncnn::vk_constant_type> constants(13);
     constants[0].u32 = static_cast<uint32_t>(query_count);
     constants[1].u32 = static_cast<uint32_t>(destination_count);
     constants[2].u32 = config.head_count;
@@ -1025,6 +1032,7 @@ static bool record_flash(const ncnn::Pipeline* pipeline, const ncnn::VkMat& quer
     constants[9].u32 = static_cast<uint32_t>(cache_start_position);
     constants[10].u32 = config.sliding_window;
     constants[11].f = config.attn_scale;
+    constants[12].u32 = has_flag(config.flags, AttentionSink) ? 1u : 0u;
 
     ncnn::VkMat dispatcher;
     constexpr int workgroup = 256;
@@ -1041,6 +1049,7 @@ static bool record_prefill_cm2(const ncnn::Pipeline* pipeline,
                                uint32_t br, uint32_t bc, uint32_t device_parallelism,
                                VulkanContext* context,
                                const ncnn::VkMat& query, const ncnn::VkMat& key, const ncnn::VkMat& value,
+                               const ncnn::VkMat& sinks,
                                const AttentionConfig_vulkan& config,
                                uint64_t query_count, uint64_t destination_count,
                                uint64_t position_offset, uint64_t cache_start_position,
@@ -1112,22 +1121,23 @@ static bool record_prefill_cm2(const ncnn::Pipeline* pipeline,
     dispatcher.w = static_cast<int>(group_size * split_count * 128u);
     dispatcher.h = static_cast<int>(query_tiles);
     dispatcher.c = static_cast<int>(config.kv_head_count);
-    command.record_pipeline_readonly(pipeline, {query, key, value, output, partial},
-                                     {1, 1, 1, 0, 0}, constants, dispatcher);
+    command.record_pipeline_readonly(pipeline, {query, key, value, output, partial, sinks},
+                                     {1, 1, 1, 0, 0, 1}, constants, dispatcher);
 
     if (split_count > 1u)
     {
-        constants.resize(5);
+        constants.resize(6);
         constants[0].u32 = static_cast<uint32_t>(query_count);
         constants[1].u32 = config.head_count;
         constants[2].u32 = config.head_dimension;
         constants[3].u32 = static_cast<uint32_t>(query_columns);
         constants[4].u32 = split_count;
+        constants[5].u32 = has_flag(config.flags, AttentionSink) ? 1u : 0u;
         ncnn::VkMat merge_dispatcher;
         merge_dispatcher.w = static_cast<int>(query_count * 128u);
         merge_dispatcher.h = static_cast<int>(config.head_count);
         merge_dispatcher.c = 1;
-        command.record_pipeline_readonly(merge_pipeline, {partial, output}, {1, 0},
+        command.record_pipeline_readonly(merge_pipeline, {partial, output, sinks}, {1, 0, 1},
                                          constants, merge_dispatcher);
     }
     return true;
@@ -1615,17 +1625,17 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
         && (config.head_dimension == 64u || config.head_dimension == 128u || config.head_dimension == 256u)
         && config.head_count != 0 && config.kv_head_count != 0
         && config.head_count % config.kv_head_count == 0
-        && !has_flag(config.flags, AttentionSink)
         && vkdev->info.subgroup_size() == 32)
     {
         const uint32_t br = config.head_dimension >= 256u ? 32u : 64u;
         const uint32_t bc = br;
         const bool has_win = config.sliding_window != 0u;
+        const bool has_sink = has_flag(config.flags, AttentionSink);
         if (supports_workgroup_cm2_matrix(vkdev->info, 128u, br, bc, config.head_dimension)
             && supports_workgroup_cm2_matrix(vkdev->info, 128u, br, config.head_dimension, bc)
             && supports_workgroup_cm2_matrix(vkdev->info, 128u, br, bc, bc)
             && create_prefill_cm2_pipeline(implementation.vulkan_context, br, bc, config.head_dimension,
-                                           config.kv_dtype == DType::BFloat16, has_win,
+                                           config.kv_dtype == DType::BFloat16, has_win, has_sink,
                                            implementation.cm2_pipe[0], false))
         {
             implementation.cm2_br = br;
@@ -1639,7 +1649,7 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
             const bool o_uses_cm2 = !output_gate && ((implementation.output_projection_bfloat16 && implementation.output_projection_bfloat16->use_cm2()) || (implementation.native_projections[3].qnk && implementation.native_projections[3].qnk->use_cm2()));
             if (o_uses_cm2 && (config.head_dimension & 1u) == 0u
                 && create_prefill_cm2_pipeline(implementation.vulkan_context, br, bc, config.head_dimension,
-                                               config.kv_dtype == DType::BFloat16, has_win,
+                                               config.kv_dtype == DType::BFloat16, has_win, has_sink,
                                                implementation.cm2_pipe[1], true))
             {
                 (void)create_pipeline_prefixed(implementation.vulkan_context, attn_prefill_cm2_merge_shader,
@@ -1840,7 +1850,7 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
     }
 
     const char* flash_defs = prefill_defines(config.head_dimension);
-    if (flash_defs != nullptr && !has_flag(config.flags, AttentionSink))
+    if (flash_defs != nullptr)
     {
         const uint32_t arith_ops = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT;
         if (vkdev->info.subgroup_size() == 32
@@ -1855,7 +1865,6 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create_impl(const TensorData
         }
     }
     implementation.flash_ok = implementation.flash_pipeline != nullptr
-                              && !has_flag(config.flags, AttentionSink)
                               && config.sliding_window < std::numeric_limits<uint32_t>::max();
 
     ncnn::Mat query_norm_model;
@@ -2464,7 +2473,7 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
                                   config.sliding_window != 0, command))
         return false;
 
-    if (sink_token_count != 0 && !use_qkv_ring)
+    if (sink_token_count != 0 && !use_qkv_ring && !flash)
     {
         const uint64_t sink_row = ring_first_slot + actual_token_count;
         if (!record_attention_ring_zero(implementation.ring_zero_pipeline.get(),
@@ -2472,8 +2481,9 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
             return false;
     }
 
-    auto& combined_key = ticket.keep_buffer(attention_ring_view(next_cache->key, ring_first_slot, destination_count));
-    auto& combined_value = ticket.keep_buffer(attention_ring_view(next_cache->value, ring_first_slot, destination_count));
+    const uint64_t view_rows = flash ? actual_token_count : destination_count;
+    auto& combined_key = ticket.keep_buffer(attention_ring_view(next_cache->key, ring_first_slot, view_rows));
+    auto& combined_value = ticket.keep_buffer(attention_ring_view(next_cache->value, ring_first_slot, view_rows));
     if (combined_key.empty() || combined_value.empty())
         return false;
 
@@ -2498,16 +2508,18 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
                                                 implementation.cm2_br, implementation.cm2_bc,
                                                 implementation.device_parallelism,
                                                 implementation.vulkan_context.get(),
-                                                query_rope, combined_key, combined_value, config,
-                                                token_count, destination_count, position_offset,
+                                                query_rope, combined_key, combined_value,
+                                                implementation.attention_sinks, config,
+                                                token_count, actual_token_count, position_offset,
                                                 cache.start_position, attention_matrix, command,
                                                 implementation.option.blob_vkallocator, bf16_out);
         }
         if (!flash_recorded && flash)
         {
             flash_recorded = record_flash(implementation.flash_pipeline.get(),
-                                          query_rope, combined_key, combined_value, config,
-                                          token_count, destination_count, position_offset,
+                                          query_rope, combined_key, combined_value,
+                                          implementation.attention_sinks, config,
+                                          token_count, actual_token_count, position_offset,
                                           cache.start_position, attention_matrix, command,
                                           implementation.option.blob_vkallocator);
         }
@@ -2521,11 +2533,18 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
                                                  implementation.vulkan_context->staging_allocator())
                     || !record_mapped_upload(ticket.attention_mask, mask_gpu, command, implementation.option)))
                 return false;
-            if (sink_token_count != 0 && use_qkv_ring)
+            if (sink_token_count != 0 && (use_qkv_ring || flash))
             {
                 const uint64_t sink_row = ring_first_slot + actual_token_count;
                 if (!record_attention_ring_zero(implementation.ring_zero_pipeline.get(),
                                                 next_cache->key, next_cache->value, sink_row, command))
+                    return false;
+            }
+            if (view_rows != destination_count)
+            {
+                combined_key = ticket.keep_buffer(attention_ring_view(next_cache->key, ring_first_slot, destination_count));
+                combined_value = ticket.keep_buffer(attention_ring_view(next_cache->value, ring_first_slot, destination_count));
+                if (combined_key.empty() || combined_value.empty())
                     return false;
             }
             auto& sdpa_key = ticket.keep_buffer();

@@ -1,14 +1,24 @@
-#include "qnk_msvc.h"
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+
+#include "kernels/cpu/x86/x86_internal.h"
+
+#include "kernels/qnk.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <immintrin.h>
 
+#if defined(__clang__)
+#pragma clang attribute push(__attribute__((target("avx512f,avx512bw,avx512vl"))), apply_to = function)
+#elif defined(__GNUC__)
+#pragma GCC push_options
+#pragma GCC target("avx512f,avx512bw,avx512vl")
+#endif
+
 namespace ncnn {
 namespace moe {
 
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
 static float horizontal_sum(__m512 value) noexcept
 {
     __m256 halves = _mm256_add_ps(_mm512_castps512_ps256(value), _mm512_extractf32x8_ps(value, 1));
@@ -245,7 +255,7 @@ static float dot_q6_block_direct(const uint8_t* block, const float* input) noexc
     return sum;
 }
 
-float msvc_avx512_qnk_dot_block(DType dtype, const uint8_t* block, const float* input) noexcept
+float avx512_qnk_dot_block(DType dtype, const uint8_t* block, const float* input) noexcept
 {
     if (!block || !input)
         return 0.0f;
@@ -255,7 +265,7 @@ float msvc_avx512_qnk_dot_block(DType dtype, const uint8_t* block, const float* 
         return dot_q5_block_direct(block, input);
     if (dtype == DType::Q6K)
         return dot_q6_block_direct(block, input);
-    return msvc_avx2_qnk_dot_block(dtype, block, input);
+    return avx2_qnk_dot_block(dtype, block, input);
 }
 
 static float horizontal_max(__m512 value) noexcept
@@ -268,12 +278,12 @@ static float horizontal_max(__m512 value) noexcept
     return maximum;
 }
 
-void msvc_avx512_qnk_gemm(const QnKPack& weights,
-                          const float* input,
-                          size_t input_stride,
-                          size_t token_count,
-                          float* output,
-                          size_t output_stride) noexcept
+void avx512_qnk_gemm(const QnKPack& weights,
+                     const float* input,
+                     size_t input_stride,
+                     size_t token_count,
+                     float* output,
+                     size_t output_stride) noexcept
 {
     alignas(64) float decoded[qnk_block_elements];
     for (size_t row = 0; row < weights.rows; ++row)
@@ -287,7 +297,7 @@ void msvc_avx512_qnk_gemm(const QnKPack& weights,
                 const uint8_t* encoded = qnk_packed_block(weights, row, block);
                 const float* block_input = token_input + static_cast<size_t>(block) * qnk_block_elements;
                 if (is_qnk_dtype(weights.dtype))
-                    sum += msvc_avx512_qnk_dot_block(weights.dtype, encoded, block_input);
+                    sum += avx512_qnk_dot_block(weights.dtype, encoded, block_input);
                 else
                 {
                     qnk_dequantize_block(weights.dtype, encoded, decoded);
@@ -299,7 +309,7 @@ void msvc_avx512_qnk_gemm(const QnKPack& weights,
     }
 }
 
-void msvc_avx512_qnk_q8k_quantize(const float* source, uint8_t* output, uint32_t columns) noexcept
+void avx512_qnk_q8k_quantize(const float* source, uint8_t* output, uint32_t columns) noexcept
 {
     const uint32_t block_count = columns / qnk_block_elements;
     const __m512 sign_mask = _mm512_set1_ps(-0.0f);
@@ -354,7 +364,14 @@ void msvc_avx512_qnk_q8k_quantize(const float* source, uint8_t* output, uint32_t
         }
     }
 }
-#endif
 
 } // namespace moe
 } // namespace ncnn
+
+#if defined(__clang__)
+#pragma clang attribute pop
+#elif defined(__GNUC__)
+#pragma GCC pop_options
+#endif
+
+#endif

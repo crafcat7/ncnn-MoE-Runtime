@@ -1,4 +1,4 @@
-#include "mxfp4_sve2.h"
+#include "kernels/cpu/arm/arm_internal.h"
 
 #include <arm_sve.h>
 

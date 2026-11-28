@@ -272,8 +272,8 @@ static void test_qnk_paired_linear()
                         ActivationBuffer second_scalar;
                         forward_linear(first, input, first_scalar, flags, &first_owner);
                         forward_linear(second, input, second_scalar, flags, &second_owner);
-                        const auto first_pack = first_owner.qnk_packed;
-                        const auto second_pack = second_owner.qnk_packed;
+                        const auto first_pack = first_owner.cpu.qnk_packed;
+                        const auto second_pack = second_owner.cpu.qnk_packed;
                         int4_check(!packed || (first_pack && second_pack), "packed scalar Qn_K owner did not retain its sidecar");
 
                         ActivationBuffer first_paired;
@@ -293,7 +293,7 @@ static void test_qnk_paired_linear()
                             int4_near(second_paired.values()[index], second_scalar.values()[index]);
 
                         int4_check(forward_pair(), "repeated paired Qn_K forward rejected valid matrices");
-                        int4_check(first_owner.qnk_packed == first_pack && second_owner.qnk_packed == second_pack,
+                        int4_check(first_owner.cpu.qnk_packed == first_pack && second_owner.cpu.qnk_packed == second_pack,
                                    "paired Qn_K forward did not reuse weight sidecars");
                         for (size_t index = 0; index < first_scalar.values().size(); ++index)
                             int4_near(first_paired.values()[index], first_scalar.values()[index]);

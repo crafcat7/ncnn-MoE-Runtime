@@ -1,11 +1,28 @@
-#include "float8_msvc.h"
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
 
-#include "float8.h"
+#include "kernels/cpu/x86/x86_internal.h"
+
+#include "kernels/float8.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <immintrin.h>
+
+#if defined(_MSC_VER)
+#define NCNN_MOE_FORCE_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define NCNN_MOE_FORCE_INLINE inline __attribute__((always_inline))
+#else
+#define NCNN_MOE_FORCE_INLINE inline
+#endif
+
+#if defined(__clang__)
+#pragma clang attribute push(__attribute__((target("avx512f,avx512bw,avx512vl"))), apply_to = function)
+#elif defined(__GNUC__)
+#pragma GCC push_options
+#pragma GCC target("avx512f,avx512bw,avx512vl")
+#endif
 
 namespace ncnn {
 namespace moe {
@@ -33,44 +50,11 @@ static __m512 decode_float8_e4m3(__m128i packed) noexcept
     return decoded;
 }
 
-static __forceinline __m512bh decode_float8_e4m3_bfloat16(__m256i packed) noexcept
-{
-    const __m512i bytes = _mm512_cvtepu8_epi16(packed);
-    const __m512i exponent = _mm512_and_si512(_mm512_srli_epi16(bytes, 3), _mm512_set1_epi16(15));
-    const __m512i mantissa = _mm512_and_si512(bytes, _mm512_set1_epi16(7));
-    const __m512i sign = _mm512_slli_epi16(_mm512_and_si512(bytes, _mm512_set1_epi16(128)), 8);
-    const __m512i normal = _mm512_or_si512(sign,
-                                           _mm512_or_si512(_mm512_slli_epi16(_mm512_add_epi16(exponent, _mm512_set1_epi16(120)), 7),
-                                                           _mm512_slli_epi16(mantissa, 4)));
-    const __m512i subnormal_table = _mm512_setr_epi16(0x0000, 0x3b00, 0x3b80, 0x3bc0,
-                                                      0x3c00, 0x3c20, 0x3c40, 0x3c60,
-                                                      0x0000, 0x3b00, 0x3b80, 0x3bc0,
-                                                      0x3c00, 0x3c20, 0x3c40, 0x3c60,
-                                                      0x0000, 0x3b00, 0x3b80, 0x3bc0,
-                                                      0x3c00, 0x3c20, 0x3c40, 0x3c60,
-                                                      0x0000, 0x3b00, 0x3b80, 0x3bc0,
-                                                      0x3c00, 0x3c20, 0x3c40, 0x3c60);
-    const __m512i subnormal = _mm512_or_si512(sign, _mm512_permutexvar_epi16(mantissa, subnormal_table));
-    const __mmask32 exponent_zero = _mm512_cmpeq_epi16_mask(exponent, _mm512_setzero_si512());
-    __m512i decoded = _mm512_mask_blend_epi16(exponent_zero, normal, subnormal);
-    const __mmask32 nan_mask = _mm512_cmpeq_epi16_mask(exponent, _mm512_set1_epi16(15))
-                               & _mm512_cmpeq_epi16_mask(mantissa, _mm512_set1_epi16(7));
-    decoded = _mm512_mask_blend_epi16(nan_mask, decoded,
-                                      _mm512_or_si512(sign, _mm512_set1_epi16(0x7fc0)));
-    return (__m512bh)decoded;
-}
-
-static __forceinline __m512bh pack_input_bfloat16(const float* input) noexcept
-{
-    return _mm512_cvtne2ps_pbh(_mm512_loadu_ps(input + 16),
-                               _mm512_loadu_ps(input));
-}
-
-void msvc_avx512_quantize_float8_e4m3(const float* source,
-                                      float* values,
-                                      uint32_t count,
-                                      uint32_t block_size,
-                                      bool power_of_two_scale) noexcept
+void avx512_quantize_float8_e4m3(const float* source,
+                                 float* values,
+                                 uint32_t count,
+                                 uint32_t block_size,
+                                 bool power_of_two_scale) noexcept
 {
     const __m512 absolute_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff));
     const __m512 maximum_value = _mm512_set1_ps(448.0f);
@@ -140,7 +124,7 @@ void msvc_avx512_quantize_float8_e4m3(const float* source,
     }
 }
 
-float msvc_avx512_float8_e4m3_block_dot(const uint8_t* weights, const float* scales, const float* input, uint32_t count, uint32_t block_size) noexcept
+float avx512_float8_e4m3_block_dot(const uint8_t* weights, const float* scales, const float* input, uint32_t count, uint32_t block_size) noexcept
 {
     float result = 0.0f;
     for (uint32_t block_begin = 0, block = 0; block_begin < count; block_begin += block_size, ++block)
@@ -161,8 +145,8 @@ float msvc_avx512_float8_e4m3_block_dot(const uint8_t* weights, const float* sca
     return result;
 }
 
-void msvc_avx512_float8_e4m3_block_dot_rows4(const uint8_t* weights, uint32_t weight_row_stride, const float* scales, const float* input, uint32_t count,
-                                             uint32_t block_size, uint32_t row_count, float* output) noexcept
+void avx512_float8_e4m3_block_dot_rows4(const uint8_t* weights, uint32_t weight_row_stride, const float* scales, const float* input, uint32_t count,
+                                        uint32_t block_size, uint32_t row_count, float* output) noexcept
 {
     if (row_count == 0 || row_count > 4)
         return;
@@ -194,11 +178,63 @@ void msvc_avx512_float8_e4m3_block_dot_rows4(const uint8_t* weights, uint32_t we
     }
 }
 
-float msvc_avx512_bfloat16_float8_e4m3_block_dot(const uint8_t* weights,
-                                                 const float* scales,
-                                                 const float* input,
-                                                 uint32_t count,
-                                                 uint32_t block_size) noexcept
+} // namespace moe
+} // namespace ncnn
+
+#if defined(__clang__)
+#pragma clang attribute pop
+#elif defined(__GNUC__)
+#pragma GCC pop_options
+#endif
+
+#if defined(__clang__)
+#pragma clang attribute push(__attribute__((target("avx512f,avx512bw,avx512vl,avx512bf16"))), apply_to = function)
+#elif defined(__GNUC__)
+#pragma GCC push_options
+#pragma GCC target("avx512f,avx512bw,avx512vl,avx512bf16")
+#endif
+
+namespace ncnn {
+namespace moe {
+
+static NCNN_MOE_FORCE_INLINE __m512bh decode_float8_e4m3_bfloat16(__m256i packed) noexcept
+{
+    const __m512i bytes = _mm512_cvtepu8_epi16(packed);
+    const __m512i exponent = _mm512_and_si512(_mm512_srli_epi16(bytes, 3), _mm512_set1_epi16(15));
+    const __m512i mantissa = _mm512_and_si512(bytes, _mm512_set1_epi16(7));
+    const __m512i sign = _mm512_slli_epi16(_mm512_and_si512(bytes, _mm512_set1_epi16(128)), 8);
+    const __m512i normal = _mm512_or_si512(sign,
+                                           _mm512_or_si512(_mm512_slli_epi16(_mm512_add_epi16(exponent, _mm512_set1_epi16(120)), 7),
+                                                           _mm512_slli_epi16(mantissa, 4)));
+    const __m512i subnormal_table = _mm512_setr_epi16(0x0000, 0x3b00, 0x3b80, 0x3bc0,
+                                                      0x3c00, 0x3c20, 0x3c40, 0x3c60,
+                                                      0x0000, 0x3b00, 0x3b80, 0x3bc0,
+                                                      0x3c00, 0x3c20, 0x3c40, 0x3c60,
+                                                      0x0000, 0x3b00, 0x3b80, 0x3bc0,
+                                                      0x3c00, 0x3c20, 0x3c40, 0x3c60,
+                                                      0x0000, 0x3b00, 0x3b80, 0x3bc0,
+                                                      0x3c00, 0x3c20, 0x3c40, 0x3c60);
+    const __m512i subnormal = _mm512_or_si512(sign, _mm512_permutexvar_epi16(mantissa, subnormal_table));
+    const __mmask32 exponent_zero = _mm512_cmpeq_epi16_mask(exponent, _mm512_setzero_si512());
+    __m512i decoded = _mm512_mask_blend_epi16(exponent_zero, normal, subnormal);
+    const __mmask32 nan_mask = _mm512_cmpeq_epi16_mask(exponent, _mm512_set1_epi16(15))
+                               & _mm512_cmpeq_epi16_mask(mantissa, _mm512_set1_epi16(7));
+    decoded = _mm512_mask_blend_epi16(nan_mask, decoded,
+                                      _mm512_or_si512(sign, _mm512_set1_epi16(0x7fc0)));
+    return (__m512bh)decoded;
+}
+
+static NCNN_MOE_FORCE_INLINE __m512bh pack_input_bfloat16(const float* input) noexcept
+{
+    return _mm512_cvtne2ps_pbh(_mm512_loadu_ps(input + 16),
+                               _mm512_loadu_ps(input));
+}
+
+float avx512_bfloat16_float8_e4m3_block_dot(const uint8_t* weights,
+                                            const float* scales,
+                                            const float* input,
+                                            uint32_t count,
+                                            uint32_t block_size) noexcept
 {
     float result = 0.0f;
     for (uint32_t block_begin = 0, block = 0; block_begin < count;
@@ -293,14 +329,14 @@ static bool use_unrolled_bfloat16_float8_rows8() noexcept
     return true;
 }
 
-void msvc_avx512_bfloat16_float8_e4m3_block_dot_rows(const uint8_t* weights,
-                                                     uint32_t weight_row_stride,
-                                                     const float* scales,
-                                                     const float* input,
-                                                     uint32_t count,
-                                                     uint32_t block_size,
-                                                     uint32_t row_count,
-                                                     float* output) noexcept
+void avx512_bfloat16_float8_e4m3_block_dot_rows(const uint8_t* weights,
+                                                uint32_t weight_row_stride,
+                                                const float* scales,
+                                                const float* input,
+                                                uint32_t count,
+                                                uint32_t block_size,
+                                                uint32_t row_count,
+                                                float* output) noexcept
 {
     if (row_count == 0 || row_count > 8)
         return;
@@ -346,17 +382,17 @@ void msvc_avx512_bfloat16_float8_e4m3_block_dot_rows(const uint8_t* weights,
     }
 }
 
-void msvc_avx512_bfloat16_float8_e4m3_block_dot_rows_batch(const uint8_t* weights,
-                                                           uint32_t weight_row_stride,
-                                                           const float* scales,
-                                                           const float* input,
-                                                           size_t input_stride,
-                                                           uint32_t count,
-                                                           uint32_t block_size,
-                                                           uint32_t row_count,
-                                                           size_t output_stride,
-                                                           size_t token_count,
-                                                           float* output) noexcept
+void avx512_bfloat16_float8_e4m3_block_dot_rows_batch(const uint8_t* weights,
+                                                      uint32_t weight_row_stride,
+                                                      const float* scales,
+                                                      const float* input,
+                                                      size_t input_stride,
+                                                      uint32_t count,
+                                                      uint32_t block_size,
+                                                      uint32_t row_count,
+                                                      size_t output_stride,
+                                                      size_t token_count,
+                                                      float* output) noexcept
 {
     if (row_count == 0 || row_count > 4 || token_count == 0
         || token_count > 4)
@@ -420,3 +456,11 @@ void msvc_avx512_bfloat16_float8_e4m3_block_dot_rows_batch(const uint8_t* weight
 
 } // namespace moe
 } // namespace ncnn
+
+#if defined(__clang__)
+#pragma clang attribute pop
+#elif defined(__GNUC__)
+#pragma GCC pop_options
+#endif
+
+#endif

@@ -94,6 +94,7 @@ static Result<void> prepare_graph(CompiledModel& model,
     if (!allocated)
         return allocated.error();
     resources->plan = std::move(plan);
+    resources->resident_submission_rows.store(model.resident_submission_rows, std::memory_order_release);
     model.graph_resources = std::move(resources);
     return {};
 }
@@ -292,33 +293,48 @@ Result<void> prepare_model_expert_banks(CompiledModel& model, uint32_t prefill_r
             // a fictitious (base_rows * layers)-row LM-head and scratch arena.
             uint32_t layers = static_cast<uint32_t>(std::min<size_t>(32u, std::max<size_t>(1u, plans.size())));
             const uint32_t base_rows = std::max(1u, prefill_rows);
+            const auto live_before = bank_live_resources(model, device);
+            const auto fit_devices = model.memory_plan.gpu_devices;
+            const auto fit_device = std::find_if(fit_devices.begin(), fit_devices.end(),
+                                                 [&](const auto& item) { return item.initial.device_index == device; });
+            const uint64_t initial_free = fit_device != fit_devices.end()
+                                                  && fit_device->initial.heap_budget > fit_device->initial.heap_usage
+                                              ? fit_device->initial.heap_budget - fit_device->initial.heap_usage
+                                              : 0;
+            const uint64_t live_free = live_before.heap_budget != 0
+                                           ? (live_before.heap_budget > live_before.heap_usage
+                                                  ? live_before.heap_budget - live_before.heap_usage
+                                                  : 0)
+                                           : initial_free;
+            // Weights-First: reserve full Expert Banks + headroom before
+            // granting extra compute arena budget for multi-layer coalescing.
+            constexpr uint64_t bank_headroom = UINT64_C(256) * 1024 * 1024;
+            constexpr uint64_t max_coalesce_arena = UINT64_C(512) * 1024 * 1024;
+            const uint64_t bank_need = total <= std::numeric_limits<uint64_t>::max() - bank_headroom
+                                           ? total + bank_headroom
+                                           : std::numeric_limits<uint64_t>::max();
+            const uint64_t after_banks = live_free > bank_need ? live_free - bank_need : 0;
+            const uint64_t compute_budget = std::min(after_banks, max_coalesce_arena);
+            const uint32_t sessions = std::max(1u, model.opt.num_concurrent_sessions);
             for (;;)
             {
                 model.resident_submission_rows = base_rows <= std::numeric_limits<uint32_t>::max() / layers
                                                      ? base_rows * layers
                                                      : base_rows;
-                // The plan grows with the grouping, so verify it still fits this
-                // device and step back instead of degrading silently.
-                const auto planned = plan_model_graph_memory(model, base_rows,
-                                                             std::max(1u, model.opt.num_concurrent_sessions));
+                // The plan grows with the grouping, so verify it fits within the
+                // weights-first compute budget and step back instead of starving banks.
+                const auto planned = plan_model_graph_memory(model, base_rows, sessions);
                 if (planned)
                 {
-                    const auto fit_requests = graph_resource_requests(planned.value(),
-                                                                      std::max(1u, model.opt.num_concurrent_sessions));
+                    const auto fit_requests = graph_resource_requests(planned.value(), sessions);
                     const auto fit_request = fit_requests.find(device);
-                    const auto fit_devices = model.memory_plan.gpu_devices;
-                    const auto fit_device = std::find_if(fit_devices.begin(), fit_devices.end(),
-                                                         [&](const auto& item) { return item.initial.device_index == device; });
-                    const uint64_t free_heap = fit_device != fit_devices.end()
-                                                       && fit_device->initial.heap_budget > fit_device->initial.heap_usage
-                                                   ? fit_device->initial.heap_budget - fit_device->initial.heap_usage
-                                                   : 0;
                     const uint64_t plan_bytes = fit_request == fit_requests.end()
                                                     ? 0
-                                                    : fit_request->second.persistent_size
-                                                          + fit_request->second.session_state_size
-                                                          + fit_request->second.workspace_size;
-                    if (fit_request == fit_requests.end() || free_heap == 0 || plan_bytes <= free_heap)
+                                                    : (fit_request->second.session_state_size
+                                                       + fit_request->second.workspace_size)
+                                                          * sessions;
+                    if (fit_request == fit_requests.end() || (live_free == 0 && fit_device == fit_devices.end())
+                        || plan_bytes <= compute_budget)
                         break;
                 }
                 if (layers <= 1)
@@ -478,7 +494,7 @@ Result<uint64_t> ensure_graph(const CompiledModel& model, uint64_t rows, uint64_
     // maxima. A long-context decode can reuse a larger short-context prefill
     // arena without reserving a fictitious long-context 512-row prefill.
     const uint32_t next_rows = std::max(1u, static_cast<uint32_t>(rows));
-    uint32_t next_context = std::max(1u, resources.plan.context_tokens);
+    uint32_t next_context = std::max(1u, next_rows);
     while (next_context < context_tokens)
     {
         if (next_context > std::numeric_limits<uint32_t>::max() / 2)
@@ -488,25 +504,62 @@ Result<uint64_t> ensure_graph(const CompiledModel& model, uint64_t rows, uint64_
         }
         next_context *= 2;
     }
-    auto plan = plan_model_graph_memory(model, next_rows, std::max(sequence_count, resources.plan.sequence_count), next_context);
-    if (!plan)
-        return plan.error();
-    // Published host outputs may outlive a smaller-row context replan. Keep
-    // each workspace's already-admitted slot capacity until model teardown.
-    plan.value().host_output_slot_size = std::max(plan.value().host_output_slot_size, resources.plan.host_output_slot_size);
-    plan.value().host_output_workspace_size = std::max(plan.value().host_output_workspace_size, resources.plan.host_output_workspace_size);
-    const uint32_t sessions = std::max({1u, model.opt.num_concurrent_sessions, plan.value().sequence_count});
-    const auto requests = graph_resource_requests(plan.value(), sessions);
-    auto allocated = allocate_graph_resources(model, requests, sessions, nullptr);
-    if (!allocated)
+    const uint32_t next_sessions = std::max(sequence_count, resources.plan.sequence_count);
+    uint32_t candidate_sub_rows = resources.resident_submission_rows.load(std::memory_order_acquire);
+    if (candidate_sub_rows == 0)
+        candidate_sub_rows = model.resident_submission_rows;
+    for (;;)
     {
+        auto plan = plan_model_graph_memory(model, next_rows, next_sessions, next_context, candidate_sub_rows);
+        if (!plan)
+            return plan.error();
+        // Published host outputs may outlive a smaller-row context replan. Keep
+        // each workspace's already-admitted slot capacity until model teardown.
+        plan.value().host_output_slot_size = std::max(plan.value().host_output_slot_size, resources.plan.host_output_slot_size);
+        plan.value().host_output_workspace_size = std::max(plan.value().host_output_workspace_size, resources.plan.host_output_workspace_size);
+        const uint32_t sessions = std::max({1u, model.opt.num_concurrent_sessions, plan.value().sequence_count});
+        const auto requests = graph_resource_requests(plan.value(), sessions);
+        auto allocated = allocate_graph_resources(model, requests, sessions, nullptr);
+        if (allocated)
+        {
+            if (candidate_sub_rows != 0)
+                resources.resident_submission_rows.store(candidate_sub_rows, std::memory_order_release);
+            resources.plan = std::move(plan).value();
+            return resources.plan.host_output_slot_size;
+        }
+        if (candidate_sub_rows > next_rows)
+        {
+            candidate_sub_rows = std::max(next_rows, candidate_sub_rows / 2);
+            continue;
+        }
         // Replanning may have released obsolete free arena backing. Keep the
         // host-output capacity, but force the next request to reserve again.
         resources.plan.prefill_rows = 0;
-        return allocated.error();
+        return Error{allocated.error().code,
+                     allocated.error().message
+                         + " (rows=" + std::to_string(next_rows)
+                         + ", context=" + std::to_string(next_context)
+                         + ", submission_rows=" + std::to_string(candidate_sub_rows) + ")"};
     }
-    resources.plan = std::move(plan).value();
-    return resources.plan.host_output_slot_size;
+}
+
+Result<size_t> admit_prefill_chunk(const CompiledModel& model,
+                                   size_t requested_rows,
+                                   uint64_t required_context)
+{
+    const size_t initial_rows = std::max<size_t>(1, requested_rows);
+    if (!model.graph_resources || model.memory_plan.gpu_devices.empty())
+        return initial_rows;
+    size_t rows = initial_rows;
+    for (;;)
+    {
+        auto admitted = ensure_graph(model, rows, required_context);
+        if (admitted)
+            return rows;
+        if (rows <= 1)
+            return admitted.error();
+        rows = std::max<size_t>(1, rows / 2);
+    }
 }
 
 } // namespace moe

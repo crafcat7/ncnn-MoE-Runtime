@@ -1,4 +1,5 @@
 #include "kernels/ops.h"
+#include "kernels/cpu/cpu_ops.h"
 #include "kernels/qnk.h"
 #include "kernels/vector.h"
 #include "graph/compiledoperator.h"
@@ -21,7 +22,7 @@ namespace moe {
 static bool q8_activation_kernels()
 {
 #if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__clang__)
-    return neon_qnk_q8_supported();
+    return cpu_backend_caps().qnk_q8_supported;
 #else
     // Other platforms fall back to the float path, so the int8 oracles below do
     // not apply.
@@ -530,7 +531,10 @@ static void test_qnk_rows8_equivalence()
 {
     // Compare the 8-row kernel against the 4-row kernel with the same q8
     // activations; this isolates row-tiling from quantization noise.
-    if (!neon_qnk_q8_supported())
+    const CpuKernelOps& ops = cpu_ops();
+    if (!cpu_backend_caps().qnk_q8_supported
+        || ops.qnk_prefill_q8 == nullptr
+        || ops.qnk_prefill_q8_rows8 == nullptr)
     {
         std::cout << "SKIP QnK rows8 equivalence: no ARM dot-product support\n";
         return;
@@ -548,16 +552,16 @@ static void test_qnk_rows8_equivalence()
         std::vector<float> scales(4 * blocks);
         std::vector<int32_t> sums(4 * blocks);
         for (size_t token = 0; token < 4; ++token)
-            neon_qnk_q8_quant(input.row(token), codes.data() + token * 64,
-                              scales.data() + token * blocks, sums.data() + token * blocks, 64);
+            ops.qnk_q8_quant(input.row(token), codes.data() + token * 64,
+                             scales.data() + token * blocks, sums.data() + token * blocks, 64);
         ActivationBuffer rows4(4, 8);
         ActivationBuffer rows8(4, 8);
-        neon_qnk_prefill_q8(dtype, matrix.quantized_data.data(), 8, 64,
-                            codes.data(), scales.data(), sums.data(), 4,
-                            rows4.row(0), rows4.columns());
-        neon_qnk_prefill_q8_rows8(dtype, matrix.quantized_data.data(), 8, 64,
-                                  codes.data(), scales.data(), sums.data(), 4,
-                                  rows8.row(0), rows8.columns());
+        ops.qnk_prefill_q8(dtype, matrix.quantized_data.data(), 8, 64,
+                           codes.data(), scales.data(), sums.data(), 4,
+                           rows4.row(0), rows4.columns());
+        ops.qnk_prefill_q8_rows8(dtype, matrix.quantized_data.data(), 8, 64,
+                                 codes.data(), scales.data(), sums.data(), 4,
+                                 rows8.row(0), rows8.columns());
         for (size_t token = 0; token < 4; ++token)
             for (uint32_t row = 0; row < 8; ++row)
             {

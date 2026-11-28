@@ -1,9 +1,18 @@
-#include "float8_msvc.h"
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
 
-#include "float8.h"
+#include "kernels/cpu/x86/x86_internal.h"
+
+#include "kernels/float8.h"
 
 #include <algorithm>
 #include <immintrin.h>
+
+#if defined(__clang__)
+#pragma clang attribute push(__attribute__((target("avx2,fma"))), apply_to = function)
+#elif defined(__GNUC__)
+#pragma GCC push_options
+#pragma GCC target("avx2,fma")
+#endif
 
 namespace ncnn {
 namespace moe {
@@ -38,7 +47,7 @@ static __m256 decode_float8_e4m3(__m128i packed) noexcept
     return decoded;
 }
 
-float msvc_avx2_float8_e4m3_block_dot(const uint8_t* weights, const float* scales, const float* input, uint32_t count, uint32_t block_size) noexcept
+float avx2_float8_e4m3_block_dot(const uint8_t* weights, const float* scales, const float* input, uint32_t count, uint32_t block_size) noexcept
 {
     float result = 0.0f;
     for (uint32_t block_begin = 0, block = 0; block_begin < count; block_begin += block_size, ++block)
@@ -59,8 +68,8 @@ float msvc_avx2_float8_e4m3_block_dot(const uint8_t* weights, const float* scale
     return result;
 }
 
-void msvc_avx2_float8_e4m3_block_dot_rows4(const uint8_t* weights, uint32_t weight_row_stride, const float* scales, const float* input, uint32_t count,
-                                           uint32_t block_size, uint32_t row_count, float* output) noexcept
+void avx2_float8_e4m3_block_dot_rows4(const uint8_t* weights, uint32_t weight_row_stride, const float* scales, const float* input, uint32_t count,
+                                      uint32_t block_size, uint32_t row_count, float* output) noexcept
 {
     if (row_count == 0 || row_count > 4)
         return;
@@ -97,3 +106,11 @@ void msvc_avx2_float8_e4m3_block_dot_rows4(const uint8_t* weights, uint32_t weig
 
 } // namespace moe
 } // namespace ncnn
+
+#if defined(__clang__)
+#pragma clang attribute pop
+#elif defined(__GNUC__)
+#pragma GCC pop_options
+#endif
+
+#endif

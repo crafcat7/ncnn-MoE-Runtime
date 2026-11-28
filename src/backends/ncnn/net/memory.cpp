@@ -10,6 +10,7 @@
 #include "backends/ncnn/layer/router_vulkan.h"
 #include "backends/ncnn/linear/linear.h"
 #include "backends/ncnn/net/segment.h"
+#include "engine/graphresources.h"
 #include "graph/compiledmodel.h"
 #include "graph/compiler.h"
 #include "graph/memoryplan.h"
@@ -70,11 +71,15 @@ static uint64_t gated_delta_state_size(const CompiledModel& compiled,
 static uint64_t attn_init_size(const CompiledModel& compiled,
                                const AttentionBlockPlan& attention,
                                uint32_t device_index,
-                               uint32_t context_tokens = 0) noexcept
+                               uint32_t context_tokens = 0,
+                               uint32_t prefill_rows = default_prefill_rows) noexcept
 {
     const uint64_t key_columns = saturating_multiply_u64(attention.kv_head_count,
                                                          attention.head_dimension);
     uint64_t required_tokens = std::max<uint64_t>(1, context_tokens == 0 ? default_prefill_rows : context_tokens);
+    if (attention.sliding_window != 0)
+        required_tokens = std::min<uint64_t>(required_tokens,
+                                             saturating_add_u64(attention.sliding_window, prefill_rows));
     if (has_flag(attention.flags, AttentionBlockSink))
         required_tokens = saturating_add_u64(required_tokens, 1);
     const uint64_t capacity = kv_capacity(attention.sliding_window != 0, required_tokens);
@@ -96,7 +101,8 @@ static uint64_t attn_init_size(const CompiledModel& compiled,
 static uint64_t attention_session_state_size(const CompiledModel& compiled,
                                              const AttentionBlockPlan& attention,
                                              uint32_t device_index,
-                                             uint32_t context_tokens = 0) noexcept
+                                             uint32_t context_tokens = 0,
+                                             uint32_t prefill_rows = default_prefill_rows) noexcept
 {
     const uint64_t sessions = std::max(1u, compiled.opt.num_concurrent_sessions);
     if (attention.kind == AttentionKind::GatedDeltaNet)
@@ -122,7 +128,7 @@ static uint64_t attention_session_state_size(const CompiledModel& compiled,
         if (attention.sliding_window == 0)
             return 0;
         const uint64_t state = attn_init_size(compiled, attention, device_index,
-                                              context_tokens);
+                                              context_tokens, prefill_rows);
         return state == UINT64_MAX ? UINT64_MAX : state / sessions;
     }
     if (attention.kind != AttentionKind::MultiHeadLatent)
@@ -181,14 +187,27 @@ static uint32_t graph_node_device(const CompiledModel& model, const Net& graph,
                : model.opt.vulkan_device_index;
 }
 
-static bool graph_has_resident_chain(const CompiledModel& model, const Net& graph)
+static uint32_t effective_submission_rows(const CompiledModel& model, uint32_t override_rows = 0) noexcept
 {
-    return &graph == &model.net && model.resident_submission_rows != 0 && !graph.layer_plans.empty();
+    if (override_rows != 0)
+        return override_rows;
+    if (model.graph_resources)
+    {
+        const uint32_t live = model.graph_resources->resident_submission_rows.load(std::memory_order_acquire);
+        if (live != 0)
+            return live;
+    }
+    return model.resident_submission_rows;
 }
 
-static bool graph_has_expert_banks(const CompiledModel& model, const Net& graph)
+static bool graph_has_resident_chain(const CompiledModel& model, const Net& graph, uint32_t submission_rows_override = 0)
 {
-    return graph_has_resident_chain(model, graph) && model.resident_bank_layers != 0
+    return &graph == &model.net && effective_submission_rows(model, submission_rows_override) != 0 && !graph.layer_plans.empty();
+}
+
+static bool graph_has_expert_banks(const CompiledModel& model, const Net& graph, uint32_t submission_rows_override = 0)
+{
+    return graph_has_resident_chain(model, graph, submission_rows_override) && model.resident_bank_layers != 0
            && model.gpu_expert_bank_plans.size() == graph.layer_plans.size();
 }
 
@@ -1533,7 +1552,8 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
                                                uint32_t rows, uint32_t logits_rows,
                                                uint32_t context_tokens, uint32_t sequence_count, uint32_t node_offset,
                                                std::vector<GraphMemoryBuffer>& buffers,
-                                               std::vector<GraphMemorySubmission>& submissions)
+                                               std::vector<GraphMemorySubmission>& submissions,
+                                               uint32_t submission_rows_override = 0)
 {
     if (graph.layers.empty())
         return {};
@@ -1543,10 +1563,12 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
     std::vector<uint32_t> positions(graph.layers.size());
     for (uint32_t position = 0; position < graph.order.size(); ++position)
         positions[graph.order[position]] = node_offset + position;
-    const bool resident_chain = graph_has_resident_chain(model, graph);
+    const uint32_t submission_rows = effective_submission_rows(model, submission_rows_override);
+    const bool resident_chain = &graph == &model.net && submission_rows != 0 && !graph.layer_plans.empty();
     if (resident_chain)
     {
-        const uint32_t chunk = resident_chunk_layers(model, rows);
+        const uint32_t chunk = static_cast<uint32_t>(std::min<size_t>(graph.layer_plans.size(),
+                                                                      std::max(1u, submission_rows / std::max(1u, rows))));
         std::vector<LayerId> attention(graph.layer_plans.size(), invalid_layer_id);
         std::vector<LayerId> combine(graph.layer_plans.size(), invalid_layer_id);
         LayerId head = invalid_layer_id;
@@ -1838,7 +1860,8 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
 }
 
 Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compiled, uint32_t prefill_rows,
-                                                     uint32_t sequence_count, uint32_t context_tokens)
+                                                     uint32_t sequence_count, uint32_t context_tokens,
+                                                     uint32_t submission_rows_override)
 {
     if (prefill_rows == 0 || sequence_count == 0)
         return Error{ErrorCode::InvalidArgument, "graph memory planning requires nonzero prefill rows and sequence count"};
@@ -1873,7 +1896,8 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
         std::vector<GraphMemoryBuffer> buffers;
         std::vector<GraphMemorySubmission> submissions;
         auto ret = append_graph_region_memory(compiled, compiled.net, rows, rows,
-                                              result.context_tokens, sequence_count, 0, buffers, submissions);
+                                              result.context_tokens, sequence_count, 0, buffers, submissions,
+                                              submission_rows_override);
         if (!ret)
             return ret.error();
         // Target and draft graphs execute serially, sharing the same arena.
@@ -1881,7 +1905,8 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
         const uint32_t draft_rows = std::max(rows, compiled.speculative.block_size);
         ret = append_graph_region_memory(compiled, compiled.speculative.net,
                                          draft_rows, draft_rows,
-                                         result.context_tokens, sequence_count, static_cast<uint32_t>(compiled.net.layers.size()), buffers, submissions);
+                                         result.context_tokens, sequence_count, static_cast<uint32_t>(compiled.net.layers.size()), buffers, submissions,
+                                         submission_rows_override);
         if (!ret)
             return ret.error();
         auto plan = plan_graph_memory(buffers, submissions);
@@ -1896,17 +1921,35 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
             return plan.error();
         (decode ? result.decode : result.prefill) = std::move(plan).value();
     }
-    if (graph_has_resident_chain(compiled, compiled.net))
+    const uint32_t submission_rows = effective_submission_rows(compiled, submission_rows_override);
+    const bool resident_chain = submission_rows != 0 && !compiled.net.layer_plans.empty();
+    if (resident_chain)
     {
         // Smaller row counts record more layers before a fence. A reservation
-        // for P rows therefore needs the peak envelope of every 1..P shape,
-        // not just the largest matrix. Above the recording row budget the
-        // chunk is one layer; cover its largest packed and unpacked shapes.
+        // for P rows therefore needs the peak envelope across all distinct
+        // layer-chunk transitions and packing/CM2 boundaries, not just P.
         std::vector<uint32_t> shapes;
-        const uint32_t submission_rows = compiled.resident_submission_rows;
         const uint32_t enumerated = std::min(prefill_rows, submission_rows);
-        for (uint32_t rows = 1; rows <= enumerated; ++rows)
-            shapes.push_back(rows);
+        const uint32_t layer_count = static_cast<uint32_t>(std::max<size_t>(1, compiled.net.layer_plans.size()));
+        if (enumerated >= 1)
+        {
+            for (uint32_t base : {1u, 7u, 8u, enumerated})
+                if (base <= enumerated)
+                    shapes.push_back(base);
+            const uint32_t max_chunk = std::min(layer_count, submission_rows);
+            for (uint32_t chunk = 1; chunk <= max_chunk; ++chunk)
+            {
+                const uint32_t r_max = std::min(enumerated, submission_rows / chunk);
+                if (r_max == 0)
+                    continue;
+                shapes.push_back(r_max);
+                const uint32_t packed = r_max - r_max % 4;
+                if (packed >= 1)
+                    shapes.push_back(packed);
+                if (r_max % 4 == 0 && r_max > 1)
+                    shapes.push_back(r_max - 1);
+            }
+        }
         if (prefill_rows > enumerated)
         {
             shapes.push_back(prefill_rows);
@@ -1916,6 +1959,8 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
             if (prefill_rows % 4 == 0 && prefill_rows - 1 > enumerated)
                 shapes.push_back(prefill_rows - 1);
         }
+        std::sort(shapes.begin(), shapes.end());
+        shapes.erase(std::unique(shapes.begin(), shapes.end()), shapes.end());
         for (uint32_t rows : shapes)
         {
             if (rows == prefill_rows)
@@ -1937,7 +1982,6 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
     }
     std::map<uint32_t, uint64_t> states;
     std::map<uint32_t, uint64_t> growth;
-    const bool resident_chain = graph_has_resident_chain(compiled, compiled.net);
     std::vector<uint64_t> resident_growth(compiled.net.layer_plans.size(), 0);
     for (const Net* graph : {&compiled.net, &compiled.speculative.net})
         for (const Layer& node : graph->layers)
@@ -1947,7 +1991,7 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
                 continue;
             const CompiledLayerPlan& layer = graph->layer_plans[node.plan_index];
             uint64_t bytes = attention_session_state_size(compiled, layer.attention, layer.vulkan_device_index,
-                                                          result.context_tokens);
+                                                          result.context_tokens, prefill_rows);
             if (layer.attention.kind == AttentionKind::Standard)
             {
                 // Contiguous caches carry a growth margin in the capacity and
@@ -1956,7 +2000,7 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
                 {
                     const uint64_t previous = result.context_tokens > 16
                                                   ? attention_session_state_size(compiled, layer.attention, layer.vulkan_device_index,
-                                                                                 std::max(1u, result.context_tokens / 2))
+                                                                                 std::max(1u, result.context_tokens / 2), prefill_rows)
                                                   : 0;
                     if (resident_chain && graph == &compiled.net)
                         resident_growth[node.plan_index] = previous;
@@ -1975,7 +2019,7 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
             {
                 bytes /= 2;
                 const uint64_t previous = attention_session_state_size(compiled, layer.attention, layer.vulkan_device_index,
-                                                                       std::max(1u, result.context_tokens / 2))
+                                                                       std::max(1u, result.context_tokens / 2), prefill_rows)
                                           / 2;
                 growth[layer.vulkan_device_index] = std::max(growth[layer.vulkan_device_index], previous);
             }
@@ -1990,10 +2034,12 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
         // until the common fence. Cover each row-dependent chunk partition;
         // one-layer-at-a-time growth is insufficient for a resident decode.
         std::vector<uint32_t> chunks{1};
-        const uint32_t submission_rows = compiled.resident_submission_rows;
-        for (uint32_t rows = 1; rows <= submission_rows; ++rows)
+        const uint32_t max_chunk = static_cast<uint32_t>(std::min<size_t>(compiled.net.layer_plans.size(), submission_rows));
+        for (uint32_t chunk_target = 1; chunk_target <= max_chunk; ++chunk_target)
         {
-            const uint32_t chunk = resident_chunk_layers(compiled, rows);
+            const uint32_t rows = std::max(1u, submission_rows / chunk_target);
+            const uint32_t chunk = static_cast<uint32_t>(std::min<size_t>(compiled.net.layer_plans.size(),
+                                                                          std::max(1u, submission_rows / rows)));
             if (std::find(chunks.begin(), chunks.end(), chunk) == chunks.end())
                 chunks.push_back(chunk);
         }

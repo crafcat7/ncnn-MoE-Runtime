@@ -241,7 +241,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                    q8_flags,
                    &packed_owner,
                    ExecutionBackend::Cpu);
-    check(static_cast<bool>(!packed_owner.mxfp4_q8_packed));
+    check(static_cast<bool>(!packed_owner.cpu.mxfp4_q8_packed));
     const ActivationBuffer owner_packed_q8_projected = forward_linear(matrix,
                                                                       input,
                                                                       q8_flags | OptimizationCpuPackedWeights,
@@ -255,8 +255,8 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             check_near(owner_packed_q8_projected.row(input_row)[matrix_row], packed_q8_projected.row(input_row)[matrix_row], 0.15f);
         }
     if (mxfp4_q8_ready())
-        check(static_cast<bool>(packed_owner.mxfp4_q8_packed));
-    const std::shared_ptr<const Mxfp4Q8PackedMatrix> packed_owner_sidecar = packed_owner.mxfp4_q8_packed;
+        check(static_cast<bool>(packed_owner.cpu.mxfp4_q8_packed));
+    const std::shared_ptr<const Mxfp4Q8PackedMatrix> packed_owner_sidecar = packed_owner.cpu.mxfp4_q8_packed;
     ActivationBuffer owner_packed_q8_projected_again;
     forward_linear(matrix,
                    input,
@@ -264,7 +264,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                    q8_flags | OptimizationCpuPackedWeights,
                    &packed_owner,
                    ExecutionBackend::Cpu);
-    check(static_cast<bool>(packed_owner.mxfp4_q8_packed == packed_owner_sidecar));
+    check(static_cast<bool>(packed_owner.cpu.mxfp4_q8_packed == packed_owner_sidecar));
     auto vulkan_projection = Mxfp4Linear_vulkan::create(matrix,
                                                         nullptr,
                                                         automatic_vulkan_device_index,
@@ -370,7 +370,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                    q8_flags,
                    &biased_owner,
                    ExecutionBackend::Cpu);
-    check(static_cast<bool>(!biased_owner.mxfp4_q8_packed));
+    check(static_cast<bool>(!biased_owner.cpu.mxfp4_q8_packed));
     const ActivationBuffer biased_owner_output = forward_linear(matrix,
                                                                 bias,
                                                                 input,
@@ -387,8 +387,8 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                        biased_reference.row(input_row)[matrix_row],
                        0.15f);
     if (mxfp4_q8_ready())
-        check(static_cast<bool>(biased_owner.mxfp4_q8_packed));
-    const std::shared_ptr<const Mxfp4Q8PackedMatrix> biased_owner_sidecar = biased_owner.mxfp4_q8_packed;
+        check(static_cast<bool>(biased_owner.cpu.mxfp4_q8_packed));
+    const std::shared_ptr<const Mxfp4Q8PackedMatrix> biased_owner_sidecar = biased_owner.cpu.mxfp4_q8_packed;
     ActivationBuffer biased_owner_output_again;
     forward_linear(matrix,
                    bias,
@@ -397,7 +397,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                    q8_flags | OptimizationCpuPackedWeights,
                    &biased_owner,
                    ExecutionBackend::Cpu);
-    check(static_cast<bool>(biased_owner.mxfp4_q8_packed == biased_owner_sidecar));
+    check(static_cast<bool>(biased_owner.cpu.mxfp4_q8_packed == biased_owner_sidecar));
     for (bool with_bias : {false, true})
     {
         CompiledOperator missing_gpu_product;
@@ -415,7 +415,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
             rejected = true;
         }
         check(rejected);
-        check(!missing_gpu_product.mxfp4_q8_packed);
+        check(!missing_gpu_product.cpu.mxfp4_q8_packed);
     }
     ActivationBuffer fused;
     forward_gate_up_mxfp4(matrix,
@@ -2293,7 +2293,7 @@ void test_qnk_cpu_kernel()
                        0,
                        &packed_owner,
                        ExecutionBackend::Cpu);
-        check(static_cast<bool>(!packed_owner.qnk_packed));
+        check(static_cast<bool>(!packed_owner.cpu.qnk_packed));
         ActivationBuffer owner_packed_projected;
         forward_linear(matrix,
                        input,
@@ -2301,8 +2301,8 @@ void test_qnk_cpu_kernel()
                        OptimizationCpuPackedWeights,
                        &packed_owner,
                        ExecutionBackend::Cpu);
-        check(static_cast<bool>(packed_owner.qnk_packed));
-        const std::shared_ptr<const QnKPack> packed_owner_sidecar = packed_owner.qnk_packed;
+        check(static_cast<bool>(packed_owner.cpu.qnk_packed));
+        const std::shared_ptr<const QnKPack> packed_owner_sidecar = packed_owner.cpu.qnk_packed;
         ActivationBuffer owner_packed_projected_again;
         forward_linear(matrix,
                        input,
@@ -2310,7 +2310,7 @@ void test_qnk_cpu_kernel()
                        OptimizationCpuPackedWeights,
                        &packed_owner,
                        ExecutionBackend::Cpu);
-        check(static_cast<bool>(packed_owner.qnk_packed == packed_owner_sidecar));
+        check(static_cast<bool>(packed_owner.cpu.qnk_packed == packed_owner_sidecar));
         check(packed_projected.rows() == input_rows);
         check(packed_projected.columns() == rows);
         check(owner_packed_projected.rows() == input_rows);

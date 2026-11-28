@@ -1,6 +1,7 @@
 #include "ncnn/moe/session.h"
 
 #include "executor.h"
+#include "graphresources.h"
 #include "sessionstate.h"
 #include "expertbackend.h"
 #include "storage/expertcache.h"
@@ -219,11 +220,23 @@ Result<void> Session::prefill_unlocked(std::span<const int32_t> input_ids)
     stats_scratch = stats;
     SessionStatistics& updated_statistics = stats_scratch;
     size_t processed_tokens = 0;
+    size_t chunk_cap = prefill_chunk_size;
     while (processed_tokens < input_ids.size())
     {
         const size_t remaining_tokens = input_ids.size() - processed_tokens;
-        const size_t chunk_size = prefill_chunk_size == 0 ? remaining_tokens
-                                                          : std::min<size_t>(remaining_tokens, prefill_chunk_size);
+        size_t chunk_size = chunk_cap == 0 ? remaining_tokens
+                                           : std::min<size_t>(remaining_tokens, chunk_cap);
+        if (compiled.graph_resources && !compiled.memory_plan.gpu_devices.empty())
+        {
+            auto admitted = admit_prefill_chunk(compiled, chunk_size, state->planned_context);
+            if (!admitted)
+                return admitted.error();
+            if (admitted.value() < chunk_size)
+            {
+                chunk_size = admitted.value();
+                chunk_cap = chunk_size;
+            }
+        }
         const std::span<const int32_t> chunk = input_ids.subspan(processed_tokens, chunk_size);
         const LogitsOutput logits_output = processed_tokens + chunk_size == input_ids.size()
                                                ? LogitsOutput::Last

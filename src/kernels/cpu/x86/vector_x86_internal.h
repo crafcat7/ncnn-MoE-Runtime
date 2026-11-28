@@ -1,5 +1,5 @@
-#ifndef NCNN_MOE_VECTOR_X86_H
-#define NCNN_MOE_VECTOR_X86_H
+#ifndef NCNN_MOE_KERNELS_CPU_X86_VECTOR_X86_INTERNAL_H
+#define NCNN_MOE_KERNELS_CPU_X86_VECTOR_X86_INTERNAL_H
 
 #include <cstddef>
 #include <cstdint>
@@ -7,10 +7,13 @@
 namespace ncnn {
 namespace moe {
 
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+
 float avx2_float_dot(const float* left, const float* right, uint32_t count) noexcept;
 float avx512_float_dot(const float* left, const float* right, uint32_t count) noexcept;
 size_t avx2_float_argmax(const float* values, size_t count) noexcept;
 size_t avx512_float_argmax(const float* values, size_t count) noexcept;
+
 void avx2_float_gemm_4x4(const float* weights,
                          size_t weight_stride,
                          const float* input,
@@ -65,6 +68,7 @@ void avx512_bfloat16_gemm_4x8(const uint16_t* weights,
                               uint32_t token_count,
                               float* output,
                               size_t output_stride) noexcept;
+
 void avx2_float_exp_inplace(float* values, uint32_t count) noexcept;
 void avx512_float_exp_inplace(float* values, uint32_t count) noexcept;
 void avx2_float_silu_inplace(float* values, uint32_t count) noexcept;
@@ -168,7 +172,9 @@ void avx512_float_hc_post_4(float* output, const float* branch, const float* res
                             const float* post, const float* combine,
                             uint32_t hidden_size) noexcept;
 
+#endif // x86
+
 } // namespace moe
 } // namespace ncnn
 
-#endif // NCNN_MOE_VECTOR_X86_H
+#endif // NCNN_MOE_KERNELS_CPU_X86_VECTOR_X86_INTERNAL_H

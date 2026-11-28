@@ -189,8 +189,15 @@ static void release_dense(CompiledModel& compiled, TensorHandle handle)
 {
     if (handle == invalid_tensor_handle)
         return;
-    compiled.released_dense_host_size = saturating_add_u64(compiled.released_dense_host_size,
-                                                           release_storage(compiled.weights.at_mutable(handle)));
+    const uint64_t released = release_storage(compiled.weights.at_mutable(handle));
+    if (released != 0)
+    {
+        compiled.released_dense_host_size = saturating_add_u64(compiled.released_dense_host_size,
+                                                               released);
+        CompiledOperator& op = compiled.operators.at_weight_mutable(handle);
+        op.cpu.residency = WeightResidencyPolicy::DeviceOnly;
+        op.cpu.release_host_packs();
+    }
 }
 
 void release_host_copies(CompiledModel& compiled)
@@ -225,13 +232,18 @@ void release_host_copies(CompiledModel& compiled)
         retain_shared(layer);
     for (const CompiledLayerPlan& layer : compiled.speculative.net.layer_plans)
         retain_shared(layer);
+    for (TensorHandle handle : shared_fallback_handles)
+    {
+        if (handle != invalid_tensor_handle)
+            compiled.operators.at_weight_mutable(handle).cpu.residency = WeightResidencyPolicy::HybridDual;
+    }
     for (TensorHandle handle = 0; handle < compiled.weights.size(); ++handle)
     {
-        TensorData& tensor = compiled.weights.at_mutable(handle);
         if (uses_vulkan_dense_operator(compiled.operators.at_weight(handle))
             && std::find(shared_fallback_handles.begin(), shared_fallback_handles.end(), handle) == shared_fallback_handles.end())
-            compiled.released_dense_host_size = saturating_add_u64(compiled.released_dense_host_size,
-                                                                   release_storage(tensor));
+        {
+            release_dense(compiled, handle);
+        }
     }
 
     const auto release_fused_layer_handles = [&compiled](CompiledLayerPlan& layer) {

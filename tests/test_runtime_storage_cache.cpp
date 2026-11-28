@@ -1443,8 +1443,8 @@ void test_file_backed_mxfp4_expert_cache()
     }
     check(static_cast<bool>(retained_lease.gate_up_operator != nullptr));
     check(static_cast<bool>(retained_lease.down_operator != nullptr));
-    check(static_cast<bool>(retained_lease.gate_up_operator->mxfp4_q8_packed == nullptr));
-    check(static_cast<bool>(retained_lease.down_operator->mxfp4_q8_packed == nullptr));
+    check(static_cast<bool>(retained_lease.gate_up_operator->cpu.mxfp4_q8_packed == nullptr));
+    check(static_cast<bool>(retained_lease.down_operator->cpu.mxfp4_q8_packed == nullptr));
 
     const std::filesystem::path packed_path = directory / "packed.bin";
     {

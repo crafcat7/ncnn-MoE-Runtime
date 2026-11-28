@@ -1,12 +1,9 @@
-// Q8_0 i8mm GEMM kernels (4x4 / 4x8 / 4x16 tiles): token group outer, block
-// inner, fp32 accumulators across blocks. Compiled with
-// -march=armv8.6-a+dotprod+i8mm -fno-lto by CMake; without the feature the
-// bodies below degrade to stubs and neon_qnk_i8mm_supported() reports false.
+#include "kernels/cpu/arm/arm_internal.h"
 
-#include "qnk.h"
-#include "ops.h"
-#include "vector.h"
 #include "engine/cpu.h"
+#include "kernels/ops.h"
+#include "kernels/qnk.h"
+#include "kernels/vector.h"
 #include "ncnn/moe/runtime.h"
 
 #if defined(__aarch64__) || defined(_M_ARM64)

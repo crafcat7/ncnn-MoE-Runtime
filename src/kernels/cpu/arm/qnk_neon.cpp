@@ -1,18 +1,12 @@
-// ARM64 int8 activation path for the 32-value GGML QnK formats.
-//
-// The x86 build has an opt-in Q8-activation path for Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/
-// IQ4_NL: quantize one activation row to int8 blocks, then keep the weight
-// codes packed and use integer dot products. The arm64 build previously fell
-// back to dequantize-to-fp32 + FMA for every block. This file provides the
-// same contract with NEON, using SDOT when the CPU advertises dotprod.
-
-#include "qnk.h"
-#include "ops.h"
-#include "vector.h"
-#include "engine/cpu.h"
-#include "ncnn/moe/runtime.h"
-
 #if defined(__aarch64__) || defined(_M_ARM64)
+
+#include "kernels/cpu/arm/arm_internal.h"
+
+#include "engine/cpu.h"
+#include "kernels/ops.h"
+#include "kernels/qnk.h"
+#include "kernels/vector.h"
+#include "ncnn/moe/runtime.h"
 
 #include <arm_neon.h>
 
@@ -27,6 +21,76 @@
 
 namespace ncnn {
 namespace moe {
+
+void neon_qnk_q8k_quantize(const float* source, uint8_t* output, uint32_t columns) noexcept
+{
+    const uint32_t block_count = columns / qnk_block_elements;
+    for (uint32_t block_index = 0; block_index < block_count; ++block_index)
+    {
+        const float* values = source + static_cast<size_t>(block_index) * qnk_block_elements;
+        uint8_t* encoded = output + static_cast<size_t>(block_index) * qnk_block_bytes(DType::Q8K);
+        float maximum = 0.0f;
+        float signed_maximum = 0.0f;
+        bool finite = true;
+        for (uint32_t index = 0; index < qnk_block_elements; ++index)
+        {
+            const float value = values[index];
+            finite = finite && std::isfinite(value);
+            const float absolute = std::fabs(value);
+            if (absolute > maximum)
+            {
+                maximum = absolute;
+                signed_maximum = value;
+            }
+        }
+        if (maximum == 0.0f)
+        {
+            std::memset(encoded, 0, qnk_block_bytes(DType::Q8K));
+            continue;
+        }
+        const float inverse_scale = -127.0f / signed_maximum;
+        const float scale = 1.0f / inverse_scale;
+        std::memcpy(encoded, &scale, sizeof(scale));
+        int8_t* quantized = reinterpret_cast<int8_t*>(encoded + 4);
+        if (finite && std::isfinite(inverse_scale))
+        {
+            const int32x4_t minimum_value = vdupq_n_s32(-127);
+            const int32x4_t maximum_value = vdupq_n_s32(127);
+            for (uint32_t index = 0; index < qnk_block_elements; index += 16)
+            {
+                const int32x4_t q0 = vcvtq_s32_f32(vrndxq_f32(vmulq_n_f32(vld1q_f32(values + index), inverse_scale)));
+                const int32x4_t q1 = vcvtq_s32_f32(vrndxq_f32(vmulq_n_f32(vld1q_f32(values + index + 4), inverse_scale)));
+                const int32x4_t q2 = vcvtq_s32_f32(vrndxq_f32(vmulq_n_f32(vld1q_f32(values + index + 8), inverse_scale)));
+                const int32x4_t q3 = vcvtq_s32_f32(vrndxq_f32(vmulq_n_f32(vld1q_f32(values + index + 12), inverse_scale)));
+                const int32x4_t c0 = vmaxq_s32(vminq_s32(q0, maximum_value), minimum_value);
+                const int32x4_t c1 = vmaxq_s32(vminq_s32(q1, maximum_value), minimum_value);
+                const int32x4_t c2 = vmaxq_s32(vminq_s32(q2, maximum_value), minimum_value);
+                const int32x4_t c3 = vmaxq_s32(vminq_s32(q3, maximum_value), minimum_value);
+                const int16x8_t c01 = vcombine_s16(vmovn_s32(c0), vmovn_s32(c1));
+                const int16x8_t c23 = vcombine_s16(vmovn_s32(c2), vmovn_s32(c3));
+                const int8x16_t packed = vcombine_s8(vmovn_s16(c01), vmovn_s16(c23));
+                vst1q_s8(quantized + index, packed);
+                const int16_t sum = vaddlvq_s8(packed);
+                std::memcpy(encoded + 260 + index / 16 * sizeof(sum), &sum, sizeof(sum));
+            }
+        }
+        else
+        {
+            for (uint32_t index = 0; index < qnk_block_elements; ++index)
+            {
+                const long rounded = std::lrintf(inverse_scale * values[index]);
+                quantized[index] = static_cast<int8_t>(std::clamp<long>(rounded, -127, 127));
+            }
+            for (uint32_t sum_index = 0; sum_index < qnk_block_elements / 16; ++sum_index)
+            {
+                int16_t sum = 0;
+                for (uint32_t lane = 0; lane < 16; ++lane)
+                    sum = static_cast<int16_t>(sum + quantized[sum_index * 16 + lane]);
+                std::memcpy(encoded + 260 + sum_index * sizeof(int16_t), &sum, sizeof(sum));
+            }
+        }
+    }
+}
 
 constexpr int8_t kIq4NlTable[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
@@ -967,4 +1031,4 @@ void neon_qnk_prefill_q8_rows8(DType,
 } // namespace moe
 } // namespace ncnn
 
-#endif // aarch64
+#endif

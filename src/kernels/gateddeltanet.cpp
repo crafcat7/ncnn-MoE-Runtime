@@ -1,5 +1,6 @@
 #include "gateddeltanet.h"
 
+#include "backends/ncnn/layer/gateddeltanet_vulkan.h"
 #include "fastmath.h"
 #include "bfloat16.h"
 #include "ops.h"

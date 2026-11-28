@@ -1853,7 +1853,8 @@ uint64_t vulkan_pending_reserve(const CompiledModel&, uint32_t) noexcept
 Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel&,
                                                      uint32_t prefill_rows,
                                                      uint32_t sequence_count,
-                                                     uint32_t context_tokens)
+                                                     uint32_t context_tokens,
+                                                     uint32_t)
 {
     if (prefill_rows == 0 || sequence_count == 0)
         return Error{ErrorCode::InvalidArgument, "graph memory planning requires nonzero prefill rows and sequence count"};

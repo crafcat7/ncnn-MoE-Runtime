@@ -4,6 +4,7 @@
 #include "graph/memoryplan.h"
 #include "ncnn/moe/result.h"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -20,6 +21,7 @@ class GraphResources
 public:
     std::mutex mutex;
     ModelGraphMemoryPlan plan;
+    std::atomic<uint32_t> resident_submission_rows{0};
     std::vector<std::shared_ptr<void>> contexts;
 };
 
@@ -33,6 +35,12 @@ public:
 // Returns the admitted host output slot size.
 [[nodiscard]] Result<uint64_t> ensure_graph(const CompiledModel& model,
                                             uint64_t rows, uint64_t context_tokens, uint32_t sequence_count = 1);
+
+// Steps down prefill chunk rows if the requested row count cannot fit in the
+// remaining device memory budget. Returns the admitted chunk row count (>= 1).
+[[nodiscard]] Result<size_t> admit_prefill_chunk(const CompiledModel& model,
+                                                 size_t requested_rows,
+                                                 uint64_t required_context);
 
 } // namespace moe
 } // namespace ncnn

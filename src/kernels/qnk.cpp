@@ -1,17 +1,18 @@
 #include "qnk.h"
 
 #include "ncnn/moe/option.h"
+#include "ncnn/moe/runtime.h"
 
-#include "mxfp4.h"
-#include "qnk_msvc.h"
 #include "activationbuffer.h"
+#include "bfloat16.h"
+#include "kernels/cpu/cpu_ops.h"
 #include "ops.h"
 #include "vector.h"
 
 #include <algorithm>
 #include <array>
-#include <cassert>
 #include <atomic>
+#include <cassert>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -24,6 +25,7 @@
 
 namespace ncnn {
 namespace moe {
+
 bool qnk_q8_act(const DType* dtypes, size_t count) noexcept
 {
     if (dtypes == nullptr || count == 0)
@@ -38,8 +40,12 @@ bool qnk_q8_act(const DType* dtypes, size_t count) noexcept
     return true;
 }
 
-static inline const uint8_t* qnk_row0(const uint8_t* raw, const QnKPack* pack, size_t row,
-                                      uint32_t block_count, size_t block_bytes, size_t& stride) noexcept
+static inline const uint8_t* qnk_row0(const uint8_t* raw,
+                                      const QnKPack* pack,
+                                      size_t row,
+                                      uint32_t block_count,
+                                      size_t block_bytes,
+                                      size_t& stride) noexcept
 {
     stride = pack ? block_bytes * 8 : block_bytes;
     return pack ? qnk_packed_block(*pack, row, 0)
@@ -75,8 +81,9 @@ static void qnk_gemm(const uint8_t* raw,
                      // of its native block payload.
                      const uint8_t* raw2_override = nullptr) noexcept
 {
-    static_cast<void>(q8);
     assert(!q8 || token_count == 1);
+    const CpuKernelOps& ops = cpu_ops();
+    const CpuBackendCaps& caps = cpu_backend_caps();
     const uint32_t block_size = qnk_block_size(dtype);
     const uint32_t block_count = columns / block_size;
     const size_t block_bytes = qnk_block_bytes(dtype);
@@ -92,47 +99,40 @@ static void qnk_gemm(const uint8_t* raw,
         output_stride2 = output2->columns();
     }
 
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
-    // 32-value GGML blocks decode eight lanes per step inside the fused row
-    // kernel; the ISA check stays out of the per-block loop.
-    const MxFp4KernelKind simd_kind = block_size == 32 ? mxfp4_kernel_kind() : MxFp4KernelKind::Scalar;
-    const bool use_simd_block32 = simd_kind == MxFp4KernelKind::X86Avx2 || simd_kind == MxFp4KernelKind::X86Avx512;
-#endif
-    const auto dot = [&](const uint8_t* data, const QnKPack* pack, float* result, size_t stride, size_t row)
-#if defined(__GNUC__) || defined(__clang__)
-                         __attribute__((always_inline))
-#endif
-    {
-#if defined(__aarch64__) || defined(_M_ARM64)
-        static_cast<void>(stride);
-        float sum = 0.0f;
-        for (uint32_t block = 0; block < block_count; ++block)
+    const bool use_simd_block32 = block_size == 32
+                                  && ((caps.active_isa_flags & (CpuIsaX86Avx2Fma | CpuIsaX86Avx512)) != 0);
+    const bool is_arm_single = (caps.active_isa_flags & CpuIsaArmNeon) != 0 && token_count == 1;
+    const auto dot = [&](const uint8_t* data, const QnKPack* pack, float* result, size_t stride, size_t row) {
+        if (is_arm_single)
         {
-            const uint8_t* encoded = pack
-                                         ? qnk_packed_block(*pack, row, block)
-                                         : data + ((row * static_cast<size_t>(block_count) + block) * block_bytes);
-            sum += qnk_dot_block(dtype,
-                                 encoded,
-                                 input + static_cast<size_t>(block) * block_size);
+            static_cast<void>(stride);
+            float sum = 0.0f;
+            for (uint32_t block = 0; block < block_count; ++block)
+            {
+                const uint8_t* encoded = pack
+                                             ? qnk_packed_block(*pack, row, block)
+                                             : data + ((row * static_cast<size_t>(block_count) + block) * block_bytes);
+                sum += qnk_dot_block(dtype,
+                                     encoded,
+                                     input + static_cast<size_t>(block) * block_size);
+            }
+            result[row] = sum;
+            return;
         }
-        result[row] = sum;
-#else
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
         if (use_simd_block32)
         {
             size_t encoded_stride = 0;
             const uint8_t* first = qnk_row0(data, pack, row, block_count, block_bytes, encoded_stride);
             for (size_t token = 0; token < token_count; ++token)
             {
-                result[token * stride + row] = msvc_avx2_qnk_dot_row(dtype,
-                                                                     first,
-                                                                     encoded_stride,
-                                                                     block_count,
-                                                                     input + token * input_stride);
+                result[token * stride + row] = ops.qnk_dot_row(dtype,
+                                                               first,
+                                                               encoded_stride,
+                                                               block_count,
+                                                               input + token * input_stride);
             }
             return;
         }
-#endif
         for (size_t token = 0; token < token_count; ++token)
         {
             const float* token_input = input + token * input_stride;
@@ -148,38 +148,27 @@ static void qnk_gemm(const uint8_t* raw,
             }
             result[token * stride + row] = sum;
         }
-#endif
     };
-#if defined(__aarch64__) || defined(_M_ARM64) || defined(NCNN_MOE_MSVC_X86_SIMD)
-    // Single-token int8 rows are selected once per call instead of branching
-    // inside the output-row loop.
     const auto row_q8 = [&](const uint8_t* data, const QnKPack* pack, float* result, size_t row) {
         size_t encoded_stride = 0;
         const uint8_t* first = qnk_row0(data, pack, row, block_count, block_bytes, encoded_stride);
-#if defined(__aarch64__) || defined(_M_ARM64)
-        result[row] = neon_qnk_q8_row(dtype, first, encoded_stride, block_count,
-                                      q8->codes, q8->scales, q8->sums);
-#else
-        result[row] = msvc_avx2_qnk_q8_row(dtype, first, encoded_stride, block_count,
-                                           q8->codes, q8->scales, q8->sums);
-#endif
+        result[row] = ops.qnk_q8_row(dtype, first, encoded_stride, block_count,
+                                     q8->codes, q8->scales, q8->sums);
     };
-#endif
-#if defined(__aarch64__) || defined(_M_ARM64)
+
     if (token_count == 1)
     {
-#if defined(_OPENMP)
-        const size_t task_count = rows + rows2;
-        const uint64_t operation_count = static_cast<uint64_t>(task_count) * columns;
-        const int team_size = static_cast<int>(std::min<size_t>(task_count,
-                                                                static_cast<size_t>(cpu_linear_team_size(operation_count, dtype))));
-        if (team_size > 1)
+        if (q8)
         {
-            if (q8)
+#if defined(_OPENMP)
+            const uint64_t q8_operation_count = static_cast<uint64_t>(rows + rows2) * columns;
+            const int q8_team_size = static_cast<int>(std::min<size_t>(rows + rows2,
+                                                                       static_cast<size_t>(cpu_linear_team_size(q8_operation_count, dtype))));
+            if (q8_team_size > 1)
             {
                 if constexpr (paired)
                 {
-#pragma omp parallel num_threads(team_size)
+#pragma omp parallel num_threads(q8_team_size)
                     {
 #pragma omp for schedule(static) nowait
                         for (int64_t row = 0; row < static_cast<int64_t>(rows); ++row)
@@ -191,34 +180,13 @@ static void qnk_gemm(const uint8_t* raw,
                 }
                 else
                 {
-#pragma omp parallel for schedule(static) num_threads(team_size)
+#pragma omp parallel for schedule(static) num_threads(q8_team_size)
                     for (int64_t row = 0; row < static_cast<int64_t>(rows); ++row)
                         row_q8(raw, packed, output, static_cast<size_t>(row));
                 }
+                return;
             }
-            else if constexpr (paired)
-            {
-#pragma omp parallel num_threads(team_size)
-                {
-#pragma omp for schedule(static) nowait
-                    for (int64_t row = 0; row < static_cast<int64_t>(rows); ++row)
-                        dot(raw, packed, output, output_stride, static_cast<size_t>(row));
-#pragma omp for schedule(static) nowait
-                    for (int64_t row = 0; row < static_cast<int64_t>(rows2); ++row)
-                        dot(raw2, packed2, output2_data, output_stride2, static_cast<size_t>(row));
-                }
-            }
-            else
-            {
-#pragma omp parallel for schedule(static) num_threads(team_size)
-                for (int64_t row = 0; row < static_cast<int64_t>(rows); ++row)
-                    dot(raw, packed, output, output_stride, static_cast<size_t>(row));
-            }
-            return;
-        }
 #endif
-        if (q8)
-        {
             for (size_t row = 0; row < rows; ++row)
                 row_q8(raw, packed, output, row);
             if constexpr (paired)
@@ -226,42 +194,9 @@ static void qnk_gemm(const uint8_t* raw,
                     row_q8(raw2, packed2, output2_data, row);
             return;
         }
-        for (size_t row = 0; row < rows; ++row)
-            dot(raw, packed, output, output_stride, row);
-        if constexpr (paired)
-            for (size_t row = 0; row < rows2; ++row)
-                dot(raw2, packed2, output2_data, output_stride2, row);
-        return;
-    }
-#else
-    if (token_count == 1)
-    {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
-        if (q8)
-        {
-#if defined(_OPENMP)
-            const uint64_t q8_operation_count = static_cast<uint64_t>(rows + rows2) * columns;
-            const int q8_team_size = static_cast<int>(std::min<size_t>(rows + rows2, static_cast<size_t>(cpu_linear_team_size(q8_operation_count, dtype))));
-#pragma omp parallel for schedule(static) num_threads(q8_team_size) if (q8_team_size > 1)
-#endif
-            for (int64_t index = 0; index < static_cast<int64_t>(rows + rows2); ++index)
-            {
-                if (static_cast<size_t>(index) < rows)
-                    row_q8(raw, packed, output, static_cast<size_t>(index));
-                else if constexpr (paired)
-                    row_q8(raw2, packed2, output2_data, static_cast<size_t>(index) - rows);
-            }
-            return;
-        }
-#endif
 #if defined(_OPENMP)
         const uint64_t operation_count = static_cast<uint64_t>(rows + rows2) * columns;
-        // Every block layout benefits from row parallelism; 32-value formats are
-        // no longer the only ones that would otherwise run this GEMV on one thread.
         const int team_size = static_cast<int>(std::min<size_t>(rows + rows2, static_cast<size_t>(cpu_linear_team_size(operation_count, dtype))));
-#endif
-        // Gate/up share one parallel region so a fused projection pays one fork.
-#if defined(_OPENMP)
 #pragma omp parallel for schedule(static) num_threads(team_size) if (team_size > 1)
 #endif
         for (int64_t index = 0; index < static_cast<int64_t>(rows + rows2); ++index)
@@ -273,7 +208,7 @@ static void qnk_gemm(const uint8_t* raw,
         }
         return;
     }
-#endif
+
     // Prefill decodes one 8-row weight tile per block and reuses it across four
     // tokens, matching the GPU kernel's token tile instead of re-decoding the
     // same block for every token.
@@ -354,7 +289,10 @@ enum QnKNeed : uint32_t
 };
 
 // K-quant -> Q8_0 blocks for the int8-activation dots.
-static bool build_q8_compat(const uint8_t* raw, DType dtype, size_t rows, uint32_t columns,
+static bool build_q8_compat(const uint8_t* raw,
+                            DType dtype,
+                            size_t rows,
+                            uint32_t columns,
                             std::vector<uint8_t>& output)
 {
     const uint32_t block_size = qnk_block_size(dtype);
@@ -396,7 +334,9 @@ static bool build_q8_compat(const uint8_t* raw, DType dtype, size_t rows, uint32
 }
 
 // Q8_0 4-row x 4-token repack for the 4x8 GEMM.
-static bool build_q8_pack(const uint8_t* raw, size_t rows, uint32_t columns,
+static bool build_q8_pack(const uint8_t* raw,
+                          size_t rows,
+                          uint32_t columns,
                           std::vector<uint8_t>& output)
 {
     if (raw == nullptr || rows == 0 || rows % 4 != 0 || columns % 32 != 0)
@@ -427,9 +367,6 @@ static bool build_q8_pack(const uint8_t* raw, size_t rows, uint32_t columns,
     return true;
 }
 
-// Lazily builds the requested derived layouts once and publishes them on the
-// operator sidecar, so the lifetime follows the model instead of a
-// process-global pointer-keyed cache.
 static std::shared_ptr<const QnKPack> get_qnk_packed_weights(const TensorData& matrix,
                                                              std::shared_ptr<const QnKPack>* sidecar,
                                                              size_t rows,
@@ -449,7 +386,6 @@ static std::shared_ptr<const QnKPack> get_qnk_packed_weights(const TensorData& m
             return false;
         return true;
     };
-    // Published packs are immutable, so the steady-state read is lock-free.
     if (sidecar != nullptr)
     {
         const std::shared_ptr<const QnKPack> fast = std::atomic_load_explicit(sidecar, std::memory_order_acquire);
@@ -505,7 +441,6 @@ static std::shared_ptr<const QnKPack> get_qnk_packed_weights(const TensorData& m
     }
 }
 
-// Q8 payload for the int8-activation kernels; the owner keeps it alive.
 struct Q8Payload
 {
     std::shared_ptr<const QnKPack> pack;
@@ -589,8 +524,6 @@ static bool qnk_linear_impl(std::initializer_list<const TensorData*> matrices,
         convert_activations = convert_activations || results[index]->dtype() == DType::BFloat16;
     if (convert_activations)
     {
-        // Only activations are widened. Immutable GGML weights and
-        // optional packed sidecars retain their original native bytes.
         ActivationBuffer prepared;
         const ActivationBuffer* float_input = &input;
         if (input.dtype() == DType::BFloat16)
@@ -636,11 +569,8 @@ static bool qnk_linear_impl(std::initializer_list<const TensorData*> matrices,
         }
         return true;
     }
-    // Thread-local activation quantization reused across projections on this
-    // thread; qnk_quantize_input keeps the buffer capacity between calls.
+
     static thread_local QnkQ8Input q8_scratch;
-    // Shared quantization for this input, reusing the caller's buffer when it
-    // matches and otherwise the thread-local scratch.
     const auto q8_get = [&](uint32_t columns) -> const QnkQ8Input& {
         if (q8_input != nullptr && q8_input->columns == columns
             && qnk_q8_input_matches(*q8_input, input))
@@ -648,22 +578,22 @@ static bool qnk_linear_impl(std::initializer_list<const TensorData*> matrices,
         qnk_quantize_input(input, q8_scratch);
         return q8_scratch;
     };
-#if defined(__aarch64__) || defined(_M_ARM64)
     struct Q8PackScratch
     {
         std::vector<int8_t> pack;
         std::vector<float> scales;
     };
     static thread_local Q8PackScratch q8_pack_scratch;
-#endif
 
-    // View of the quantized activation row used by both prefill and decode.
     const auto q8_row = [&](uint32_t columns) {
         const QnkQ8Input& act = q8_get(columns);
         if (act.rows != input.rows() || act.columns != columns)
             return QnkQ8Row{};
         return QnkQ8Row{act.codes.data(), act.scales.data(), act.sums.data()};
     };
+
+    const CpuBackendCaps& caps = cpu_backend_caps();
+    const CpuKernelOps& ops = cpu_ops();
 
     if (matrix_count == 1)
     {
@@ -677,9 +607,14 @@ static bool qnk_linear_impl(std::initializer_list<const TensorData*> matrices,
         const bool q8_dtype = matrix.dtype == DType::Q4_0 || matrix.dtype == DType::Q4_1
                               || matrix.dtype == DType::Q5_0 || matrix.dtype == DType::Q5_1
                               || matrix.dtype == DType::Q8_0 || matrix.dtype == DType::IQ4NL;
-#if defined(__aarch64__) || defined(_M_ARM64)
+        const bool has_arm_q8_prefill = caps.qnk_q8_supported
+                                        && ops.qnk_prefill_q8_0 != nullptr
+                                        && ops.qnk_prefill_q8_0_rows8 != nullptr
+                                        && ops.qnk_prefill_q8 != nullptr
+                                        && ops.qnk_prefill_q8_rows8 != nullptr;
+
         if (use_q8_activations && input.rows() > 1 && is_qnk_dtype(matrix.dtype)
-            && qnk_block_size(matrix.dtype) != 32 && neon_qnk_q8_supported())
+            && qnk_block_size(matrix.dtype) != 32 && has_arm_q8_prefill)
         {
             const Q8Payload fallback = q8_payload(matrix, sidecars.empty() ? nullptr : sidecars[0], rows, columns);
             if (fallback.valid())
@@ -688,22 +623,24 @@ static bool qnk_linear_impl(std::initializer_list<const TensorData*> matrices,
                 if (view.codes != nullptr)
                 {
                     if (rows % 8 == 0)
-                        neon_qnk_prefill_q8_0_rows8(fallback.data->data(), rows, columns,
-                                                    view.codes, view.scales, input.rows(),
-                                                    results[0]->row(0), results[0]->columns());
+                        ops.qnk_prefill_q8_0_rows8(fallback.data->data(), rows, columns,
+                                                   view.codes, view.scales, input.rows(),
+                                                   results[0]->row(0), results[0]->columns());
                     else
-                        neon_qnk_prefill_q8_0(fallback.data->data(), rows, columns,
-                                              view.codes, view.scales, input.rows(),
-                                              results[0]->row(0), results[0]->columns());
+                        ops.qnk_prefill_q8_0(fallback.data->data(), rows, columns,
+                                             view.codes, view.scales, input.rows(),
+                                             results[0]->row(0), results[0]->columns());
                     return true;
                 }
             }
         }
-        if (use_q8_activations && input.rows() > 1 && q8_dtype
-            && neon_qnk_q8_supported())
+        if (use_q8_activations && input.rows() > 1 && q8_dtype && has_arm_q8_prefill)
         {
             if (matrix.dtype == DType::Q8_0 && rows % 4 == 0 && input.rows() % 4 == 0
-                && neon_qnk_i8mm_supported())
+                && caps.qnk_i8mm_supported
+                && ops.qnk_q8_quant_pack4 != nullptr
+                && ops.qnk_prefill_q8_0_gemm8 != nullptr
+                && ops.qnk_prefill_q8_0_gemm4 != nullptr)
             {
                 const Q8Payload weight_pack = q8_payload(matrix, sidecars.empty() ? nullptr : sidecars[0], rows, columns);
                 if (weight_pack.valid())
@@ -711,20 +648,20 @@ static bool qnk_linear_impl(std::initializer_list<const TensorData*> matrices,
                     Q8PackScratch& scratch = q8_pack_scratch;
                     scratch.pack.resize(input.rows() * static_cast<std::size_t>(columns));
                     scratch.scales.resize(input.rows() * static_cast<std::size_t>(columns / 32));
-                    neon_qnk_q8_quant_pack4(input.row(0), input.rows(), columns,
-                                            scratch.pack.data(), scratch.scales.data());
+                    ops.qnk_q8_quant_pack4(input.row(0), input.rows(), columns,
+                                           scratch.pack.data(), scratch.scales.data());
                     const std::vector<int8_t>& activation_pack = scratch.pack;
                     const std::vector<float>& activation_scales = scratch.scales;
                     if (input.rows() % 8 == 0)
-                        neon_qnk_prefill_q8_0_gemm8(weight_pack.data->data(), rows, columns,
-                                                    reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                    activation_scales.data(), input.rows(),
-                                                    results[0]->row(0), results[0]->columns());
+                        ops.qnk_prefill_q8_0_gemm8(weight_pack.data->data(), rows, columns,
+                                                   reinterpret_cast<const uint8_t*>(activation_pack.data()),
+                                                   activation_scales.data(), input.rows(),
+                                                   results[0]->row(0), results[0]->columns());
                     else
-                        neon_qnk_prefill_q8_0_gemm4(weight_pack.data->data(), rows, columns,
-                                                    reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                    activation_scales.data(), input.rows(),
-                                                    results[0]->row(0), results[0]->columns());
+                        ops.qnk_prefill_q8_0_gemm4(weight_pack.data->data(), rows, columns,
+                                                   reinterpret_cast<const uint8_t*>(activation_pack.data()),
+                                                   activation_scales.data(), input.rows(),
+                                                   results[0]->row(0), results[0]->columns());
                     return true;
                 }
             }
@@ -734,29 +671,28 @@ static bool qnk_linear_impl(std::initializer_list<const TensorData*> matrices,
                 if (matrix.dtype == DType::Q8_0)
                 {
                     if (rows % 8 == 0)
-                        neon_qnk_prefill_q8_0_rows8(raw.data(), rows, columns,
-                                                    view.codes, view.scales, input.rows(),
-                                                    results[0]->row(0), results[0]->columns());
+                        ops.qnk_prefill_q8_0_rows8(raw.data(), rows, columns,
+                                                   view.codes, view.scales, input.rows(),
+                                                   results[0]->row(0), results[0]->columns());
                     else
-                        neon_qnk_prefill_q8_0(raw.data(), rows, columns,
-                                              view.codes, view.scales, input.rows(),
-                                              results[0]->row(0), results[0]->columns());
+                        ops.qnk_prefill_q8_0(raw.data(), rows, columns,
+                                             view.codes, view.scales, input.rows(),
+                                             results[0]->row(0), results[0]->columns());
                 }
                 else if (rows % 8 == 0)
-                    neon_qnk_prefill_q8_rows8(matrix.dtype, raw.data(), rows, columns,
-                                              view.codes, view.scales, view.sums, input.rows(),
-                                              results[0]->row(0), results[0]->columns());
+                    ops.qnk_prefill_q8_rows8(matrix.dtype, raw.data(), rows, columns,
+                                             view.codes, view.scales, view.sums, input.rows(),
+                                             results[0]->row(0), results[0]->columns());
                 else
-                    neon_qnk_prefill_q8(matrix.dtype, raw.data(), rows, columns,
-                                        view.codes, view.scales, view.sums, input.rows(),
-                                        results[0]->row(0), results[0]->columns());
+                    ops.qnk_prefill_q8(matrix.dtype, raw.data(), rows, columns,
+                                       view.codes, view.scales, view.sums, input.rows(),
+                                       results[0]->row(0), results[0]->columns());
                 return true;
             }
         }
-#endif
-#if defined(__aarch64__) || defined(_M_ARM64)
-        if (use_q8_activations && input.rows() == 1 && is_qnk_dtype(matrix.dtype)
-            && qnk_block_size(matrix.dtype) != 32 && neon_qnk_q8_supported())
+        if ((caps.active_isa_flags & CpuIsaArmNeon) != 0
+            && use_q8_activations && input.rows() == 1 && is_qnk_dtype(matrix.dtype)
+            && qnk_block_size(matrix.dtype) != 32 && caps.qnk_q8_supported)
         {
             const Q8Payload fallback = q8_payload(matrix, sidecars.empty() ? nullptr : sidecars[0], rows, columns);
             if (fallback.valid())
@@ -772,35 +708,16 @@ static bool qnk_linear_impl(std::initializer_list<const TensorData*> matrices,
                 }
             }
         }
-#endif
+
         QnkQ8Row q8;
-        bool q8_enabled = false;
-#if !defined(NCNN_MOE_MSVC_X86_SIMD) && !defined(__aarch64__) && !defined(_M_ARM64)
-        static_cast<void>(q8_dtype);
-#endif
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
-        // Single-token decode only. One quantized activation row serves every
-        // output row, and qnk_gemm keeps the threading and packed-weight policy,
-        // so this function no longer needs its own row loop.
-        q8_enabled = use_q8_activations && input.rows() == 1
-                     && qnk_block_size(matrix.dtype) == 32 && q8_dtype
-                     && (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2
-                         || mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512);
+        bool q8_enabled = use_q8_activations && input.rows() == 1
+                          && qnk_block_size(matrix.dtype) == 32 && q8_dtype
+                          && caps.qnk_q8_supported;
         if (q8_enabled)
         {
             q8 = q8_row(columns);
             q8_enabled = q8.codes != nullptr;
         }
-#elif defined(__aarch64__) || defined(_M_ARM64)
-        q8_enabled = use_q8_activations && input.rows() == 1
-                     && qnk_block_size(matrix.dtype) == 32 && q8_dtype
-                     && neon_qnk_q8_supported();
-        if (q8_enabled)
-        {
-            q8 = q8_row(columns);
-            q8_enabled = q8.codes != nullptr;
-        }
-#endif
         if (!use_packed_weights)
         {
             qnk_gemm<false>(raw.data(), nullptr, matrix.dtype, rows, columns,
@@ -814,22 +731,13 @@ static bool qnk_linear_impl(std::initializer_list<const TensorData*> matrices,
         if (!packed)
             return false;
 
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
         if (qnk_block_size(matrix.dtype) == qnk_block_elements && matrix.dtype != DType::IQ4XS
-            && mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512)
+            && (caps.active_isa_flags & (CpuIsaX86Avx2Fma | CpuIsaX86Avx512)) != 0)
         {
-            msvc_avx512_qnk_gemm(*packed, input.row(0), columns, input.rows(),
-                                 results[0]->row(0), results[0]->columns());
+            ops.qnk_gemm(*packed, input.row(0), columns, input.rows(),
+                         results[0]->row(0), results[0]->columns());
             return true;
         }
-        if (qnk_block_size(matrix.dtype) == qnk_block_elements && matrix.dtype != DType::IQ4XS
-            && mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2)
-        {
-            msvc_avx2_qnk_gemm(*packed, input.row(0), columns, input.rows(),
-                               results[0]->row(0), results[0]->columns());
-            return true;
-        }
-#endif
         qnk_gemm<false>(nullptr, packed.get(), matrix.dtype, rows, columns,
                         input.row(0), columns, input.rows(), results[0]->row(0), results[0]->columns(),
                         nullptr, nullptr, nullptr, q8_enabled ? &q8 : nullptr);
@@ -843,37 +751,35 @@ static bool qnk_linear_impl(std::initializer_list<const TensorData*> matrices,
     const uint32_t columns = matrix0.shape[1];
     const std::span<const uint8_t> raw0 = matrix0.qnk_values();
     const std::span<const uint8_t> raw1 = matrix1.qnk_values();
-
+    results[0]->reset(input.rows(), static_cast<uint32_t>(rows0), false);
+    results[1]->reset(input.rows(), static_cast<uint32_t>(rows1), false);
     if (input.rows() == 0)
-    {
-        results[0]->reset(0, static_cast<uint32_t>(rows0), false);
-        results[1]->reset(0, static_cast<uint32_t>(rows1), false);
         return true;
-    }
-
     std::shared_ptr<const QnKPack> packed0;
     std::shared_ptr<const QnKPack> packed1;
     if (use_packed_weights)
     {
         packed0 = get_qnk_packed_weights(matrix0, sidecars.empty() ? nullptr : sidecars[0], rows0, columns, QnKNeedNative);
-        if (!packed0)
-            return false;
-        packed1 = get_qnk_packed_weights(matrix1, sidecars.empty() ? nullptr : sidecars[1], rows1, columns, QnKNeedNative);
-        if (!packed1)
+        packed1 = get_qnk_packed_weights(matrix1, sidecars.size() < 2 ? nullptr : sidecars[1], rows1, columns, QnKNeedNative);
+        if (!packed0 || !packed1)
             return false;
     }
-    results[0]->reset(input.rows(), static_cast<uint32_t>(rows0), false);
-    results[1]->reset(input.rows(), static_cast<uint32_t>(rows1), false);
-    const bool q8_dtype = (matrix0.dtype == DType::Q4_0 || matrix0.dtype == DType::Q4_1
-                           || matrix0.dtype == DType::Q5_0 || matrix0.dtype == DType::Q5_1
-                           || matrix0.dtype == DType::Q8_0 || matrix0.dtype == DType::IQ4NL)
-                          && qnk_block_size(matrix0.dtype) == 32;
-#if defined(__aarch64__) || defined(_M_ARM64)
-    if (use_q8_activations && input.rows() > 1 && is_qnk_dtype(matrix0.dtype)
-        && qnk_block_size(matrix0.dtype) != 32 && neon_qnk_q8_supported())
+    const bool q8_dtype = matrix0.dtype == matrix1.dtype
+                          && (matrix0.dtype == DType::Q4_0 || matrix0.dtype == DType::Q4_1
+                              || matrix0.dtype == DType::Q5_0 || matrix0.dtype == DType::Q5_1
+                              || matrix0.dtype == DType::Q8_0 || matrix0.dtype == DType::IQ4NL);
+    const bool has_arm_q8_prefill = caps.qnk_q8_supported
+                                    && ops.qnk_prefill_q8_0 != nullptr
+                                    && ops.qnk_prefill_q8_0_rows8 != nullptr
+                                    && ops.qnk_prefill_q8 != nullptr
+                                    && ops.qnk_prefill_q8_rows8 != nullptr;
+
+    if (use_q8_activations && input.rows() > 1
+        && matrix0.dtype == matrix1.dtype && is_qnk_dtype(matrix0.dtype)
+        && qnk_block_size(matrix0.dtype) != 32 && has_arm_q8_prefill)
     {
         const Q8Payload fallback0 = q8_payload(matrix0, sidecars.empty() ? nullptr : sidecars[0], rows0, columns);
-        const Q8Payload fallback1 = q8_payload(matrix1, sidecars.empty() ? nullptr : sidecars[1], rows1, columns);
+        const Q8Payload fallback1 = q8_payload(matrix1, sidecars.size() < 2 ? nullptr : sidecars[1], rows1, columns);
         if (fallback0.valid() && fallback1.valid())
         {
             const QnkQ8Row view = q8_row(columns);
@@ -881,75 +787,78 @@ static bool qnk_linear_impl(std::initializer_list<const TensorData*> matrices,
             {
                 if (rows0 % 8 == 0 && rows1 % 8 == 0)
                 {
-                    neon_qnk_prefill_q8_0_rows8(fallback0.data->data(), rows0, columns,
-                                                view.codes, view.scales, input.rows(),
-                                                results[0]->row(0), results[0]->columns());
-                    neon_qnk_prefill_q8_0_rows8(fallback1.data->data(), rows1, columns,
-                                                view.codes, view.scales, input.rows(),
-                                                results[1]->row(0), results[1]->columns());
+                    ops.qnk_prefill_q8_0_rows8(fallback0.data->data(), rows0, columns,
+                                               view.codes, view.scales, input.rows(),
+                                               results[0]->row(0), results[0]->columns());
+                    ops.qnk_prefill_q8_0_rows8(fallback1.data->data(), rows1, columns,
+                                               view.codes, view.scales, input.rows(),
+                                               results[1]->row(0), results[1]->columns());
                 }
                 else
                 {
-                    neon_qnk_prefill_q8_0(fallback0.data->data(), rows0, columns,
-                                          view.codes, view.scales, input.rows(),
-                                          results[0]->row(0), results[0]->columns());
-                    neon_qnk_prefill_q8_0(fallback1.data->data(), rows1, columns,
-                                          view.codes, view.scales, input.rows(),
-                                          results[1]->row(0), results[1]->columns());
+                    ops.qnk_prefill_q8_0(fallback0.data->data(), rows0, columns,
+                                         view.codes, view.scales, input.rows(),
+                                         results[0]->row(0), results[0]->columns());
+                    ops.qnk_prefill_q8_0(fallback1.data->data(), rows1, columns,
+                                         view.codes, view.scales, input.rows(),
+                                         results[1]->row(0), results[1]->columns());
                 }
                 return true;
             }
         }
     }
-    if (use_q8_activations && input.rows() > 1 && q8_dtype
-        && neon_qnk_q8_supported())
+    if (use_q8_activations && input.rows() > 1 && q8_dtype && has_arm_q8_prefill)
     {
         if (matrix0.dtype == DType::Q8_0 && rows0 % 4 == 0 && rows1 % 4 == 0
-            && input.rows() % 4 == 0 && neon_qnk_i8mm_supported())
+            && input.rows() % 4 == 0 && caps.qnk_i8mm_supported
+            && ops.qnk_q8_quant_pack4 != nullptr
+            && ops.qnk_prefill_q8_0_gemm16 != nullptr
+            && ops.qnk_prefill_q8_0_gemm8 != nullptr
+            && ops.qnk_prefill_q8_0_gemm4 != nullptr)
         {
             const Q8Payload weight_pack0 = q8_payload(matrix0, sidecars.empty() ? nullptr : sidecars[0], rows0, columns);
-            const Q8Payload weight_pack1 = q8_payload(matrix1, sidecars.empty() ? nullptr : sidecars[1], rows1, columns);
+            const Q8Payload weight_pack1 = q8_payload(matrix1, sidecars.size() < 2 ? nullptr : sidecars[1], rows1, columns);
             if (weight_pack0.valid() && weight_pack1.valid())
             {
                 Q8PackScratch& scratch = q8_pack_scratch;
                 scratch.pack.resize(input.rows() * static_cast<std::size_t>(columns));
                 scratch.scales.resize(input.rows() * static_cast<std::size_t>(columns / 32));
-                neon_qnk_q8_quant_pack4(input.row(0), input.rows(), columns,
-                                        scratch.pack.data(), scratch.scales.data());
+                ops.qnk_q8_quant_pack4(input.row(0), input.rows(), columns,
+                                       scratch.pack.data(), scratch.scales.data());
                 const std::vector<int8_t>& activation_pack = scratch.pack;
                 const std::vector<float>& activation_scales = scratch.scales;
                 if (input.rows() % 16 == 0)
                 {
-                    neon_qnk_prefill_q8_0_gemm16(weight_pack0.data->data(), rows0, columns,
-                                                 reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                 activation_scales.data(), input.rows(),
-                                                 results[0]->row(0), results[0]->columns());
-                    neon_qnk_prefill_q8_0_gemm16(weight_pack1.data->data(), rows1, columns,
-                                                 reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                 activation_scales.data(), input.rows(),
-                                                 results[1]->row(0), results[1]->columns());
+                    ops.qnk_prefill_q8_0_gemm16(weight_pack0.data->data(), rows0, columns,
+                                                reinterpret_cast<const uint8_t*>(activation_pack.data()),
+                                                activation_scales.data(), input.rows(),
+                                                results[0]->row(0), results[0]->columns());
+                    ops.qnk_prefill_q8_0_gemm16(weight_pack1.data->data(), rows1, columns,
+                                                reinterpret_cast<const uint8_t*>(activation_pack.data()),
+                                                activation_scales.data(), input.rows(),
+                                                results[1]->row(0), results[1]->columns());
                 }
                 else if (input.rows() % 8 == 0)
                 {
-                    neon_qnk_prefill_q8_0_gemm8(weight_pack0.data->data(), rows0, columns,
-                                                reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                activation_scales.data(), input.rows(),
-                                                results[0]->row(0), results[0]->columns());
-                    neon_qnk_prefill_q8_0_gemm8(weight_pack1.data->data(), rows1, columns,
-                                                reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                activation_scales.data(), input.rows(),
-                                                results[1]->row(0), results[1]->columns());
+                    ops.qnk_prefill_q8_0_gemm8(weight_pack0.data->data(), rows0, columns,
+                                               reinterpret_cast<const uint8_t*>(activation_pack.data()),
+                                               activation_scales.data(), input.rows(),
+                                               results[0]->row(0), results[0]->columns());
+                    ops.qnk_prefill_q8_0_gemm8(weight_pack1.data->data(), rows1, columns,
+                                               reinterpret_cast<const uint8_t*>(activation_pack.data()),
+                                               activation_scales.data(), input.rows(),
+                                               results[1]->row(0), results[1]->columns());
                 }
                 else
                 {
-                    neon_qnk_prefill_q8_0_gemm4(weight_pack0.data->data(), rows0, columns,
-                                                reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                activation_scales.data(), input.rows(),
-                                                results[0]->row(0), results[0]->columns());
-                    neon_qnk_prefill_q8_0_gemm4(weight_pack1.data->data(), rows1, columns,
-                                                reinterpret_cast<const uint8_t*>(activation_pack.data()),
-                                                activation_scales.data(), input.rows(),
-                                                results[1]->row(0), results[1]->columns());
+                    ops.qnk_prefill_q8_0_gemm4(weight_pack0.data->data(), rows0, columns,
+                                               reinterpret_cast<const uint8_t*>(activation_pack.data()),
+                                               activation_scales.data(), input.rows(),
+                                               results[0]->row(0), results[0]->columns());
+                    ops.qnk_prefill_q8_0_gemm4(weight_pack1.data->data(), rows1, columns,
+                                               reinterpret_cast<const uint8_t*>(activation_pack.data()),
+                                               activation_scales.data(), input.rows(),
+                                               results[1]->row(0), results[1]->columns());
                 }
                 return true;
             }
@@ -961,54 +870,51 @@ static bool qnk_linear_impl(std::initializer_list<const TensorData*> matrices,
             {
                 if (rows0 % 8 == 0 && rows1 % 8 == 0)
                 {
-                    neon_qnk_prefill_q8_0_rows8(raw0.data(), rows0, columns,
-                                                view.codes, view.scales, input.rows(),
-                                                results[0]->row(0), results[0]->columns());
-                    neon_qnk_prefill_q8_0_rows8(raw1.data(), rows1, columns,
-                                                view.codes, view.scales, input.rows(),
-                                                results[1]->row(0), results[1]->columns());
+                    ops.qnk_prefill_q8_0_rows8(raw0.data(), rows0, columns,
+                                               view.codes, view.scales, input.rows(),
+                                               results[0]->row(0), results[0]->columns());
+                    ops.qnk_prefill_q8_0_rows8(raw1.data(), rows1, columns,
+                                               view.codes, view.scales, input.rows(),
+                                               results[1]->row(0), results[1]->columns());
                 }
                 else
                 {
-                    neon_qnk_prefill_q8_0(raw0.data(), rows0, columns,
-                                          view.codes, view.scales, input.rows(),
-                                          results[0]->row(0), results[0]->columns());
-                    neon_qnk_prefill_q8_0(raw1.data(), rows1, columns,
-                                          view.codes, view.scales, input.rows(),
-                                          results[1]->row(0), results[1]->columns());
+                    ops.qnk_prefill_q8_0(raw0.data(), rows0, columns,
+                                         view.codes, view.scales, input.rows(),
+                                         results[0]->row(0), results[0]->columns());
+                    ops.qnk_prefill_q8_0(raw1.data(), rows1, columns,
+                                         view.codes, view.scales, input.rows(),
+                                         results[1]->row(0), results[1]->columns());
                 }
+            }
+            else if (rows0 % 8 == 0 && rows1 % 8 == 0)
+            {
+                ops.qnk_prefill_q8_rows8(matrix0.dtype, raw0.data(), rows0, columns,
+                                         view.codes, view.scales, view.sums, input.rows(),
+                                         results[0]->row(0), results[0]->columns());
+                ops.qnk_prefill_q8_rows8(matrix1.dtype, raw1.data(), rows1, columns,
+                                         view.codes, view.scales, view.sums, input.rows(),
+                                         results[1]->row(0), results[1]->columns());
             }
             else
             {
-                if (rows0 % 8 == 0 && rows1 % 8 == 0)
-                {
-                    neon_qnk_prefill_q8_rows8(matrix0.dtype, raw0.data(), rows0, columns,
-                                              view.codes, view.scales, view.sums, input.rows(),
-                                              results[0]->row(0), results[0]->columns());
-                    neon_qnk_prefill_q8_rows8(matrix1.dtype, raw1.data(), rows1, columns,
-                                              view.codes, view.scales, view.sums, input.rows(),
-                                              results[1]->row(0), results[1]->columns());
-                }
-                else
-                {
-                    neon_qnk_prefill_q8(matrix0.dtype, raw0.data(), rows0, columns,
-                                        view.codes, view.scales, view.sums, input.rows(),
-                                        results[0]->row(0), results[0]->columns());
-                    neon_qnk_prefill_q8(matrix1.dtype, raw1.data(), rows1, columns,
-                                        view.codes, view.scales, view.sums, input.rows(),
-                                        results[1]->row(0), results[1]->columns());
-                }
+                ops.qnk_prefill_q8(matrix0.dtype, raw0.data(), rows0, columns,
+                                   view.codes, view.scales, view.sums, input.rows(),
+                                   results[0]->row(0), results[0]->columns());
+                ops.qnk_prefill_q8(matrix1.dtype, raw1.data(), rows1, columns,
+                                   view.codes, view.scales, view.sums, input.rows(),
+                                   results[1]->row(0), results[1]->columns());
             }
             return true;
         }
     }
-#endif
-#if defined(__aarch64__) || defined(_M_ARM64)
-    if (use_q8_activations && input.rows() == 1 && is_qnk_dtype(matrix0.dtype)
-        && qnk_block_size(matrix0.dtype) != 32 && neon_qnk_q8_supported())
+    if ((caps.active_isa_flags & CpuIsaArmNeon) != 0
+        && use_q8_activations && input.rows() == 1
+        && matrix0.dtype == matrix1.dtype && is_qnk_dtype(matrix0.dtype)
+        && qnk_block_size(matrix0.dtype) != 32 && caps.qnk_q8_supported)
     {
         const Q8Payload fallback0 = q8_payload(matrix0, sidecars.empty() ? nullptr : sidecars[0], rows0, columns);
-        const Q8Payload fallback1 = q8_payload(matrix1, sidecars.empty() ? nullptr : sidecars[1], rows1, columns);
+        const Q8Payload fallback1 = q8_payload(matrix1, sidecars.size() < 2 ? nullptr : sidecars[1], rows1, columns);
         if (fallback0.valid() && fallback1.valid())
         {
             const QnkQ8Row q8 = q8_row(columns);
@@ -1022,29 +928,14 @@ static bool qnk_linear_impl(std::initializer_list<const TensorData*> matrices,
             }
         }
     }
-#endif
+
     QnkQ8Row q8;
-    bool q8_enabled = false;
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
-    q8_enabled = use_q8_activations && input.rows() == 1 && q8_dtype
-                 && (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2
-                     || mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512);
+    bool q8_enabled = use_q8_activations && input.rows() == 1 && q8_dtype && caps.qnk_q8_supported;
     if (q8_enabled)
     {
         q8 = q8_row(columns);
         q8_enabled = q8.codes != nullptr;
     }
-#elif defined(__aarch64__) || defined(_M_ARM64)
-    q8_enabled = use_q8_activations && input.rows() == 1 && q8_dtype
-                 && neon_qnk_q8_supported();
-    if (q8_enabled)
-    {
-        q8 = q8_row(columns);
-        q8_enabled = q8.codes != nullptr;
-    }
-#else
-    static_cast<void>(q8_dtype);
-#endif
     qnk_gemm<true>(raw0.data(), packed0.get(), matrix0.dtype, rows0, columns,
                    input.row(0), columns, input.rows(), results[0]->row(0), results[0]->columns(),
                    &matrix1, packed1.get(), results[1], q8_enabled ? &q8 : nullptr);
@@ -1067,15 +958,7 @@ void qnk_quantize_input(const ActivationBuffer& input, QnkQ8Input& quantized) no
     quantized.source = nullptr;
     quantized.rows = 0;
     quantized.columns = 0;
-#if defined(__aarch64__) || defined(_M_ARM64)
-    const bool supported = neon_qnk_q8_supported();
-#elif defined(NCNN_MOE_MSVC_X86_SIMD)
-    const bool supported = mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2
-                           || mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512;
-#else
-    const bool supported = false;
-#endif
-    if (!supported || input.dtype() != DType::Float32
+    if (!cpu_backend_caps().qnk_q8_supported || input.dtype() != DType::Float32
         || input.rows() == 0 || input.columns() == 0 || input.columns() % 32 != 0)
         return;
     try
@@ -1087,6 +970,7 @@ void qnk_quantize_input(const ActivationBuffer& input, QnkQ8Input& quantized) no
         int8_t* codes = quantized.codes.data();
         float* scales = quantized.scales.data();
         int32_t* sums = quantized.sums.data();
+        const CpuKernelOps& ops = cpu_ops();
 #if defined(_OPENMP)
         const int team_size = omp_in_parallel() != 0
                                   ? 1
@@ -1101,11 +985,7 @@ void qnk_quantize_input(const ActivationBuffer& input, QnkQ8Input& quantized) no
             int8_t* token_codes = codes + token * static_cast<std::size_t>(input.columns());
             float* token_scales = scales + token * static_cast<std::size_t>(block_count);
             int32_t* token_sums = sums + token * static_cast<std::size_t>(block_count);
-#if defined(__aarch64__) || defined(_M_ARM64)
-            neon_qnk_q8_quant(input.row(token), token_codes, token_scales, token_sums, input.columns());
-#else
-            msvc_avx2_qnk_q8_quant(input.row(token), token_codes, token_scales, token_sums, input.columns());
-#endif
+            ops.qnk_q8_quant(input.row(token), token_codes, token_scales, token_sums, input.columns());
         }
         quantized.source = input.row(0);
         quantized.rows = input.rows();

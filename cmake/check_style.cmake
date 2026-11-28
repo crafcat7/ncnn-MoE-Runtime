@@ -53,6 +53,10 @@ foreach(SOURCE_FILE IN LISTS NCNN_MOE_STYLE_FILES)
                AND INCLUDE_DIRECTIVE MATCHES "[<\"]((\\.\\./)*(src/)?(backends|engine|kernels|models)/[^>\"]+|((\\.\\./)*(src/)?graph/)?compiledoperator\\.h)[>\"]")
             string(APPEND NCNN_MOE_STYLE_ERRORS
                 "${RELATIVE_FILE}: graph foundation headers must not include backend or execution implementations\n")
+        elseif(RELATIVE_FILE MATCHES "^src/kernels/cpu/"
+               AND INCLUDE_DIRECTIVE MATCHES "[<\"]((\\.\\./)*(src/)?(backends|models|graph)/[^>\"]+)[>\"]")
+            string(APPEND NCNN_MOE_STYLE_ERRORS
+                "${RELATIVE_FILE}: CPU kernel implementations must not include backend, model, or graph internals\n")
         endif()
     endforeach()
 

@@ -37,6 +37,10 @@ layout(binding = 3) writeonly buffer output_blob
 {
     float output_data[];
 };
+layout(binding = 4) readonly buffer sink_blob
+{
+    float sink_data[];
+};
 
 layout(push_constant) uniform parameter
 {
@@ -52,6 +56,7 @@ layout(push_constant) uniform parameter
     uint cache_start;
     uint sliding_window;
     float scale;
+    uint has_sink;
 }
 p;
 
@@ -149,10 +154,12 @@ void main()
     float acc_odd[ROWS * VALUE_PAIRS];
     float running_max[ROWS];
     float running_sum[ROWS];
+    const float sink_logit = p.has_sink != 0u ? sink_data[head] : -3.402823466e+38;
+    const float init_sum = p.has_sink != 0u ? 1.0 : 0.0;
     [[unroll]] for (uint r = 0u; r < ROWS; ++r)
     {
-        running_max[r] = -3.402823466e+38;
-        running_sum[r] = 0.0;
+        running_max[r] = sink_logit;
+        running_sum[r] = init_sum;
     }
     [[unroll]] for (uint index = 0u; index < ROWS * VALUE_PAIRS; ++index)
     {

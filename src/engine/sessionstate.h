@@ -1,6 +1,7 @@
 #ifndef NCNN_MOE_SESSIONSTATE_H
 #define NCNN_MOE_SESSIONSTATE_H
 
+#include "backends/ncnn/layer/gateddeltanet_vulkan.h"
 #include "backends/ncnn/net/latent_layer.h"
 #include "backends/ncnn/layer/moecombine_vulkan.h"
 #include "backends/ncnn/net/residual_layer.h"

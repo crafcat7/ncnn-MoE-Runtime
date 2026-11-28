@@ -12,6 +12,7 @@
 #include "kernels/vector.h"
 #include "storage/expertcache.h"
 #include "storage/weightstore.h"
+#include "backends/capabilities.h"
 #include "backends/ncnn/linear/linear.h"
 #include "backends/ncnn/net/model.h"
 #include "backends/ncnn/expert/ffn_region.h"
@@ -1437,7 +1438,11 @@ try
                                                  return active.batch.routes.size() == 1
                                                         && active.batch.routes.front().token_index == 0;
                                              });
-    const bool gpu_expert_batch_eligible = layer_state.normalized.rows() >= vulkan_expert_gpu_min_rows
+    const size_t expert_gpu_min_rows = backend == ExecutionBackend::Vulkan
+                                           ? resolve_vulkan_expert_min_rows(query_backend_capabilities(model.opt.vulkan_device_index),
+                                                                            model.opt.hybrid_mode)
+                                           : vulkan_expert_gpu_min_rows;
+    const bool gpu_expert_batch_eligible = layer_state.normalized.rows() >= expert_gpu_min_rows
                                            || model.opt.hybrid_mode == HybridMode::HybridExperts;
     const bool use_backend_batch = backend == ExecutionBackend::Vulkan
                                    && model.expert_backend

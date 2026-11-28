@@ -1,8 +1,8 @@
 #include "qnk.h"
 
-#include "mxfp4.h"
-#include "qnk_msvc.h"
+#include "kernels/cpu/cpu_ops.h"
 #include "vector.h"
+#include "ncnn/moe/runtime.h"
 
 #include <array>
 #include <cmath>
@@ -653,15 +653,12 @@ void qnk_dequantize_block(DType dtype, const uint8_t* block, float* output) noex
 {
     if (!block || !output || !is_qnk_dtype(dtype))
         return;
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
     if (qnk_block_size(dtype) == 32
-        && (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2
-            || mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512))
+        && (cpu_backend_caps().active_isa_flags & (CpuIsaX86Avx2Fma | CpuIsaX86Avx512)) != 0)
     {
-        msvc_avx2_qnk_deq32(dtype, block, output);
+        cpu_ops().qnk_dequantize_block_32(dtype, block, output);
         return;
     }
-#endif
     if (dtype == DType::Q6K)
     {
         QnKOutput destination;
@@ -683,185 +680,36 @@ float qnk_dot_block(DType dtype, const uint8_t* block, const float* input) noexc
         qnk_dequantize_block(dtype, block, decoded.data());
         return float_dot(decoded.data(), input, static_cast<uint32_t>(decoded.size()));
     }
+    const CpuBackendCaps& caps = cpu_backend_caps();
+    const CpuKernelOps& ops = cpu_ops();
+    const bool has_x86_simd = (caps.active_isa_flags & (CpuIsaX86Avx2Fma | CpuIsaX86Avx512)) != 0;
+    const bool has_arm_neon = (caps.active_isa_flags & CpuIsaArmNeon) != 0;
     if (qnk_block_size(dtype) == 32)
     {
-        // Consume the native FP16 scale and codes directly. K-series integer
-        // kernels and activation quantization use a different block ABI.
-#if defined(__aarch64__) || defined(_M_ARM64)
-        return forward_qnk(dtype, block, input, nullptr);
-#else
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
-        const MxFp4KernelKind simd_kind = mxfp4_kernel_kind();
-        if (simd_kind == MxFp4KernelKind::X86Avx2 || simd_kind == MxFp4KernelKind::X86Avx512)
-        {
-            // block_count 1 with a zero stride is the single-block case of the
-            // row kernel, so 32-value blocks have one dispatch site.
-            return msvc_avx2_qnk_dot_row(dtype, block, 0, 1, input);
-        }
-#endif
-        const float scale = load_f16(block);
-        float sum = 0.0f;
-        if (dtype == DType::Q5_1)
-        {
-            const float minimum = load_f16(block + 2);
-            const uint32_t high = load_u32(block + 4);
-            for (uint32_t index = 0; index < 32; ++index)
-            {
-                const uint32_t value = ((block[8 + index % 16] >> (index / 16 * 4)) & 15u)
-                                       | (((high >> index) & 1u) << 4);
-                sum += (scale * static_cast<float>(value) + minimum) * input[index];
-            }
-            return sum;
-        }
-        if (dtype == DType::Q4_0 || dtype == DType::Q4_1)
-        {
-            const bool affine = dtype == DType::Q4_1;
-            const float minimum = affine ? load_f16(block + 2) : 0.0f;
-            const uint8_t* values = block + (affine ? 4 : 2);
-            for (uint32_t index = 0; index < 16; ++index)
-            {
-                const float low = scale * static_cast<float>(static_cast<int>(values[index] & 15u) - (affine ? 0 : 8)) + minimum;
-                const float high = scale * static_cast<float>(static_cast<int>(values[index] >> 4) - (affine ? 0 : 8)) + minimum;
-                sum += low * input[index] + high * input[index + 16];
-            }
-            return sum;
-        }
-        if (dtype == DType::Q5_0)
-        {
-            const uint32_t high_bits = load_u32(block + 2);
-            const uint8_t* values = block + 6;
-            for (uint32_t index = 0; index < 16; ++index)
-            {
-                const int low = static_cast<int>((values[index] & 15u) | (((high_bits >> index) & 1u) << 4)) - 16;
-                const int high = static_cast<int>((values[index] >> 4) | (((high_bits >> (index + 16)) & 1u) << 4)) - 16;
-                sum += scale * static_cast<float>(low) * input[index]
-                       + scale * static_cast<float>(high) * input[index + 16];
-            }
-            return sum;
-        }
-        for (uint32_t index = 0; index < 32; ++index)
-        {
-            const int8_t value = dtype == DType::IQ4NL
-                                     ? iq4_nl_values[(block[2 + index % 16] >> (index / 16 * 4)) & 15u]
-                                     : reinterpret_cast<const int8_t*>(block + 2)[index];
-            sum += (scale * static_cast<float>(value)) * input[index];
-        }
-        return sum;
-#endif
+        if (has_x86_simd)
+            return ops.qnk_dot_row(dtype, block, 0, 1, input);
+        if (has_arm_neon)
+            return forward_qnk(dtype, block, input, nullptr);
+        return ops.qnk_dot_block(dtype, block, input);
     }
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
-    if (qnk_block_size(dtype) == qnk_block_elements && dtype != DType::IQ4XS)
+    if (qnk_block_size(dtype) == qnk_block_elements && dtype != DType::IQ4XS && has_x86_simd)
+        return ops.qnk_dot_block(dtype, block, input);
+    if (has_arm_neon
+        && (dtype == DType::Q2K || dtype == DType::Q3K || dtype == DType::Q4K
+            || dtype == DType::Q5K || dtype == DType::Q6K || dtype == DType::Q8K))
     {
-        if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512)
-            return msvc_avx512_qnk_dot_block(dtype, block, input);
-        if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2)
-            return msvc_avx2_qnk_dot_block(dtype, block, input);
-    }
-#endif
-#if defined(__aarch64__) || defined(_M_ARM64)
-    if (block && input && (dtype == DType::Q2K || dtype == DType::Q3K || dtype == DType::Q4K || dtype == DType::Q5K || dtype == DType::Q6K || dtype == DType::Q8K))
         return forward_qnk(dtype, block, input, nullptr);
-#endif
+    }
     alignas(64) float decoded[qnk_block_elements];
     qnk_dequantize_block(dtype, block, decoded);
-#if defined(__aarch64__) || defined(_M_ARM64)
     return float_dot(decoded, input, qnk_block_elements);
-#else
-    float sum = 0.0f;
-    for (uint32_t index = 0; index < qnk_block_elements; ++index)
-        sum += decoded[index] * input[index];
-    return sum;
-#endif
 }
 
 void qnk_q8k_quantize(const float* source, uint8_t* output, uint32_t columns) noexcept
 {
     if (!source || !output || columns == 0 || columns % qnk_block_elements != 0)
         return;
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
-    if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512)
-    {
-        msvc_avx512_qnk_q8k_quantize(source, output, columns);
-        return;
-    }
-    if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2)
-    {
-        msvc_avx2_qnk_q8k_quantize(source, output, columns);
-        return;
-    }
-#endif
-    const uint32_t block_count = columns / qnk_block_elements;
-    for (uint32_t block_index = 0; block_index < block_count; ++block_index)
-    {
-        const float* values = source + static_cast<size_t>(block_index) * qnk_block_elements;
-        uint8_t* encoded = output + static_cast<size_t>(block_index) * qnk_block_bytes(DType::Q8K);
-        float maximum = 0.0f;
-        float signed_maximum = 0.0f;
-#if defined(__aarch64__) || defined(_M_ARM64)
-        bool finite = true;
-#endif
-        for (uint32_t index = 0; index < qnk_block_elements; ++index)
-        {
-            const float value = values[index];
-#if defined(__aarch64__) || defined(_M_ARM64)
-            finite = finite && std::isfinite(value);
-#endif
-            const float absolute = std::fabs(value);
-            if (absolute > maximum)
-            {
-                maximum = absolute;
-                signed_maximum = value;
-            }
-        }
-        if (maximum == 0.0f)
-        {
-            std::memset(encoded, 0, qnk_block_bytes(DType::Q8K));
-            continue;
-        }
-        const float inverse_scale = -127.0f / signed_maximum;
-        const float scale = 1.0f / inverse_scale;
-        std::memcpy(encoded, &scale, sizeof(scale));
-        int8_t* quantized = reinterpret_cast<int8_t*>(encoded + 4);
-#if defined(__aarch64__) || defined(_M_ARM64)
-        if (finite && std::isfinite(inverse_scale))
-        {
-            const int32x4_t minimum_value = vdupq_n_s32(-127);
-            const int32x4_t maximum_value = vdupq_n_s32(127);
-            for (uint32_t index = 0; index < qnk_block_elements; index += 16)
-            {
-                const int32x4_t q0 = vcvtq_s32_f32(vrndxq_f32(vmulq_n_f32(vld1q_f32(values + index), inverse_scale)));
-                const int32x4_t q1 = vcvtq_s32_f32(vrndxq_f32(vmulq_n_f32(vld1q_f32(values + index + 4), inverse_scale)));
-                const int32x4_t q2 = vcvtq_s32_f32(vrndxq_f32(vmulq_n_f32(vld1q_f32(values + index + 8), inverse_scale)));
-                const int32x4_t q3 = vcvtq_s32_f32(vrndxq_f32(vmulq_n_f32(vld1q_f32(values + index + 12), inverse_scale)));
-                const int32x4_t c0 = vmaxq_s32(vminq_s32(q0, maximum_value), minimum_value);
-                const int32x4_t c1 = vmaxq_s32(vminq_s32(q1, maximum_value), minimum_value);
-                const int32x4_t c2 = vmaxq_s32(vminq_s32(q2, maximum_value), minimum_value);
-                const int32x4_t c3 = vmaxq_s32(vminq_s32(q3, maximum_value), minimum_value);
-                const int16x8_t c01 = vcombine_s16(vmovn_s32(c0), vmovn_s32(c1));
-                const int16x8_t c23 = vcombine_s16(vmovn_s32(c2), vmovn_s32(c3));
-                const int8x16_t packed = vcombine_s8(vmovn_s16(c01), vmovn_s16(c23));
-                vst1q_s8(quantized + index, packed);
-                const int16_t sum = vaddlvq_s8(packed);
-                std::memcpy(encoded + 260 + index / 16 * sizeof(sum), &sum, sizeof(sum));
-            }
-        }
-        else
-#endif
-        {
-            for (uint32_t index = 0; index < qnk_block_elements; ++index)
-            {
-                const long rounded = std::lrintf(inverse_scale * values[index]);
-                quantized[index] = static_cast<int8_t>(std::clamp<long>(rounded, -127, 127));
-            }
-            for (uint32_t sum_index = 0; sum_index < qnk_block_elements / 16; ++sum_index)
-            {
-                int16_t sum = 0;
-                for (uint32_t lane = 0; lane < 16; ++lane)
-                    sum = static_cast<int16_t>(sum + quantized[sum_index * 16 + lane]);
-                std::memcpy(encoded + 260 + sum_index * sizeof(int16_t), &sum, sizeof(sum));
-            }
-        }
-    }
+    cpu_ops().qnk_q8k_quantize(source, output, columns);
 }
 
 } // namespace moe

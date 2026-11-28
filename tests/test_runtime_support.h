@@ -53,7 +53,7 @@
 #endif
 
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
-#include "kernels/vector_x86.h"
+#include "kernels/cpu/x86/vector_x86_internal.h"
 #endif
 
 #if defined(__APPLE__)

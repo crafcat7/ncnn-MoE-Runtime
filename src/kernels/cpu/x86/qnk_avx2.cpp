@@ -1,14 +1,24 @@
-#include "qnk_msvc.h"
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+
+#include "kernels/cpu/x86/x86_internal.h"
+
+#include "kernels/qnk.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <immintrin.h>
 
+#if defined(__clang__)
+#pragma clang attribute push(__attribute__((target("avx2,fma"))), apply_to = function)
+#elif defined(__GNUC__)
+#pragma GCC push_options
+#pragma GCC target("avx2,fma")
+#endif
+
 namespace ncnn {
 namespace moe {
 
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
 static float horizontal_sum(__m256 value) noexcept
 {
     const __m128 halves = _mm_add_ps(_mm256_castps256_ps128(value), _mm256_extractf128_ps(value, 1));
@@ -519,7 +529,7 @@ static float dot32(DType dtype, const uint8_t* block, const float* input) noexce
 
 // Decode one 32-value block into 32 consecutive float32 weights. The
 // same 32-value decoding feeds a stored block instead of a fused dot product.
-void msvc_avx2_qnk_deq32(DType dtype, const uint8_t* block, float* output) noexcept
+void avx2_qnk_deq32(DType dtype, const uint8_t* block, float* output) noexcept
 {
     if (!block || !output)
         return;
@@ -619,11 +629,11 @@ void msvc_avx2_qnk_deq32(DType dtype, const uint8_t* block, float* output) noexc
     }
 }
 
-float msvc_avx2_qnk_dot_row(DType dtype,
-                            const uint8_t* weights,
-                            size_t block_stride,
-                            uint32_t block_count,
-                            const float* input) noexcept
+float avx2_qnk_dot_row(DType dtype,
+                       const uint8_t* weights,
+                       size_t block_stride,
+                       uint32_t block_count,
+                       const float* input) noexcept
 {
     if (!weights || !input || block_count == 0)
         return 0.0f;
@@ -653,11 +663,11 @@ static float horizontal_max(__m256 value) noexcept;
 //       + (additive - scale * code_bias) * input_scale * sum(q)
 // so the code bias and the additive minimum collapse into one scalar correction
 // per block while the integer sum stays a vector accumulator.
-void msvc_avx2_qnk_q8_quant(const float* source,
-                            int8_t* values,
-                            float* scales,
-                            int32_t* sums,
-                            uint32_t columns) noexcept
+void avx2_qnk_q8_quant(const float* source,
+                       int8_t* values,
+                       float* scales,
+                       int32_t* sums,
+                       uint32_t columns) noexcept
 {
     if (!source || !values || !scales || !sums || columns == 0 || columns % 32 != 0)
         return;
@@ -711,13 +721,13 @@ static __m128i expand_q5_high_bits(uint8_t group) noexcept
     return _mm_and_si128(hit, _mm_set1_epi8(16));
 }
 
-float msvc_avx2_qnk_q8_row(DType dtype,
-                           const uint8_t* weights,
-                           size_t block_stride,
-                           uint32_t block_count,
-                           const int8_t* input,
-                           const float* input_scales,
-                           const int32_t* input_sums) noexcept
+float avx2_qnk_q8_row(DType dtype,
+                      const uint8_t* weights,
+                      size_t block_stride,
+                      uint32_t block_count,
+                      const int8_t* input,
+                      const float* input_scales,
+                      const int32_t* input_sums) noexcept
 {
     if (!weights || !input || !input_scales || !input_sums || block_count == 0)
         return 0.0f;
@@ -814,7 +824,7 @@ float msvc_avx2_qnk_q8_row(DType dtype,
     return horizontal_sum(accumulator) + correction;
 }
 
-float msvc_avx2_qnk_dot_block(DType dtype, const uint8_t* block, const float* input) noexcept
+float avx2_qnk_dot_block(DType dtype, const uint8_t* block, const float* input) noexcept
 {
     if (!block || !input)
         return 0.0f;
@@ -845,12 +855,12 @@ static float horizontal_max(__m256 value) noexcept
     return _mm_cvtss_f32(_mm_max_ss(pairs, _mm_movehdup_ps(pairs)));
 }
 
-void msvc_avx2_qnk_gemm(const QnKPack& weights,
-                        const float* input,
-                        size_t input_stride,
-                        size_t token_count,
-                        float* output,
-                        size_t output_stride) noexcept
+void avx2_qnk_gemm(const QnKPack& weights,
+                   const float* input,
+                   size_t input_stride,
+                   size_t token_count,
+                   float* output,
+                   size_t output_stride) noexcept
 {
     for (size_t row = 0; row < weights.rows; ++row)
     {
@@ -859,15 +869,15 @@ void msvc_avx2_qnk_gemm(const QnKPack& weights,
             const float* token_input = input + token * input_stride;
             float sum = 0.0f;
             for (uint32_t block = 0; block < weights.block_count; ++block)
-                sum += msvc_avx2_qnk_dot_block(weights.dtype,
-                                               qnk_packed_block(weights, row, block),
-                                               token_input + static_cast<size_t>(block) * qnk_block_elements);
+                sum += avx2_qnk_dot_block(weights.dtype,
+                                          qnk_packed_block(weights, row, block),
+                                          token_input + static_cast<size_t>(block) * qnk_block_elements);
             output[token * output_stride + row] = sum;
         }
     }
 }
 
-void msvc_avx2_qnk_q8k_quantize(const float* source, uint8_t* output, uint32_t columns) noexcept
+void avx2_qnk_q8k_quantize(const float* source, uint8_t* output, uint32_t columns) noexcept
 {
     const uint32_t block_count = columns / qnk_block_elements;
     const __m256 sign_mask = _mm256_set1_ps(-0.0f);
@@ -922,7 +932,14 @@ void msvc_avx2_qnk_q8k_quantize(const float* source, uint8_t* output, uint32_t c
         }
     }
 }
-#endif
 
 } // namespace moe
 } // namespace ncnn
+
+#if defined(__clang__)
+#pragma clang attribute pop
+#elif defined(__GNUC__)
+#pragma GCC pop_options
+#endif
+
+#endif

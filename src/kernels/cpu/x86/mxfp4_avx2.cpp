@@ -1,17 +1,29 @@
-#include "mxfp4_msvc.h"
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+
+#include "kernels/cpu/x86/x86_internal.h"
+
+#include "kernels/cpu/scalar/scalar_internal.h"
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <immintrin.h>
 
+#if defined(__clang__)
+#pragma clang attribute push(__attribute__((target("avx2,fma"))), apply_to = function)
+#elif defined(__GNUC__)
+#pragma GCC push_options
+#pragma GCC target("avx2,fma")
+#endif
+
 namespace ncnn {
 namespace moe {
 
-void msvc_avx2_unpack_gguf_mxfp4_rows(const uint8_t* source, uint8_t* blocks, uint8_t* scales,
-                                      size_t rows, size_t blocks_per_row,
-                                      size_t block_row_stride, size_t scale_row_stride) noexcept
+void avx2_unpack_gguf_mxfp4_rows(const uint8_t* source, uint8_t* blocks, uint8_t* scales,
+                                 size_t rows, size_t blocks_per_row,
+                                 size_t block_row_stride, size_t scale_row_stride) noexcept
 {
     const __m256i low_mask = _mm256_set1_epi16(0x000f);
     const __m256i high_mask = _mm256_set1_epi16(0x00f0);
@@ -75,10 +87,10 @@ static float avx2_horizontal_max(__m256 values) noexcept
     return _mm_cvtss_f32(result);
 }
 
-void msvc_avx2_mxfp4_q8_quantize(const float* source,
-                                 int8_t* values,
-                                 float* scales,
-                                 uint32_t columns) noexcept
+void avx2_mxfp4_q8_quantize(const float* source,
+                            int8_t* values,
+                            float* scales,
+                            uint32_t columns) noexcept
 {
     if (!source || !values || !scales || columns == 0)
         return;
@@ -159,99 +171,7 @@ static int32_t avx2_horizontal_sum_epi32(__m256i values) noexcept
     return _mm_cvtsi128_si32(sum);
 }
 
-float msvc_avx2_bfloat16_dot(const uint16_t* weights, const float* input, uint32_t count) noexcept
-{
-    __m256 accumulator0 = _mm256_setzero_ps();
-    __m256 accumulator1 = _mm256_setzero_ps();
-    __m256 accumulator2 = _mm256_setzero_ps();
-    __m256 accumulator3 = _mm256_setzero_ps();
-    uint32_t index = 0;
-    for (; index + 32 <= count; index += 32)
-    {
-        const __m128i packed0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(weights + index));
-        const __m128i packed1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(weights + index + 8));
-        const __m128i packed2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(weights + index + 16));
-        const __m128i packed3 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(weights + index + 24));
-        accumulator0 = _mm256_fmadd_ps(_mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(packed0), 16)),
-                                       _mm256_loadu_ps(input + index),
-                                       accumulator0);
-        accumulator1 = _mm256_fmadd_ps(_mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(packed1), 16)),
-                                       _mm256_loadu_ps(input + index + 8),
-                                       accumulator1);
-        accumulator2 = _mm256_fmadd_ps(_mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(packed2), 16)),
-                                       _mm256_loadu_ps(input + index + 16),
-                                       accumulator2);
-        accumulator3 = _mm256_fmadd_ps(_mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(packed3), 16)),
-                                       _mm256_loadu_ps(input + index + 24),
-                                       accumulator3);
-    }
-    float sum = avx2_horizontal_sum(_mm256_add_ps(_mm256_add_ps(accumulator0, accumulator1),
-                                                  _mm256_add_ps(accumulator2, accumulator3)));
-    for (; index + 8 <= count; index += 8)
-    {
-        const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(weights + index));
-        const __m256 values = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(packed), 16));
-        sum += avx2_horizontal_sum(_mm256_mul_ps(values, _mm256_loadu_ps(input + index)));
-    }
-    for (; index < count; ++index)
-    {
-        const uint32_t bits = static_cast<uint32_t>(weights[index]) << 16;
-        float weight = 0.0f;
-        std::memcpy(&weight, &bits, sizeof(weight));
-        sum += weight * input[index];
-    }
-    return sum;
-}
-
-void msvc_avx2_float_to_bfloat16_array(uint16_t* output,
-                                       const float* input,
-                                       uint32_t count) noexcept
-{
-    const __m256i rounding_bias = _mm256_set1_epi32(0x7fff);
-    const __m256i low_bit_mask = _mm256_set1_epi32(1);
-    uint32_t index = 0;
-    for (; index + 8 <= count; index += 8)
-    {
-        const __m256i bits = _mm256_castps_si256(_mm256_loadu_ps(input + index));
-        const __m256i rounding = _mm256_add_epi32(rounding_bias,
-                                                  _mm256_and_si256(_mm256_srli_epi32(bits, 16), low_bit_mask));
-        const __m256i high = _mm256_srli_epi32(_mm256_add_epi32(bits, rounding), 16);
-        const __m128i shuffle_mask = _mm_setr_epi8(0, 1, 4, 5, 8, 9, 12, 13,
-                                                   -128, -128, -128, -128, -128, -128, -128, -128);
-        const __m128i packed_low = _mm_shuffle_epi8(_mm256_castsi256_si128(high), shuffle_mask);
-        const __m128i packed_high = _mm_shuffle_epi8(_mm256_extracti128_si256(high, 1), shuffle_mask);
-        const __m128i packed = _mm_unpacklo_epi64(packed_low, packed_high);
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(output + index), packed);
-    }
-    for (; index < count; ++index)
-    {
-        uint32_t bits = 0;
-        std::memcpy(&bits, input + index, sizeof(bits));
-        const uint32_t rounding = 0x7fffu + ((bits >> 16) & 1u);
-        output[index] = static_cast<uint16_t>((bits + rounding) >> 16);
-    }
-}
-
-void msvc_avx2_bfloat16_scaled_add(float* output, const uint16_t* input, float scale, uint32_t count) noexcept
-{
-    const __m256 scale_vector = _mm256_set1_ps(scale);
-    uint32_t index = 0;
-    for (; index + 8 <= count; index += 8)
-    {
-        const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(input + index));
-        const __m256 values = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(packed), 16));
-        _mm256_storeu_ps(output + index, _mm256_fmadd_ps(values, scale_vector, _mm256_loadu_ps(output + index)));
-    }
-    for (; index < count; ++index)
-    {
-        const uint32_t bits = static_cast<uint32_t>(input[index]) << 16;
-        float value = 0.0f;
-        std::memcpy(&value, &bits, sizeof(value));
-        output[index] += scale * value;
-    }
-}
-
-float msvc_avx2_mxfp4_dot(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, const float* input) noexcept
+float avx2_mxfp4_dot(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, const float* input) noexcept
 {
     const std::array<float, 256>& scales_by_exponent = avx2_scale_table();
     __m256 total = _mm256_setzero_ps();
@@ -272,8 +192,8 @@ float msvc_avx2_mxfp4_dot(const uint8_t* packed, const uint8_t* scales, uint32_t
     return avx2_horizontal_sum(total);
 }
 
-float msvc_avx2_mxfp4_q8_dot(const uint8_t* packed, const uint8_t* scales, uint32_t block_count,
-                             const int8_t* input, const float* input_scales) noexcept
+float avx2_mxfp4_q8_dot(const uint8_t* packed, const uint8_t* scales, uint32_t block_count,
+                        const int8_t* input, const float* input_scales) noexcept
 {
     const __m128i nibble_mask = _mm_set1_epi8(0x0f);
     const __m128i value_table = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
@@ -298,20 +218,41 @@ float msvc_avx2_mxfp4_q8_dot(const uint8_t* packed, const uint8_t* scales, uint3
     return sum;
 }
 
-void msvc_avx2_mxfp4_q8_matmul_rows2(const uint8_t* first_packed,
-                                     const uint8_t* first_scales,
-                                     const uint8_t* second_packed,
-                                     const uint8_t* second_scales,
-                                     uint32_t block_count,
-                                     const int8_t* input,
-                                     size_t input_stride,
-                                     const float* input_scales,
-                                     size_t scale_stride,
-                                     size_t token_count,
-                                     float* first_output,
-                                     size_t first_output_stride,
-                                     float* second_output,
-                                     size_t second_output_stride) noexcept
+void avx2_mxfp4_q8_gemm_row(const uint8_t* packed,
+                            const uint8_t* scales,
+                            uint32_t block_count,
+                            const int8_t* input,
+                            size_t input_stride,
+                            const float* input_scales,
+                            size_t scale_stride,
+                            size_t token_count,
+                            float* output,
+                            size_t output_stride) noexcept
+{
+    for (size_t token = 0; token < token_count; ++token)
+    {
+        output[token * output_stride] = avx2_mxfp4_q8_dot(packed,
+                                                          scales,
+                                                          block_count,
+                                                          input + token * input_stride,
+                                                          input_scales + token * scale_stride);
+    }
+}
+
+void avx2_mxfp4_q8_matmul_rows2(const uint8_t* first_packed,
+                                const uint8_t* first_scales,
+                                const uint8_t* second_packed,
+                                const uint8_t* second_scales,
+                                uint32_t block_count,
+                                const int8_t* input,
+                                size_t input_stride,
+                                const float* input_scales,
+                                size_t scale_stride,
+                                size_t token_count,
+                                float* first_output,
+                                size_t first_output_stride,
+                                float* second_output,
+                                size_t second_output_stride) noexcept
 {
     const std::array<float, 256>& scales_by_exponent = avx2_scale_table();
     for (size_t token = 0; token < token_count; ++token)
@@ -352,7 +293,44 @@ void msvc_avx2_mxfp4_q8_matmul_rows2(const uint8_t* first_packed,
     }
 }
 
-static int32_t msvc_avx2_mxfp4_q8_packed_chunk_dot(const uint8_t* packed, const int8_t* input) noexcept
+void avx2_mxfp4_q8_matmul_row_pairs(const uint8_t* packed,
+                                    const uint8_t* scales,
+                                    uint32_t block_count,
+                                    uint32_t row_pair_count,
+                                    const int8_t* input,
+                                    size_t input_stride,
+                                    const float* input_scales,
+                                    size_t scale_stride,
+                                    size_t token_count,
+                                    float* first_output,
+                                    size_t first_pair_stride,
+                                    size_t first_token_stride,
+                                    float* second_output,
+                                    size_t second_pair_stride,
+                                    size_t second_token_stride) noexcept
+{
+    const size_t packed_row_bytes = static_cast<size_t>(block_count) * 16;
+    for (uint32_t pair = 0; pair < row_pair_count; ++pair)
+    {
+        const size_t first_row = static_cast<size_t>(pair) * 2;
+        avx2_mxfp4_q8_matmul_rows2(packed + first_row * packed_row_bytes,
+                                   scales + first_row * block_count,
+                                   packed + (first_row + 1) * packed_row_bytes,
+                                   scales + (first_row + 1) * block_count,
+                                   block_count,
+                                   input,
+                                   input_stride,
+                                   input_scales,
+                                   scale_stride,
+                                   token_count,
+                                   first_output + static_cast<size_t>(pair) * first_pair_stride,
+                                   first_token_stride,
+                                   second_output + static_cast<size_t>(pair) * second_pair_stride,
+                                   second_token_stride);
+    }
+}
+
+static int32_t avx2_mxfp4_q8_packed_chunk_dot(const uint8_t* packed, const int8_t* input) noexcept
 {
     const __m128i nibble_mask = _mm_set1_epi8(0x0f);
     const __m128i value_table = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
@@ -365,19 +343,26 @@ static int32_t msvc_avx2_mxfp4_q8_packed_chunk_dot(const uint8_t* packed, const 
     return avx2_horizontal_sum_epi32(_mm256_madd_epi16(weights, input_values));
 }
 
-void msvc_avx2_mxfp4_q8_packed_gemm(const uint8_t* packed,
-                                    uint32_t row_count,
-                                    uint32_t block_count,
-                                    uint32_t tile_rows,
-                                    const int8_t* input,
-                                    size_t input_stride,
-                                    const float* input_scales,
-                                    size_t scale_stride,
-                                    size_t token_count,
-                                    float* output,
-                                    size_t output_stride) noexcept
+void avx2_mxfp4_q8_packed_gemm(const uint8_t* packed,
+                               uint32_t row_count,
+                               uint32_t block_count,
+                               uint32_t tile_rows,
+                               const int8_t* input,
+                               size_t input_stride,
+                               const float* input_scales,
+                               size_t scale_stride,
+                               size_t token_count,
+                               float* output,
+                               size_t output_stride) noexcept
 {
-    if (!packed || !input || !input_scales || !output || row_count == 0 || block_count == 0 || tile_rows != 8 || token_count == 0)
+    if (tile_rows != 8)
+    {
+        scalar_mxfp4_q8_packed_gemm(packed, row_count, block_count, tile_rows,
+                                    input, input_stride, input_scales, scale_stride,
+                                    token_count, output, output_stride);
+        return;
+    }
+    if (!packed || !input || !input_scales || !output || row_count == 0 || block_count == 0 || token_count == 0)
         return;
 
     const size_t block_bytes = 8 * 17;
@@ -403,7 +388,7 @@ void msvc_avx2_mxfp4_q8_packed_gemm(const uint8_t* packed,
                         if (matrix_row >= row_count)
                             continue;
                         const uint8_t* row_values = packed_values + (static_cast<size_t>(chunk) * 8 + row) * 8;
-                        accumulators[row] += static_cast<float>(msvc_avx2_mxfp4_q8_packed_chunk_dot(row_values, input_chunk))
+                        accumulators[row] += static_cast<float>(avx2_mxfp4_q8_packed_chunk_dot(row_values, input_chunk))
                                              * (scales_by_exponent[packed_block[row]]) * input_scale;
                     }
                 }
@@ -441,7 +426,7 @@ void msvc_avx2_mxfp4_q8_packed_gemm(const uint8_t* packed,
                         if (matrix_row >= row_count)
                             continue;
                         const uint8_t* row_values = packed_values + (static_cast<size_t>(chunk) * 8 + row) * 8;
-                        output[token * output_stride + matrix_row] += static_cast<float>(msvc_avx2_mxfp4_q8_packed_chunk_dot(row_values, input_chunk))
+                        output[token * output_stride + matrix_row] += static_cast<float>(avx2_mxfp4_q8_packed_chunk_dot(row_values, input_chunk))
                                                                       * (scales_by_exponent[packed_block[row]]) * input_scale;
                     }
                 }
@@ -450,15 +435,15 @@ void msvc_avx2_mxfp4_q8_packed_gemm(const uint8_t* packed,
     }
 }
 
-void msvc_avx2_mxfp4_gemm_row(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, const float* input, size_t input_stride, size_t token_count,
-                              float* output, size_t output_stride) noexcept
+void avx2_mxfp4_gemm_row(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, const float* input, size_t input_stride, size_t token_count,
+                         float* output, size_t output_stride) noexcept
 {
     const std::array<float, 256>& scales_by_exponent = avx2_scale_table();
     for (size_t token_index = 0; token_index < token_count; ++token_index)
         output[token_index * output_stride] = 0.0f;
     if (token_count == 1)
     {
-        output[0] = msvc_avx2_mxfp4_dot(packed, scales, block_count, input);
+        output[0] = avx2_mxfp4_dot(packed, scales, block_count, input);
         return;
     }
     for (uint32_t block_index = 0; block_index < block_count; ++block_index)
@@ -482,9 +467,9 @@ void msvc_avx2_mxfp4_gemm_row(const uint8_t* packed, const uint8_t* scales, uint
     }
 }
 
-void msvc_avx2_mxfp4_matmul_rows2(const uint8_t* first_packed, const uint8_t* first_scales, const uint8_t* second_packed, const uint8_t* second_scales,
-                                  uint32_t block_count, const float* input, size_t input_stride, size_t token_count, float* first_output,
-                                  size_t first_output_stride, float* second_output, size_t second_output_stride) noexcept
+void avx2_mxfp4_matmul_rows2(const uint8_t* first_packed, const uint8_t* first_scales, const uint8_t* second_packed, const uint8_t* second_scales,
+                             uint32_t block_count, const float* input, size_t input_stride, size_t token_count, float* first_output,
+                             size_t first_output_stride, float* second_output, size_t second_output_stride) noexcept
 {
     const std::array<float, 256>& scales_by_exponent = avx2_scale_table();
     for (size_t token_index = 0; token_index < token_count; ++token_index)
@@ -592,9 +577,9 @@ void msvc_avx2_mxfp4_matmul_rows2(const uint8_t* first_packed, const uint8_t* fi
     }
 }
 
-void msvc_avx2_mxfp4_matmul_row_pairs(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, uint32_t row_pair_count, const float* input,
-                                      size_t input_stride, size_t token_count, float* first_output, size_t first_pair_stride, size_t first_token_stride,
-                                      float* second_output, size_t second_pair_stride, size_t second_token_stride) noexcept
+void avx2_mxfp4_matmul_row_pairs(const uint8_t* packed, const uint8_t* scales, uint32_t block_count, uint32_t row_pair_count, const float* input,
+                                 size_t input_stride, size_t token_count, float* first_output, size_t first_pair_stride, size_t first_token_stride,
+                                 float* second_output, size_t second_pair_stride, size_t second_token_stride) noexcept
 {
     const size_t packed_row_bytes = static_cast<size_t>(block_count) * 16;
     uint32_t pair = 0;
@@ -641,12 +626,20 @@ void msvc_avx2_mxfp4_matmul_row_pairs(const uint8_t* packed, const uint8_t* scal
     for (; pair < row_pair_count; ++pair)
     {
         const size_t first_row = static_cast<size_t>(pair) * 2;
-        msvc_avx2_mxfp4_matmul_rows2(packed + first_row * packed_row_bytes, scales + first_row * block_count, packed + (first_row + 1) * packed_row_bytes,
-                                     scales + (first_row + 1) * block_count, block_count, input, input_stride, token_count,
-                                     first_output + static_cast<size_t>(pair) * first_pair_stride, first_token_stride,
-                                     second_output + static_cast<size_t>(pair) * second_pair_stride, second_token_stride);
+        avx2_mxfp4_matmul_rows2(packed + first_row * packed_row_bytes, scales + first_row * block_count, packed + (first_row + 1) * packed_row_bytes,
+                                scales + (first_row + 1) * block_count, block_count, input, input_stride, token_count,
+                                first_output + static_cast<size_t>(pair) * first_pair_stride, first_token_stride,
+                                second_output + static_cast<size_t>(pair) * second_pair_stride, second_token_stride);
     }
 }
 
 } // namespace moe
 } // namespace ncnn
+
+#if defined(__clang__)
+#pragma clang attribute pop
+#elif defined(__GNUC__)
+#pragma GCC pop_options
+#endif
+
+#endif

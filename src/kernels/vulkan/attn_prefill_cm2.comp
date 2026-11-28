@@ -19,6 +19,7 @@ layout(constant_id = 1) const uint BC = 64;
 layout(constant_id = 2) const uint HEAD_DIM = 64;
 layout(constant_id = 3) const uint KV_BF16 = 1;
 layout(constant_id = 4) const uint HAS_WIN = 0;
+layout(constant_id = 5) const uint HAS_SINK = 0;
 
 layout(binding = 0) readonly buffer query_blob
 { float query_data[]; };
@@ -35,6 +36,8 @@ layout(binding = 3) writeonly buffer output_blob
 #endif
 layout(binding = 4) writeonly buffer partial_blob
 { float partial_data[]; };
+layout(binding = 5) readonly buffer sink_blob
+{ float sink_data[]; };
 
 layout(push_constant) uniform parameter
 {
@@ -293,6 +296,9 @@ void main()
     }
 
     coopMatPerElementNV(L, L, write_row_sum, 0u);
+    barrier();
+    if (HAS_SINK != 0u && gl_LocalInvocationIndex < BR)
+        row_sum_s[gl_LocalInvocationIndex] += exp2(min(sink_data[head] * LOG2E, 80.0));
     barrier();
     coopMatPerElementNV(O, O, div_row_sum, 0u);
     store_output(O, head, q_base);

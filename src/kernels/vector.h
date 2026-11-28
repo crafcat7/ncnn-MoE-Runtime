@@ -9,6 +9,8 @@ namespace moe {
 
 float float_dot(const float* left, const float* right, uint32_t count) noexcept;
 size_t float_argmax(const float* values, size_t count) noexcept;
+// Computes token_count input rows by output_count output rows, internally
+// tiling into 4x4 or 4x8 register blocks for small-batch GEMM dispatch.
 void float_gemm_4x4(const float* weights,
                     size_t weight_stride,
                     const float* input,
@@ -18,9 +20,6 @@ void float_gemm_4x4(const float* weights,
                     uint32_t token_count,
                     float* output,
                     size_t output_stride) noexcept;
-// Computes up to four input rows by up to eight output rows.  The caller
-// keeps the tile within those bounds and uses this for small-batch GEMM
-// dispatch so the input tile and each weight vector are reused across rows.
 void float_gemm_4x8(const float* weights,
                     size_t weight_stride,
                     const float* input,

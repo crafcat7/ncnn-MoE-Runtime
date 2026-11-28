@@ -29,6 +29,31 @@ struct QnKPack;
 
 // Execution products are owned by the resident model or an Expert-cache
 // Entry; TensorData contains only weight storage.
+enum class WeightResidencyPolicy : uint8_t
+{
+    HostOnly,
+    DeviceOnly,
+    HybridDual
+};
+
+struct CpuOperatorArtifacts
+{
+    mutable std::shared_ptr<const Mxfp4Q8PackedMatrix> mxfp4_q8_packed;
+    mutable std::shared_ptr<const QnKPack> qnk_packed;
+    WeightResidencyPolicy residency = WeightResidencyPolicy::HostOnly;
+
+    [[nodiscard]] bool allows_cpu_pack() const noexcept
+    {
+        return residency != WeightResidencyPolicy::DeviceOnly;
+    }
+
+    void release_host_packs() const noexcept
+    {
+        mxfp4_q8_packed.reset();
+        qnk_packed.reset();
+    }
+};
+
 struct CompiledOperator
 {
     std::shared_ptr<Linear> linear;
@@ -44,9 +69,9 @@ struct CompiledOperator
     std::shared_ptr<QsaAttention_vulkan> qsa_attention;
     std::shared_ptr<GatedResidualLayer_vulkan> gated_residual_layer;
 
-    // Created lazily when the explicit CPU packed-weight option is enabled.
-    mutable std::shared_ptr<const Mxfp4Q8PackedMatrix> mxfp4_q8_packed;
-    mutable std::shared_ptr<const QnKPack> qnk_packed;
+    // Created lazily when the explicit CPU packed-weight option is enabled
+    // and host residency allows CPU artifacts.
+    CpuOperatorArtifacts cpu;
 };
 
 class CompiledOperatorTable

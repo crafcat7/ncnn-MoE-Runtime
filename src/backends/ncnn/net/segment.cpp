@@ -12,6 +12,7 @@
 #include "backends/ncnn/layer/rmsnorm_vulkan.h"
 #include "backends/ncnn/layer/router_vulkan.h"
 #include "backends/ncnn/linear/linear.h"
+#include "engine/graphresources.h"
 #include "graph/compiledmodel.h"
 #include "graph/memoryplan.h"
 #include "graph/submissionbudget.h"
@@ -79,9 +80,14 @@ static bool segment_norm_supported(const CompiledModel& model, TensorHandle weig
 
 uint32_t resident_chunk_layers(const CompiledModel& model, uint32_t rows) noexcept
 {
-    if (model.resident_submission_rows == 0 || model.net.layer_plans.empty()) return 0;
+    uint32_t submission_rows = model.graph_resources
+                                   ? model.graph_resources->resident_submission_rows.load(std::memory_order_acquire)
+                                   : 0u;
+    if (submission_rows == 0)
+        submission_rows = model.resident_submission_rows;
+    if (submission_rows == 0 || model.net.layer_plans.empty()) return 0;
     return static_cast<uint32_t>(std::min<size_t>(model.net.layer_plans.size(),
-                                                  std::max(1u, model.resident_submission_rows / std::max(1u, rows))));
+                                                  std::max(1u, submission_rows / std::max(1u, rows))));
 }
 
 class GpuSegmentWorkspace_vulkan::Implementation

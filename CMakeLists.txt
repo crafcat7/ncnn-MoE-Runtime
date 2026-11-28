@@ -122,6 +122,8 @@ endif()
 # ==============================================================================
 # Runtime sources (Vulkan backend or stub.cpp is attached after NCNN_MOE_WITH_VULKAN resolves).
 set(NCNN_MOE_SOURCES
+    src/backends/capabilities.cpp
+    src/backends/dispatch.cpp
     # Execution
     src/engine/cpu.cpp
     src/engine/executor.cpp
@@ -154,11 +156,18 @@ set(NCNN_MOE_SOURCES
     src/kernels/ple.cpp
     src/kernels/qnk.cpp
     src/kernels/qnk_format.cpp
-    src/kernels/qnk_neon.cpp
-    src/kernels/qnk_neon_i8mm.cpp
     src/kernels/int4.cpp
     src/kernels/statecache.cpp
     src/kernels/vector.cpp
+    src/kernels/cpu/cpu_dispatch.cpp
+    src/kernels/cpu/ncnn/register_ncnn_cpu.cpp
+    src/kernels/cpu/scalar/vector_scalar.cpp
+    src/kernels/cpu/scalar/bfloat16_scalar.cpp
+    src/kernels/cpu/scalar/float8_scalar.cpp
+    src/kernels/cpu/scalar/mxfp4_scalar.cpp
+    src/kernels/cpu/scalar/qnk_scalar.cpp
+    src/kernels/cpu/x86/register_x86.cpp
+    src/kernels/cpu/arm/register_arm.cpp
     # Models and package I/O
     src/models/modeladapter.cpp
     src/models/modeladapter_gptoss.cpp
@@ -183,18 +192,6 @@ set(NCNN_MOE_SOURCES
     src/storage/mappedfile.cpp
     src/storage/weightstore.cpp
 )
-if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$"
-   AND NOT (APPLE AND CMAKE_OSX_ARCHITECTURES MATCHES "x86_64|i386"))
-    # Universal builds apply per-source flags to every architecture slice, so the
-    # i8mm TU only gets -march when the whole build is ARM64. Without the flag
-    # the kernels degrade to stubs and neon_qnk_i8mm_supported() reports false.
-    include(CheckCXXCompilerFlag)
-    check_cxx_compiler_flag("-march=armv8.6-a+dotprod+i8mm" NCNN_MOE_COMPILER_SUPPORTS_I8MM)
-    if(NCNN_MOE_COMPILER_SUPPORTS_I8MM)
-        set_source_files_properties(src/kernels/qnk_neon_i8mm.cpp PROPERTIES
-            COMPILE_OPTIONS "-march=armv8.6-a+dotprod+i8mm;-fno-lto")
-    endif()
-endif()
 
 add_library(ncnn_moe STATIC ${NCNN_MOE_SOURCES})
 ncnn_moe_optimize_target(ncnn_moe)
@@ -254,34 +251,137 @@ endif()
 # Architecture-specific compilation
 # ==============================================================================
 # Keep ISA flags local so baseline code remains portable.
+function(ncnn_moe_add_cpu_isa_sources)
+    cmake_parse_arguments(ARG "" "TARGET;ISA" "SOURCES" ${ARGN})
+    if(NOT ARG_TARGET OR NOT ARG_ISA OR NOT ARG_SOURCES)
+        message(FATAL_ERROR "ncnn_moe_add_cpu_isa_sources requires TARGET, ISA, and SOURCES")
+    endif()
+
+    set(_has_x86 OFF)
+    set(_has_arm64 OFF)
+    set(_is_apple_universal OFF)
+    if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+        list(LENGTH CMAKE_OSX_ARCHITECTURES _osx_arch_count)
+        if(_osx_arch_count GREATER 1)
+            set(_is_apple_universal ON)
+        endif()
+        foreach(_arch IN LISTS CMAKE_OSX_ARCHITECTURES)
+            if(_arch MATCHES "^(x86_64|AMD64|amd64|X86|x86|x64|i[3-6]86)$")
+                set(_has_x86 ON)
+            elseif(_arch MATCHES "^(aarch64|arm64|ARM64)$")
+                set(_has_arm64 ON)
+            endif()
+        endforeach()
+    else()
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|X86|x86|x64|i[3-6]86)$"
+           OR CMAKE_CXX_COMPILER_ARCHITECTURE_ID MATCHES "^(x86_64|AMD64|amd64|X86|x86|x64|i[3-6]86)$")
+            set(_has_x86 ON)
+        endif()
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$"
+           OR CMAKE_CXX_COMPILER_ARCHITECTURE_ID MATCHES "^(aarch64|arm64|ARM64)$")
+            set(_has_arm64 ON)
+        endif()
+    endif()
+
+    if(ARG_ISA STREQUAL "AVX2" OR ARG_ISA STREQUAL "AVX512")
+        if(NOT NCNN_MOE_ENABLE_X86_SIMD OR NOT _has_x86)
+            return()
+        endif()
+        target_sources(${ARG_TARGET} PRIVATE ${ARG_SOURCES})
+        source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${ARG_SOURCES})
+        if(MSVC)
+            if(ARG_ISA STREQUAL "AVX2")
+                set_source_files_properties(${ARG_SOURCES} PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+            else()
+                set_source_files_properties(${ARG_SOURCES} PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+            endif()
+        elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT _is_apple_universal)
+            if(ARG_ISA STREQUAL "AVX2")
+                set_source_files_properties(${ARG_SOURCES} PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+            else()
+                set_source_files_properties(${ARG_SOURCES} PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl")
+            endif()
+        endif()
+    elseif(ARG_ISA STREQUAL "ARM_NEON")
+        if(NOT _has_arm64)
+            return()
+        endif()
+        target_sources(${ARG_TARGET} PRIVATE ${ARG_SOURCES})
+        source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${ARG_SOURCES})
+    elseif(ARG_ISA STREQUAL "ARM_I8MM")
+        if(NOT _has_arm64)
+            return()
+        endif()
+        target_sources(${ARG_TARGET} PRIVATE ${ARG_SOURCES})
+        source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${ARG_SOURCES})
+        if(NOT MSVC AND NOT _is_apple_universal)
+            include(CheckCXXCompilerFlag)
+            check_cxx_compiler_flag("-march=armv8.6-a+dotprod+i8mm" NCNN_MOE_COMPILER_SUPPORTS_I8MM)
+            if(NCNN_MOE_COMPILER_SUPPORTS_I8MM)
+                set_source_files_properties(${ARG_SOURCES} PROPERTIES
+                    COMPILE_OPTIONS "-march=armv8.6-a+dotprod+i8mm;-fno-lto")
+            endif()
+        endif()
+    elseif(ARG_ISA STREQUAL "ARM_SVE2")
+        if(NOT NCNN_MOE_ENABLE_ARM_SVE2 OR NOT _has_arm64 OR MSVC
+           OR NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            return()
+        endif()
+        include(CheckCXXCompilerFlag)
+        check_cxx_compiler_flag("-march=armv8.2-a+sve2" NCNN_MOE_COMPILER_SUPPORTS_SVE2)
+        if(NCNN_MOE_COMPILER_SUPPORTS_SVE2)
+            target_sources(${ARG_TARGET} PRIVATE ${ARG_SOURCES})
+            source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${ARG_SOURCES})
+            set_source_files_properties(${ARG_SOURCES} PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+sve2")
+            target_compile_definitions(${ARG_TARGET} PRIVATE NCNN_MOE_ARM_SVE2_KERNEL=1)
+        endif()
+    else()
+        message(FATAL_ERROR "Unsupported ISA '${ARG_ISA}' in ncnn_moe_add_cpu_isa_sources")
+    endif()
+endfunction()
+
+ncnn_moe_add_cpu_isa_sources(
+    TARGET ncnn_moe
+    ISA AVX2
+    SOURCES
+        src/kernels/cpu/x86/vector_avx2.cpp
+        src/kernels/cpu/x86/bfloat16_avx2.cpp
+        src/kernels/cpu/x86/float8_avx2.cpp
+        src/kernels/cpu/x86/mxfp4_avx2.cpp
+        src/kernels/cpu/x86/qnk_avx2.cpp
+)
+ncnn_moe_add_cpu_isa_sources(
+    TARGET ncnn_moe
+    ISA AVX512
+    SOURCES
+        src/kernels/cpu/x86/vector_avx512.cpp
+        src/kernels/cpu/x86/bfloat16_avx512.cpp
+        src/kernels/cpu/x86/float8_avx512.cpp
+        src/kernels/cpu/x86/mxfp4_avx512.cpp
+        src/kernels/cpu/x86/qnk_avx512.cpp
+)
+ncnn_moe_add_cpu_isa_sources(
+    TARGET ncnn_moe
+    ISA ARM_NEON
+    SOURCES
+        src/kernels/cpu/arm/vector_neon.cpp
+        src/kernels/cpu/arm/bfloat16_neon.cpp
+        src/kernels/cpu/arm/mxfp4_neon.cpp
+        src/kernels/cpu/arm/qnk_neon.cpp
+)
+ncnn_moe_add_cpu_isa_sources(
+    TARGET ncnn_moe
+    ISA ARM_I8MM
+    SOURCES src/kernels/cpu/arm/qnk_neon_i8mm.cpp
+)
+ncnn_moe_add_cpu_isa_sources(
+    TARGET ncnn_moe
+    ISA ARM_SVE2
+    SOURCES src/kernels/cpu/arm/mxfp4_sve2.cpp
+)
+
 if(NCNN_MOE_ENABLE_X86_SIMD AND MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
-    set(NCNN_MOE_MSVC_SIMD_SOURCES
-        src/kernels/float8_msvc_avx2.cpp
-        src/kernels/float8_msvc_avx512.cpp
-        src/kernels/mxfp4_msvc_avx2.cpp
-        src/kernels/mxfp4_msvc_avx512.cpp
-        src/kernels/qnk_msvc_avx2.cpp
-        src/kernels/qnk_msvc_avx512.cpp
-        src/kernels/vector_x86_avx2.cpp
-        src/kernels/vector_x86_avx512.cpp
-    )
-    target_sources(ncnn_moe PRIVATE ${NCNN_MOE_MSVC_SIMD_SOURCES})
-    source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${NCNN_MOE_MSVC_SIMD_SOURCES})
-    set_source_files_properties(
-        src/kernels/float8_msvc_avx2.cpp
-        src/kernels/mxfp4_msvc_avx2.cpp
-        src/kernels/qnk_msvc_avx2.cpp
-        src/kernels/vector_x86_avx2.cpp
-        PROPERTIES COMPILE_OPTIONS "/arch:AVX2"
-    )
-    set_source_files_properties(
-        src/kernels/float8_msvc_avx512.cpp
-        src/kernels/mxfp4_msvc_avx512.cpp
-        src/kernels/qnk_msvc_avx512.cpp
-        src/kernels/vector_x86_avx512.cpp
-        PROPERTIES COMPILE_OPTIONS "/arch:AVX512"
-    )
-    target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_MSVC_X86_SIMD=1 NCNN_MOE_X86_SIMD=1)
+    target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_X86_SIMD=1)
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     set(NCNN_MOE_TARGET_HAS_X86 OFF)
     if(APPLE AND CMAKE_OSX_ARCHITECTURES)
@@ -299,39 +399,7 @@ elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     endif()
 
     if(NCNN_MOE_TARGET_HAS_X86 AND NCNN_MOE_ENABLE_X86_SIMD)
-        set(NCNN_MOE_X86_SIMD_SOURCES
-            src/kernels/vector_x86_avx2.cpp
-            src/kernels/vector_x86_avx512.cpp
-        )
-        target_sources(ncnn_moe PRIVATE ${NCNN_MOE_X86_SIMD_SOURCES})
-        source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${NCNN_MOE_X86_SIMD_SOURCES})
         target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_X86_SIMD=1)
-    endif()
-endif()
-# Compiler support does not imply runtime CPU support.
-if(
-    NCNN_MOE_ENABLE_ARM_SVE2
-    AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$"
-    AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"
-)
-    include(CheckCXXCompilerFlag)
-    check_cxx_compiler_flag(
-        "-march=armv8.2-a+sve2"
-        NCNN_MOE_COMPILER_SUPPORTS_SVE2
-    )
-    if(NCNN_MOE_COMPILER_SUPPORTS_SVE2)
-        target_sources(
-            ncnn_moe
-            PRIVATE src/kernels/mxfp4_sve2.cpp
-        )
-        set_source_files_properties(
-            src/kernels/mxfp4_sve2.cpp
-            PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+sve2"
-        )
-        target_compile_definitions(
-            ncnn_moe
-            PRIVATE NCNN_MOE_ARM_SVE2_KERNEL=1
-        )
     endif()
 endif()
 

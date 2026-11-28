@@ -1,10 +1,13 @@
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
 
-#include "vector_x86.h"
+#include "kernels/cpu/x86/vector_x86_internal.h"
 
-#include "fastmath.h"
+#include "kernels/cpu/gemm_tile.h"
+#include "kernels/fastmath.h"
 #include <bit>
+#include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <immintrin.h>
 #include <limits>
 
@@ -326,16 +329,21 @@ void avx512_float_hc_post_4(float* output,
     }
 }
 
-void avx512_float_gemm_4x4(const float* weights,
-                           size_t weight_stride,
-                           const float* input,
-                           size_t input_stride,
-                           uint32_t input_columns,
-                           uint32_t output_count,
-                           uint32_t token_count,
-                           float* output,
-                           size_t output_stride) noexcept
+static void avx512_float_gemm_tile_4x4(const float* weights,
+                                       size_t weight_stride,
+                                       const float* input,
+                                       size_t input_stride,
+                                       uint32_t input_columns,
+                                       uint32_t output_count,
+                                       uint32_t token_count,
+                                       float* output,
+                                       size_t output_stride) noexcept
 {
+    if (token_count == 0 || output_count == 0)
+        return;
+    assert(token_count <= 4 && output_count <= 4);
+    if (token_count > 4 || output_count > 4)
+        std::abort();
     __m512 accumulators[4][4] = {};
     uint32_t column = 0;
     for (; column + 16 <= input_columns; column += 16)
@@ -379,16 +387,21 @@ void avx512_float_gemm_4x4(const float* weights,
             output[static_cast<size_t>(token) * output_stride + output_index] = results[token][output_index];
 }
 
-void avx512_float_gemm_4x8(const float* weights,
-                           size_t weight_stride,
-                           const float* input,
-                           size_t input_stride,
-                           uint32_t input_columns,
-                           uint32_t output_count,
-                           uint32_t token_count,
-                           float* output,
-                           size_t output_stride) noexcept
+static void avx512_float_gemm_tile_4x8(const float* weights,
+                                       size_t weight_stride,
+                                       const float* input,
+                                       size_t input_stride,
+                                       uint32_t input_columns,
+                                       uint32_t output_count,
+                                       uint32_t token_count,
+                                       float* output,
+                                       size_t output_stride) noexcept
 {
+    if (token_count == 0 || output_count == 0)
+        return;
+    assert(token_count <= 4 && output_count <= 8);
+    if (token_count > 4 || output_count > 8)
+        std::abort();
     __m512 accumulators[4][8] = {};
     uint32_t column = 0;
     for (; column + 16 <= input_columns; column += 16)
@@ -425,16 +438,21 @@ void avx512_float_gemm_4x8(const float* weights,
             output[static_cast<size_t>(token) * output_stride + output_index] = results[token][output_index];
 }
 
-void avx512_bfloat16_gemm_4x8(const uint16_t* weights,
-                              size_t weight_stride,
-                              const float* input,
-                              size_t input_stride,
-                              uint32_t input_columns,
-                              uint32_t output_count,
-                              uint32_t token_count,
-                              float* output,
-                              size_t output_stride) noexcept
+static void avx512_bfloat16_gemm_tile_4x8(const uint16_t* weights,
+                                          size_t weight_stride,
+                                          const float* input,
+                                          size_t input_stride,
+                                          uint32_t input_columns,
+                                          uint32_t output_count,
+                                          uint32_t token_count,
+                                          float* output,
+                                          size_t output_stride) noexcept
 {
+    if (token_count == 0 || output_count == 0)
+        return;
+    assert(token_count <= 4 && output_count <= 8);
+    if (token_count > 4 || output_count > 8)
+        std::abort();
     __m512 accumulators[4][8] = {};
     uint32_t column = 0;
     for (; column + 16 <= input_columns; column += 16)
@@ -474,6 +492,48 @@ void avx512_bfloat16_gemm_4x8(const uint16_t* weights,
     for (uint32_t token = 0; token < token_count; ++token)
         for (uint32_t output_index = 0; output_index < output_count; ++output_index)
             output[static_cast<size_t>(token) * output_stride + output_index] = results[token][output_index];
+}
+
+void avx512_float_gemm_4x4(const float* weights,
+                           size_t weight_stride,
+                           const float* input,
+                           size_t input_stride,
+                           uint32_t input_columns,
+                           uint32_t output_count,
+                           uint32_t token_count,
+                           float* output,
+                           size_t output_stride) noexcept
+{
+    run_tiled_float_gemm(4u, 4u, avx512_float_gemm_tile_4x4, weights, weight_stride, input, input_stride,
+                         input_columns, output_count, token_count, output, output_stride);
+}
+
+void avx512_float_gemm_4x8(const float* weights,
+                           size_t weight_stride,
+                           const float* input,
+                           size_t input_stride,
+                           uint32_t input_columns,
+                           uint32_t output_count,
+                           uint32_t token_count,
+                           float* output,
+                           size_t output_stride) noexcept
+{
+    run_tiled_float_gemm(4u, 8u, avx512_float_gemm_tile_4x8, weights, weight_stride, input, input_stride,
+                         input_columns, output_count, token_count, output, output_stride);
+}
+
+void avx512_bfloat16_gemm_4x8(const uint16_t* weights,
+                              size_t weight_stride,
+                              const float* input,
+                              size_t input_stride,
+                              uint32_t input_columns,
+                              uint32_t output_count,
+                              uint32_t token_count,
+                              float* output,
+                              size_t output_stride) noexcept
+{
+    run_tiled_bfloat16_gemm(4u, 8u, avx512_bfloat16_gemm_tile_4x8, weights, weight_stride, input, input_stride,
+                            input_columns, output_count, token_count, output, output_stride);
 }
 
 void avx512_float_exp_inplace(float* values, uint32_t count) noexcept

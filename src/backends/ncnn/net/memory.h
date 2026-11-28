@@ -143,7 +143,8 @@ private:
 [[nodiscard]] Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compiled,
                                                                    uint32_t prefill_rows,
                                                                    uint32_t sequence_count = 1,
-                                                                   uint32_t context_tokens = 0);
+                                                                   uint32_t context_tokens = 0,
+                                                                   uint32_t submission_rows_override = 0);
 
 } // namespace moe
 } // namespace ncnn

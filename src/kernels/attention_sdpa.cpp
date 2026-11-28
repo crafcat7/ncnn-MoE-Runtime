@@ -1,6 +1,7 @@
 #include "attention_internal.h"
 
 #include "bfloat16.h"
+#include "cpu/cpu_caps.h"
 #include "engine/cpu.h"
 #include "fastmath.h"
 #include "ops.h"
@@ -101,11 +102,7 @@ void sdpa_into(const AttentionBlockPlan& plan, const TensorData* sinks, uint64_t
                                       && direct_bfloat16
                                       && !direct_bfloat16_contiguous;
     const bool bf16_pv = use_flash && query.rows() == 1 && direct_bfloat16;
-#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
-    constexpr bool f16_hw = true;
-#else
-    constexpr bool f16_hw = false;
-#endif
+    const bool f16_hw = cpu_backend_caps().has_f16_vector;
     const bool f16 = use_flash
                      && query.rows() > 1
                      && has_flag(optimization_flags, OptimizationCpuFlashAttentionF16)
@@ -1300,8 +1297,8 @@ void sdpa_into(const AttentionBlockPlan& plan, const TensorData* sinks, uint64_t
                         const uint64_t slot = direct_bfloat16_contiguous
                                                   ? cache.first_slot + key_index
                                                   : cache_slot(cache, key_index);
-#if defined(__aarch64__) || defined(_M_ARM64)
-                        if (cache.token_count - key_index >= 4
+                        if (f16_hw
+                            && cache.token_count - key_index >= 4
                             && cache.capacity_tokens - slot >= 4)
                         {
                             const uint16_t* key_rows = bfloat16_key_values
@@ -1325,7 +1322,6 @@ void sdpa_into(const AttentionBlockPlan& plan, const TensorData* sinks, uint64_t
                             key_index += 4;
                             continue;
                         }
-#endif
                         const uint16_t* key_vector = bfloat16_key_values + static_cast<size_t>(slot) * cache.columns
                                                      + static_cast<size_t>(kv_head) * head_dimension;
                         head_logits[key_index] = bfloat16_dot(key_vector, query_vector, head_dimension) * scale;

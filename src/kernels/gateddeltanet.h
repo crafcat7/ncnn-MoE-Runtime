@@ -1,7 +1,6 @@
 #ifndef NCNN_MOE_GATEDDELTANET_H
 #define NCNN_MOE_GATEDDELTANET_H
 
-#include "backends/ncnn/layer/gateddeltanet_vulkan.h"
 #include "kernels/activationbuffer.h"
 #include "graph/layerplan.h"
 #include "graph/graph.h"
@@ -16,6 +15,7 @@ namespace ncnn {
 namespace moe {
 
 class CompiledOperatorTable;
+struct GatedDeltaBatchEntry_vulkan;
 struct GatedDeltaScratch
 {
     ActivationBuffer normalized;
