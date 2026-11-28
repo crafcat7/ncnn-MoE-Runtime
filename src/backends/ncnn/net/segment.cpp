@@ -83,7 +83,10 @@ uint32_t resident_chunk_layers(const CompiledModel& model, uint32_t rows) noexce
     uint32_t submission_rows = model.graph_resources
                                    ? model.graph_resources->resident_submission_rows.load(std::memory_order_acquire)
                                    : 0u;
-    if (submission_rows == 0)
+    // Live replanning may narrow the budget; a copied model that overrides the
+    // prepared value must not inherit a wider one from the source model's arena.
+    if (model.resident_submission_rows != 0
+        && (submission_rows == 0 || submission_rows > model.resident_submission_rows))
         submission_rows = model.resident_submission_rows;
     if (submission_rows == 0 || model.net.layer_plans.empty()) return 0;
     return static_cast<uint32_t>(std::min<size_t>(model.net.layer_plans.size(),

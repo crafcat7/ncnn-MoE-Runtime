@@ -193,9 +193,13 @@ static uint32_t effective_submission_rows(const CompiledModel& model, uint32_t o
         return override_rows;
     if (model.graph_resources)
     {
+        // Live replanning may narrow the budget, but a copied model that
+        // overrides the prepared value must not inherit a wider one.
         const uint32_t live = model.graph_resources->resident_submission_rows.load(std::memory_order_acquire);
         if (live != 0)
-            return live;
+            return model.resident_submission_rows != 0
+                       ? std::min(live, model.resident_submission_rows)
+                       : live;
     }
     return model.resident_submission_rows;
 }
