@@ -1103,7 +1103,7 @@ void qnk_quantize_input(const ActivationBuffer& input, QnkQ8Input& quantized) no
             int32_t* token_sums = sums + token * static_cast<std::size_t>(block_count);
 #if defined(__aarch64__) || defined(_M_ARM64)
             neon_qnk_q8_quant(input.row(token), token_codes, token_scales, token_sums, input.columns());
-#else
+#elif defined(NCNN_MOE_MSVC_X86_SIMD)
             msvc_avx2_qnk_q8_quant(input.row(token), token_codes, token_scales, token_sums, input.columns());
 #endif
         }
