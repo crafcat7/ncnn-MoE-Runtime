@@ -92,7 +92,7 @@ static void qnk_gemm(const uint8_t* raw,
         output_stride2 = output2->columns();
     }
 
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_QNK_X86_SIMD)
     // 32-value GGML blocks decode eight lanes per step inside the fused row
     // kernel; the ISA check stays out of the per-block loop.
     const MxFp4KernelKind simd_kind = block_size == 32 ? mxfp4_kernel_kind() : MxFp4KernelKind::Scalar;
@@ -117,7 +117,7 @@ static void qnk_gemm(const uint8_t* raw,
         }
         result[row] = sum;
 #else
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_QNK_X86_SIMD)
         if (use_simd_block32)
         {
             size_t encoded_stride = 0;
@@ -150,7 +150,7 @@ static void qnk_gemm(const uint8_t* raw,
         }
 #endif
     };
-#if defined(__aarch64__) || defined(_M_ARM64) || defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(NCNN_MOE_QNK_X86_SIMD)
     // Single-token int8 rows are selected once per call instead of branching
     // inside the output-row loop.
     const auto row_q8 = [&](const uint8_t* data, const QnKPack* pack, float* result, size_t row) {
@@ -236,7 +236,7 @@ static void qnk_gemm(const uint8_t* raw,
 #else
     if (token_count == 1)
     {
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_QNK_X86_SIMD)
         if (q8)
         {
 #if defined(_OPENMP)
@@ -775,10 +775,10 @@ static bool qnk_linear_impl(std::initializer_list<const TensorData*> matrices,
 #endif
         QnkQ8Row q8;
         bool q8_enabled = false;
-#if !defined(NCNN_MOE_MSVC_X86_SIMD) && !defined(__aarch64__) && !defined(_M_ARM64)
+#if !defined(NCNN_MOE_QNK_X86_SIMD) && !defined(__aarch64__) && !defined(_M_ARM64)
         static_cast<void>(q8_dtype);
 #endif
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_QNK_X86_SIMD)
         // Single-token decode only. One quantized activation row serves every
         // output row, and qnk_gemm keeps the threading and packed-weight policy,
         // so this function no longer needs its own row loop.
@@ -814,7 +814,7 @@ static bool qnk_linear_impl(std::initializer_list<const TensorData*> matrices,
         if (!packed)
             return false;
 
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_QNK_X86_SIMD)
         if (qnk_block_size(matrix.dtype) == qnk_block_elements && matrix.dtype != DType::IQ4XS
             && mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512)
         {
@@ -1025,7 +1025,7 @@ static bool qnk_linear_impl(std::initializer_list<const TensorData*> matrices,
 #endif
     QnkQ8Row q8;
     bool q8_enabled = false;
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_QNK_X86_SIMD)
     q8_enabled = use_q8_activations && input.rows() == 1 && q8_dtype
                  && (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2
                      || mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512);
@@ -1069,7 +1069,7 @@ void qnk_quantize_input(const ActivationBuffer& input, QnkQ8Input& quantized) no
     quantized.columns = 0;
 #if defined(__aarch64__) || defined(_M_ARM64)
     const bool supported = neon_qnk_q8_supported();
-#elif defined(NCNN_MOE_MSVC_X86_SIMD)
+#elif defined(NCNN_MOE_QNK_X86_SIMD)
     const bool supported = mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2
                            || mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512;
 #else
@@ -1103,7 +1103,7 @@ void qnk_quantize_input(const ActivationBuffer& input, QnkQ8Input& quantized) no
             int32_t* token_sums = sums + token * static_cast<std::size_t>(block_count);
 #if defined(__aarch64__) || defined(_M_ARM64)
             neon_qnk_q8_quant(input.row(token), token_codes, token_scales, token_sums, input.columns());
-#else
+#elif defined(NCNN_MOE_QNK_X86_SIMD)
             msvc_avx2_qnk_q8_quant(input.row(token), token_codes, token_scales, token_sums, input.columns());
 #endif
         }

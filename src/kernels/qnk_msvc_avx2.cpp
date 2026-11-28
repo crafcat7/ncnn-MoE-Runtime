@@ -8,7 +8,7 @@
 namespace ncnn {
 namespace moe {
 
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_QNK_X86_SIMD)
 static float horizontal_sum(__m256 value) noexcept
 {
     const __m128 halves = _mm_add_ps(_mm256_castps256_ps128(value), _mm256_extractf128_ps(value, 1));
