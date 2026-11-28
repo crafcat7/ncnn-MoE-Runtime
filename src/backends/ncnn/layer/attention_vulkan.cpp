@@ -979,13 +979,9 @@ static bool record_attention_output_gate(const ncnn::Pipeline* pipeline,
                                          ncnn::VkCompute& command)
 {
     const uint64_t elements = static_cast<uint64_t>(token_count) * columns;
-    if (!pipeline || attention.empty() || gate.empty()
-        || elements == 0
-        || gate.dims != 2 || gate.w != static_cast<int>(columns)
-        || gate.h != static_cast<int>(token_count)
-        || gate.elempack != 1 || gate.elemsize != sizeof(float)
-        || attention.elempack != 1 || attention.elemsize != sizeof(float)
-        || attention.total() * attention.elempack < elements)
+    // `gate` is allocated by record_qkv_norm_rope and unpack_in_place may leave
+    // `attention` empty when its conversion allocation fails.
+    if (attention.empty())
         return false;
 
     const std::vector<ncnn::VkMat> bindings = {attention, gate};
@@ -1348,10 +1344,7 @@ static bool record_attention_ring_zero(const ncnn::Pipeline* pipeline, ncnn::VkM
                                        ncnn::VkMat& destination_value, uint64_t destination_row,
                                        ncnn::VkCompute& command)
 {
-    if (!pipeline || destination_key.empty() || destination_value.empty()
-        || (destination_key.elemsize != sizeof(float) && destination_key.elemsize != sizeof(uint16_t))
-        || destination_value.elemsize != destination_key.elemsize
-        || destination_row >= static_cast<uint64_t>(destination_key.h))
+    if (destination_row >= static_cast<uint64_t>(destination_key.h))
         return false;
 
     const std::vector<ncnn::VkMat> bindings = {destination_key, destination_value};
@@ -2649,8 +2642,6 @@ bool Attention_vulkan::record_forward(uint64_t position_offset, LayerCache& cach
     if (implementation.post_attention_norm)
     {
         // Post-attention RMSNorm normalizes the output projection before residual add.
-        if (projected_gpu.empty() || projected_gpu.elempack != 1 || projected_gpu.elemsize != sizeof(float))
-            return false;
         auto& post_attention_normalized = ticket.keep_buffer();
         if (!implementation.post_attention_norm->record(projected_gpu, post_attention_normalized, command))
             return false;
@@ -2840,8 +2831,7 @@ bool Attention_vulkan::materialize_device_cache(LayerCache& cache) const
     ncnn::VkMat& value_staging = transfer_slot.attention_cache_value;
     if (!record_attention_copy(implementation.ring_append_pipeline.get(), device_cache.key,
                                device_cache.value, key_staging, value_staging,
-                               cache.capacity_tokens, 0, false, cache.first_slot, true, false, command)
-        || key_staging.empty() || value_staging.empty())
+                               cache.capacity_tokens, 0, false, cache.first_slot, true, false, command))
         return false;
 
     if (submit_wait(command, implementation.vulkan_context->device()) != 0)
@@ -3082,9 +3072,7 @@ AttentionBatchResult_vulkan Attention_vulkan::forward_batch(std::span<const Atte
         const ActivationBuffer& input = *entry.input;
         const uint64_t actual_token_count = cache.token_count + 1;
         const uint64_t destination_count = actual_token_count + sink_token_count;
-        if (actual_token_count <= cache.token_count
-            || actual_token_count > cache.capacity_tokens
-            || destination_count < actual_token_count)
+        if (actual_token_count > cache.capacity_tokens)
             return AttentionBatchResult_vulkan::NotExecuted;
 
         prepared.emplace_back();
@@ -3192,7 +3180,6 @@ AttentionBatchResult_vulkan Attention_vulkan::forward_batch(std::span<const Atte
                     return AttentionBatchResult_vulkan::NotExecuted;
             }
             else if (!fused_gate || work.normalized_unpacked_gpu.empty()
-                     || work.normalized_unpacked_gpu.dims != 2 || work.normalized_unpacked_gpu.h != 1
                      || fused_gate->forward(work.normalized_unpacked_gpu, work.fused_gpu,
                                             command, implementation.option)
                             != 0)

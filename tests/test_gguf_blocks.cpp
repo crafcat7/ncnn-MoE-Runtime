@@ -794,8 +794,10 @@ static void test_native_pairs_and_invalid_layouts()
             }
         }
         ActivationBuffer output;
-        block_check(!forward_linear_qnk({&first}, input, {&input}, false), "native input/output alias accepted");
-        block_check(!forward_linear_qnk({&first, &second}, input, {&output, &output}, true), "native paired output alias accepted");
+        block_check(!forward_linear({&first, &second}, input, {&input, &output}, 0),
+                    "dispatched input/output alias accepted");
+        block_check(!forward_linear({&first, &second}, input, {&output, &output}, 0),
+                    "dispatched paired output alias accepted");
         for (uint32_t invalid_columns : {0u, block_size - 1, block_size + 1, 2 * block_size - 1})
             block_check(!qnk_shape_supported(dtype, 1, invalid_columns) && qnk_storage_bytes(dtype, 1, invalid_columns) == 0, "partial native block row accepted");
         const uint32_t wide = std::numeric_limits<uint32_t>::max() - (block_size - 1);

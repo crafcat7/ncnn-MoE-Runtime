@@ -64,10 +64,6 @@ void residual_record(const ncnn::Pipeline* pipeline, uint32_t mode, uint32_t hid
 bool residual_allocate(ncnn::VkMat& value, uint32_t columns, int rows,
                        const std::shared_ptr<VulkanContext>& context)
 {
-    if (columns == 0 || rows <= 0 || columns > static_cast<uint32_t>(std::numeric_limits<int>::max())
-        || static_cast<uint64_t>(columns) * rows > std::numeric_limits<uint32_t>::max())
-        return false;
-
     value.create(static_cast<int>(columns), rows, sizeof(float), context->blob_allocator());
     return !value.empty();
 }
@@ -210,7 +206,7 @@ bool GatedResidual_vulkan::record_post(const ncnn::VkMat& branch, const ncnn::Vk
                                        ncnn::VkCompute& cmd) const
 {
     const auto& impl = *d;
-    if (branch.h != residual.h || injection.h != residual.h
+    if (branch.h != residual.h
         || !residual_allocate(output, residual.w, residual.h, impl.context))
         return false;
 

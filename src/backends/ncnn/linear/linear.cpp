@@ -327,9 +327,6 @@ std::shared_ptr<Linear> Linear::create_fused(const std::vector<const TensorData*
 bool Linear::forward(const ActivationBuffer& input, ActivationBuffer& output) const
 {
     const Implementation& impl = *d;
-    if (!impl.layer)
-        return false;
-
     VulkanRuntimeState& state = impl.vulkan_context->runtime_state();
     VkTransferLease lease = impl.vulkan_context->acquire_transfer_slot();
     VkTransferSlot& slot = lease.slot();

@@ -132,10 +132,6 @@ bool QsaAttentionWork_vulkan::commit()
 
 static bool qsa_matrix(ncnn::VkMat& target, uint32_t columns, uint32_t rows, VulkanContext& context)
 {
-    // VkMat uses signed dimensions; zero-sized matrices are rejected by create.
-    if (columns == 0 || rows == 0)
-        return false;
-
     target.create(static_cast<int>(columns), static_cast<int>(rows), sizeof(float), context.blob_allocator());
     return !target.empty();
 }

@@ -1747,8 +1747,6 @@ std::unique_ptr<ExpertSubmission> VulkanExpertBackend::submit_batch(std::span<co
             if (private_request.route_aggregation.output)
             {
                 const ActivationBuffer* client_aggregation = work->client_requests[request_index].route_aggregation.output;
-                if (!client_aggregation)
-                    continue;
                 if (work->private_aggregation.rows() == 0)
                 {
                     work->private_aggregation.reset(client_aggregation->rows(),
@@ -2139,7 +2137,7 @@ bool VulkanExpertBackend::build_ra_meta(std::span<const ExpertRequest> requests,
         total_rows += aggregation.routes.size();
         for (const ExpertRoute& route : aggregation.routes)
         {
-            if (route.token_index >= token_count || offsets[route.token_index + 1] == std::numeric_limits<uint32_t>::max())
+            if (offsets[route.token_index + 1] == std::numeric_limits<uint32_t>::max())
                 return false;
             ++offsets[route.token_index + 1];
         }
@@ -2665,12 +2663,6 @@ bool VulkanExpertBackend::forward_bfloat16_batch(WorkItem& work,
     for (size_t index = 0; index < selected.size(); ++index)
     {
         const Selection& selection = selected[index];
-        if (selection.request_index >= requests.size()
-            || !selection.entry
-            || !selection.entry->bfloat16_operation)
-        {
-            return false;
-        }
         const ExpertRequest& request = requests[selection.request_index];
         if (!request.has_host_input() || !request.output)
             return false;
@@ -2710,20 +2702,12 @@ bool VulkanExpertBackend::forward_qnk_batch(WorkItem& work,
 
     for (const Selection& selection : selected)
     {
-        if (selection.request_index >= requests.size()
-            || !selection.entry
-            || !selection.entry->qnk_operation)
-        {
-            return false;
-        }
         const ExpertRequest& request = requests[selection.request_index];
         if (!request.has_host_input() || !request.output)
             return false;
     }
 
     const uint32_t output_columns = selected.front().entry->qnk_operation->output_columns();
-    if (output_columns == 0)
-        return false;
 
     ActivationBuffer* aggregated_output = nullptr;
     uint32_t aggregated_token_count = 0;

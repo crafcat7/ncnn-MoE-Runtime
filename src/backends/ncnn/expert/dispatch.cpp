@@ -213,8 +213,7 @@ bool VulkanExpertBackend::forward_batch(std::span<const ExpertRequest> requests,
         for (const Selection& selection : selected)
         {
             const ExpertRequest& request = requests[selection.request_index];
-            if ((!region && request.device_input != retained_input)
-                || request.device_routes.size() != request.rows())
+            if (!region && request.device_input != retained_input)
             {
                 use_device_input = false;
                 break;

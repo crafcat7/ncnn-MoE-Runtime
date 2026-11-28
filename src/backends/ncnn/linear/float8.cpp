@@ -351,10 +351,6 @@ static bool forward_float8_chain(const VulkanContext& context,
         if (!rms_norm_quantize_pipeline || rms_norm_weight.empty())
             return false;
     }
-    else if (!quantize_pipeline)
-    {
-        return false;
-    }
 
     VulkanContext& mutable_context = const_cast<VulkanContext&>(context);
     VulkanRuntimeState& runtime_state = mutable_context.runtime_state();
@@ -1185,8 +1181,7 @@ bool Float8Linear_vulkan::forward_rms_norm_chain_parallel_bfloat16(const Activat
     const Implementation& first = *d;
     const Implementation& second = *next.d;
     const Implementation& parallel = *parallel_operator.d;
-    if (!first.quantize_pipeline || !first.rms_norm_quantize_pipeline
-        || first.rms_norm_weight.empty())
+    if (!first.rms_norm_quantize_pipeline || first.rms_norm_weight.empty())
     {
         return false;
     }
@@ -1408,8 +1403,6 @@ bool Float8Linear_vulkan::forward_swiglu_chain(const ActivationBuffer& input,
     const Implementation& gate = *d;
     const Implementation& up = *up_operator.d;
     const Implementation& down = *down_operator.d;
-    if (!gate.swiglu_quantize_pipeline)
-        return false;
 
     VulkanRuntimeState& runtime_state = gate.vulkan_context->runtime_state();
     VkTransferLease transfer_lease = gate.vulkan_context->acquire_transfer_slot();

@@ -370,9 +370,6 @@ bool record_cm2_gemm(const Cm2Gemm (&pipes)[4],
         || stride < static_cast<uint64_t>(shape.offset) + shape.n
         || in.empty() || in.elempack != 1 || (!input_bf16 && !input_f32)
         || out.empty() || out.elempack != 1
-        || w.empty() || bias.empty()
-        || w.buffer_capacity() < static_cast<uint64_t>(shape.k) * shape.n * sizeof(uint16_t)
-        || bias.buffer_capacity() < static_cast<uint64_t>(shape.n) * sizeof(float)
         || out.buffer_capacity() < static_cast<uint64_t>(stride) * shape.rows * out.elemsize)
     {
         return false;
@@ -537,9 +534,6 @@ bool record_tile_gemm(const TileGemm (&pipes)[2],
         // vec4 activation loads: the binding must be 16 B aligned and the rows contiguous.
         || (in.offset & 15u) != 0 || in.cstep != static_cast<size_t>(in.w) * in.h
         || out.empty() || out.elempack != 1 || out.elemsize != sizeof(float)
-        || w.empty() || bias.empty()
-        || w.buffer_capacity() < static_cast<uint64_t>(shape.k) * shape.n * sizeof(uint16_t)
-        || bias.buffer_capacity() < static_cast<uint64_t>(shape.n) * sizeof(float)
         || out.buffer_capacity() < static_cast<uint64_t>(stride) * shape.rows * sizeof(float))
     {
         return false;

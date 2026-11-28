@@ -1099,9 +1099,7 @@ std::shared_ptr<GpuSegmentContinuation_vulkan> GpuSegment_vulkan::prepare_contin
                                                                                        std::string& error) const
 {
     if (d->head || !workspace.active() || workspace.d->combined || workspace.d->context != d->context
-        || positions.empty() || positions.size() != caches.size() || positions.size() != workspace.d->residual->rows()
-        || positions.size() > static_cast<size_t>(std::numeric_limits<int>::max())
-        || std::any_of(caches.begin(), caches.end(), [](auto* cache) { return cache == nullptr; }))
+        || positions.empty() || positions.size() != caches.size() || positions.size() != workspace.d->residual->rows())
     {
         error = "invalid Vulkan continuation inputs";
         return {};
@@ -1282,16 +1280,15 @@ bool GpuSegment_vulkan::forward_resident(const CompiledModel& model, const Activ
     const size_t layers = model.net.layer_plans.size();
     const size_t rows = positions.size();
     const size_t limit = layer_limit == 0 ? layers : std::min(layers, static_cast<size_t>(layer_limit));
-    if (layers == 0 || limit == 0 || rows == 0 || rows > static_cast<size_t>(std::numeric_limits<int>::max())
+    if (layers == 0 || rows == 0 || rows > static_cast<size_t>(std::numeric_limits<int>::max())
         || layers > std::numeric_limits<size_t>::max() / rows || caches.size() != layers * rows
         || (!options.empty() && options.size() != layers)
         || (!model.gpu_expert_banks.empty() && model.gpu_expert_banks.size() != layers)
-        || model.gpu_segments.size() != layers || (!model.gpu_head && limit == layers)
         || model.resident_submission_rows == 0
         || (limit < layers && produce_logits)
         || initial_hidden.dtype() != DType::Float32 || initial_hidden.rows() != rows
         || initial_hidden.columns() != model.descriptor.hidden_size
-        || std::any_of(caches.begin(), caches.end(), [](auto* cache) { return cache == nullptr || cache->vulkan_attention_state_unknown; }))
+        || std::any_of(caches.begin(), caches.end(), [](auto* cache) { return cache->vulkan_attention_state_unknown; }))
     {
         error = "invalid resident graph chain inputs";
         return false;
@@ -1610,7 +1607,6 @@ bool GpuSegment_vulkan::forward(const ActivationBuffer& initial_hidden, std::spa
 {
     if (d->head || !d->context || positions.empty() || positions.size() != caches.size()
         || positions.size() > static_cast<size_t>(std::numeric_limits<int>::max())
-        || std::any_of(caches.begin(), caches.end(), [](auto* cache) { return cache == nullptr; })
         || (workspace.d->context && workspace.d->context != d->context)
         || (!workspace.d->context
             && (initial_hidden.dtype() != DType::Float32 || initial_hidden.rows() != positions.size() || initial_hidden.columns() != d->hidden)))

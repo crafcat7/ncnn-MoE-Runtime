@@ -256,9 +256,6 @@ bool VkHostOutput::prepare(const std::shared_ptr<VulkanContext>& ctx,
     }
 
     const size_t bytes = rows * static_cast<size_t>(cols) * sizeof(float);
-    if (bytes > std::numeric_limits<uint64_t>::max() - 63)
-        return false;
-
     const uint64_t planned = align_up(bytes, 64);
     if (planned > slot_limit)
         return false;

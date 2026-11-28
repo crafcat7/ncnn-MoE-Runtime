@@ -34,10 +34,6 @@ static bool gated_delta_record_columns(uint32_t head_count, uint32_t kv_head_cou
                                        uint32_t& convolution_columns, uint32_t& value_columns,
                                        uint32_t& fused_columns) noexcept
 {
-    if (head_count == 0 || kv_head_count == 0 || head_count % kv_head_count != 0
-        || head_dimension == 0 || value_head_dimension == 0 || gate_channels == 0)
-        return false;
-
     const uint64_t key_size = saturating_multiply_u64(kv_head_count, head_dimension);
     const uint64_t values = saturating_multiply_u64(head_count, value_head_dimension);
     const uint64_t int_max = static_cast<uint64_t>(std::numeric_limits<int>::max());
@@ -1499,8 +1495,6 @@ GatedDeltaNet_vulkan::forward_batch(std::span<const GatedDeltaBatchEntry_vulkan>
         GatedDeltaState_vulkan::Implementation& state_implementation = *states[entry_index]->d;
         ncnn::VkMat fused_view = row_view(fused_gpu, entry_index, 1);
         ncnn::VkMat recurrent_view = row_view(recurrent_output_gpu, entry_index, 1);
-        if (fused_view.empty() || recurrent_view.empty())
-            return GatedDeltaBatchResult_vulkan::Failed;
 
         // One row per entry, so the cached token count of one applies.
         record_dispatch(cmd, implementation.conv,

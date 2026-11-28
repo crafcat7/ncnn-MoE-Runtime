@@ -239,9 +239,6 @@ bool MoeCombine_vulkan::record(const MoeCombinePending_vulkan& pending, ncnn::Vk
                                ncnn::VkCompute& command, std::vector<ncnn::VkMat>& storage,
                                uint64_t& uploads) const
 {
-    if (pending.d->context != d->context)
-        return false;
-
     std::vector<MoeCombineInput_vulkan> views;
     views.reserve(pending.d->inputs.size());
     for (const auto& input : pending.d->inputs)

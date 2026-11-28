@@ -25,10 +25,6 @@ namespace moe {
 static bool allocate_hyper_buffer(ncnn::VkMat& output, uint32_t columns, int rows,
                                   const std::shared_ptr<VulkanContext>& context)
 {
-    if (columns == 0 || columns > static_cast<uint32_t>(std::numeric_limits<int>::max()) || rows <= 0
-        || static_cast<uint64_t>(columns) * static_cast<uint64_t>(rows) > std::numeric_limits<uint32_t>::max())
-        return false;
-
     output.create(static_cast<int>(columns), rows, sizeof(float), context->blob_allocator());
     return !output.empty();
 }
@@ -271,9 +267,7 @@ bool HyperConnection_vulkan::record_pre(const ncnn::VkMat& input,
 {
     if (d->head
         || static_cast<uint32_t>(input.h) > d->context->device()->info.max_workgroup_count_y()
-        || static_cast<uint32_t>(input.h) > d->context->device()->info.max_workgroup_count_z()
-        || &input == &result.reduced || &input == &result.post || &input == &result.combine
-        || &input == &workspace.normalized || &input == &workspace.projection || &input == &workspace.pre)
+        || static_cast<uint32_t>(input.h) > d->context->device()->info.max_workgroup_count_z())
         return false;
 
     HyperConnectionMix_vulkan next;
@@ -302,10 +296,9 @@ bool HyperConnection_vulkan::record_post(const ncnn::VkMat& branch,
                                          ncnn::VkMat& output,
                                          ncnn::VkCompute& cmd) const
 {
-    if (d->head || mix.context != d->context
+    if (d->head
         || static_cast<uint32_t>(branch.h) > d->context->device()->info.max_workgroup_count_y()
-        || residual.h != branch.h || mix.post.h != branch.h || mix.combine.h != branch.h
-        || &output == &branch || &output == &residual || &output == &mix.post || &output == &mix.combine)
+        || residual.h != branch.h)
         return false;
 
     ncnn::VkMat next;
@@ -325,11 +318,9 @@ bool HyperConnection_vulkan::record_head(const ncnn::VkMat& input,
                                          HyperConnectionWorkspace_vulkan& workspace,
                                          ncnn::VkCompute& cmd) const
 {
-    if (!d->head || &output == &input
+    if (!d->head
         || static_cast<uint32_t>(input.h) > d->context->device()->info.max_workgroup_count_y()
-        || static_cast<uint32_t>(input.h) > d->context->device()->info.max_workgroup_count_z()
-        || &input == &workspace.normalized || &input == &workspace.projection || &input == &workspace.pre
-        || &output == &workspace.normalized || &output == &workspace.projection || &output == &workspace.pre)
+        || static_cast<uint32_t>(input.h) > d->context->device()->info.max_workgroup_count_z())
         return false;
 
     HyperConnectionWorkspace_vulkan work;

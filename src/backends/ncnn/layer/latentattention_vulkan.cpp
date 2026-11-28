@@ -804,7 +804,7 @@ static bool record_latent_shadow(const ncnn::VkMat& source,
                                  uint32_t columns,
                                  ncnn::VkMat& staging)
 {
-    if (source.empty() || source.total() < columns)
+    if (source.empty())
         return false;
 
     // Keep the device result live; shadows are copied and downloaded once after projections.

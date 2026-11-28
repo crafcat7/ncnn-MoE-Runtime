@@ -218,8 +218,6 @@ static bool graph_has_expert_banks(const CompiledModel& model, const Net& graph,
 static uint64_t graph_tensor_elements(const CompiledModel& model, const Net& graph,
                                       const Blob& tensor, uint32_t rows, uint32_t logits_rows)
 {
-    if (tensor.producer >= graph.layers.size())
-        return UINT64_MAX;
     const Layer& producer = graph.layers[tensor.producer];
     // Full-bank recording folds routed aggregation and the following Combine
     // into one output. The ExpertGroup tensor is not materialized there.
@@ -1561,9 +1559,6 @@ static Result<void> append_graph_region_memory(const CompiledModel& model, const
 {
     if (graph.layers.empty())
         return {};
-    auto valid = graph.validate_order();
-    if (!valid)
-        return valid.error();
     std::vector<uint32_t> positions(graph.layers.size());
     for (uint32_t position = 0; position < graph.order.size(); ++position)
         positions[graph.order[position]] = node_offset + position;
@@ -1869,6 +1864,13 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
 {
     if (prefill_rows == 0 || sequence_count == 0)
         return Error{ErrorCode::InvalidArgument, "graph memory planning requires nonzero prefill rows and sequence count"};
+    for (const Net* graph : {&compiled.net, &compiled.speculative.net})
+        if (!graph->layers.empty())
+        {
+            auto valid = graph->validate_order();
+            if (!valid)
+                return valid.error();
+        }
     ModelGraphMemoryPlan result;
     result.prefill_rows = prefill_rows;
     result.sequence_count = sequence_count;
@@ -1934,25 +1936,20 @@ Result<ModelGraphMemoryPlan> plan_model_graph_memory(const CompiledModel& compil
         // layer-chunk transitions and packing/CM2 boundaries, not just P.
         std::vector<uint32_t> shapes;
         const uint32_t enumerated = std::min(prefill_rows, submission_rows);
-        const uint32_t layer_count = static_cast<uint32_t>(std::max<size_t>(1, compiled.net.layer_plans.size()));
-        if (enumerated >= 1)
+        const uint32_t layer_count = static_cast<uint32_t>(compiled.net.layer_plans.size());
+        for (uint32_t base : {1u, 7u, 8u, enumerated})
+            if (base <= enumerated)
+                shapes.push_back(base);
+        const uint32_t max_chunk = std::min(layer_count, submission_rows);
+        for (uint32_t chunk = 1; chunk <= max_chunk; ++chunk)
         {
-            for (uint32_t base : {1u, 7u, 8u, enumerated})
-                if (base <= enumerated)
-                    shapes.push_back(base);
-            const uint32_t max_chunk = std::min(layer_count, submission_rows);
-            for (uint32_t chunk = 1; chunk <= max_chunk; ++chunk)
-            {
-                const uint32_t r_max = std::min(enumerated, submission_rows / chunk);
-                if (r_max == 0)
-                    continue;
-                shapes.push_back(r_max);
-                const uint32_t packed = r_max - r_max % 4;
-                if (packed >= 1)
-                    shapes.push_back(packed);
-                if (r_max % 4 == 0 && r_max > 1)
-                    shapes.push_back(r_max - 1);
-            }
+            const uint32_t r_max = std::min(enumerated, submission_rows / chunk);
+            shapes.push_back(r_max);
+            const uint32_t packed = r_max - r_max % 4;
+            if (packed >= 1)
+                shapes.push_back(packed);
+            if (r_max % 4 == 0 && r_max > 1)
+                shapes.push_back(r_max - 1);
         }
         if (prefill_rows > enumerated)
         {

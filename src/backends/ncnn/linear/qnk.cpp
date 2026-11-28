@@ -1519,18 +1519,14 @@ bool QnkExpert_vulkan::record(const ncnn::VkMat& input, ncnn::VkMat& output,
     const QnkLinear_vulkan::Implementation& gate = *implementation.gate_up->d;
     const uint32_t rows = input.dims == 1 ? 1u : static_cast<uint32_t>(input.h);
     uint64_t scratch_columns[5]{};
-    const size_t scratch_count = qnk_expert_scratch_shapes(implementation.intermediate_columns,
-                                                           implementation.output_columns,
-                                                           static_cast<bool>(implementation.up),
-                                                           static_cast<bool>(implementation.router_gate),
-                                                           scratch_columns);
-    if (scratch_count == 0 || gate.output_columns != scratch_columns[0])
-        return false;
+    (void)qnk_expert_scratch_shapes(implementation.intermediate_columns,
+                                    implementation.output_columns,
+                                    static_cast<bool>(implementation.up),
+                                    static_cast<bool>(implementation.router_gate),
+                                    scratch_columns);
 
     size_t scratch_index = 0;
     const auto create_scratch = [&](ncnn::VkMat& value, uint64_t columns, bool bf16 = false) {
-        if (columns == 0 || columns > static_cast<uint64_t>(std::numeric_limits<int>::max()))
-            return false;
         value.create(static_cast<int>(columns), static_cast<int>(rows),
                      bf16 ? sizeof(uint16_t) : sizeof(float), 1,
                      implementation.vulkan_context->blob_allocator());
