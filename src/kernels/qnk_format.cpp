@@ -653,7 +653,7 @@ void qnk_dequantize_block(DType dtype, const uint8_t* block, float* output) noex
 {
     if (!block || !output || !is_qnk_dtype(dtype))
         return;
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_QNK_X86_SIMD)
     if (qnk_block_size(dtype) == 32
         && (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx2
             || mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512))
@@ -690,7 +690,7 @@ float qnk_dot_block(DType dtype, const uint8_t* block, const float* input) noexc
 #if defined(__aarch64__) || defined(_M_ARM64)
         return forward_qnk(dtype, block, input, nullptr);
 #else
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_QNK_X86_SIMD)
         const MxFp4KernelKind simd_kind = mxfp4_kernel_kind();
         if (simd_kind == MxFp4KernelKind::X86Avx2 || simd_kind == MxFp4KernelKind::X86Avx512)
         {
@@ -749,7 +749,7 @@ float qnk_dot_block(DType dtype, const uint8_t* block, const float* input) noexc
         return sum;
 #endif
     }
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_QNK_X86_SIMD)
     if (qnk_block_size(dtype) == qnk_block_elements && dtype != DType::IQ4XS)
     {
         if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512)
@@ -778,7 +778,7 @@ void qnk_q8k_quantize(const float* source, uint8_t* output, uint32_t columns) no
 {
     if (!source || !output || columns == 0 || columns % qnk_block_elements != 0)
         return;
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_QNK_X86_SIMD)
     if (mxfp4_kernel_kind() == MxFp4KernelKind::X86Avx512)
     {
         msvc_avx512_qnk_q8k_quantize(source, output, columns);
