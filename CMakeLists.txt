@@ -294,7 +294,7 @@ if(NCNN_MOE_ENABLE_X86_SIMD AND MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STRE
         src/kernels/vector_x86_avx512.cpp
         PROPERTIES COMPILE_OPTIONS "/arch:AVX512"
     )
-    target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_MSVC_X86_SIMD=1 NCNN_MOE_X86_SIMD=1)
+    target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_MSVC_X86_SIMD=1 NCNN_MOE_QNK_X86_SIMD=1 NCNN_MOE_X86_SIMD=1)
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     set(NCNN_MOE_TARGET_HAS_X86 OFF)
     if(APPLE AND CMAKE_OSX_ARCHITECTURES)
@@ -316,9 +316,20 @@ elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
             src/kernels/vector_x86_avx2.cpp
             src/kernels/vector_x86_avx512.cpp
         )
+        # The GGUF block kernels (Q4_0 ... Q8_0, K-quants) use plain <immintrin.h>
+        # intrinsics, so GCC and Clang build them with per-file ISA flags too. They
+        # run only after the runtime CPU check in mxfp4_kernel_kind().
+        list(APPEND NCNN_MOE_X86_SIMD_SOURCES
+            src/kernels/qnk_msvc_avx2.cpp
+            src/kernels/qnk_msvc_avx512.cpp
+        )
         target_sources(ncnn_moe PRIVATE ${NCNN_MOE_X86_SIMD_SOURCES})
         source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${NCNN_MOE_X86_SIMD_SOURCES})
-        target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_X86_SIMD=1)
+        set_source_files_properties(src/kernels/qnk_msvc_avx2.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+        set_source_files_properties(src/kernels/qnk_msvc_avx512.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512cd;-mavx512bw;-mavx512dq;-mavx512vl;-mfma;-mf16c")
+        target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_QNK_X86_SIMD=1 NCNN_MOE_X86_SIMD=1)
     endif()
 endif()
 # Compiler support does not imply runtime CPU support.

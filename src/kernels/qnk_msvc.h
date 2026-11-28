@@ -8,7 +8,7 @@
 namespace ncnn {
 namespace moe {
 
-#if defined(NCNN_MOE_MSVC_X86_SIMD)
+#if defined(NCNN_MOE_QNK_X86_SIMD)
 float msvc_avx2_qnk_dot_block(DType dtype,
                               const uint8_t* block,
                               const float* input) noexcept;
