@@ -1059,6 +1059,21 @@ bool forward_linear_qnk(std::initializer_list<const TensorData*> matrices,
                         bool use_q8_activations,
                         QnkQ8Input* q8_input)
 {
+    // qnk_linear_impl indexes outputs and sidecars by matrix and writes every
+    // output while it still reads the input, so reject what it cannot handle.
+    const size_t matrix_count = matrices.size();
+    if ((matrix_count != 1 && matrix_count != 2)
+        || outputs.size() != matrix_count
+        || (!sidecars.empty() && sidecars.size() != matrix_count))
+        return false;
+    const TensorData* const* weights = matrices.begin();
+    ActivationBuffer* const* results = outputs.begin();
+    for (size_t index = 0; index < matrix_count; ++index)
+    {
+        if (!weights[index] || !results[index] || results[index] == &input
+            || (index != 0 && results[index] == results[0]))
+            return false;
+    }
     return qnk_linear_impl(matrices, input, outputs, use_packed_weights, sidecars, use_q8_activations, q8_input);
 }
 
